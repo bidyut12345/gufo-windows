@@ -1185,6 +1185,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
       sampled && platform::PlatformTuning().fast_sampling &&
       k <= candidates.size() && sampler.config().top_k > 0 &&
       !sampler.config().penalties_enabled() &&
+      !sampler.config().constraint &&
       exec.VerifyCandidates(std::span(candidates).first(k), &candidate_error);
   // Full rows kept on the GPU are fetched once, only when a row is needed.
   bool rows_ready = !pending.rows_on_device;
@@ -1351,7 +1352,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
   pending.rows_on_device =
       pending.speculative && !pending.gpu_verification && pending.sampled &&
       platform::PlatformTuning().fast_sampling && sampler.config().top_k > 0 &&
-      !sampler.config().penalties_enabled();
+      !sampler.config().penalties_enabled() &&
+      !sampler.config().constraint;
   float* logits = !pending.speculative ? logits_.data()
                   : pending.gpu_verification || pending.rows_on_device
                       ? nullptr

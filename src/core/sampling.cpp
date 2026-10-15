@@ -646,7 +646,7 @@ std::optional<SamplingDistribution> SamplerState::DistributionFromTop(
     std::size_t vocab) const {
   if (values.size() != ids.size() || values.empty() ||
       config_.temperature == 0 || config_.top_k <= 0 ||
-      !penalty_counts_.empty()) {
+      !penalty_counts_.empty() || config_.constraint) {
     return std::nullopt;
   }
   std::vector<Probability> candidates;
@@ -706,6 +706,9 @@ std::optional<TokenId> SamplerState::SampleFromTop(
     std::span<const float> values, std::span<const TokenId> ids,
     std::size_t vocab) {
   config_.Validate();
+  if (config_.constraint) {
+    return std::nullopt;
+  }
   if (pending_sample_) {
     if (*pending_sample_ >= vocab) {
       throw std::invalid_argument("pending sample exceeds vocabulary");
