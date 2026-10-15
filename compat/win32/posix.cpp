@@ -55,6 +55,7 @@
 
 #include <atomic>
 #include <exception>
+#include <filesystem>
 #include <mutex>
 #include <random>
 #include <string>
@@ -472,6 +473,9 @@ std::wstring DirectoryPathOf(int dirfd) {
 }
 
 std::wstring ResolveAt(int dirfd, const char* path) {
+  if (path == nullptr) {
+    return {};
+  }
   std::wstring relative = Widen(path);
   const bool absolute =
       relative.size() >= 2 && (relative[1] == L':' || relative[0] == L'\\');
@@ -482,10 +486,30 @@ std::wstring ResolveAt(int dirfd, const char* path) {
   if (base.empty()) {
     return {};
   }
-  if (base.back() != L'\\') {
-    base += L'\\';
+  bool hadVerbatim = false;
+  bool hadVerbatimUnc = false;
+  if (base.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+    hadVerbatimUnc = true;
+    base = L"\\\\" + base.substr(8);
+  } else if (base.rfind(L"\\\\?\\", 0) == 0) {
+    hadVerbatim = true;
+    base = base.substr(4);
   }
-  return base + relative;
+  std::filesystem::path basePath(base);
+  std::filesystem::path resolved = (basePath / relative).lexically_normal();
+  std::wstring resStr = resolved.wstring();
+  if (hadVerbatimUnc) {
+    resStr = L"\\\\?\\UNC\\" + resStr.substr(2);
+  } else if (hadVerbatim) {
+    resStr = L"\\\\?\\" + resStr;
+  }
+  if (resStr.size() == 6 && resStr[0] == L'\\' && resStr[1] == L'\\' &&
+      resStr[2] == L'?' && resStr[3] == L'\\' && resStr[5] == L':') {
+    resStr += L'\\';
+  } else if (resStr.size() == 2 && resStr[1] == L':') {
+    resStr += L'\\';
+  }
+  return resStr;
 }
 
 struct timespec TimespecFromFiletime(const FILETIME& ft) {
@@ -873,9 +897,18 @@ int unlink(const char* path) {
 
 int unlinkat(int dirfd, const char* path, int flags) {
   const std::wstring resolved = ResolveAt(dirfd, path);
-  const std::string narrow = Narrow(resolved.c_str());
-  return (flags & 0x200 /* AT_REMOVEDIR */) ? rmdir(narrow.c_str())
-                                            : unlink(narrow.c_str());
+  if (resolved.empty()) {
+    errno = EBADF;
+    return -1;
+  }
+  if (flags & 0x200 /* AT_REMOVEDIR */) {
+    if (!RemoveDirectoryW(resolved.c_str()))
+      return Fail(GetLastError());
+  } else {
+    if (!DeleteFileW(resolved.c_str()))
+      return Fail(GetLastError());
+  }
+  return 0;
 }
 
 int rmdir(const char* path) {
@@ -893,12 +926,16 @@ int mkdir(const char* path, mode_t) {
 }
 
 int mkdirat(int dirfd, const char* path, mode_t mode) {
+  (void)mode;
   const std::wstring resolved = ResolveAt(dirfd, path);
   if (resolved.empty()) {
     errno = EBADF;
     return -1;
   }
-  return mkdir(Narrow(resolved.c_str()).c_str(), mode);
+  if (!CreateDirectoryW(resolved.c_str(), nullptr)) {
+    return Fail(GetLastError());
+  }
+  return 0;
 }
 
 int access(const char* path, int mode) {
