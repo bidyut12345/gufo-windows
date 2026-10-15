@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <future>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
+#include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
 
@@ -30,7 +32,9 @@ void RequireExact(std::span<const float> expected,
           message);
 }
 
-void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model) {
+void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model,
+                                     bool warm_storage,
+                                     bool protect_rows = false) {
   std::string error;
   const auto mode = gufo::core::SessionMode::kAutoregressive;
   auto decoding = model->CreateSession(mode, 128, &error);
@@ -40,8 +44,20 @@ void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model) {
   const auto prompt = model->Tokenize("Continue: red, blue, red, blue,");
   for (auto* session : {decoding.get(), reference.get(), frozen.get()})
     Require(session->Sync(prompt, &error), error);
-  const auto expected_snapshot = frozen->SaveSnapshot(&error);
+  auto expected_snapshot =
+      (warm_storage ? frozen : reference)->SaveSnapshot(&error);
   Require(expected_snapshot != nullptr, error);
+  std::unique_ptr<qfn::SessionSnapshot> prefix_checkpoint;
+  if (protect_rows) {
+    prefix_checkpoint = frozen->SaveSnapshot(&error);
+    Require(prefix_checkpoint != nullptr, error);
+    auto extended = prompt;
+    extended.push_back(prompt.front());
+    Require(frozen->Sync(extended, &error), error);
+    expected_snapshot =
+        frozen->SaveSnapshot(&error, qfn::Session::SnapshotMode::kMaterialized);
+    Require(expected_snapshot != nullptr, error);
+  }
 
   // Warm the one-token shape; its next execution records the decode graph.
   Require(decoding->Evaluate(prompt.front(), &error) &&
@@ -52,15 +68,26 @@ void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model) {
   unsigned checkpoints = 0;
   decoding->SetCancellationCheck([&] {
     // Forward checks once before capture and again at its first layer.
-    if (++checkpoints == 2)
-      concurrent_snapshot = std::async(std::launch::async, [&] {
-                              return frozen->SaveSnapshot(&snapshot_error);
-                            }).get();
+    if (++checkpoints == 2) {
+      try {
+        concurrent_snapshot = std::async(std::launch::async, [&] {
+                                return frozen->SaveSnapshot(&snapshot_error);
+                              }).get();
+      } catch (const std::exception& e) {
+        snapshot_error = e.what();
+        throw;
+      }
+    }
     return false;
   });
-  Require(decoding->Evaluate(prompt.back(), &error), error);
+  const bool evaluated = decoding->Evaluate(prompt.back(), &error);
+  Require(evaluated, error + "; peer snapshot: " + snapshot_error);
   decoding->SetCancellationCheck({});
   Require(concurrent_snapshot != nullptr, snapshot_error);
+  // Restore shares the executor's stream and follows its completed forward.
+  // The captured checkpoint must preserve its suffix before the rewind.
+  if (prefix_checkpoint)
+    Require(frozen->RestoreSnapshot(*prefix_checkpoint, &error), error);
   Require(concurrent_snapshot->bytes().size() ==
                   expected_snapshot->bytes().size() &&
               std::memcmp(concurrent_snapshot->bytes().data(),
@@ -106,17 +133,31 @@ void CheckFailureRecovery(const std::shared_ptr<qfn::Model>& model) {
   Require(snapshot->SizeBytes() < 200ULL * 1024 * 1024,
           "short prompt snapshot retains a full prefill hidden buffer");
 
+  auto peer = model->CreateSession(gufo::core::SessionMode::kAutoregressive, 64,
+                                   &error);
+  Require(peer && peer->Sync(pattern, &error), error);
+  const std::vector<float> peer_expected(peer->Logits().begin(),
+                                         peer->Logits().end());
   unsigned checks = 0;
-  session->SetCancellationCheck([&] { return ++checks >= 6; });
-  Require(!session->Evaluate(prompt.front(), &error) && !session->IsValid(),
-          "cancelled mutation left a reusable session");
-  Require(session->Tokens().empty() && session->Logits().empty() &&
-              !session->SaveSnapshot(&error),
-          "poisoned state exposed reusable tokens, logits or a snapshot");
-  session->SetCancellationCheck({});
-  Require(session->Sync(prompt, &error) && session->IsValid(), error);
-  RequireExact(expected, session->Logits(),
-               "Sync reused partially mutated state");
+  for (const unsigned stop_at : {3U, 4U, 6U}) {
+    peer->Reset();
+    checks = 0;
+    // Exercise both sides of PLE and reuse its mapped reader buffer in
+    // another request immediately after cancellation.
+    session->SetCancellationCheck([&] { return ++checks >= stop_at; });
+    Require(!session->Evaluate(prompt.front(), &error) && !session->IsValid(),
+            "cancelled mutation left a reusable session");
+    Require(session->Tokens().empty() && session->Logits().empty() &&
+                !session->SaveSnapshot(&error),
+            "poisoned state exposed reusable tokens, logits or a snapshot");
+    session->SetCancellationCheck({});
+    Require(peer->Sync(pattern, &error), error);
+    RequireExact(peer_expected, peer->Logits(),
+                 "cancelled forward left pinned inputs in use");
+    Require(session->Sync(prompt, &error) && session->IsValid(), error);
+    RequireExact(expected, session->Logits(),
+                 "Sync reused partially mutated state");
+  }
 
   checks = 0;
   session->SetCancellationCheck([&] { return ++checks >= 3; });
@@ -202,6 +243,7 @@ void CheckImageSnapshotAttachment(const std::shared_ptr<qfn::Model>& model) {
     for (std::size_t i = blue ? 2 : 0; i < pixels.pixels.size(); i += 3)
       pixels.pixels[i] = 255;
     prompt->images.push_back({std::move(pixels), grid});
+    prompt->images.back().prefix_identity.fill(blue ? 2 : 1);
     prompt->cache_identity.assign(32, blue ? 2 : 1);
     return prompt;
   };
@@ -278,6 +320,7 @@ void CheckPrefillChunks(const std::shared_ptr<qfn::Model>& model) {
                 split->Sync(std::span(tokens).first(boundary), &error) &&
                 split->Sync(tokens, &error),
             error);
+    std::vector<sampling::TokenId> history(tokens.begin(), tokens.end());
     for (unsigned step = 0; step < 4; ++step) {
       const auto logits = bulk->Logits();
       RequireExact(
@@ -289,10 +332,106 @@ void CheckPrefillChunks(const std::shared_ptr<qfn::Model>& model) {
           std::max_element(logits.begin(), logits.end()) - logits.begin());
       Require(bulk->Evaluate(token, &error) && split->Evaluate(token, &error),
               error);
+      history.push_back(token);
+    }
+    if (model->HasMtp()) {
+      const sampling::SamplingConfig config{
+          .temperature = 0.8F, .top_k = 20, .top_p = 0.95F, .seed = 73};
+      sampling::SamplerState a(config, history), b(config, history);
+      for (unsigned generated = 0; generated < 16;) {
+        qfn::Session::DecodeResult first, second;
+        Require(
+            bulk->DecodeStep(16 - generated, a, &first, &error, false) &&
+                split->DecodeStep(16 - generated, b, &second, &error, false),
+            error);
+        Require(!first.tokens.empty() && first.tokens == second.tokens &&
+                    a.rng_state() == b.rng_state(),
+                "prefill chunking changed sampled MTP replay: length=" +
+                    std::to_string(length) +
+                    " boundary=" + std::to_string(boundary));
+        RequireExact(bulk->Logits(), split->Logits(),
+                     "prefill chunking changed MTP target logits");
+        generated += first.tokens.size();
+      }
     }
     std::cout << "prefill chunks: length=" << length << " boundary=" << boundary
-              << " four logit rows exact\n"
+              << " four logit rows and sampled MTP replay exact\n"
               << std::flush;
+  }
+}
+
+void CheckMtpCacheReplay(const std::shared_ptr<qfn::Model>& model) {
+  namespace qt = gufo::tokenization;
+  std::string error;
+  for (const auto seed : {1U, 2U}) {
+    std::string system = "Case " + std::to_string(seed) + ". ";
+    for (unsigned i = 0; i < 32; ++i)
+      system += "Follow the user instruction carefully and answer accurately. ";
+    const std::array messages{
+        qt::ChatMessage{qt::ChatRole::kSystem, system},
+        qt::ChatMessage{qt::ChatRole::kUser,
+                        "Name three rivers in Europe and one fact about each."},
+        qt::ChatMessage{qt::ChatRole::kAssistant,
+                        "The Danube, the Rhine and the Loire."},
+        qt::ChatMessage{qt::ChatRole::kUser,
+                        "Now write a short story about one of them."}};
+    const auto encoded = qt::QwenChatTemplate::RenderAndTokenize(
+        model->tokenizer(), messages, {.enable_thinking = false}, &error);
+    Require(encoded.has_value(), error);
+    const std::vector<std::int32_t> prompt(encoded->begin(), encoded->end());
+    Require(prompt.size() == 355, "MTP cache replay fixture changed");
+    const sampling::SamplingConfig config{
+        .temperature = 0.8F, .top_k = 20, .top_p = 0.95F, .seed = seed};
+    const std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
+    std::vector<std::int32_t> expected;
+    std::vector<std::size_t> expected_widths;
+    std::uint64_t expected_rng = 0;
+    // The server's immutable frontier excludes the seven-token generation
+    // suffix. Rebuilding the same prompt must not depend on whether a
+    // previous turn already supplied its first 320 tokens.
+    for (const auto boundary : {320U, 348U}) {
+      auto session = model->CreateSession(gufo::core::SessionMode::kSpeculative,
+                                          6145, &error);
+      Require(session &&
+                  session->Sync(std::span(prompt).first(boundary), &error) &&
+                  session->Sync(prompt, &error),
+              error);
+      const auto snapshot = session->SaveSnapshot(&error);
+      Require(snapshot != nullptr, error);
+      for (unsigned restore = 0; restore < 2; ++restore) {
+        if (restore)
+          Require(session->RestoreSnapshot(*snapshot, &error), error);
+        session->ResetDraftPolicy();
+        sampling::SamplerState sampler(config, history);
+        std::vector<std::int32_t> tokens;
+        std::vector<std::size_t> widths;
+        while (tokens.size() < 200) {
+          qfn::Session::DecodeResult step;
+          Require(session->DecodeStep(200 - tokens.size(), sampler, &step,
+                                      &error, false),
+                  error);
+          Require(!step.tokens.empty(), "MTP replay made no progress");
+          tokens.insert(tokens.end(), step.tokens.begin(), step.tokens.end());
+          widths.push_back(step.tokens.size());
+        }
+        if (expected.empty()) {
+          expected = tokens;
+          expected_widths = widths;
+          expected_rng = sampler.rng_state();
+        } else {
+          Require(tokens == expected && widths == expected_widths &&
+                      sampler.rng_state() == expected_rng,
+                  "MTP cache replay changed tokens, acceptance or RNG: seed=" +
+                      std::to_string(seed) +
+                      " boundary=" + std::to_string(boundary) +
+                      " restore=" + std::to_string(restore));
+        }
+        std::cout << "MTP cache replay seed=" << seed
+                  << " boundary=" << boundary << " restore=" << restore
+                  << " tokens=200 exact=1\n"
+                  << std::flush;
+      }
+    }
   }
 }
 
@@ -423,7 +562,14 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
     Require(snapshot && batched.back()->RestoreSnapshot(*snapshot, &error),
             error);
     std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
-    const auto config = cases[(i * 3) % cases.size()].config;
+    auto config = cases[(i * 3) % cases.size()].config;
+    if (i % 2 == 0) {
+      config.temperature = 0;
+      config.repeat_penalty = i == 0 ? 0.7F : 1.3F;
+      config.repeat_last_n = 3;
+      config.frequency_penalty = i == 0 ? -0.4F : 0.2F;
+      config.presence_penalty = i == 0 ? -1.5F : 1.5F;
+    }
     serial_samplers.emplace_back(config, history);
     batch_samplers.emplace_back(config, history);
   }
@@ -537,15 +683,50 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
   std::cout << "batch independent_state_exact=1\n" << std::flush;
 }
 
-void CheckExecutionModes(const std::shared_ptr<qfn::Model>& model) {
+void CheckExecutionModes(const std::shared_ptr<qfn::Model>& model,
+                         std::uint32_t prompt_tokens = 4096,
+                         bool with_image = false) {
   using gufo::core::SessionMode;
+  namespace vision = gufo::models::qwen::vision;
   std::string error;
-  auto ar = model->CreateSession(SessionMode::kAutoregressive, 128, &error);
-  auto mtp = model->CreateSession(SessionMode::kSpeculative, 128, &error);
+  auto ar = model->CreateSession(SessionMode::kAutoregressive,
+                                 prompt_tokens + 16, &error);
+  auto mtp = model->CreateSession(SessionMode::kSpeculative, prompt_tokens + 16,
+                                  &error);
   Require(ar && mtp, error);
   Require(ar->AllocatedBytes() < mtp->AllocatedBytes(),
           "AR allocated predictor state");
-  const auto prompt = model->Tokenize("Continue: red, blue, red, blue,");
+  const auto pattern = model->Tokenize(
+      "Review this transaction log and identify the failed request.\n"
+      "def retry(items):\n"
+      "    return [item for item in items if item['status'] != 200]\n"
+      "{\"request\":\"tools.read\",\"status\":503,\"retry_after\":2.5}\n"
+      "The train travels 60 km in 45 minutes. Explain the calculation.\n"
+      "Café, e\u0301, 日本語, العربية. Keep Unicode and literal <tags> "
+      "intact.\n");
+  Require(!pattern.empty(), "empty execution-mode fixture");
+  std::vector<std::int32_t> prompt(prompt_tokens);
+  for (std::size_t i = 0; i < prompt.size(); ++i)
+    prompt[i] = pattern[i % pattern.size()];
+  if (with_image) {
+    Require(model->VisionEncoder() != nullptr && prompt_tokens >= 4,
+            "image prefill requires its encoder and four image tokens");
+    auto image = std::make_shared<vision::Prompt>();
+    const vision::ImageGrid grid{0, 2, 2};
+    std::fill_n(prompt.begin(), 4, vision::kImageToken);
+    image->tokens.assign(prompt.begin(), prompt.end());
+    image->rope.images.push_back(grid);
+    gufo::core::Image pixels;
+    pixels.width = pixels.height = 64;
+    pixels.pixels.resize(64 * 64 * 3);
+    for (std::size_t i = 0; i < pixels.pixels.size(); ++i)
+      pixels.pixels[i] = static_cast<std::uint8_t>((i * 37 + i / 64) % 256);
+    image->images.push_back({std::move(pixels), grid});
+    image->images.back().prefix_identity.fill(3);
+    image->cache_identity.assign(32, 3);
+    ar->ConfigureVision(image);
+    mtp->ConfigureVision(image);
+  }
   Require(ar->Sync(prompt, &error) && mtp->Sync(prompt, &error), error);
   RequireExact(ar->Logits(), mtp->Logits(),
                "execution mode changes target prefill logits");
@@ -562,16 +743,129 @@ void CheckExecutionModes(const std::shared_ptr<qfn::Model>& model) {
   Require(qfn::Session::EvaluateBatch(mixed, &error), error);
   RequireExact(ar->Logits(), mtp->Logits(),
                "mixed execution modes contaminate target logits");
-  sampling::SamplerState sampler;
+  const sampling::SamplingConfig config{
+      .temperature = 0.8F, .top_k = 20, .top_p = 0.95F, .seed = 73};
+  sampling::SamplerState sampler(config);
   qfn::Session::DecodeResult step;
   Require(ar->DecodeStep(8, sampler, &step, &error, false), error);
   Require(step.tokens.size() == 1 && ar->Statistics().drafted == 0,
           "AR session with a resident sidecar executed speculative decoding");
+  const std::vector<float> expected(ar->Logits().begin(), ar->Logits().end());
+  for (bool serialized : {false, true}) {
+    if (serialized) {
+      std::vector<std::uint8_t> bytes(ar_snapshot->SizeBytes());
+      Require(ar_snapshot->CopyTo(bytes), "serialize AR frontier");
+      Require(ar->RestoreSnapshot(bytes, &error), error);
+    } else {
+      Require(ar->RestoreSnapshot(*ar_snapshot, &error), error);
+    }
+    Require(ar->Evaluate(anchor, &error), error);
+    sampling::SamplerState replay(config);
+    qfn::Session::DecodeResult resumed;
+    Require(ar->DecodeStep(8, replay, &resumed, &error, false), error);
+    Require(resumed.tokens == step.tokens &&
+                replay.rng_state() == sampler.rng_state(),
+            "AR frontier changed sampled replay");
+    RequireExact(expected, ar->Logits(),
+                 "AR frontier changed resumed target logits");
+  }
   Require(!mtp->RestoreSnapshot(*ar_snapshot, &error) &&
               !ar->RestoreSnapshot(*mtp_snapshot, &error),
           "snapshots crossed execution modes");
-  std::cout << "execution_modes=independent AR_predictor_bytes=0 "
-               "mixed_batch_exact=1\n"
+  std::cout << "execution_tokens=" << prompt_tokens << " image=" << with_image
+            << " execution_modes=independent AR_predictor_bytes=0 "
+               "mixed_batch_exact=1 RAM_serialized_sampled_replay=1\n"
+            << std::flush;
+}
+
+void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
+  namespace server = gufo::server;
+  using Backend = server::InferenceBackend;
+  Backend backend;
+  std::string error;
+  server::TextSpeculativeConfig options;
+  options.backend = server::TextSpeculativeBackend::kMtp;
+  Require(backend.load(model, &error, 128, 2, {}, {}, options), error);
+  // Synthetic grammar pieces make the boundary deterministic: any ordinary
+  // first token completes the empty JSON object; only stop tokens may follow.
+  // Actual token IDs, EOS recognition, GPU execution and checkpoints stay real.
+  auto constraint = std::make_shared<sampling::TokenConstraint>();
+  constraint->grammar = sampling::JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{},"additionalProperties":false})"),
+      true);
+  constraint->vocabulary = std::make_shared<sampling::ConstraintVocabulary>(
+      model->VocabSize(), [&](std::uint32_t token) {
+        return sampling::ConstraintVocabulary::Piece{
+            .text = model->IsStopToken(token) ? "" : "{}",
+            .stop = model->IsStopToken(token),
+        };
+      });
+  sampling::SamplingConfig config;
+  config.constraint = std::move(constraint);
+  const std::array<std::string, 2> prompts{
+      "EOS fixture one: continue red, blue,",
+      "EOS fixture two: continue green, yellow,"};
+  std::array<Backend::Result, 2> references;
+  for (std::size_t row = 0; row < prompts.size(); ++row) {
+    references[row] = backend.complete(prompts[row], 8, config);
+    Require(
+        references[row].tokens.size() == 1 &&
+            !model->IsStopToken(references[row].tokens.front()),
+        "scalar MTP executed EOS or trailing work after the forced boundary");
+    const auto replay = backend.complete(prompts[row], 8, config);
+    Require(
+        replay.tokens == references[row].tokens && replay.prefill_tokens == 0,
+        "scalar EOS checkpoint did not replay exactly without prefill");
+  }
+  std::array<std::future<Backend::Result>, 2> pending;
+  std::latch ready(pending.size());
+  for (std::size_t row = 0; row < pending.size(); ++row) {
+    pending[row] = std::async(
+        std::launch::async, [&backend, &ready, &prompts, &config, row] {
+          ready.arrive_and_wait();
+          return backend.complete(prompts[row], 8, config);
+        });
+  }
+  std::size_t batched = 0;
+  for (std::size_t row = 0; row < pending.size(); ++row) {
+    const auto result = pending[row].get();
+    Require(result.tokens == references[row].tokens,
+            "batched EOS accounting differs from the scalar checkpoint");
+    batched += result.physical_execution_width > 1;
+  }
+  Require(batched > 0, "EOS fixture did not exercise batched MTP");
+  // Completions explicitly ignoring EOS must retain their requested budget.
+  const auto ignored_request =
+      backend.start_complete(prompts.front(), 8, config, {}, false, true);
+  const auto ignored = ignored_request->Wait({}, {});
+  Require(
+      ignored.tokens.size() == 8 &&
+          std::all_of(ignored.tokens.begin() + 1, ignored.tokens.end(),
+                      [&](auto token) { return model->IsStopToken(token); }),
+      "MTP ignored the request's explicit ignore_eos policy");
+  std::latch mixed_ready(pending.size());
+  for (std::size_t row = 0; row < pending.size(); ++row) {
+    pending[row] = std::async(
+        std::launch::async, [&backend, &mixed_ready, &prompts, &config, row] {
+          mixed_ready.arrive_and_wait();
+          const auto request = backend.start_complete(prompts[row], 8, config,
+                                                      {}, false, row == 1);
+          return request->Wait({}, {});
+        });
+  }
+  const auto stopped = pending[0].get();
+  const auto continuing = pending[1].get();
+  Require(
+      stopped.tokens == references[0].tokens && continuing.tokens.size() == 8 &&
+          std::all_of(continuing.tokens.begin() + 1, continuing.tokens.end(),
+                      [&](auto token) { return model->IsStopToken(token); }) &&
+          (stopped.physical_execution_width > 1 ||
+           continuing.physical_execution_width > 1),
+      "mixed MTP batch did not respect each row's EOS policy");
+  std::cout << "serving_eos scalar_and_batch_exact=1 checkpoint_replay=1 "
+               "ignore_eos_budget=8 batched_requests="
+            << batched << '\n'
             << std::flush;
 }
 
@@ -717,36 +1011,75 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
 }
 
 int main(int argc, char** argv) {
+  const bool execution_only =
+      argc == 7 && std::string_view(argv[5]) == "--execution-only";
+  std::uint32_t execution_tokens = 4096;
   const bool batch_only =
       argc == 6 && std::string_view(argv[5]) == "--batch-only";
   const bool prefill_only =
       argc == 6 && std::string_view(argv[5]) == "--prefill-only";
   const bool sampling_only =
       argc == 6 && std::string_view(argv[5]) == "--sampling-only";
-  if ((argc != 5 && !batch_only && !prefill_only && !sampling_only) ||
+  const bool cache_only =
+      argc == 6 && std::string_view(argv[5]) == "--cache-only";
+  const bool eos_only = argc == 6 && std::string_view(argv[5]) == "--eos-only";
+  if ((argc != 5 && !batch_only && !prefill_only && !sampling_only &&
+       !cache_only && !eos_only && !execution_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
     std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
-                 "[--batch-only | --prefill-only | --sampling-only]\n";
+                 "[--batch-only | --prefill-only | --sampling-only | "
+                 "--cache-only | --eos-only | --execution-only TOKENS]\n";
     return 77;
+  }
+  if (execution_only) {
+    const std::string_view value(argv[6]);
+    const auto [end, ec] = std::from_chars(
+        value.data(), value.data() + value.size(), execution_tokens);
+    if (ec != std::errc{} || end != value.data() + value.size() ||
+        execution_tokens == 0 || execution_tokens > 262128) {
+      std::cerr << "--execution-only requires 1..262128 prompt tokens\n";
+      return 2;
+    }
   }
   try {
     std::string error;
     auto model = qfn::Model::Load(
         argv[2],
-        {.max_context = 6145, .mtp_model_path = argv[4], .max_draft_tokens = 7},
+        {.max_context = execution_only ? execution_tokens + 16 : 6145,
+         .mtp_model_path = argv[4],
+         .max_draft_tokens = 7},
         &error);
     Require(model != nullptr, error);
-    CheckSnapshotDuringGraphCapture(model);
+    if (execution_only) {
+      CheckExecutionModes(model, execution_tokens);
+      return 0;
+    }
+    if (eos_only) {
+      CheckServingEos(model);
+      return 0;
+    }
+    if (cache_only) {
+      CheckMtpCacheReplay(model);
+      return 0;
+    }
+    CheckSnapshotDuringGraphCapture(model, false);
+    CheckSnapshotDuringGraphCapture(model, true);
+    CheckSnapshotDuringGraphCapture(model, true, true);
     CheckExecutionModes(model);
     if (sampling_only) {
+      CheckServingEos(model);
       CheckServingSampling(model);
       return 0;
     }
-    if (!batch_only)
+    if (!batch_only) {
+      CheckExecutionModes(model, 2048, true);
       CheckPrefillChunks(model);
+    }
     if (prefill_only)
       return 0;
+    if (!batch_only)
+      CheckMtpCacheReplay(model);
     CheckFailureRecovery(model);
     CheckRollbackReuse(model);
     CheckImageSnapshotAttachment(model);
@@ -754,6 +1087,7 @@ int main(int argc, char** argv) {
     CheckBatchedSessions(model);
     if (batch_only)
       return 0;
+    CheckServingEos(model);
     const auto pattern = model->Tokenize(
         "The quick brown fox jumps over the lazy dog. "
         "Strix Halo executes this deterministic benchmark sequence. ");

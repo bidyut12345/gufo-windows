@@ -2,6 +2,7 @@
 
 | Experiment | Decision / qualification |
 | --- | --- |
+| Conversation checkpoints | Retained: bounded edit checkpoints and advancing conversation boundaries. Q4/Q8 AR and DFlash2 cancellation, image replay and disk restart pass; Q4 edits and growing histories match cold answer controls. [Functional checks](../../../tests/functional/README.md). |
 | Bounded prefill submission for cancellation | Retained: Q4/Q8 AR resume in 302/412 ms after a prefill disconnect; DFlash2 in 214/281 ms. Exact image/snapshot logits and seeded replay; matched 2,504-token C1 prefill times remain within 1.7% across all four modes. Two reusable events, no tensor allocation or arithmetic change. |
 | Quantized verification row groups | Retained per shape; scalar FP32 bits, full target logits and private acceptance/RNG must match. |
 | Shared DFlash2 body/context injection | Retained across requests; independent attention, convolution, history and selector state. |
@@ -99,6 +100,7 @@
 | Concurrent generated-reply forks | Retained: freeze the live generated checkpoint before branching, within the snapshot budget. C1 avoids the copy; Q4/Q8 greedy/seeded forks, disk restoration and cancellation pass. |
 | Visible causal attention tails | Retained: FP32 FMA over visible tail keys removes chunk-boundary drift while complete tiles keep WMMA. Q8 full logits/features match at 8K across scheduling budgets; four 32K DFlash2 continuations match isolated AR. Later packed V loads and row-first scale reuse recover PP speed without spills; large shallow chunks use the same packed route. |
 | Separate causal-tail passes, helper functions and deeper V prefetch | Rejected: exact outputs, but extra work or register pressure makes attention slower. |
+| Clang 23 prefill GEMM spills | Retained: a `sched_barrier` fence per K block in BK=2 W8A8 tiles, no K-block unroll in BK=4 tiles, SLP off for the two K-quant units. Clang 23 (ROCm 10.0) Q8 pp2048 291 → 464, pp64 112 → 308, Q4 pp64 230 → 335 (published 0.8.1 image: Q8 454/322, Q4 327). Greedy output and prefill validation are byte-identical. Clang 22: pp2048 and decode do not change, 16–64 token prefill is 1.2–1.7% slower. |
 
 Q4 C1 AR leads the pinned d0/d32K controls; Q8 C1 AR matches them.
 DFlash2 retains AR output in the focused shallow/deep and concurrent checks.

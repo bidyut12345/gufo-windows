@@ -61,6 +61,12 @@ public:
   ContinuationSnapshot& operator=(ContinuationSnapshot&&) = delete;
 
   [[nodiscard]] virtual std::size_t PayloadBytes() const noexcept = 0;
+  /// Prefer an available state that still holds this snapshot's borrowed rows.
+  /// This is an allocation hint; every state must remain able to restore it.
+  [[nodiscard]] virtual bool PrefersState(
+      const ContinuationState&) const noexcept {
+    return false;
+  }
 };
 
 enum class SnapshotEventAction : std::uint8_t {
@@ -74,6 +80,16 @@ enum class SnapshotEventReason : std::uint8_t {
   kExactReplacement,
   kCaptureFailure,
   kReservationMismatch,
+};
+
+/// Continuation boundaries take precedence over optional history/retry copies.
+/// A branch point is a continuation boundary learned where two prompts
+/// diverged; it stays a branch point after the older prompt's checkpoints go.
+enum class SnapshotPurpose : std::uint8_t {
+  kContinuation,
+  kHistory,
+  kRetry,
+  kBranchPoint,
 };
 
 /// Sanitized snapshot-retention event.
@@ -151,9 +167,13 @@ public:
     /// Reserves aggregate retained-snapshot capacity before model allocation.
     ///
     /// Byte-pressure evictions happen synchronously before this returns true.
-    [[nodiscard]] bool TryReserveSnapshot(std::size_t snapshot_bytes,
-                                          std::size_t token_count,
-                                          bool preserve_source = false);
+    /// A verified replacement prefix can retire this family's old boundary
+    /// before evicting another family's last copy, unless preserve_source.
+    [[nodiscard]] bool TryReserveSnapshot(
+        std::size_t snapshot_bytes, std::size_t token_count,
+        bool preserve_source = false,
+        SnapshotPurpose purpose = SnapshotPurpose::kContinuation,
+        std::span<const ContinuationToken> replacement_prefix = {});
 
     /// Releases an admitted reservation and records a sanitized skip reason.
     void SkipSnapshot(SnapshotEventReason reason, std::size_t snapshot_bytes,
@@ -161,9 +181,12 @@ public:
 
     /// Publishes a reserved immutable checkpoint without releasing this state.
     /// Peers can fork it before this lease advances the live continuation.
+    /// Intermediate captures preserve the original branching source so later
+    /// byte/entry admission cannot replace the required fallback with them.
     std::size_t PublishSnapshot(
         std::vector<ContinuationToken> tokens,
-        std::shared_ptr<const ContinuationSnapshot> snapshot);
+        std::shared_ptr<const ContinuationSnapshot> snapshot,
+        bool preserve_source = false);
 
     /// Atomically publishes the state and the exact tokens it represents.
     ///
@@ -194,6 +217,7 @@ public:
     double restore_ms_{0.0};
     bool restored_from_disk_{false};
     std::size_t reserved_snapshot_bytes_{0};
+    SnapshotPurpose snapshot_purpose_{SnapshotPurpose::kContinuation};
     std::size_t prompt_tokens_{0};
     std::size_t stable_prefix_tokens_{0};
     std::vector<std::uint8_t> input_identity_;
@@ -205,8 +229,8 @@ public:
     ContinuationLookup lookup_;
   };
 
-  /// Extra snapshot entries allocate no execution state; the byte budget
-  /// still bounds all retained and in-flight snapshots.
+  /// Snapshot records are separate from execution slots. A zero record count
+  /// defaults to capacity; the byte budget bounds retained/in-flight payloads.
   ContinuationCache(std::size_t capacity, const StateFactory& factory,
                     SnapshotSupport snapshot_support = {},
                     std::size_t snapshot_capacity = 0);
@@ -226,8 +250,25 @@ public:
       const std::function<void(ContinuationState&)>& prepare_state = {},
       bool reuse_prompt = true, std::size_t stable_prefix_tokens = 0,
       std::span<const ContinuationInputPrefix> input_prefixes = {});
+  /// Longest retained prefix of prompt with a matching input identity,
+  /// ignoring stable-prefix fallback rules. Leases nothing.
+  [[nodiscard]] std::size_t CachedPrefixTokens(
+      std::span<const ContinuationToken> prompt,
+      std::span<const std::uint8_t> input_identity = {},
+      std::span<const ContinuationInputPrefix> input_prefixes = {}) const;
+
+  /// Longest prefix prompt shares with any retained checkpoint or live
+  /// frontier of the same input identity, whether or not that record ends
+  /// there. This is where prompts diverge, so a checkpoint captured there
+  /// serves later prompts that share it. Leases nothing.
+  [[nodiscard]] std::size_t CommonPrefixTokens(
+      std::span<const ContinuationToken> prompt,
+      std::span<const std::uint8_t> input_identity = {},
+      std::span<const ContinuationInputPrefix> input_prefixes = {}) const;
 
   [[nodiscard]] std::size_t capacity() const noexcept;
+  /// Immutable checkpoint records, independent of execution capacity().
+  [[nodiscard]] std::size_t entry_capacity() const noexcept;
   [[nodiscard]] std::size_t snapshot_capacity_bytes() const noexcept;
   [[nodiscard]] std::size_t retained_snapshot_bytes() const noexcept;
   [[nodiscard]] std::size_t reserved_snapshot_bytes() const noexcept;
@@ -236,10 +277,13 @@ private:
   struct Entry;
 
   [[nodiscard]] ContinuationState& StateAt(std::size_t index);
-  [[nodiscard]] bool ReserveSnapshot(std::size_t source_index,
-                                     std::size_t snapshot_bytes,
-                                     std::size_t token_count,
-                                     bool preserve_source);
+  /// Reclaiming a retained copy of the same prefix keeps its learned branch
+  /// point: purpose becomes kBranchPoint for the publication.
+  [[nodiscard]] bool ReserveSnapshot(
+      std::size_t source_index, std::size_t snapshot_bytes,
+      std::size_t token_count, bool preserve_source, SnapshotPurpose& purpose,
+      std::span<const ContinuationToken> replacement_prefix,
+      std::span<const std::uint8_t> input_identity);
   void SkipSnapshot(std::size_t reservation_bytes, SnapshotEventReason reason,
                     std::size_t snapshot_bytes,
                     std::size_t token_count) noexcept;
@@ -251,7 +295,8 @@ private:
       std::vector<ContinuationToken> live_tokens,
       std::vector<std::uint8_t> live_identity, bool release_state = true,
       std::size_t* published_index = nullptr,
-      std::size_t stable_prefix_tokens = 0);
+      std::size_t stable_prefix_tokens = 0,
+      SnapshotPurpose purpose = SnapshotPurpose::kContinuation);
   void Invalidate(std::size_t index, std::size_t reservation_bytes) noexcept;
 
   struct Impl;

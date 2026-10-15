@@ -8,6 +8,7 @@
 #include <random>
 #include <stdexcept>
 
+#include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen_image_21/hip/runtime.hpp"
 #include "src/models/qwen_image_21/tokenizer.hpp"
 
@@ -129,9 +130,14 @@ Visual EncodeVision(Runtime& rt, const Image& image,
   return output;
 }
 
-constexpr std::string_view kSystem =
-    "<|im_start|>system\nComprehend and analyze the provided "
-    "prompt.<|im_end|>\n";
+constexpr std::string_view kSystemText =
+    "system\nComprehend and analyze the provided prompt.";
+constexpr std::string_view kNewline = "\n";
+constexpr auto kSystemStorage =
+    tokenization::ConcatControlText<tokenization::kImStart, kSystemText,
+                                    tokenization::kImEnd, kNewline>();
+constexpr std::string_view kSystem(kSystemStorage.data(),
+                                   kSystemStorage.size());
 
 struct EncodedPrompt {
   Matrix hidden;
@@ -146,12 +152,14 @@ EncodedPrompt EncodePrompt(Runtime& rt, const Tokenizer& tokenizer,
                            const Observer& observer) {
   EncodedPrompt output;
   std::string text(kSystem);
-  text += "<|im_start|>user\n";
+  text.append(tokenization::kImStart).append("user\n");
   for (std::size_t i = 0; i < request.images.size(); ++i) {
     if (i)
       text += ' ';
-    text += "<image" + std::to_string(i + 1) +
-            "><|vision_start|><|image_pad|><|vision_end|>";
+    text += "<image" + std::to_string(i + 1) + ">";
+    text.append(tokenization::kVisionStart)
+        .append(tokenization::kImagePad)
+        .append(tokenization::kVisionEnd);
     const auto& image = request.images[i];
     const double ratio = static_cast<double>(image.width) / image.height;
     const double width = std::sqrt(1024.0 * 1024 * ratio);
@@ -164,7 +172,8 @@ EncodedPrompt EncodePrompt(Runtime& rt, const Tokenizer& tokenizer,
     output.images.push_back(ResizeImage(image, rw, rh));
   }
   text += request.prompt.empty() ? " " : request.prompt;
-  text += "<|im_end|>\n<|im_start|>assistant\n";
+  text.append(tokenization::kImEnd).append("\n");
+  text.append(tokenization::kImStart).append("assistant\n");
   const auto raw_ids = tokenizer.Encode(text);
   std::vector<int> image_positions;
   std::vector<std::array<int, 3>> positions;
@@ -561,7 +570,11 @@ Result Model::Generate(const Request& request,
     result.metrics.prompt_ms = Milliseconds(start);
     // Generate independent full-precision normal draws; seed replay never
     // depends on admission order, wall time, or another request's RNG.
-    std::mt19937_64 rng(request.seed);
+    // A generated reference can otherwise reuse exactly the same noise when
+    // edited at the same size and seed. Bind edit noise to its reference
+    // pixels, including later edits of an edit, without changing generation or
+    // replay.
+    std::mt19937_64 rng(InitialNoiseSeed(request.seed, prompt.images));
     std::normal_distribution<float> normal(0, 1);
     std::vector<float> noise(static_cast<std::size_t>(height) * width * 64);
     for (float& value : noise)

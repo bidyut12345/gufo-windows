@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "qfn_mmq.h"
+#include "src/core/hip/managed_alloc.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
@@ -124,10 +125,11 @@ void Executor::UseScratch(const Scratch& scratch) const {
 
 bool Executor::AllocateBatch(std::string* error) const {
   return batch_logits_ != nullptr ||
-         Check(hipMalloc(&batch_logits_,
-                         static_cast<std::size_t>(kBatchSessions) *
-                             std::min(kDecodeRows, options_.max_logit_rows) *
-                             config().vocab_size * sizeof(float)),
+         Check(hip::AllocateDevice(
+                   &batch_logits_,
+                   static_cast<std::size_t>(kBatchSessions) *
+                       std::min(kDecodeRows, options_.max_logit_rows) *
+                       config().vocab_size * sizeof(float)),
                error);
 }
 
@@ -136,6 +138,7 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
                           std::string* error) const {
   const auto& c = config();
   xn_half_ = false;
+  DropReadyQ8();  // the batched route rewrites xn and mixed unfused
   if (!normed)
     RmsNormRows(res, m.norm.f32(), s_.xn, rows, c.HcDim(), c.hc_count,
                 c.rms_eps, stream_);
@@ -149,8 +152,8 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
                             m.inject.type == core::GgmlType::kF32;
   q8t_src_ = nullptr;
   half_src_ = nullptr;
-  // Every request contains at most eight decode rows. Keep its scalar
-  // epilogue/reduction even when the concatenated batch exceeds eight.
+  // Keep each row's scalar epilogue/reduction independently of the total
+  // row count, including prompt replay and concatenated decode batches.
   HcMixEpilogue(s_.xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
                 mixed, inject, rows, c.hidden_size, c.hc_count, stream_);
   inject_parts_ = fused_inject ? HcInjectParts(c.hidden_size) : 1;
@@ -164,6 +167,7 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
 void Executor::CombineBatch(float* res, const float* gamma,
                             std::uint32_t rows) const {
   const auto& c = config();
+  DropReadyQ8();
   HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, rows,
             c.hidden_size, c.hc_count, c.rms_eps, stream_, true);
 }
@@ -174,6 +178,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     return false;
   }
   const Config& c = config();
+  DropReadyQ8();
   if (!has_mtp() || items.empty() || items.size() > kBatchSessions) {
     return Fail(error, "invalid MTP body batch");
   }
@@ -185,7 +190,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     const auto n = item.tokens.size();
     if (item.session == nullptr || item.session->owner_ != this ||
         !item.session->mtp_enabled_ || n == 0 || n > kDecodeRows ||
-        (item.hidden_row < 0 && n != 1) ||
+        (item.hidden_row < 0 &&
+         (n != 1 || !item.session->mtp_.residual_valid)) ||
         (item.hidden_row >= 0 &&
          static_cast<std::uint32_t>(item.hidden_row) + n >
              options_.max_speculative) ||
@@ -212,6 +218,20 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     const auto& item = items.front();
     return MtpForward(*item.session, item.tokens, item.hidden_row, {}, error);
   }
+  for (const auto& item : items) {
+    auto& session = *item.session;
+    if (!session.Cancelled() && session.continuation_hooks_) {
+      const auto end = session.mtp_.position +
+                       static_cast<std::uint32_t>(item.tokens.size());
+      session.continuation_hooks_->BeforeWrite(
+          true, session.mtp_.position, end, session.mtp_.blocks,
+          end > c.indexer_top_k ? end / c.compress_ratio : session.mtp_.blocks);
+    }
+  }
+  for (const auto& item : items)
+    if (!item.session->Cancelled())
+      item.session->PreserveSnapshots(item.session->position_,
+                                      item.session->mtp_.position);
   if (!AllocateBatch(error) ||
       (batch_controls_ == nullptr &&
        !Check(hipHostMalloc(&batch_controls_,
@@ -257,36 +277,16 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     }
     RmsNormRows(base.mtp_h, l.nextn_hnorm.f32(), base.mtp_h, rows, c.HcDim(), 1,
                 c.rms_eps, stream_);
-    // Keep each session's vector/matrix arithmetic while sharing weight
-    // reads among adjacent vector-sized inputs. Project the embedding once.
-    for (std::size_t i = 0; i < items.size();) {
-      const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
-      auto end = i + 1;
-      if (n * c.hc_count <= kDecodeRows) {
-        while (end < items.size() &&
-               items[end].tokens.size() * c.hc_count <= kDecodeRows)
-          ++end;
-      }
-      const auto end_row = end == items.size() ? rows : offsets[end];
-      const auto count = end_row - offsets[i];
-      UseScratch(RowScratch(base, offsets[i]));
-      if (n * c.hc_count <= kDecodeRows) {
-        if (!DenseBatch(l.nextn_fc_embedding, s_.mtp_embd, s_.mtp_eproj, count,
-                        error) ||
-            !DenseBatch(l.nextn_fc_hidden, s_.mtp_h, s_.mtp_res,
-                        count * c.hc_count, error))
-          return false;
-      } else if (!Dense(l.nextn_fc_embedding, s_.mtp_embd, s_.mtp_eproj, n,
-                        error) ||
-                 !Dense(l.nextn_fc_hidden, s_.mtp_h, s_.mtp_res, n * c.hc_count,
-                        error)) {
-        return false;
-      }
-      MtpAddEmbedding(s_.mtp_eproj, s_.mtp_res, count, c.hidden_size,
-                      c.hc_count, stream_);
-      i = end;
-    }
     UseScratch(base);
+    // Persistent draft KV uses the same projections for every prompt split,
+    // catch-up length and number of independent sessions.
+    if (!DenseBatch(l.nextn_fc_embedding, base.mtp_embd, base.mtp_eproj, rows,
+                    error) ||
+        !DenseBatch(l.nextn_fc_hidden, base.mtp_h, base.mtp_res,
+                    rows * c.hc_count, error))
+      return false;
+    MtpAddEmbedding(base.mtp_eproj, base.mtp_res, rows, c.hidden_size,
+                    c.hc_count, stream_);
     if (!HcMixBatch(l.hc_attn, base.mtp_res, false, base.mixed, base.inject,
                     rows, error))
       return false;
@@ -315,6 +315,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         continue;
       }
       ++session.mutation_epoch_;
+      session.mtp_.residual_valid = false;
       Session::AttentionState attention;
       attention.rope = session.vision_input_.rope();
       attention.k_cache = session.mtp_.k_cache;
@@ -397,6 +398,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     if (item.session->Cancelled())
       continue;
     item.session->mtp_.position += item.tokens.size();
+    item.session->mtp_.residual_valid = true;
     if (item.session->mtp_.position > c.indexer_top_k)
       item.session->mtp_.blocks =
           item.session->mtp_.position / c.compress_ratio;
@@ -418,6 +420,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
     const auto& item = items[i];
     if (item.session == nullptr || item.session->owner_ != this ||
         !item.session->mtp_enabled_ || item.session->mtp_.position == 0 ||
+        !item.session->mtp_.residual_valid || item.output.kv_only ||
         item.output.trace != nullptr ||
         (item.output.token == nullptr && item.output.candidates == nullptr)) {
       return Fail(error, "invalid MTP head request");
@@ -574,9 +577,15 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   }
   // Three matrix tiles help 33–48 rows; four tiles cost more than two
   // 32-row launches. Small outputs with long K sweeps stay at eight.
-  const auto chunk = w.cols == 2560 && w.rows >= 8192
-                         ? (rows > 32 && rows <= 48 ? 48U : 32U)
-                         : kDecodeRows;
+  const auto chunk =
+      ((w.cols == 2560 && w.rows >= 1024) || (w.cols == 320 && w.rows == 10240))
+          ? (w.cols == 2560 && w.rows >= 8192 && rows > 32 && rows <= 48 ? 48U
+                                                                         : 32U)
+          : kDecodeRows;
+  if (chunk == 32 && rows >= 64) {
+    const auto full = rows / 32 * 32;
+    return project(0, full) && (full == rows || project(full, rows - full));
+  }
   for (std::uint32_t r = 0; r < rows; r += chunk) {
     if (!project(r, std::min(chunk, rows - r)))
       return false;
@@ -666,6 +675,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     return false;
   }
   selected_logits_ = nullptr;
+  DropReadyQ8();
   const Config& c = config();
   if (items.empty() || items.size() > kBatchSessions) {
     return Fail(error, "decode batch must contain 1..8 sessions");
@@ -709,6 +719,19 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   if (!AnyActive(items))
     return true;
   for (const auto& item : items) {
+    auto& session = *item.session;
+    if (!session.Cancelled() && session.continuation_hooks_) {
+      const auto end =
+          session.position_ + static_cast<std::uint32_t>(item.tokens.size());
+      session.continuation_hooks_->BeforeWrite(
+          false, session.position_, end, session.blocks_,
+          end > c.indexer_top_k ? end / c.compress_ratio : session.blocks_);
+    }
+  }
+  for (const auto& item : items) {
+    if (!item.session->Cancelled())
+      item.session->PreserveSnapshots(item.session->position_,
+                                      item.session->mtp_.position);
     if (item.speculative &&
         !EnsureRollback(*item.session, item.tokens.size() - 1, error))
       return false;
@@ -739,6 +762,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   if (ple_pending_ && !WaitPle(error)) {
     return false;
   }
+  FinishPrefetch();
   batch_rows_ = 0;
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
@@ -807,16 +831,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       if (!AnyActive(items))
         return true;
       const auto& l = layers[il];
-      if (c.IsPleLayer(il)) {
-        if (!WaitPle(error) ||
-            !Check(hipMemcpyAsync(base.ple_emb, host_emb_,
-                                  static_cast<std::size_t>(rows) *
-                                      c.PleEmbeddingDim() * sizeof(float),
-                                  hipMemcpyHostToDevice, stream_),
-                   error)) {
-          return false;
-        }
-      }
+      if (c.IsPleLayer(il) && !WaitPle(error))
+        return false;
       for (std::size_t i = 0; i < items.size(); ++i) {
         const auto& item = items[i];
         const auto n = static_cast<std::uint32_t>(item.tokens.size());

@@ -60,12 +60,9 @@ void Expect(bool condition, std::string_view message) {
 class TemporaryDirectory {
 public:
   TemporaryDirectory() {
-    std::array<char, 64> pattern{};
-    const std::string base = (std::filesystem::temp_directory_path() /
-                              "gufo-continuation-disk-XXXXXX")
-                                 .string();
-    Expect(base.size() + 1 <= pattern.size(), "temporary path fits buffer");
-    std::copy(base.begin(), base.end(), pattern.begin());
+    std::string pattern = (std::filesystem::temp_directory_path() /
+                           "gufo-continuation-disk-XXXXXX")
+                              .string();
     char* created = ::mkdtemp(pattern.data());
     if (created == nullptr) {
       throw std::runtime_error("failed to create temporary directory");
@@ -528,8 +525,8 @@ void TestAutomaticStagingAndAdmissionDiagnostics() {
   ContinuationDiskStore defaults({.directory = default_directory.path()});
   Expect(defaults.capacity_bytes() == std::size_t{8} * 1024U * 1024U * 1024U &&
              defaults.staging_capacity_bytes() > kDiskHeaderBytes &&
-             defaults.staging_capacity_bytes() <= 1024U * 1024U * 1024U,
-         "defaults bound RAM staging to 1 GiB independently of disk retention");
+             defaults.staging_capacity_bytes() <= defaults.capacity_bytes(),
+         "defaults bound RAM staging by available RAM and disk retention");
 
   TemporaryDirectory directory;
   std::vector<ContinuationDiskEvent> events;
@@ -882,6 +879,51 @@ void TestConcurrentStoreInstancesPublishSafely() {
       "concurrent publishers expose no partial or confused entry");
 }
 
+void TestStartupPreservesActivePublisher() {
+  TemporaryDirectory directory;
+  auto runner = std::make_shared<FakeRunner>("startup-publisher");
+  std::binary_semaphore entered(0), release(0);
+  const auto orphan = directory.path() / ".tmp-orphan";
+  {
+    ContinuationDiskStore writer(StoreOptions(directory.path()));
+    runner->before_stream = [&] {
+      entered.release();
+      release.acquire();
+    };
+    Expect(writer.SaveAsync(runner, {1, 2}, MakeSnapshot(*runner, 42, 2)) != 0,
+           "writer accepts a checkpoint before another store starts");
+    const bool started = entered.try_acquire_for(std::chrono::seconds(2));
+    if (!started)
+      release.release();
+    Expect(started, "writer reaches the temporary-file serialization barrier");
+    {
+      std::ofstream output(orphan, std::ios::binary);
+      output << "interrupted older write";
+    }
+    auto startup = std::async(std::launch::async, [&] {
+      ContinuationDiskStore reader(StoreOptions(directory.path()));
+    });
+    const bool ready =
+        startup.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    release.release();
+    startup.get();
+    writer.Flush();
+    Expect(ready, "startup does not wait for an active checkpoint writer");
+    Expect(
+        writer.entry_count() == 1 && CacheFiles(directory.path()).size() == 1,
+        "overlapping startup does not discard the active writer's checkpoint");
+  }
+  runner->before_stream = {};
+
+  ContinuationDiskStore restarted(StoreOptions(directory.path()));
+  auto state = runner->CreateState();
+  Expect(RestoreTokens(restarted, *runner, *state, {1, 2, 3}).restored &&
+             RequireFakeState(*state).value == 42,
+         "checkpoint published across startup restores its exact payload");
+  Expect(!std::filesystem::exists(orphan),
+         "startup without a publisher removes abandoned temporary files");
+}
+
 void TestSharedPrefixBoundariesAndExactDedup() {
   TemporaryDirectory directory;
   const FakeRunner runner("shared-prefix-model");
@@ -1118,10 +1160,65 @@ void TestAppendedImagePrefixesSurviveRestart() {
          "moving the first image before the checkpoint invalidates reuse");
 }
 
+void TestMinimumCheckpointStep() {
+  TemporaryDirectory directory;
+  auto runner = std::make_shared<FakeRunner>("min-step-model");
+  std::vector<ContinuationDiskEvent> events;
+  auto options = StoreOptions(directory.path());
+  options.min_checkpoint_step_tokens = 3;
+  ContinuationDiskStore store(
+      options, [&](const auto& event) { events.push_back(event); });
+
+  Expect(
+      SaveTokens(store, *runner, {1, 2}, *MakeSnapshot(*runner, 1, 2)).stored,
+      "the first checkpoint has no covering prefix and is stored");
+  Expect(store.WithinCheckpointStep(*runner,
+                                    std::vector<TextRunnerToken>{1, 2, 3, 4}) &&
+             !store.WithinCheckpointStep(
+                 *runner, std::vector<TextRunnerToken>{1, 2, 3, 4, 5}) &&
+             !store.WithinCheckpointStep(*runner,
+                                         std::vector<TextRunnerToken>{8, 8}),
+         "callers can skip a capture the step would discard");
+  Expect(!SaveTokens(store, *runner, {1, 2, 3, 4}, *MakeSnapshot(*runner, 2, 4))
+                 .stored &&
+             events.back().reason == ContinuationDiskEventReason::kMinStep,
+         "a checkpoint less than one step past a stored prefix is skipped");
+  Expect(
+      SaveTokens(store, *runner, {9, 9}, *MakeSnapshot(*runner, 3, 2)).stored,
+      "an unrelated checkpoint is not covered by another prompt");
+  Expect(
+      SaveTokens(store, *runner, {1, 2, 3, 4, 5}, *MakeSnapshot(*runner, 4, 5))
+          .stored,
+      "a checkpoint one full step past the prefix is stored");
+
+  Expect(store.SaveAsync(runner, {1, 2, 3, 4, 5, 6},
+                         MakeSnapshot(*runner, 5, 6), {}, {},
+                         /*shared_prefix=*/true) != 0,
+         "a shared prefix is queued");
+  store.Flush();
+  auto state = runner->CreateState();
+  Expect(
+      RestoreTokens(store, *runner, *state, {1, 2, 3, 4, 5, 6, 7}).restored &&
+          RequireFakeState(*state).value == 5,
+      "shared prefixes are exempt from the step");
+
+  options.min_checkpoint_step_tokens = 0;
+  TemporaryDirectory ungated_directory;
+  options.directory = ungated_directory.path();
+  ContinuationDiskStore ungated(options);
+  Expect(
+      SaveTokens(ungated, *runner, {1, 2}, *MakeSnapshot(*runner, 1, 2))
+              .stored &&
+          SaveTokens(ungated, *runner, {1, 2, 3}, *MakeSnapshot(*runner, 2, 3))
+              .stored,
+      "zero disables the step");
+}
+
 int main() {
   TestAppendedImagePrefixesSurviveRestart();
   TestBoundedAsyncPersistenceDoesNotBlockLookup();
   TestIndexedPrefixLookup();
+  TestMinimumCheckpointStep();
   TestImageIdentitySurvivesRestart();
   TestSharedPrefixBoundariesAndExactDedup();
   TestSha256KnownVector();
@@ -1137,6 +1234,7 @@ int main() {
   TestRootSymlinkIsRejected();
   TestConcurrentCallersRemainBoundedAndExact();
   TestConcurrentStoreInstancesPublishSafely();
+  TestStartupPreservesActivePublisher();
   std::cout << "continuation disk store tests passed\n";
   return 0;
 }

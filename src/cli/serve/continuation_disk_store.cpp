@@ -1,6 +1,7 @@
 #include "src/cli/serve/continuation_disk_store.hpp"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -160,6 +161,34 @@ public:
 
 private:
   std::binary_semaphore& gate_;
+  bool acquired_{false};
+};
+
+class ScopedFileLock {
+public:
+  ScopedFileLock(int descriptor, int operation) noexcept
+      : descriptor_(descriptor) {
+    int result;
+    do {
+      result = ::flock(descriptor_, operation);
+    } while (result != 0 && errno == EINTR);
+    acquired_ = result == 0;
+  }
+
+  ~ScopedFileLock() {
+    if (acquired_) {
+      while (::flock(descriptor_, LOCK_UN) != 0 && errno == EINTR) {
+      }
+    }
+  }
+
+  explicit operator bool() const noexcept { return acquired_; }
+
+  ScopedFileLock(const ScopedFileLock&) = delete;
+  ScopedFileLock& operator=(const ScopedFileLock&) = delete;
+
+private:
+  int descriptor_;
   bool acquired_{false};
 };
 
@@ -539,6 +568,7 @@ struct ContinuationDiskStore::Impl {
     std::shared_ptr<const TextRunnerSnapshot> snapshot;
     std::vector<std::uint8_t> identity;
     std::size_t retained_bytes;
+    bool shared_prefix{false};
   };
 
   Impl(ContinuationDiskStoreOptions store_options, EventSink sink,
@@ -584,7 +614,8 @@ struct ContinuationDiskStore::Impl {
         pending.pop_front();
       }
       try {
-        (void)Save(*job.runner, job.tokens, *job.snapshot, job.identity);
+        (void)Save(*job.runner, job.tokens, *job.snapshot, job.identity,
+                   job.shared_prefix);
       } catch (...) {
         Emit(ContinuationDiskEventAction::kSkipped,
              ContinuationDiskEventReason::kIoFailure, 0, 0, job.tokens.size());
@@ -610,11 +641,10 @@ struct ContinuationDiskStore::Impl {
     }
     if (options.staging_capacity_bytes == 0) {
       // The host snapshot budget already leaves half of available RAM free.
-      // Disk staging gets a quarter of that budget and a conservative hard cap.
+      // Disk staging gets a quarter of that budget. It allocates nothing
+      // upfront, so a fixed cap would only refuse checkpoints larger than it.
       options.staging_capacity_bytes =
-          std::min({options.capacity_bytes,
-                    TextRunnerDiskCacheOptions::kAutomaticStagingMaxBytes,
-                    HostSnapshotBudgetBytes() / 4});
+          std::min(options.capacity_bytes, HostSnapshotBudgetBytes() / 4);
     }
     if (options.staging_capacity_bytes < kHeaderBytes) {
       throw std::invalid_argument(
@@ -812,7 +842,12 @@ struct ContinuationDiskStore::Impl {
     for (const auto& directory_entry : iterator) {
       const std::string filename = directory_entry.path().filename().string();
       if (filename.starts_with(kTemporaryPrefix)) {
-        RemoveFileOnly(filename);
+        // Publishers hold a shared directory lock from before temporary-file
+        // creation through rename. Defer orphan cleanup while any is active;
+        // readers must not wait for another store's potentially long write.
+        const ScopedFileLock cleanup_lock(directory_fd, LOCK_EX | LOCK_NB);
+        if (cleanup_lock)
+          RemoveFileOnly(filename);
         continue;
       }
       if (!HasSuffix(filename, kFileSuffix)) {
@@ -1020,6 +1055,12 @@ struct ContinuationDiskStore::Impl {
                                   const TextModelRunner& runner,
                                   const TextRunnerSnapshot& snapshot,
                                   std::size_t payload_bytes) {
+    // Save serializes publishers in this instance with write_mutex, and
+    // startup indexing completes before its worker starts. Thus no two lock
+    // owners in this instance can share directory_fd's open file description.
+    const ScopedFileLock publication_lock(directory_fd, LOCK_SH);
+    if (!publication_lock)
+      return false;
     const std::string temporary_filename =
         std::string(kTemporaryPrefix) + UniqueSuffix();
     ScopedFileDescriptor temporary(
@@ -1092,7 +1133,8 @@ struct ContinuationDiskStore::Impl {
       const TextModelRunner& runner,
       std::span<const TextRunnerToken> checkpoint_tokens,
       const TextRunnerSnapshot& snapshot,
-      std::span<const std::uint8_t> input_identity) {
+      std::span<const std::uint8_t> input_identity,
+      bool shared_prefix = false) {
     // Serialize writers, but keep existing entries readable during payload
     // serialization, hashing and filesystem durability operations.
     const std::lock_guard write_lock(write_mutex);
@@ -1122,6 +1164,22 @@ struct ContinuationDiskStore::Impl {
       Emit(ContinuationDiskEventAction::kSkipped,
            ContinuationDiskEventReason::kExactReplacement, existing->file_bytes,
            existing->payload_bytes, checkpoint_tokens.size());
+      return {};
+    }
+
+    // A continuation advances by a few hundred tokens per turn, so persisting
+    // every turn rewrites a largely identical snapshot. Skipping writes that
+    // barely move past a stored prefix trades that write for re-prefilling the
+    // short gap, which the caller does anyway when no checkpoint matches.
+    //
+    // Shared prefixes are exempt: they exist to give a new conversation a place
+    // to start from, and they sit only a few tokens past a deeper entry by
+    // construction.
+    if (!shared_prefix &&
+        WithinCheckpointStep(runner, checkpoint_tokens, input_identity)) {
+      Emit(ContinuationDiskEventAction::kSkipped,
+           ContinuationDiskEventReason::kMinStep, 0, 0,
+           checkpoint_tokens.size());
       return {};
     }
 
@@ -1374,6 +1432,19 @@ struct ContinuationDiskStore::Impl {
     return boundaries;
   }
 
+  [[nodiscard]] bool WithinCheckpointStep(
+      const TextModelRunner& runner, std::span<const TextRunnerToken> tokens,
+      std::span<const std::uint8_t> input_identity) {
+    if (options.min_checkpoint_step_tokens == 0 ||
+        !DescriptorForInput(runner, input_identity).persistence.has_value())
+      return false;
+    const auto base =
+        FindLongestInputCandidate(runner, tokens, input_identity, {});
+    return base != entries.end() && base->tokens.size() < tokens.size() &&
+           tokens.size() - base->tokens.size() <
+               options.min_checkpoint_step_tokens;
+  }
+
   [[nodiscard]] bool Touch(const TextModelRunner& runner,
                            std::span<const TextRunnerToken> tokens,
                            std::span<const std::uint8_t> input_identity) {
@@ -1465,7 +1536,7 @@ std::size_t ContinuationDiskStore::SaveAsync(
     std::vector<TextRunnerToken> checkpoint_tokens,
     std::shared_ptr<const TextRunnerSnapshot> snapshot,
     std::vector<std::uint8_t> input_identity,
-    std::unique_ptr<CaptureReservation> reservation) {
+    std::unique_ptr<CaptureReservation> reservation, bool shared_prefix) {
   if (!runner || !snapshot || checkpoint_tokens.empty())
     return 0;
   const auto descriptor = DescriptorForInput(*runner, input_identity);
@@ -1492,7 +1563,7 @@ std::size_t ContinuationDiskStore::SaveAsync(
       return 0;
     impl_->pending.push_back({std::move(runner), std::move(checkpoint_tokens),
                               std::move(snapshot), std::move(input_identity),
-                              charge});
+                              charge, shared_prefix});
     impl_->queued_bytes += charge;
   }
   impl_->queue_changed.notify_one();
@@ -1551,6 +1622,15 @@ bool ContinuationDiskStore::Touch(
   if (!permit)
     return false;
   return impl_->Touch(runner, tokens, input_identity);
+}
+
+bool ContinuationDiskStore::WithinCheckpointStep(
+    const TextModelRunner& runner, std::span<const TextRunnerToken> tokens,
+    std::span<const std::uint8_t> input_identity) {
+  const ScopedOperationPermit permit(impl_->operation_gate, false);
+  if (!permit)
+    return false;
+  return impl_->WithinCheckpointStep(runner, tokens, input_identity);
 }
 
 std::size_t ContinuationDiskStore::entry_count() const noexcept {

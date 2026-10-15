@@ -1,8 +1,10 @@
 #ifndef GUFO_SERVER_HTTP_SERVER_HPP_
 #define GUFO_SERVER_HTTP_SERVER_HPP_
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -77,6 +79,10 @@ struct HttpResponse {
   };
   std::shared_ptr<StreamLog> stream_log{};
   std::function<void(WebSocket&)> websocket{};
+  /// Text streams commit headers when generation starts or has queued for a
+  /// bounded time, so failures before that return a real 5xx while
+  /// keepalives still cover prefill and queue waits.
+  bool defer_stream_headers{false};
 };
 
 using Handler =
@@ -86,7 +92,16 @@ struct HttpServerOptions {
   std::size_t max_request_body_bytes{static_cast<std::size_t>(8) * 1024 * 1024};
   std::size_t max_connections{16};
   std::string api_key;
+  std::chrono::milliseconds sse_heartbeat_interval{std::chrono::seconds(15)};
+  /// Called once, on the listener or a request thread, when the backend reports
+  /// a lost device. Health, readiness and generation answer 503 `device_lost`
+  /// from then on; the hook decides how the process exits.
+  std::function<void()> on_device_lost{};
 };
+
+/// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names
+/// are not resolved; IPv6 link-local literals may carry a `%<interface>` scope.
+bool IsListenAddress(const std::string& host);
 
 /// Minimal bounded HTTP/1.1 server for trusted-LAN model serving.
 class HttpServer {
@@ -122,6 +137,7 @@ private:
   struct ConnectionWorker;
 
   HttpResponse handle_request(const HttpRequest& req);
+  bool device_lost();
   void handle_connection(int client_fd);
   void reap_workers();
   void register_routes();
@@ -137,50 +153,29 @@ private:
   std::string api_key_hash_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
+  std::atomic<bool> device_lost_reported_{false};
   std::mutex workers_mutex_;
   std::vector<std::unique_ptr<ConnectionWorker>> workers_;
   std::vector<std::pair<std::pair<std::string, std::string>, Handler>> routes_;
 };
 
-namespace detail {
-inline std::atomic<std::uint64_t>& TotalPromptTokens() {
-  static std::atomic<std::uint64_t> count{0};
-  return count;
-}
-inline std::atomic<std::uint64_t>& TotalGenTokens() {
-  static std::atomic<std::uint64_t> count{0};
-  return count;
-}
-inline std::atomic<double>& LastPromptSpeed() {
-  static std::atomic<double> val{0.0};
-  return val;
-}
-inline std::atomic<double>& LastGenSpeed() {
-  static std::atomic<double> val{0.0};
-  return val;
-}
-}  // namespace detail
-
+/// Scheduled requests are recorded by the scheduler when they finish. Other
+/// backends contribute here, at completion.
 inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
-  detail::TotalPromptTokens().fetch_add(result.prompt_tokens,
+  if (result.token_metrics_recorded)
+    return;
+  // Older backends may only report prompt/cache totals. Infer their completed
+  // uncached prompt, but never infer work for a partially cancelled request.
+  const auto prompt_tokens =
+      result.prefill_tokens > 0 || result.cancelled
+          ? result.prefill_tokens
+          : result.prompt_tokens -
+                std::min(result.prompt_tokens, result.cached_prompt_tokens);
+  detail::TotalPromptTokens().fetch_add(prompt_tokens,
                                         std::memory_order_relaxed);
   detail::TotalGenTokens().fetch_add(result.completion_tokens,
                                      std::memory_order_relaxed);
-
-  const double prompt_per_second = PrefillTokensPerSecond(result);
-  const double tok_per_sec =
-      (result.decode_ms > 0.0 && result.completion_tokens > 0)
-          ? (static_cast<double>(result.completion_tokens) /
-             (result.decode_ms / 1000.0))
-          : 0.0;
-
-  if (prompt_per_second > 0.0) {
-    detail::LastPromptSpeed().store(prompt_per_second,
-                                    std::memory_order_relaxed);
-  }
-  if (tok_per_sec > 0.0) {
-    detail::LastGenSpeed().store(tok_per_sec, std::memory_order_relaxed);
-  }
+  RecordRequestMetrics(result);
 }
 
 }  // namespace gufo::server

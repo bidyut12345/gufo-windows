@@ -37,6 +37,11 @@ struct TextPrefillPolicy {
 };
 
 struct TextSchedulerPolicy {
+  /// Internal cadence; idle monitoring performs no work during inference.
+  std::chrono::milliseconds device_probe_interval{std::chrono::seconds(5)};
+  /// Internal bound after which a still-queued stream reports its start, so
+  /// transports can keep the connection alive while it waits.
+  std::chrono::milliseconds stream_start_delay{std::chrono::seconds(5)};
   std::size_t max_pending_requests{16};
   std::size_t max_pending_requests_per_client{4};
   std::size_t max_output_bytes_per_request{kDefaultMaxOutputBytes};
@@ -45,6 +50,11 @@ struct TextSchedulerPolicy {
   std::size_t max_buffered_output_bytes_total{
       kDefaultMaxBufferedOutputBytesTotal};
   std::chrono::milliseconds request_timeout{0};
+  /// A scheduler that has work but starts no work unit and completes no
+  /// pending capture for this long is reported as a lost device. Zero
+  /// disables it.
+  std::chrono::milliseconds stall_timeout{0};
+  bool log_progress{false};
 };
 
 /// Single-owner scheduler for opaque text-model runner states.
@@ -57,6 +67,9 @@ public:
   using Result = TextGenerationBackend::Result;
   using CancellationCheck = TextGenerationBackend::CancellationCheck;
   using TokenCallback = TextGenerationBackend::TokenCallback;
+  using ProgressCallback = TextGenerationBackend::ProgressCallback;
+  using StartCallback = TextGenerationBackend::StartCallback;
+  using SessionState = TextGenerationBackend::SessionState;
 
   struct RequestMetadata {
     std::string client_id{"anonymous"};
@@ -65,7 +78,9 @@ public:
     std::shared_ptr<const TextPromptContext> prompt_context;
     bool cache_prompt{true};
     std::size_t cache_prefix_tokens{0};
+    bool stop_at_eos{true};
     std::vector<std::string> stop_sequences;
+    bool return_progress{false};
   };
 
   class Request {
@@ -83,8 +98,13 @@ public:
     [[nodiscard]] TextRequestPhase phase() const noexcept;
 
     /// Consumes queued output pieces on the calling thread and waits for the
-    /// scheduler-owned request to become terminal.
-    Result Wait(const TokenCallback& on_token = {});
+    /// scheduler-owned request to become terminal. Streaming requests report
+    /// only the latest prompt progress, always before their first piece.
+    /// Their start is reported once at admission, or after
+    /// `stream_start_delay` in the queue, before progress and pieces.
+    Result Wait(const TokenCallback& on_token = {},
+                const ProgressCallback& on_progress = {},
+                const StartCallback& on_start = {});
     void Cancel() noexcept;
 
   private:
@@ -107,6 +127,11 @@ public:
 
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  /// Set once a failed work unit finds the runner's device unusable; later
+  /// submissions and failures report TextGenerationErrorCode::kDeviceLost.
+  [[nodiscard]] bool device_lost() const noexcept;
+  /// One entry per session; admitted requests hold one until terminal.
+  [[nodiscard]] std::vector<SessionState> SessionStates() const;
   [[nodiscard]] std::size_t buffered_output_bytes() const noexcept;
   [[nodiscard]] std::size_t max_buffered_output_bytes() const noexcept;
 

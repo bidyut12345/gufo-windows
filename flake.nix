@@ -16,13 +16,21 @@
     let
       # Strix Halo is a Linux x86-64-only target (see README non-goals).
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" ];
-      version = self.shortRev or self.dirtyShortRev or "dirty";
+      releaseVersion =
+        let
+          value = builtins.replaceStrings [ "\n" "\r" ] [ "" "" ] (
+            builtins.readFile ./version.txt
+          );
+        in
+        assert builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+" value != null;
+        value;
+      revision = self.shortRev or self.dirtyShortRev or "dirty";
 
       pkgs = forAllSystems (system: import nixpkgs { inherit system; });
 
       gufoPackages = forAllSystems (
         system:
-        pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit version; }
+        pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit revision; }
       );
 
       llamaReferences = forAllSystems (
@@ -74,6 +82,7 @@
             ps.huggingface-hub
             ps.requests
             ps.openai # official SDK for local API compatibility checks
+            ps.jsonschema # independent structured-output schema oracle
             lpipsRocm
             ps.numpy
             ps.scipy
@@ -83,6 +92,7 @@
     in
     {
       lib = {
+        inherit releaseVersion revision;
         mkGufoServe =
           {
             pkgs ? null,
@@ -115,6 +125,9 @@
         in
         {
           default = base;
+          # Official artifacts select this output from a tagged source. The
+          # default package remains visibly developmental on moving branches.
+          release = base.override { inherit releaseVersion; };
           # Optional benchmark packages: excluded from Gufo, the default
           # development shell and hosted checks.
           ds4-reference = pkgs.${system}.callPackage ./.devops/nix/ds4-reference.nix { };
@@ -137,6 +150,15 @@
               pkgs.${system}.sox
               pkgs.${system}.rocmPackages.rocprofiler-sdk
               pkgs.${system}.sqlite
+              # Debugging and repository work. The test presets build
+              # RelWithDebInfo with assertions, and contributors commit with
+              pkgs.${system}.gdb
+              pkgs.${system}.git
+              pkgs.${system}.ripgrep
+              pkgs.${system}.radeontop
+              # Compiler cache for the local loop; CMake attaches it as the C
+              # and C++ launcher when it is on PATH, as the CPU checks do.
+              pkgs.${system}.ccache
               audio-cpp.packages.${system}.rocm-gfx1151
             ];
             env = {
@@ -146,6 +168,14 @@
                 pkgs.${system}.zlib
               ];
             };
+            # Cache policy mirrors the CPU check derivations. CCACHE_DIR stays
+            # at the user default so a container run can mount it as a volume.
+            shellHook = ''
+              export CCACHE_BASEDIR="$PWD"
+              export CCACHE_COMPILERCHECK=content
+              export CCACHE_MAXSIZE=2G
+              export CCACHE_NOHASHDIR=true
+            '';
           };
 
         }
@@ -215,6 +245,7 @@
             files = [
               ".clang-format"
               "CMakeLists.txt"
+              "docs/RELEASING.md"
               "tools/prof/prof.py"
               "tools/bench/speculative-corpus.py"
             ];
@@ -255,6 +286,7 @@
               ".devops/nix/package.nix"
               "flake.nix"
               "THIRD_PARTY_NOTICES.md"
+              "tests/tools/check_dependencies_test.py"
               "tools/ci/check-dependencies.py"
             ];
           };
@@ -275,12 +307,14 @@
               pkgsSys.clang-tools
               pkgsSys.cmake
               pkgsSys.ninja
+              pkgsSys.pkg-config
               pkgsSys.python3
               pkgsSys.findutils
               pkgsSys.icu
               pkgsSys.curl
               pkgsSys.libpng
               pkgsSys.libjpeg
+              pkgsSys.libwebp
               pkgsSys.openssl
             ];
             src = staticAnalysisSource;
@@ -331,6 +365,7 @@
             cd "$src"
             mkdir -p $out
             python3 tools/ci/check-dependencies.py --json-report $out/dependency-inventory.json
+            python3 -B tests/tools/check_dependencies_test.py
             echo "PASS: Dependency inventory clean" > $out/result.txt
           '';
 
@@ -390,11 +425,13 @@
               pkgsSys.ccache
               pkgsSys.cmake
               pkgsSys.ninja
+              pkgsSys.pkg-config
               (if full then pkgsSys.python3.withPackages (ps: [ ps.numpy ]) else pkgsSys.python3)
               pkgsSys.icu
               pkgsSys.curl
               pkgsSys.libpng
               pkgsSys.libjpeg
+              pkgsSys.libwebp
               pkgsSys.openssl
             ];
             src = testSource;

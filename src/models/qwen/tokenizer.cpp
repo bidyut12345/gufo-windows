@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/control_tokens.hpp"
 
 namespace gufo::tokenization {
 
@@ -356,14 +357,13 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
   // Dynamic lookup of special tokens from GGUF vocabulary table
   for (std::size_t i = 0; i < tokens.size(); ++i) {
     const auto& t = tokens[i];
-    if (t == "<|endoftext|>" || t == "<|im_start|>" || t == "<|im_end|>" ||
-        t == "<tool_call>" || t == "</tool_call>" || t == "<tool_response>" ||
+    if (t == kEndOfText || t == kImStart || t == kImEnd || t == "<tool_call>" ||
+        t == "</tool_call>" || t == "<tool_response>" ||
         t == "</tool_response>" || t == "<think>" || t == "</think>" ||
         t == "<tts_pad>" || t == "<tts_text_bos>" || t == "<tts_text_eod>" ||
-        t == "<tts_text_bos_single>" || t == "<|object_ref_start|>" ||
-        t == "<|object_ref_end|>" || t == "<|vision_start|>" ||
-        t == "<|vision_end|>" || t == "<|image_pad|>" || t == "<|video_pad|>" ||
-        t == "<|quad_start|>" || t == "<|quad_end|>" ||
+        t == "<tts_text_bos_single>" || t == kObjectRefStart ||
+        t == kObjectRefEnd || t == kVisionStart || t == kVisionEnd ||
+        t == kImagePad || t == kVideoPad || t == kQuadStart || t == kQuadEnd ||
         (t.size() >= 4 && t.starts_with("<|") && t.ends_with("|>"))) {
       special_tokens[t] = static_cast<TokenId>(i);
     }
@@ -381,24 +381,24 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
 
   if (auto eos = reader.GetMetadataUint32("tokenizer.ggml.eos_token_id")) {
     tokenizer->eos_token_id_ = *eos;
-  } else if (auto it = special_tokens.find("<|im_end|>");
+  } else if (auto it = special_tokens.find(std::string(kImEnd));
              it != special_tokens.end()) {
     tokenizer->eos_token_id_ = it->second;
-  } else if (auto it = special_tokens.find("<|endoftext|>");
+  } else if (auto it = special_tokens.find(std::string(kEndOfText));
              it != special_tokens.end()) {
     tokenizer->eos_token_id_ = it->second;
   }
 
   if (auto bos = reader.GetMetadataUint32("tokenizer.ggml.bos_token_id")) {
     tokenizer->bos_token_id_ = *bos;
-  } else if (auto it = special_tokens.find("<|im_start|>");
+  } else if (auto it = special_tokens.find(std::string(kImStart));
              it != special_tokens.end()) {
     tokenizer->bos_token_id_ = it->second;
   }
 
   if (auto pad = reader.GetMetadataUint32("tokenizer.ggml.padding_token_id")) {
     tokenizer->pad_token_id_ = *pad;
-  } else if (auto it = special_tokens.find("<|endoftext|>");
+  } else if (auto it = special_tokens.find(std::string(kEndOfText));
              it != special_tokens.end()) {
     tokenizer->pad_token_id_ = it->second;
   }
@@ -465,11 +465,11 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromVocabulary(
   }
 
   tokenizer->endoftext_token_id_ =
-      tokenizer->FindSpecialToken("<|endoftext|>").value_or(kInvalidTokenId);
-  tokenizer->eos_token_id_ = tokenizer->FindSpecialToken("<|im_end|>")
-                                 .value_or(tokenizer->endoftext_token_id_);
+      tokenizer->FindSpecialToken(kEndOfText).value_or(kInvalidTokenId);
+  tokenizer->eos_token_id_ = tokenizer->FindSpecialToken(kImEnd).value_or(
+      tokenizer->endoftext_token_id_);
   tokenizer->bos_token_id_ =
-      tokenizer->FindSpecialToken("<|im_start|>").value_or(kInvalidTokenId);
+      tokenizer->FindSpecialToken(kImStart).value_or(kInvalidTokenId);
   tokenizer->pad_token_id_ = tokenizer->endoftext_token_id_;
   tokenizer->InitializeByteTokens(load_options.eager_decoded_tokens);
   return tokenizer;
@@ -646,11 +646,28 @@ std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {
   }
 
   std::vector<TokenId> tokens;
+  // Repeated words have identical BPE merges within this normalized span.
+  // Keep a small request-local memo: no cross-request state or lock, and no
+  // retained copies of long/unbounded pieces.
+  std::unordered_map<std::string_view, std::vector<TokenId>> pieces;
+  if (text.size() >= 1024)
+    pieces.reserve(128);
   std::size_t offset = 0;
   while (offset < text.size()) {
     const std::size_t end = Qwen35PieceEnd(text, offset);
-    const auto piece_tokens = BpeMergeChunk(text.substr(offset, end - offset));
+    const auto piece = text.substr(offset, end - offset);
+    if (text.size() >= 1024 && piece.size() > 1 && piece.size() <= 64) {
+      if (const auto found = pieces.find(piece); found != pieces.end()) {
+        tokens.insert(tokens.end(), found->second.begin(), found->second.end());
+        offset = end;
+        continue;
+      }
+    }
+    auto piece_tokens = BpeMergeChunk(piece);
     tokens.insert(tokens.end(), piece_tokens.begin(), piece_tokens.end());
+    if (text.size() >= 1024 && piece.size() > 1 && piece.size() <= 64 &&
+        pieces.size() < 128)
+      pieces.emplace(piece, std::move(piece_tokens));
     offset = end;
   }
   return tokens;
