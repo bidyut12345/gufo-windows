@@ -3,10 +3,12 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <immintrin.h>
+#ifndef _WIN32
 #include <linux/fs.h>
+#include <sys/syscall.h>
+#endif
 #include <sys/file.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -841,9 +843,14 @@ struct DiskStore::Impl {
   }
   void Rename(int target, const std::string& name) {
     CostTimer timer(publication_stats.filesystem_ns);
+#ifdef _WIN32
+    if (renameat(temporary.Get(), name.c_str(), target, name.c_str()) < 0)
+      IoError("publish cache file");
+#else
     if (syscall(SYS_renameat2, temporary.Get(), name.c_str(), target,
                 name.c_str(), RENAME_NOREPLACE) < 0)
       IoError("publish cache file");
+#endif
   }
   void WriteFile(int fd, std::span<const std::uint8_t> bytes) {
     while (!bytes.empty()) {

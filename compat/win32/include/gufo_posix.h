@@ -263,6 +263,7 @@ int unlink(const char* path);
 int unlinkat(int dirfd, const char* path, int flags);
 int rmdir(const char* path);
 int mkdir(const char* path, mode_t mode);
+int mkdirat(int dirfd, const char* path, mode_t mode);
 int access(const char* path, int mode);
 int isatty(int fd);
 pid_t getpid(void);
@@ -323,6 +324,7 @@ unsigned long long gufo_peak_resident_bytes(void);
 unsigned long long gufo_available_physical_bytes(void);
 unsigned long long gufo_total_physical_bytes(void);
 int kill(pid_t pid, int sig);
+ssize_t getrandom(void* buf, size_t buflen, unsigned int flags);
 
 #ifdef __cplusplus
 }

@@ -184,6 +184,7 @@ bool CopyFloats(const float* src, float* dst, std::size_t count,
   return Check(hipMemcpyAsync(dst, src, count * sizeof(float),
                               hipMemcpyDeviceToDevice, stream),
                what, error_msg);
+}
 
 void PopulateSnapshotPrefix(std::uint8_t* data, std::uint64_t bytes,
                             std::uint64_t worker_limit = 4) {
@@ -2116,7 +2117,6 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
         return false;
       }
     }
-    }
   }
   const bool fused_inject =
       inject != nullptr && !m.inject.empty() && m.inject.type == GgmlType::kF32;
@@ -3020,7 +3020,6 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   } next_hint{prefetch_next_};
   if (mode == ForwardMode::kPrefill) {
     prefetch_next_ = next;
-  }
   }
   const bool speculative = mode == ForwardMode::kVerify;
   PrefillPhase phase(mode == ForwardMode::kPrefill);

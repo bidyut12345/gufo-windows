@@ -1742,11 +1742,11 @@ bool HttpServer::start(std::string* error) {
   // follows net.ipv6.bindv6only, which differs between hosts.
   const int no = 0;
   if (addr.ss_family == AF_INET6 &&
-      ::setsockopt(listen_fd_, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no)) !=
-          0) {
+      gufo::platform::SetSocketOption(listen_fd_, IPPROTO_IPV6, IPV6_V6ONLY,
+                                      no) != 0) {
     if (error != nullptr)
       *error = "setsockopt(IPV6_V6ONLY) failed";
-    ::close(listen_fd_);
+    gufo::platform::CloseSocket(listen_fd_);
     listen_fd_ = -1;
     return false;
   }

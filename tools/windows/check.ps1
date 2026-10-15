@@ -69,13 +69,24 @@ Report "VS C++ build tools" ([bool]$vs) ($(if ($vs) { $vs } else { "not found" }
   "install Visual Studio Build Tools with 'Desktop development with C++'"
 
 $cmake = Get-Command cmake -ErrorAction SilentlyContinue
+if (-not $cmake -and $vs) {
+  $vsCMake = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+  if (Test-Path $vsCMake) { $cmake = Get-Item $vsCMake }
+}
 if ($cmake) {
-  $cmakeVersion = [version]((& cmake --version | Select-Object -First 1) -replace "[^0-9.]", "")
+  $cmakeExe = if ($cmake -is [System.IO.FileInfo]) { $cmake.FullName } else { $cmake.Source }
+  $cmakeVersion = [version]((& "$cmakeExe" --version | Select-Object -First 1) -replace "[^0-9.]", "")
   Report "CMake" ($cmakeVersion -ge [version]"3.21") "$cmakeVersion" "install CMake 3.21 or newer"
 } else {
   Report "CMake" $false "not on PATH" "install CMake 3.21 or newer and add it to PATH"
 }
-$ninjaExe = if (Test-Path $Ninja) { $Ninja } else { (Get-Command ninja -ErrorAction SilentlyContinue).Source }
+$ninjaExe = if (Test-Path $Ninja) { $Ninja } else {
+  $cmd = Get-Command ninja -ErrorAction SilentlyContinue
+  if ($cmd) { $cmd.Source } elseif ($vs) {
+    $vsNinja = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+    if (Test-Path $vsNinja) { $vsNinja }
+  }
+}
 Report "Ninja" ([bool]$ninjaExe) ($(if ($ninjaExe) { $ninjaExe } else { "not found" })) `
   "put ninja.exe on PATH or at $Ninja"
 

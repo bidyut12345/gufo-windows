@@ -20,5 +20,13 @@ typedef unsigned int mode_t;
 typedef unsigned int uid_t;
 typedef unsigned int gid_t;
 typedef unsigned long long rlim_t;
+#ifndef GUFO_DEV_T_DEFINED
+#define GUFO_DEV_T_DEFINED
+typedef unsigned long long dev_t;
+#endif
+#ifndef GUFO_INO_T_DEFINED
+#define GUFO_INO_T_DEFINED
+typedef unsigned long long ino_t;
+#endif
 
 #endif /* GUFO_COMPAT_WIN32_POSIX_TYPES_H_ */

@@ -37,21 +37,33 @@ if ($rockVersion -ne $validatedRock) {
   Write-Warning "TheRock $rockVersion at $Rocm; this port is validated on $validatedRock"
 }
 
-# Ninja: the -Ninja path, else the one on PATH (as tools\windows\check.ps1 accepts).
-if (-not (Test-Path $Ninja)) {
-  $onPath = Get-Command ninja -ErrorAction SilentlyContinue
-  if (-not $onPath) { throw "ninja not found at $Ninja or on PATH (see tools\windows\check.ps1)" }
-  $Ninja = $onPath.Source
-}
-
 # Import the MSVC developer environment (headers, libs, link.exe).
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+$vs = if (Test-Path $vswhere) {
+  & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+}
 if (-not $vs) { throw "Visual Studio C++ build tools not found" }
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
 $env:PATH = "$(Split-Path $vswhere);$env:PATH"
 cmd /c "`"$vcvars`" >nul && set" | ForEach-Object {
   if ($_ -match "^([^=]+)=(.*)$") { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+}
+
+# Auto-detect CMake and Ninja from Visual Studio if not already on PATH
+$vsCMake = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
+if ((Test-Path "$vsCMake\cmake.exe") -and (-not (Get-Command cmake -ErrorAction SilentlyContinue))) {
+  $env:PATH = "$vsCMake;$env:PATH"
+}
+$vsNinja = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja"
+if ((-not (Test-Path $Ninja)) -and (Test-Path "$vsNinja\ninja.exe")) {
+  $Ninja = "$vsNinja\ninja.exe"
+}
+
+# Ninja: the -Ninja path, else the one on PATH (as tools\windows\check.ps1 accepts).
+if (-not (Test-Path $Ninja)) {
+  $onPath = Get-Command ninja -ErrorAction SilentlyContinue
+  if (-not $onPath) { throw "ninja not found at $Ninja or on PATH (see tools\windows\check.ps1)" }
+  $Ninja = $onPath.Source
 }
 
 $env:HIP_PATH = $Rocm.Replace('\', '/')

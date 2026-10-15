@@ -439,7 +439,6 @@ struct Uploader {
     }
     return u;
   }
-  }
 };
 
 }  // namespace

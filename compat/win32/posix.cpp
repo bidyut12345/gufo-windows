@@ -31,9 +31,11 @@
 #include <windows.h>
 #include <psapi.h>
 #include <winternl.h>
+#include <bcrypt.h>
 
 #include <crtdbg.h>
 #include <direct.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <io.h>
@@ -890,6 +892,15 @@ int mkdir(const char* path, mode_t) {
   return 0;
 }
 
+int mkdirat(int dirfd, const char* path, mode_t mode) {
+  const std::wstring resolved = ResolveAt(dirfd, path);
+  if (resolved.empty()) {
+    errno = EBADF;
+    return -1;
+  }
+  return mkdir(Narrow(resolved.c_str()).c_str(), mode);
+}
+
 int access(const char* path, int mode) {
   const DWORD attributes = GetFileAttributesW(Widen(path).c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES) {
@@ -1741,4 +1752,102 @@ int utimensat(int dirfd, const wchar_t* path, const struct timespec times[2],
 
 int access(const wchar_t* path, int mode) {
   return access(Narrow(path).c_str(), mode);
+}
+
+struct DIR {
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  WIN32_FIND_DATAW data{};
+  struct dirent entry{};
+  bool started = false;
+  int fd = -1;
+};
+
+DIR* opendir(const char* name) {
+  const int fd = open(name, O_RDONLY | O_DIRECTORY);
+  if (fd < 0) return nullptr;
+  DIR* d = fdopendir(fd);
+  if (!d) {
+    close(fd);
+    return nullptr;
+  }
+  return d;
+}
+
+DIR* fdopendir(int fd) {
+  std::wstring path = DirectoryPathOf(fd);
+  if (path.empty()) {
+    errno = EBADF;
+    return nullptr;
+  }
+  if (path.back() != L'\\') {
+    path += L'\\';
+  }
+  path += L'*';
+  auto* dir = new DIR;
+  dir->fd = fd;
+  dir->handle = FindFirstFileW(path.c_str(), &dir->data);
+  if (dir->handle == INVALID_HANDLE_VALUE) {
+    const DWORD err = GetLastError();
+    delete dir;
+    Fail(err);
+    return nullptr;
+  }
+  return dir;
+}
+
+struct dirent* readdir(DIR* dir) {
+  if (!dir || dir->handle == INVALID_HANDLE_VALUE) {
+    errno = EBADF;
+    return nullptr;
+  }
+  if (!dir->started) {
+    dir->started = true;
+  } else {
+    if (!FindNextFileW(dir->handle, &dir->data)) {
+      const DWORD err = GetLastError();
+      if (err == ERROR_NO_MORE_FILES) {
+        return nullptr;
+      }
+      Fail(err);
+      return nullptr;
+    }
+  }
+  const std::string narrow = Narrow(dir->data.cFileName);
+  dir->entry.d_ino = 1;
+  std::strncpy(dir->entry.d_name, narrow.c_str(), sizeof(dir->entry.d_name) - 1);
+  dir->entry.d_name[sizeof(dir->entry.d_name) - 1] = '\0';
+  return &dir->entry;
+}
+
+int closedir(DIR* dir) {
+  if (!dir) {
+    errno = EBADF;
+    return -1;
+  }
+  if (dir->handle != INVALID_HANDLE_VALUE) {
+    FindClose(dir->handle);
+  }
+  if (dir->fd >= 0) {
+    close(dir->fd);
+  }
+  delete dir;
+  return 0;
+}
+
+extern "C" ssize_t getrandom(void* buf, size_t buflen, unsigned int /*flags*/) {
+  if (buflen == 0) {
+    return 0;
+  }
+  if (buf == nullptr) {
+    errno = EFAULT;
+    return -1;
+  }
+  const NTSTATUS status = BCryptGenRandom(nullptr, static_cast<PUCHAR>(buf),
+                                         static_cast<ULONG>(buflen),
+                                         BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  if (!BCRYPT_SUCCESS(status)) {
+    errno = EIO;
+    return -1;
+  }
+  return static_cast<ssize_t>(buflen);
 }
