@@ -12,8 +12,8 @@ Ryzen AI MAX+ 395 systems with Radeon 8060S (`gfx1151`), up to 128 GiB of unifie
 See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-org/gufo/releases)
 for user-facing changes and release history.
 
-> [!TIP]
-> There are two Gufo variants that haven't been merged yet: A **[Windows port](https://github.com/pixmaate/gufo)** and **[Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo)**. Check them out!
+> [!NOTE]
+> This repository provides native Windows 11 x64 support (`gfx1151`) with AMD TheRock ROCm, fully updated with the latest upstream Gufo features and optimizations. For multi-node environments, see [Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo).
 
 ## Models and benchmarks
 
@@ -46,6 +46,27 @@ Each model guide lists the required files and complete benchmark settings.
 - Keep production dependencies small and development tools separate.
 
 ## Quickstart
+
+### Windows (Native, gfx1151)
+
+1. Check prerequisites and system configuration:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File tools\windows\check.ps1
+   ```
+2. Build Gufo natively:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File tools\windows\build.ps1
+   ```
+3. Run the interactive launcher (auto-detects models, drafts, vision sidecars, and optimal context):
+   ```cmd
+   start.cmd
+   ```
+   Or launch directly via CLI:
+   ```powershell
+   .\build\release\gufo.exe serve --host 0.0.0.0 --port 8080 llm --model "C:\path\to\model.gguf"
+   ```
+
+### Linux (Container / Podman)
 
 ```sh
 hf download unsloth/Qwen3.8-27B-GGUF \
@@ -132,17 +153,33 @@ Reasoning tokens count toward that response limit.
 
 ## Build from source
 
-Linux x86-64 on AMD Strix Halo (`gfx1151`) is the supported target. CMake owns
-one production configuration for both Nix and ordinary Linux builds. Tests,
-profilers, tuning executables and Python reference runners are not installed
-with the production package. No `build.sh` wrapper is needed.
+AMD Strix Halo (`gfx1151`) is supported natively on both **Windows 11 x64** and **Linux x86-64**.
 
-Windows 11 x64 builds natively against AMD's TheRock ROCm; see
-[Windows](docs/WINDOWS.md) for the toolchain, a setup check, the build script
-and the launchers (`start.cmd`, `tools\windows\start.ps1`); releases carry a
-prebuilt zip.
+### Windows 11 x64 (Native)
 
-### With Nix
+Windows 11 x64 builds natively against AMD's TheRock ROCm 10.0.0 and Visual Studio C++ Build Tools (MSVC STL + Windows SDK) without WSL.
+
+| Piece | Default location | Notes |
+| --- | --- | --- |
+| TheRock ROCm 10.0.0 (Windows, gfx1151) | `C:\TheRock\build` | Extracted from AMD TheRock distribution tarball |
+| vcpkg | `C:\vcpkg` | `vcpkg install icu curl openssl libpng libjpeg-turbo --triplet x64-windows` |
+| Visual Studio Build Tools | Any | "Desktop development with C++" |
+| CMake 3.21+ & Ninja | `PATH` or `C:\tools\ninja` | |
+
+```powershell
+# 1. Inspect setup and verify prerequisites
+powershell -ExecutionPolicy Bypass -File tools\windows\check.ps1
+
+# 2. Build release (produces build\release\gufo.exe and copies required DLLs)
+powershell -ExecutionPolicy Bypass -File tools\windows\build.ps1
+
+# 3. Diagnose GPU status
+.\build\release\gufo.exe diagnose
+```
+
+See [Windows documentation](docs/WINDOWS.md) for full toolchain details, test suites, and packaging scripts.
+
+### Linux (With Nix)
 
 ```sh
 nix build
