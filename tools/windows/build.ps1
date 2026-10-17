@@ -17,7 +17,7 @@ param(
   [string]$Rocm = "C:\TheRock\build",
   [string]$Vcpkg = "C:\vcpkg",
   [string]$Ninja = "C:\tools\ninja\ninja.exe",
-  [int]$Jobs = 0,
+  [int]$Jobs = 4,
   [switch]$Reconfigure,
   [switch]$KeepGoing,
   [string[]]$CMakeArgs = @()
