@@ -495,12 +495,18 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
 /// Per-token attention (decode and narrow batches). With `partials`
 /// (n_tokens * heads * splits * (d + 2) floats) the key tiles are split
 /// across `splits` blocks per row and merged in a second launch.
+/// With `lists` (n_tokens * list_capacity entries), `counts` (n_tokens) and a
+/// mask at ratio 4, each row's selected blocks are first compacted once into
+/// `lists`; `list_capacity` is the selection budget (blocks per row). The
+/// output is bitwise identical to the mask walk. Null lists use the mask walk.
 void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
-               hipStream_t stream);
+               hipStream_t stream, std::uint32_t* lists = nullptr,
+               std::uint32_t* counts = nullptr,
+               std::uint32_t list_capacity = 0);
 
 /// Fused causal attention on the WMMA cores for wide batches: scores, online
 /// softmax, PV and the sigmoid output gate in one launch. `mask` follows
@@ -590,6 +596,22 @@ void PenalizedArgmax(const float* logits, GreedyPenaltyRows penalties,
 void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
                             ArgmaxCandidate* out, std::uint32_t rows,
                             std::uint32_t vocab, hipStream_t stream);
+
+/// Draft logits of empty table slots (table[i] < 0) become -infinity.
+void MaskDraftLogits(float* logits, const std::int32_t* table, std::uint32_t n,
+                     hipStream_t stream);
+
+/// Full-vocabulary logits to the small-head layout, in place: row
+/// prefix + i becomes logits[table[i]], or -infinity for an empty slot
+/// (table[i] < 0). n is at most 1024 (one block).
+void GatherDraftLogits(float* logits, const std::int32_t* table,
+                       std::uint32_t prefix, std::uint32_t n,
+                       hipStream_t stream);
+
+/// Draft head rows back to token IDs: ids[i] >= prefix (a table row) becomes
+/// table[ids[i] - prefix]; prefix rows are already token IDs.
+void RemapDraftIds(std::uint32_t* ids, std::uint32_t n, std::uint32_t prefix,
+                   const std::int32_t* table, hipStream_t stream);
 
 /// Number of IDs in each of the two selection buffers.
 std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab);

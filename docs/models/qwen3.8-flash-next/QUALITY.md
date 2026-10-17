@@ -1,5 +1,162 @@
 # Qwen3.8 Flash-Next quality
 
+**PR #626 follow-up, October 17:** sparse attention bounds temporary K-fragment
+scheduling while retaining every dot product and softmax operation. Healthy
+MTP cache-slot reassignment retains bounded rollback scratch and its graphs;
+failure and explicit reset still free it. Prepared Qwen vision weights use
+coarse managed storage, removing the reproduced text-dispatch stalls after
+sidecar upload. Image activations and encoder arithmetic are unchanged.
+The focused numerical, cache and image checks are listed below.
+
+The complete HTTP C1 sweep retains all 24 completion hashes and prompt/cache/
+draft counts. Its 12 AR requests match current main `78248de2` and pass every
+measured phase at 5% and 3 ms. The affected mixed-MTP history was replayed
+through 64K; two unprofiled follow-ups reach 1551.64 and 1558.51 tok/s. The
+second pins the initial run's exact cache budget and matches all 11 request
+identities with no phase flags against that candidate control. That request
+shows no reclaim, swap or compaction activity. The table uses the faster
+follow-up; neither a specific driver cause nor worst-case latency is claimed.
+Raw attempts and diagnostics remain outside Git.
+
+The canonical repetitive d0 measurement is 73.80 tok/s with the full vision
+sidecar ready. In the isolated allocation control it is 73.77, versus 73.35
+on the exact published `32c4ece8` binary and 42.53 with the current raw device
+uploads. Four image/text HTTP controls preserve outputs and cache/draft work
+and pass the per-request phase gate. This focused evidence does not replace
+the older functional timing limits or upstream accuracy qualifications below.
+
+**PR #603's reduced draft vocabulary preserves the target distribution and
+supports the real sampling defaults.** The final review keeps the established
+length controller and AR backoff for every request; it removes the proposed
+confidence/calibrated stopping policy. That policy lost learned state across
+native sampled snapshots and caused repeatable mixed-session and short greedy
+slowdowns. The reduced head is used for C1 sampled requests, including penalties
+and constraints, and eligible greedy requests. Unplanned multi-session requests
+and modified greedy sampling retain the full draft head.
+
+October 15, 2026, against `f6ca085a`, with the same pinned Nix toolchain and
+Unsloth UD-Q4_K_XL/shared Q8_0 MTP weights:
+25,328,640 full-vocabulary target logits after a 28,092-token prompt and
+102 fixed continuation steps are finite and byte-identical. Independent MTP
+formula checks retain their 0.002 relative-RMS limit (worst 0.0007655).
+Native session, snapshot, component-restore, probability-correction and mixed
+head checks pass. New regressions cover actual default sampling, complete
+sampler/RNG replay, used-session table restoration and the subset path with
+penalties. All 12 independent native sampled replay cases pass; the original
+PR failed all 12.
+
+HTTP requests that omit sampling controls exercise both real presets. All
+16 short and two 35K-context default completions pass the timing gate; 17/18
+retain identical output and draft counts. Python/story generation improves
+3–10% at short context and the deep Python cases improve 5–8%. Translation
+defaults are mostly level. The standard C1 AR/MTP captures, including warmups,
+retain exact output/work with no phase flags; greedy MTP gains 5–12% at
+d0/d32K. Focused AR/MTP API, cancellation, long-context and RAM/disk cache
+checks pass correctness. Pi completes four continued coding tasks with
+17 default-sampling requests and 13 tool calls; actual edits and test results
+were inspected.
+
+This is **not a global timing or individual-answer quality pass**. API queue
+flags include simultaneous requests admitted in a different order; the same
+order reversal occurs within main's own captures. Small snapshot/cache-resume
+flags remain inconclusive: the MTP image snapshot is 83.84 → 88.97 ms, while
+unchanged main reaches 87.40 ms. The AR one-token cache-resume outlier
+(51.31 → 73.80 ms) does not recur: the final pair is 51.29 → 54.06 ms,
+and all 737 phases in that repeat pass. Raw review captures are retained
+outside the repository. A non-default sampled
+translation repeats about 9% slower with different wording and acceptance;
+its translation is correct, but its extra grammar explanation mislabels a
+declension. Changed proposals can consume RNG differently across builds.
+These numerical, replay and functional checks establish regression evidence
+against main, not upstream unquantized-model accuracy or a statistical
+language-quality result. The Gufo benchmark refresh below retains all llama.cpp
+data unchanged.
+
+The cache follow-up in `fdc21849` changes storage and bookkeeping while
+preserving model arithmetic and sampling. Large pinned segments populate with
+at most four workers and disable transparent huge pages before GPU registration
+(incorporating #605). Capture retains its prepared shared chunks across allocation
+retries, avoids repeated history scans and impossible partial allocations, and
+allocates larger payloads first. Shared KV rows and private states use opposite
+ends of the same bounded pool; KV rows retain ascending addresses for contiguous
+restores. Payload owners shrink from 128 to 16 bytes. Existing reader pins,
+atomic validity publication and generation checks remain authoritative.
+
+Byte-pressure retry admission preserves the reused frontier, forks, last copies
+and current edit boundaries. A retry adding at most 64 tokens can reclaim covered
+older history; longer resumed turns can reclaim only their own covered ancestors.
+Cold side requests prefer shallow live slots, preserving deep continuations.
+Native regressions reproduced and then fixed fragmented private-state allocation,
+reverse KV placement, lost retry reuse and premature deep-slot eviction.
+
+Aligned registered snapshot buffers use a vectorized integer copy through their
+GPU aliases; other buffers retain HIP copies. All 150 independent size/offset/
+storage cases pass, including ragged allocation tails and unregistering a source.
+Real AR/MTP snapshots at 2047 and 8203 tokens match pageable copies byte-for-byte.
+Restored full logits, sampled/greedy continuations, learned drafts, real images,
+mutation/failure guards and copying during a peer's graph capture pass.
+
+An already-warm target pass can need its first graph or a replacement after
+releasing MTP rollback storage. The new path enqueues that pass once and records
+its graph while the GPU executes. The graph is not launched a second time;
+explicit reset still releases all rollback storage. This removed reproduced
+8–10 ms MTP and 5 ms AR short-request regressions in preceding cache candidates.
+The affected AR pressure prefix has 21 exact requests and 316 passing timing
+phases; the flagged decode is 76.25 ms on main and 73.02 ms with this change.
+Deferring graph recording to the following request was rejected because it
+moved the delay there.
+
+The final native session suite passes: 65 exact full-logit AR/MTP frontier
+comparisons, eight bitwise fresh-load replays, 25 sampling configurations per
+mode, eight 200-token cache replays, image attachment/replacement, cancellation,
+rollback release and C2/4/6/8 isolation. The focused cache, backing, retention,
+component-runner and snapshot tests pass without relaxed tolerances or missing
+model skips. Pi on the final `fdc21849` production binary completes four
+continued coding tasks with 17 HTTP requests and 13 paired tool calls/results,
+using default sampling and low thinking. All 16 follow-up requests reuse cache;
+their first-token times are 145–488 ms. Tasks take 7.0–13.1 seconds. These are
+observed smoke timings, not a matched-main timing gate. Actual edits, expected
+failing tests and successful repairs were inspected; no orphan tool results or
+literal framing tags appear in assistant text. The preceding `e0bead8b` run's
+eight tasks, 33 requests and 25 tool pairs remain in the retained evidence.
+
+The final production depth sweep has 32 captured requests with exact outputs,
+prompt/cache/draft counts and all 256 timing phases passing against post-#603
+main. All 63 measured concurrent completions match fresh AR, and the complete
+128-request concurrency history retains exact output. Concurrent preparation
+can change which identical request supplies the shared prefix; cohort prefill
+work is unchanged. Loading is 15.27 s, and the two memory rows are 88.75/90.73
+GiB, matching post-#603 main within 0.01 GiB. The older published memory rows
+came from an earlier source revision.
+
+Completed MTP continuation and small-budget pressure captures have 219 requests,
+including 208 complete responses with exact request/output/draft identities and
+no lost reuse. The final AR pressure capture has 100 exact requests and no lost
+reuse. Four timing flags concern one short decode: 79.36 ms here versus an older
+73.06 ms control, while fresher unchanged main takes 79.06 ms. Both controls and
+their concurrent admission histories are retained; this remains inconclusive.
+The prepared C6/C8 MTP repeat confirms a small first-token cost: approximately
+23 → 35 ms and 31 → 59 ms. Aggregate decode is 176.28 → 175.84 tok/s and
+194.16 → 194.12 tok/s; C8 whole-request time increases about 0.5%. This startup
+tradeoff was accepted for publication. It remains a timing-gate failure, not a
+global timing pass. GPU traces locate the wait before session reset; changing
+the copy method or queue limit did not resolve it, and neither experiment was
+retained. All original timing flags and rejected candidates remain retained in
+the [compact review record](artifacts/cache-checkpoint-review.json) and raw archives.
+Flash is the only production consumer of this component cache; other text
+models retain the legacy path.
+
+**PR #596 repairs the complete functional inventory:** all 48 registered
+Flash-Next suites pass in AR and MTP at `9985ff0a`, including all four deferred
+cache workloads (122 expanded checks, 3,334 requests). The final allocation
+follow-up retains the same harness and logical cache fixes and receives focused
+continuation/cache revalidation. Existing numerical tolerances are unchanged;
+CPU regressions, GPU continuation/snapshot checks and actual Pi tool/image
+results are retained in [the qualification evidence](artifacts/functional-fixes.json).
+This is functional regression evidence, not upstream model/conversion accuracy
+or a clean global timing gate. The unreproduced five-minute MTP snapshot stall
+and individual timing flags remain visible.
+
 **PR #571's wave-owned prefill weights retain byte-exact logits:**
 99,328,000 F32 values after a 34,159-token code/prose prompt and 400 fixed
 continuation steps, batch 4096, capacity 65536, match the original PR control
@@ -37,6 +194,9 @@ Concurrent setup and maximum-token-gap flags are also retained in the evidence.
 
 | Check | Result |
 | --- | --- |
+| Vision weight storage, October 17 | Flash-Next and 27B each retain 29 finite, byte-identical encoder stages on a deterministic 1024² texture: 134,742,016 and 137,363,456 F32 values respectively. Prepared upload, repeated upload, resident-byte accounting and later encoding pass with both projectors. Four matched production image/text requests retain exact outputs and token/cache/draft counts, with no phase exceeding both 5% and 3 ms; cached image retry performs zero prefill. The original uncached repetitive text history recovers 73.77 tok/s with the full vision sidecar prepared, versus 73.35 on the exact published binary. Native storage parity does not resolve the existing image accuracy gap against the reference. |
+| Sparse scheduling, October 17 | Against PR #626 head `c1088f89`, 17,134,080 finite full-vocabulary logits are byte-identical after 133,945 prompt tokens and 69 fixed continuation steps. The complete independent FP64 attention error report is identical, including ragged and 128K cases; all 12 saved real selection masks retain exact attention outputs. |
+| Healthy MTP slot reassignment, October 17 | The new adapter regression fails before the fix and passes afterward in AR/MTP. Reused and fresh sessions agree on full logits, greedy/sampled tokens and draft counts; memory stays within the existing reservation, while cancellation and explicit reset release scratch. Guard lifetime and seeded native RAM/serialized cache replay pass. The focused HTTP `cache` and `long-context` suites pass with the Qwen sampling preset, 624 actual drafts and 458 accepted drafts, including text/thinking/tool/image cancellation and disk resume. These are correctness results, not a global timing pass. |
 | Wave-owned prefill weights, October 13 | Routed WMMA, projection/convolution, MoE epilogue and HC mix checks pass with unchanged tolerances. Routed inputs end at their allocation boundary; independently reset output tails retain their guards. Fused SSM output/state/replay and full fixed-history logits are exact. HTTP C1 pp2048/tg128, two AR captures with two repetitions and two mixed/repetitive MTP captures: 16 exact measured completions, including actual drafts. All request phases pass the timing gate; the anomalous first mixed-MTP control is excluded. |
 | Decode-kernel review, October 10 | All 13 operator tests and native snapshot/session/deep-execution checks pass. Independent MTP formulas: worst relative RMS 0.0007655 (limit 0.002), 41 reported comparisons over eight text/image states. Sampled replay, cancellation, C2/4/6/8 and RAM/disk restoration pass. [Evidence](artifacts/decode-kernels-review.json). |
 | Focused HTTP regression, October 10 | `state-edges`, `tool-agent`, `long-context`, `cache`, Flash AR/MTP only. Two main/PR pairs plus unchanged-main controls; no output or expected cache/prefill-work changes. Timing failures remain visible above and in the [evidence](artifacts/decode-kernels-review.json). |
@@ -66,8 +226,9 @@ matched-prefill AR/MTP logits and sampled snapshot replay are exact at
 
 Sampled MTP can consume different RNG draws from AR. Seeded replay requires
 the same build, request budget, capacity and sampling configuration; live cost
-timings only steer greedy decoding. Draft sampling uses the full Q8 head's
-top 64 logits; upstream draft-sampler equivalence is not claimed.
+timings only steer greedy decoding. Draft sampling uses the selected Q8 head's
+top 64 logits, with proposals corrected against the full target distribution;
+upstream draft-sampler equivalence is not claimed.
 MTP cache projections now keep the same arithmetic across prompt splits.
 Older Flash-Next disk checkpoints are rejected and rebuilt once.
 
@@ -105,55 +266,55 @@ weights. [Vision reproduction](../qwen3.8-27b/QUALITY.md#vision).
 
 ## Benchmark method
 
-The October 13 single-user refresh uses production Nix builds of PR #571:
-`0951ea2f` (binary SHA-256 prefix `61d0583912d9e2c8`), and `ac51031a`
-(`d6cc00786ffc8786`) for AR d16K/d64K and MTP d64K, whose prompts end a few
-tokens past a 128-token tile and take its W8A8 tail path. Both run through
-`tools/bench/model-bench.py run --target gufo --table single-ar,single-mtp`:
-HTTP C1, capacity 133760, greedy, thinking off, pp2048/tg128 at
-every depth from 0 to 131072, one warmed sample per point, platform profile
-`performance`. Token and cache counts pass the driver's calibration gates.
-The single-user kernels behind it retain byte-identical logits for 718 fixed
-continuation rows after a 35,559-token prompt at batch 2048 and 4096 against
-the previous PR head ([experiments](EXPERIMENTS.md)). Multi-user, loading and memory
-tables and all reference values keep their earlier provenance.
+Single-user tables were refreshed on October 17, 2026, with production Nix
+build `c1088f89` plus the PR #626 follow-up (binary SHA-256 prefix
+`fc0a6628055f970e`); the exact source and binary identities are retained.
+Concurrency still uses October 16 build `32c4ece8`, PR #622 rebased on
+`22e36769` (binary prefix `2361bcffddf74773`). Loading and memory use the
+October 16 `fdc21849` capture (binary prefix `b1ab0e9795df6fba`).
+The pinned toolchain is unchanged. Every single-user row reproduces the
+previous completion hashes and draft counts. Four prior alternating mixed
+MTP C2 repeats gave 110 drafts (about 54 tok/s) on main twice and the PR once,
+and 144 drafts (about 60 tok/s) on the PR once, all with identical text.
+The checked platform profile is `performance`, with tuned
+`accelerator-performance`. Each independent AR,
+mixed MTP and repetitive MTP depth server starts after at least 90 seconds of
+idle recovery and the recorded temperature limits. Commands, binary/model identities, counts and
+retained samples are in [artifacts](artifacts/bench.json) and
+[model identities](artifacts/model-identities.json). Full raw requests, phase
+timings, diagnostic profiles and repeated controls are retained outside Git.
 
-The October 10 sweep follows:
+The driver is `tools/bench/model-bench.py run --target gufo --fresh`.
+One warmed sample per point, HTTP, greedy, thinking off, penalties disabled;
+automatic cache RAM budget except the retained mixed 64K follow-up, which pins
+the initial run's 17145280512-byte budget. Single-user uses ordered pp2048/tg128 histories at
+every depth from 0 to 131072, with capacity 133760. MTP pp is the maximum across
+the independently retained mixed/repetitive workloads. Diagnostic profiled
+runs and abandoned candidates do not supply published cells. Matched main
+AR controls for this refresh use main `78248de2`; the retained October 16
+cache review used post-#603 main `51a8b00d` (the same source tree as reviewed
+`c4177e37`). Controls preserve prompts, settings and ordered cache histories;
+per-request phase flags require both a 5% and a 3 ms increase.
 
-Gufo refreshed October 10, 2026 using production Nix build `25cdb2a1`,
-PR #518 rebased onto main `a41e88da` with all 16 patches unchanged.
-Matched main controls use the same pinned toolchain, model and ordered workload
-histories. Binary and source hashes are retained in
-[model identities](artifacts/model-identities.json).
+C1/2/4/6/8 use the same d0 prompts. Every session prefills before measured tg128,
+with at most four prompt-tail tokens reevaluated. Rates sum individual decode
+rates. Fresh C1 AR controls provide completion hashes for both workloads.
+Depth calibration depends on the ordered sweep; paired speed controls retain
+that order. Deep AR/MTP HTTP cache frontiers differ by one token, so exact
+snapshot replay is checked separately with identical prefill boundaries.
+
 All llama.cpp data retain September 22–23 provenance, unchanged at the user's
-request; no reference benchmark refresh was run.
-The largest displayed PP decrease versus main is 3.77%, at 64K MTP; no
-single-user PP row drops more than 5% versus main or the previous published
-table. A focused C1 PP-only retry at that frontier measured AR
-1467.30 → 1497.60 tok/s (+2.1%) and MTP 1451.39 → 1463.63 tok/s (+0.8%).
-Both builds used the saved prefix/messages and exact original token/cache counts,
-with one generated token. Fresh prefix/continuation pairs omit earlier cached
-branches, so these controls remain separate from the original ordered-sweep
-samples rather than replacing or averaging them. [Evidence](artifacts/decode-kernels-review.json).
-One warmed sample per point, greedy, thinking off, penalties disabled.
-Single-user uses pp2048/tg128; MTP pp is the maximum across mixed/repetitive
-workloads. Gufo capacity is 133760; reference capacity is 35456 through 32K,
-68224 at 64K and 133760 at 128K. C1/2/4/6/8 use the same d0 prompts; every
-session prefills before measured tg128, with at most four prompt-tail tokens
-reevaluated. Rates sum individual decode rates.
-Depth calibration depends on the ordered sweep. Paired speed controls use
-the same depth list. Deep AR/MTP HTTP cache frontiers differ by one token;
-exact replay is checked separately with identical prefill boundaries.
-AR reference is llama.cpp b11069; historical MTP data use pinned `6fcaa16f`.
-A separate prerequisite check on October 10 used that same MTP binary in AR
-and MTP modes at pp2048/tg128, C1/capacity 4096. Mixed-prose fresh and prepared
-MTP outputs matched each other but differed from its own AR output; both
-generated 128 tokens and MTP proposed 152 drafts. Repetitive MTP was not
-attempted after this failure. The retained historical speed values are not
-new equivalence-qualified measurements. [Evidence](artifacts/decode-kernels-review.json).
-Loading: cold files verified with `POSIX_FADV_DONTNEED` and `mincore` on every
-target/sidecar file, C1/MTP/capacity 262144; runtime libraries may remain warm.
-Memory: C1/AR/capacity 133121,
-peak global HIP allocation including idle memory. Full commands, counts and
-identities remain in [artifacts](artifacts/bench.json) and the
+request; no reference benchmark or quality refresh was run. AR uses `b11069`;
+historical MTP uses `6fcaa16f`. Reference capacity is 35456 through 32K, 68224
+at 64K and 133760 at 128K. A separate October 10 check of that MTP pin at
+pp2048/tg128, C1/capacity 4096 found that fresh and prepared mixed-prose MTP
+outputs matched each other but differed from its own AR output. Both generated
+128 tokens and MTP proposed 152 drafts; repetitive MTP was not attempted after
+that failure. The historical speed values are not newly qualified equivalence
+measurements. [Evidence](artifacts/decode-kernels-review.json).
+
+Loading measures cold target/sidecar files to HTTP readiness, verified with
+`POSIX_FADV_DONTNEED` and `mincore` on every file, C1/MTP/capacity 262144;
+runtime libraries may remain warm. Memory uses C1/AR/capacity 133121 and peak
+global HIP allocation, including idle memory. See the
 [benchmark workflow](../../../.agents/skills/benchmark-model/SKILL.md).

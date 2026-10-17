@@ -1055,6 +1055,18 @@ void TestHistoricalTypedArgumentsUseTojson() {
              !message.tool_calls[0].arguments[1].is_string &&
              message.tool_calls[0].arguments[2].value == "2",
          "Typed historical arguments render as the template's tojson");
+  // tojson writes integers in decimal, as the model generated them.
+  const auto large = gufo::json::parse(
+      R"({"type":"function_call","call_id":"call_1","name":"read",
+          "arguments":"{\"limit\":100000,\"offsets\":[1000000]}"})");
+  gufo::tokenization::ChatMessage replayed;
+  Expect(gufo::server::ParseOpenAiResponseMessage(large, &replayed, budget,
+                                                  &error) &&
+             replayed.tool_calls.size() == 1 &&
+             replayed.tool_calls[0].arguments.size() == 2 &&
+             replayed.tool_calls[0].arguments[0].value == "100000" &&
+             replayed.tool_calls[0].arguments[1].value == "[1000000]",
+         "Typed historical integers render in decimal");
 }
 
 void TestMalformedHistoricalFunctions() {
@@ -1175,9 +1187,28 @@ void TestQwenToolBoundariesAndSchema() {
         Case{"<tool_call><function=f><parameter=text>a</parameter>"
              "<parameter=text>a </parameter></function></tool_call>",
              0, ""},
+        // A name that is only whitespace names no parameter.
+        Case{"<tool_call><function=f><parameter= >x</parameter>"
+             "</function></tool_call>",
+             0, ""},
+        // Recovery resumes after a rejected parameter, so the bytes of later
+        // parameters are scanned again.
+        Case{"<tool_call><function=f><parameter=count>\noops\n</parameter>"
+             "<parameter=text>\n<tool_call><function=f><parameter=count>5"
+             "</parameter></function></tool_call>\n</parameter></function>"
+             "</tool_call>",
+             1, R"({"count":5})"},
         Case{"<tool_call>{\"name\":\"f\",\"arguments\":{\"text\":"
              "\"literal </tool_call>\"}}</tool_call>",
-             1, R"({"text":"literal </tool_call>"})"}}) {
+             1, R"({"text":"literal </tool_call>"})"},
+        // Integers stream as the model wrote them, not as 1e+05.
+        Case{"<tool_call><function=f><parameter=count>100000</parameter>"
+             "<parameter=tags>[1000000, -100000]</parameter></function>"
+             "</tool_call>",
+             1, R"({"count":100000,"tags":[1000000,-100000]})"},
+        Case{"<tool_call>{\"name\":\"f\",\"arguments\":{\"count\":"
+             "100000}}</tool_call>",
+             1, R"({"count":100000})"}}) {
     for (bool reasoning : {false, true}) {
       for (bool stream : {false, true}) {
         auto body = schema;
@@ -1373,6 +1404,65 @@ void TestDeepSeekRepeatedToolParameters() {
     Expect((response.body.find(R"("finish_reason":"tool_calls")") !=
             std::string::npos) == accepted,
            "a conflicting DeepSeek repeat is not a tool call");
+  }
+}
+
+// #290: a non-string DSML parameter that does not parse as its declared type
+// rejects the call, as for Qwen arguments. Strings and unknown parameters stay
+// as the dialect wrote them.
+void TestDeepSeekSchemaCheckedArguments() {
+  const auto call = [](std::string_view name, std::string_view string_attr,
+                       std::string_view value) {
+    return "<｜DSML｜tool_calls><｜DSML｜invoke name=\"run\">"
+           "<｜DSML｜parameter name=\"" +
+           std::string(name) + "\" string=\"" + std::string(string_attr) +
+           "\">" + std::string(value) +
+           "</｜DSML｜parameter>"
+           "</｜DSML｜invoke></｜DSML｜tool_calls>";
+  };
+  struct Case {
+    std::string text;
+    bool accepted;
+    std::string arguments;
+  };
+  for (const auto& item :
+       {Case{call("tags", "false", "[1,2]"), true, R"({"tags":[1,2]})"},
+        Case{call("tags", "false", "oops"), false, ""},
+        Case{call("tags", "false", R"({"a":1})"), false, ""},
+        Case{call("tags", "true", "oops"), true, R"({"tags":"oops"})"},
+        // The dialect's string attribute is authoritative; a declared string is
+        // not retyped from the schema.
+        Case{call("tags", "true", "[1]"), true, R"({"tags":"[1]"})"},
+        // An undeclared parameter still has to satisfy the dialect's JSON
+        // claim.
+        Case{call("unknown", "false", "oops"), false, ""},
+        Case{call("unknown", "false", "[1]"), true, R"({"unknown":[1]})"},
+        Case{call("unknown", "true", "oops"), true, R"({"unknown":"oops"})"}}) {
+    FakeBackend backend;
+    backend.pieces = {item.text};
+    const auto response = gufo::server::HandleOpenAiChat(
+        Request(
+            R"({"model":"test-model","messages":[{"role":"user","content":"run"}],)"
+            R"("tools":[{"type":"function","function":{"name":"run",)"
+            R"("parameters":{"type":"object","properties":{"tags":{"type":"array"}}}}}]})"),
+        backend);
+    Expect(response.status == 200, "DeepSeek schema request is accepted");
+    const auto output = gufo::json::parse(response.body);
+    const auto* choices = output.find("choices");
+    const auto* message = choices != nullptr && !choices->items().empty()
+                              ? choices->items()[0].find("message")
+                              : nullptr;
+    const auto* calls =
+        message != nullptr ? message->find("tool_calls") : nullptr;
+    const bool accepted = calls != nullptr && calls->items().size() == 1;
+    Expect(accepted == item.accepted,
+           "declared DSML parameter types are enforced: " + item.text);
+    if (accepted) {
+      const auto arguments = gufo::json::parse(
+          calls->items()[0].find("function")->member_str("arguments"));
+      Expect(arguments.dump() == item.arguments,
+             "declared DSML arguments keep their JSON form: " + item.text);
+    }
   }
 }
 
@@ -5884,6 +5974,40 @@ void TestStreamingQuotedAndMalformedTools() {
   }
 }
 
+// A parameter the schema rejects ends a streamed call's arguments; neither the
+// rejected parameter nor a later unfinished value is published.
+void TestStreamingStopsAtRejectedParameter() {
+  using Format = gufo::sampling::JsonConstraint::ToolFormat;
+  for (const auto format : {Format::kQwen, Format::kDeepSeek}) {
+    const std::string raw =
+        format == Format::kQwen
+            ? "<tool_call>\n<function=record>\n<parameter=data>\nnot json\n"
+              "</parameter>\n<parameter=text>\nlater value\n</parameter>\n"
+              "</function>\n</tool_call>"
+            : "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"record\">\n"
+              "<｜DSML｜parameter name=\"data\" string=\"false\">[]"
+              "</｜DSML｜parameter>\n"
+              "<｜DSML｜parameter name=\"text\" string=\"true\">later value"
+              "</｜DSML｜parameter>\n</｜DSML｜invoke>\n"
+              "</｜DSML｜tool_calls>";
+    std::vector<std::string> bytewise;
+    for (const char byte : raw)
+      bytewise.emplace_back(1, byte);
+    for (const auto& pieces : {std::vector<std::string>{raw}, bytewise}) {
+      for (const int api : {0, 1, 2}) {
+        const auto output = ToolBoundaryRequest(pieces, format, api, true);
+        Expect(output.failed, "a rejected streamed call fails safely");
+        for (const auto& arguments : output.arguments) {
+          Expect(arguments.find("data") == std::string::npos,
+                 "a schema-rejected parameter is not streamed");
+          Expect(arguments.find("later") == std::string::npos,
+                 "arguments after a rejected parameter are not streamed");
+        }
+      }
+    }
+  }
+}
+
 void TestIncrementalToolArguments() {
   using gufo::json::Value;
   using Format = gufo::sampling::JsonConstraint::ToolFormat;
@@ -6121,6 +6245,8 @@ int main() {
   TestQwenToolBoundariesAndSchema();
   TestDeepSeekToolCallsAreStructured();
   TestDeepSeekRepeatedToolParameters();
+  TestDeepSeekSchemaCheckedArguments();
+  TestStreamingStopsAtRejectedParameter();
   TestWrongModelIsRejected();
   TestClientIdentityReachesBackend();
   TestStreamingOverloadIsRejectedBeforeHeaders();

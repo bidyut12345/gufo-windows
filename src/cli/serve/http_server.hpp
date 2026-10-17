@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -157,6 +158,40 @@ private:
   std::mutex workers_mutex_;
   std::vector<std::unique_ptr<ConnectionWorker>> workers_;
   std::vector<std::pair<std::pair<std::string, std::string>, Handler>> routes_;
+};
+
+/// Holds the listen port while a model loads and answers every request with
+/// llama-server's loading reply: 503 `Loading model`, `/health` included. A
+/// poller can tell a loading server from a dead one, and a client that treats
+/// a 200 health check as readiness (llama-swap, the functional runner) keeps
+/// waiting instead of sending work to a server that cannot serve it.
+///
+/// Best effort: when the address cannot be bound, or for port 0, nothing
+/// listens and the caller proceeds exactly as without it. stop() closes the
+/// socket so `HttpServer::start` can bind the same address.
+class LoadingResponder {
+public:
+  LoadingResponder(const std::string& host, int port);
+  ~LoadingResponder();
+
+  LoadingResponder(const LoadingResponder&) = delete;
+  LoadingResponder& operator=(const LoadingResponder&) = delete;
+  LoadingResponder(LoadingResponder&&) = delete;
+  LoadingResponder& operator=(LoadingResponder&&) = delete;
+
+  /// True while the responder owns the listen socket.
+  [[nodiscard]] bool listening() const noexcept { return listen_fd_ >= 0; }
+
+  /// Stops answering and releases the port. Returns within one poll interval
+  /// plus the bounded wait for a request that is still arriving.
+  void stop();
+
+private:
+  void serve();
+
+  int listen_fd_ = -1;
+  std::atomic<bool> stopped_{false};
+  std::thread thread_;
 };
 
 /// Scheduled requests are recorded by the scheduler when they finish. Other

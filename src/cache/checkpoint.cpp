@@ -177,6 +177,14 @@ ChunkReference::ChunkReference(std::shared_ptr<detail::Chunk> chunk, Kind kind,
       rows_pin_(std::move(rows_pin)) {
   ++chunk_->references[static_cast<std::size_t>(kind_)];
 }
+ChunkReference::ChunkReference(const CheckpointChunk& other)
+    : chunk_(other.chunk_), kind_(Kind::kCheckpoint) {
+  if (chunk_)
+    ++chunk_->references[static_cast<std::size_t>(kind_)];
+}
+bool ChunkReference::SameChunk(const CheckpointChunk& other) const noexcept {
+  return chunk_ == other.chunk_;
+}
 ChunkReference::ChunkReference(const ChunkReference& other)
     : chunk_(other.chunk_),
       kind_(other.kind_),
@@ -248,6 +256,72 @@ ChunkReference ChunkReference::PinPersistence() const {
   auto pin = chunk_->storage.PinPersistence();
   return ChunkReference(chunk_, Kind::kPersistence, std::move(pin),
                         std::move(rows_pin));
+}
+CheckpointChunk::CheckpointChunk(std::shared_ptr<detail::Chunk> chunk)
+    : chunk_(std::move(chunk)) {
+  ++chunk_->references[0];
+}
+CheckpointChunk::CheckpointChunk(const CheckpointChunk& other)
+    : chunk_(other.chunk_) {
+  if (chunk_)
+    ++chunk_->references[0];
+}
+CheckpointChunk& CheckpointChunk::operator=(const CheckpointChunk& other) {
+  if (this != &other) {
+    CheckpointChunk copy(other);
+    *this = std::move(copy);
+  }
+  return *this;
+}
+CheckpointChunk::CheckpointChunk(CheckpointChunk&& other) noexcept
+    : chunk_(std::move(other.chunk_)) {}
+CheckpointChunk& CheckpointChunk::operator=(CheckpointChunk&& other) noexcept {
+  if (this != &other) {
+    Release();
+    chunk_ = std::move(other.chunk_);
+  }
+  return *this;
+}
+CheckpointChunk::~CheckpointChunk() {
+  Release();
+}
+void CheckpointChunk::Release() noexcept {
+  if (chunk_) {
+    --chunk_->references[0];
+    chunk_.reset();
+  }
+}
+ChunkId CheckpointChunk::Id() const {
+  return chunk_->id;
+}
+LineageId CheckpointChunk::Lineage() const {
+  return chunk_->lineage->id;
+}
+ComponentId CheckpointChunk::Component() const {
+  return chunk_->component;
+}
+Rows CheckpointChunk::First() const {
+  return chunk_->first;
+}
+Rows CheckpointChunk::End() const {
+  return chunk_->end;
+}
+const Payload& CheckpointChunk::Storage() const {
+  return chunk_->storage;
+}
+ChunkReferences CheckpointChunk::References() const {
+  const auto& r = chunk_->references;
+  return {r[0].load(), r[1].load(), r[2].load()};
+}
+ChunkReference CheckpointChunk::PinReader() const {
+  return ChunkReference(chunk_, ChunkReference::Kind::kReader, {},
+                        chunk_->storage.PinRows());
+}
+ChunkReference CheckpointChunk::PinPersistence() const {
+  auto rows_pin = chunk_->storage.PinRows();
+  auto pin = chunk_->storage.PinPersistence();
+  return ChunkReference(chunk_, ChunkReference::Kind::kPersistence,
+                        std::move(pin), std::move(rows_pin));
 }
 LineageId Checkpoint::Lineage() const {
   return lineage_->id;
@@ -388,15 +462,21 @@ std::shared_ptr<const Checkpoint> ExecutionHistory::Capture(
       Add(sizeof(Checkpoint), Bytes(request.tokens.size(), sizeof(Token)));
   bytes = Add(bytes, Add(compatibility_.size(), input.size()));
   bytes = Add(bytes, Bytes(descriptors_.size(), sizeof(CheckpointComponent)));
-  bytes = Add(bytes, Bytes(chunk_count, sizeof(ChunkReference)));
+  bytes = Add(bytes, Bytes(chunk_count, sizeof(CheckpointChunk)));
   auto checkpoint_reservation =
       ledger_->Reserve(ResourceCategory::kMetadata, bytes);
   // Charge old and replacement history buffers simultaneously until
   // publication. reserve() is exact with the pinned libstdc++; verify
   // capacities before commit.
-  const auto entry_capacity = Add(entries_.size(), chunk_count);
+  // All inherited full chunks lie within the nondecreasing positions checked
+  // above. Rebuild the history alongside the checkpoint, retaining each live
+  // predecessor once and replacing holes with newly captured chunks.
+  const auto entry_capacity = chunk_count;
+  // Adjacent prompt/framing checkpoints often have identical complete chunks.
+  // Keep their existing weak index unless a predecessor actually expired.
+  bool reuse_entries = entry_capacity == entries_.size();
   auto entries_reservation =
-      entry_capacity == 0
+      entry_capacity == 0 || reuse_entries
           ? ResourceReservation{}
           : ledger_->Reserve(ResourceCategory::kMetadata,
                              Bytes(entry_capacity, sizeof(Entry)));
@@ -416,10 +496,22 @@ std::shared_ptr<const Checkpoint> ExecutionHistory::Capture(
   checkpoint->rank_ = request.rank;
   checkpoint->components_.reserve(descriptors_.size());
   std::vector<Entry> entries;
-  entries.reserve(entry_capacity);
-  for (const auto& entry : entries_)
-    if (!entry.chunk.expired())
-      entries.push_back(entry);
+  if (!reuse_entries)
+    entries.reserve(entry_capacity);
+  const auto replace_entries = [&] {
+    if (!reuse_entries)
+      return;
+    entries_reservation = ledger_->Reserve(
+        ResourceCategory::kMetadata, Bytes(entry_capacity, sizeof(Entry)));
+    entries.reserve(entry_capacity);
+    // A hole requires a new index. The already-built checkpoint pins every
+    // earlier chunk, including those whose former external owner disappeared.
+    for (const auto& component : checkpoint->components_)
+      for (const auto& ref : component.chunks)
+        entries.push_back(
+            {ref.chunk_->metadata, ref.Component(), ref.First(), ref.chunk_});
+    reuse_entries = false;
+  };
   std::vector<ComponentPosition> positions;
   positions.reserve(descriptors_.size());
   auto preparation_metadata =
@@ -458,11 +550,13 @@ std::shared_ptr<const Checkpoint> ExecutionHistory::Capture(
     } else {
       const auto full_end = end - end % d.rows_per_chunk;
       component.chunks.reserve(end / d.rows_per_chunk);
+      auto chunks = Chunks(d.id);
       for (Rows first = 0; first < full_end; first += d.rows_per_chunk) {
         // Every descriptor/range occurs once in this capture, so only the
         // published history can contain a shared predecessor.
-        auto chunk = FindChunk(d.id, first);
+        auto chunk = chunks.Find(first);
         if (!chunk) {
+          replace_entries();
           const PayloadRequest r{d.id, ResourceCategory::kBackingAssigned,
                                  first, first + d.rows_per_chunk,
                                  Bytes(d.rows_per_chunk, d.row_bytes)};
@@ -472,11 +566,11 @@ std::shared_ptr<const Checkpoint> ExecutionHistory::Capture(
               ResourceCharge{}, lineage_, d.id, r.first, r.end, Payload{});
           save(chunk->storage, r);
           chunk->metadata = metadata_reservation.Convert();
-          entries.push_back({chunk->metadata, d.id, first, chunk});
         } else if (!chunk->storage.IsValid())
           throw std::invalid_argument("cannot publish retired checkpoint rows");
-        component.chunks.push_back(ChunkReference(
-            std::move(chunk), ChunkReference::Kind::kCheckpoint));
+        if (!reuse_entries)
+          entries.push_back({chunk->metadata, d.id, first, chunk});
+        component.chunks.push_back(CheckpointChunk(std::move(chunk)));
       }
       if (full_end != end) {
         const PayloadRequest r{d.id, ResourceCategory::kPrivateTail, full_end,
@@ -507,7 +601,7 @@ std::shared_ptr<const Checkpoint> ExecutionHistory::Capture(
                                          sizeof(CheckpointComponent)));
   for (const auto& c : checkpoint->components_)
     actual_bytes =
-        Add(actual_bytes, Bytes(c.chunks.capacity(), sizeof(ChunkReference)));
+        Add(actual_bytes, Bytes(c.chunks.capacity(), sizeof(CheckpointChunk)));
   const auto actual_token_bytes =
       Add(Add(Bytes(tokens.capacity(), sizeof(Token)),
               Bytes(positions.capacity(), sizeof(ComponentPosition))),
@@ -520,9 +614,15 @@ std::shared_ptr<const Checkpoint> ExecutionHistory::Capture(
   auto entries_metadata =
       entries_reservation ? entries_reservation.Convert() : ResourceCharge{};
   auto tokens_metadata = tokens_reservation.Convert();
-  std::ranges::sort(entries, {}, &Entry::Key);
+  // Each component's rows are already ordered. Preserve arbitrary adapter
+  // descriptor order, but avoid sorting the whole history when IDs ascend.
+  if (!reuse_entries &&
+      !std::ranges::is_sorted(descriptors_, {},
+                              [](const auto& d) { return d.id.value; }))
+    std::ranges::sort(entries, {}, &Entry::Key);
   // Publication is nonthrowing. No checkpoint or new history escapes earlier.
-  entries_.swap(entries);
+  if (!reuse_entries)
+    entries_.swap(entries);
   tokens_.swap(tokens);
   positions_.swap(positions);
   input_.swap(new_input);
@@ -530,16 +630,22 @@ std::shared_ptr<const Checkpoint> ExecutionHistory::Capture(
   std::vector<Token>().swap(tokens);
   std::vector<ComponentPosition>().swap(positions);
   Identity().swap(new_input);
-  entries_metadata_ = std::move(entries_metadata);
+  if (!reuse_entries)
+    entries_metadata_ = std::move(entries_metadata);
   tokens_metadata_ = std::move(tokens_metadata);
   return checkpoint;
 }
-std::shared_ptr<detail::Chunk> ExecutionHistory::FindChunk(ComponentId id,
-                                                           Rows first) const {
-  const auto key = std::pair{id.value, first};
-  const auto entry = std::ranges::lower_bound(entries_, key, {}, &Entry::Key);
-  return entry != entries_.end() && entry->Key() == key ? entry->chunk.lock()
-                                                        : nullptr;
+ExecutionHistory::ChunkCursor ExecutionHistory::Chunks(ComponentId id) const {
+  return {std::ranges::lower_bound(entries_, std::pair{id.value, Rows{0}}, {},
+                                   &Entry::Key),
+          entries_.end(), id};
+}
+std::shared_ptr<detail::Chunk> ExecutionHistory::ChunkCursor::Find(Rows first) {
+  while (next != end && next->component == component && next->first < first)
+    ++next;
+  if (next == end || next->component != component || next->first != first)
+    return nullptr;
+  return (next++)->chunk.lock();
 }
 std::size_t ExecutionHistory::NewPayloadBytes(
     std::span<const ComponentPosition> positions) const {
@@ -562,8 +668,9 @@ std::size_t ExecutionHistory::NewPayloadBytes(
     const auto full = p.valid_rows - p.valid_rows % d.rows_per_chunk;
     (void)Bytes(p.valid_rows, d.row_bytes);
     bytes = Add(bytes, Bytes(p.valid_rows - full, d.row_bytes));
+    auto chunks = Chunks(d.id);
     for (Rows first = 0; first < full; first += d.rows_per_chunk) {
-      const auto chunk = FindChunk(d.id, first);
+      const auto chunk = chunks.Find(first);
       if (chunk && !chunk->storage.IsValid())
         throw std::invalid_argument("cannot estimate retired rows");
       if (!chunk)

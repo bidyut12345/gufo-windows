@@ -82,8 +82,6 @@ tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
                                                   std::uint32_t max_context) {
   auto options = tokenization::ResolveQwenChatOptions(request.reasoning,
                                                       request.add_vision_id);
-  options.require_tool_call =
-      request.tool_choice == ChatRequest::ToolChoice::kRequired;
   // gufo #285: the rendered prompt may be as long as the context can hold.
   options.max_output_bytes =
       tokenization::RenderedPromptBoundBytes(max_context);
@@ -158,6 +156,38 @@ std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
   if (!image)
     throw std::invalid_argument("invalid Qwen prompt context");
   return image->prompt;
+}
+
+// Hash the sidecar and upload its weights while the model loads, before the
+// runner claims state capacity and the RAM cache is sized. Otherwise the first
+// image request hashes the whole sidecar in its queue time and uploads the
+// weights in its prefill, after admission and the cache were sized without
+// them.
+void PrepareVision(
+    const std::shared_ptr<models::qwen::vision::Encoder>& encoder) {
+  if (!encoder)
+    return;
+  const auto started = Clock::now();
+  (void)encoder->identity();
+  const auto hashed = Clock::now();
+  try {
+    encoder->Upload();
+  } catch (const std::exception& e) {
+    throw std::runtime_error(
+        std::string("could not upload the Qwen vision sidecar: ") + e.what());
+  }
+  const auto uploaded = Clock::now();
+  std::size_t heap_free = 0, heap_total = 0;
+  (void)hipMemGetInfo(&heap_free, &heap_total);
+  using Milliseconds = std::chrono::duration<double, std::milli>;
+  Logger::Info("loader",
+               "event=vision_prepared resident_bytes=" +
+                   std::to_string(encoder->ResidentBytes()) + " identity_ms=" +
+                   std::to_string(Milliseconds(hashed - started).count()) +
+                   " upload_ms=" +
+                   std::to_string(Milliseconds(uploaded - hashed).count()) +
+                   " device_heap_free_bytes=" + std::to_string(heap_free) +
+                   " " + Logger::MemoryStatus());
 }
 
 constexpr std::string_view kDeepSeekStateAbi =
@@ -1828,8 +1858,6 @@ public:
     options.tools_present =
         !request.tools.empty() &&
         request.tool_choice != ChatRequest::ToolChoice::kNone;
-    options.require_tool_call =
-        request.tool_choice == ChatRequest::ToolChoice::kRequired;
     auto tokens =
         DeepSeekRunnerTokens(model_->EncodeChat(messages, tools, options));
     if (tokens.empty()) {
@@ -2504,13 +2532,11 @@ public:
         throw std::invalid_argument("insufficient component backing budget");
       const auto& allocation = plan.front();
       // Pages commit as captures need them. A payload cannot span segments,
-      // so the edge of each one strands space a ~140 MB private state cannot
-      // use; equal segments of about 1 GiB, and at least two private states,
-      // keep that small. A step costs about 200 ms of page faults and pinning
-      // (more when the host must reclaim page cache), so it runs ahead on a
-      // background thread; only a capture that outruns it grows on its own
-      // thread. Growth stops early when the host would keep less than its
-      // reserve.
+      // so equal segments of about 1 GiB bound stranded edge space and fit at
+      // least two payloads of the largest component. Completed append rows
+      // prepare more backing; private and tail copies commit only when needed.
+      // Pinning ahead after a final private copy can delay decoder launches.
+      // Growth stops when the host keeps less than its reserve.
       std::size_t largest = 0;
       for (const auto& [id, bytes] : backing->component_classes)
         largest = std::max(largest, bytes);
@@ -2566,9 +2592,15 @@ public:
                 limited->refused = now;
                 return false;
               }});
-      // The first capture would otherwise commit the first segment on the
-      // request path (seconds while the host reclaims page cache).
-      backing->pool->GrowAhead();
+      // Prepare a bounded reserve before readiness. The first shared-prefix
+      // capture needs more than one segment; preparing both avoids moving
+      // registration onto that request's capture or decode path.
+      backing->pool->GrowAhead(2);
+      backing->pool->WaitForGrowth();
+    };
+    result->prepare_prefill = [backing] { backing->pool->GrowAhead(2); };
+    result->can_capture = [backing](auto payloads) {
+      return backing->pool->CanFit(payloads);
     };
     result->owner = backing;
     result->stream = [backing]() -> std::unique_ptr<cache::Stream> {
@@ -2599,10 +2631,11 @@ public:
                                    .count()));
       if (!block)
         throw cache::ResourceExhausted();
-      // Commit the next segment off the capturing thread, which otherwise
-      // stalls this and every peer request for the allocation (up to seconds
-      // while the host reclaims page cache).
-      backing->pool->GrowAhead();
+      // Completed append rows prepare backing for subsequent prefill/guard
+      // work. Final private-state and partial-tail copies must not start
+      // speculative pinning that delays the next decode step.
+      if (request.category == cache::ResourceCategory::kBackingAssigned)
+        backing->pool->GrowAhead();
       auto owner = std::make_shared<hip::BackingBlock>(std::move(*block));
       return ComponentCaptureBuffer{
           owner->Bytes(),
@@ -3569,6 +3602,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
       speculative_options.enable_adaptive_draft_length = false;
     }
 
+    PrepareVision(model->VisionEncoder());
     auto new_state = std::make_shared<Impl::State>();
     new_state->sampling_defaults.model =
         sampling::TextPreset(model->GetConfig());
@@ -3743,6 +3777,7 @@ bool InferenceBackend::load(
     return false;
   }
   try {
+    PrepareVision(model->VisionEncoder());
     auto new_state = std::make_shared<Impl::State>();
     new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
     new_state->sampling_defaults.supplied = {};

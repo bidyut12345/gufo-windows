@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -25,6 +26,7 @@
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/tuning.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/trace.hpp"
 
@@ -921,14 +923,15 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
   ngram_snapshots_.resize(depth);
 }
 
-void Session::Reset() {
-  // With Tuning::keep_rollback_rows the rows stay allocated: every verify
-  // rewrites them before a rollback reads them, and freeing them would move
-  // the pointers recorded in this session's verify and rollback graphs,
-  // forcing every width to be captured again on the next request.
-  if (!Tune().keep_rollback_rows) {
+void Session::Reset(bool reuse_mtp) {
+  // Reset leaves append-only rows intact. Preserve them at the first write
+  // that would overwrite them, allowing cancellation to resume by rewind.
+  // Scratch is overwritten by the next verification. Retaining its stable
+  // addresses also retains the graphs; freeing it at every cache reassignment
+  // makes later MTP requests allocate and record those shapes again. Its full
+  // bound is already included in speculative SessionBytes and AllocatedBytes.
+  if ((!reuse_mtp || !mtp_enabled_) && !Tune().keep_rollback_rows)
     TrimRollback(0);
-  }
   snapshot_lineage_.reset();
   position_ = 0;
   spec_tokens_ = 0;
@@ -1135,6 +1138,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.scores = f32(e->select_score_floats_);
   s.attn_partials = f32(static_cast<std::size_t>(kVecBatch) * c.num_heads *
                         kAttnSplits * (c.head_dim + 2));
+  s.attn_lists = Alloc<std::uint32_t>(
+      a, std::size_t{kVecBatch} * (c.indexer_top_k / c.compress_ratio),
+      error_msg);
+  s.attn_counts = Alloc<std::uint32_t>(a, kVecBatch, error_msg);
   if (c.ple_layer >= 0) {
     // PLE finishes before this layer's mixer/SSM. Its gate consumes key
     // and query before normalization/convolution reuse those two buffers.
@@ -1418,6 +1425,14 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
         a, std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim,
         error_msg, &s->allocated_bytes_);
     s->mtp_.h = Alloc<float>(a, c.HcDim(), error_msg, &s->allocated_bytes_);
+    if (!model_->draft_output().empty()) {
+      s->mtp_.draft_rows = Alloc<std::uint8_t>(
+          a,
+          std::size_t{kMtpDraftExtraRows} * model_->output_row_bytes() + 4096,
+          error_msg, &s->allocated_bytes_);
+      s->mtp_.draft_ids = Alloc<std::int32_t>(a, kMtpDraftExtraRows, error_msg,
+                                              &s->allocated_bytes_);
+    }
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -1429,7 +1444,80 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   if (!Check(hipDeviceSynchronize(), "session init", error_msg)) {
     return nullptr;
   }
+  // The table starts with the special tokens; every other slot is empty.
+  if (s->mtp_.draft_rows != nullptr &&
+      (!ClearDraftRows(*s, 0, error_msg) ||
+       !AppendDraftRows(*s, 0, model_->draft_specials(), error_msg) ||
+       !Check(hipStreamSynchronize(stream_), "draft table init", error_msg))) {
+    return nullptr;
+  }
   return s;
+}
+
+bool Executor::AppendDraftRows(Session& session, std::uint32_t first,
+                               std::span<const std::int32_t> ids,
+                               std::string* error_msg) const {
+  if (ids.empty())
+    return true;
+  if (session.owner_ != this || session.mtp_.draft_rows == nullptr ||
+      first > kMtpDraftExtraRows || ids.size() > kMtpDraftExtraRows - first) {
+    AssignError(error_msg, "invalid draft table append");
+    return false;
+  }
+  const auto& output = model_->output();
+  const std::size_t row_bytes = model_->output_row_bytes();
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    if (ids[i] < 0 || static_cast<std::uint32_t>(ids[i]) >= output.rows) {
+      AssignError(error_msg, "draft table token out of range");
+      return false;
+    }
+    // The ID goes by value, so no host buffer has to outlive the call.
+    if (!Check(hipMemcpyAsync(session.mtp_.draft_rows + (first + i) * row_bytes,
+                              static_cast<const std::uint8_t*>(output.data) +
+                                  static_cast<std::size_t>(ids[i]) * row_bytes,
+                              row_bytes, hipMemcpyDeviceToDevice, stream_),
+               "draft table row", error_msg) ||
+        !Check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(
+                                     session.mtp_.draft_ids + first + i),
+                                 ids[i], 1, stream_),
+               "draft table id", error_msg))
+      return false;
+  }
+  return true;
+}
+
+bool Executor::ClearDraftRows(Session& session, std::uint32_t first,
+                              std::string* error_msg) const {
+  if (session.owner_ != this || session.mtp_.draft_ids == nullptr ||
+      first > kMtpDraftExtraRows) {
+    AssignError(error_msg, "invalid draft table clear");
+    return false;
+  }
+  // Stale rows stay; an ID of -1 masks the slot.
+  return first == kMtpDraftExtraRows ||
+         Check(
+             hipMemsetAsync(session.mtp_.draft_ids + first, 0xFF,
+                            (kMtpDraftExtraRows - first) * sizeof(std::int32_t),
+                            stream_),
+             "draft table clear", error_msg);
+}
+
+DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
+  DeviceTensor table = model_->output();
+  table.data = session.mtp_.draft_rows;
+  table.rows = kMtpDraftExtraRows;
+  return table;
+}
+
+bool Executor::DraftLogits(const Session& session, const float* x,
+                           float* logits, std::string* error_msg) const {
+  const auto& prefix = model_->draft_output();
+  if (!Dense(prefix, x, logits, 1, error_msg) ||
+      !Dense(DraftTable(session), x, logits + prefix.rows, 1, error_msg))
+    return false;
+  MaskDraftLogits(logits + prefix.rows, session.mtp_.draft_ids,
+                  kMtpDraftExtraRows, stream_);
+  return true;
 }
 
 bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
@@ -1510,7 +1598,13 @@ std::size_t Executor::SessionBytes(
          (mode == core::SessionMode::kSpeculative
               ? kv + index +
                     std::size_t{options_.max_speculative + 1} * c.HcDim() *
-                        sizeof(float)
+                        sizeof(float) +
+                    (model_->draft_output().empty()
+                         ? 0
+                         : std::size_t{kMtpDraftExtraRows} *
+                                   (model_->output_row_bytes() +
+                                    sizeof(std::int32_t)) +
+                               4096)
               : 0);
 }
 
@@ -2673,10 +2767,12 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
   const bool split = !MatrixRows(n_tokens);
-  rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
-                  split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
-                  pos, c.num_heads, c.num_kv_heads, c.head_dim,
-                  c.compress_ratio, stream_);
+  rocm::Attention(
+      s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
+      split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens, pos,
+      c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
+      split ? s_.attn_lists : nullptr, split ? s_.attn_counts : nullptr,
+      c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0);
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
   // A decode batch's output projection reads the gate's Q8_1 rows.
@@ -2891,31 +2987,29 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
 }
 
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
-                       bool candidates, std::string* error_msg) const {
-  // A draft vocabulary scores its subset rows; selected rows map back to
-  // token ids before the host reads them.
-  const bool subset = draft_ids_ != nullptr;
-  const DeviceTensor& output = subset ? draft_head_ : model_->output();
+                       bool candidates, const Session* draft,
+                       std::string* error_msg) const {
+  const std::uint32_t prefix = model_->draft_output().rows;
+  const std::uint32_t rows =
+      draft != nullptr ? prefix + kMtpDraftExtraRows : model_->output().rows;
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
-      !Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
+      !(draft != nullptr
+            ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
+            : Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg))) {
     return false;
   }
+  const auto count = std::min<std::uint32_t>(rows, kMtpCandidates);
   if (candidates) {
     MtpTopCandidates(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,
-                     output.rows, stream_);
-    if (subset) {
-      RemapIds(s_.mtp_ids,
-               static_cast<std::uint32_t>(
-                   std::min<std::size_t>(output.rows, kMtpCandidates)),
-               draft_ids_, stream_);
-    }
+                     rows, stream_);
+    if (draft != nullptr)
+      RemapDraftIds(s_.mtp_ids, count, prefix, draft->mtp_.draft_ids, stream_);
   }
   if (token) {
-    Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, output.rows, stream_);
-    if (subset) {
-      RemapIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1, draft_ids_,
-               stream_);
-    }
+    Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
+    if (draft != nullptr)
+      RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1, prefix,
+                    draft->mtp_.draft_ids, stream_);
     if (!CopyPinned(s_.mtp_token, mtp_token_host_, sizeof(std::int32_t),
                     hipMemcpyDeviceToHost, stream_, "draft token download",
                     error_msg)) {
@@ -2923,7 +3017,6 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     }
   }
   if (candidates) {
-    const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
     static_assert(offsetof(MtpCandidateLogits, logits) ==
                   kMtpCandidates * sizeof(std::uint32_t));
     const auto bytes =
@@ -2953,10 +3046,31 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
   };
   if (graph && session.warmed_.contains(key)) {
     hipGraphExec_t exec = nullptr;
+    bool enqueued = false;
     if (const auto it = session.graphs_.find(key);
         it != session.graphs_.end()) {
       exec = it->second;
     } else {
+      // A warmed target shape may need its first graph or a replacement
+      // after rollback storage was released. Queue this pass first, then
+      // record identical commands while the GPU executes it. Short prefix
+      // and draft graphs keep their existing route. No second pass is launched.
+      if (synchronize && (key & (std::uint64_t{1} << 40)) == 0) {
+        auto dispatch = std::tie(
+            moe_pending_, defer_residual_, res_deferred_, shexp_half_ready_,
+            q8t_src_, q8t_rows_, q8t_cols_, half_src_, half_rows_, half_cols_,
+            half_bf16_, xn_half_, inject_parts_, inject_fused_, q8_slot_,
+            xn_q8_ready_, mixed_q8_ready_);
+        const auto before = std::apply(
+            [](const auto&... fields) { return std::make_tuple(fields...); },
+            dispatch);
+        if (!body())
+          return false;
+        // Producer readiness and alternating scratch addresses must match
+        // the executed pass when the graph records its kernel arguments.
+        dispatch = before;
+        enqueued = true;
+      }
       hipGraph_t captured = nullptr;
       // Frozen peer sessions can copy snapshots on independent nonblocking
       // streams while the scheduler records this session's decode graph.
@@ -2989,7 +3103,8 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
       }
       session.graphs_.emplace(key, exec);
     }
-    if (!Check(hipGraphLaunch(exec, stream_), "graph launch", error_msg)) {
+    if (!enqueued &&
+        !Check(hipGraphLaunch(exec, stream_), "graph launch", error_msg)) {
       return false;
     }
   } else {
@@ -3187,12 +3302,11 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const auto body = [&] {
     return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
                        sparse, start_pos, graph ? graph_pool_grid : pool_grid,
-                       first_layer, c.num_layers, error_msg, checkpoint);
+                       first_layer, c.num_layers, error_msg, checkpoint, graph);
   };
-  // Only the suffix waits for its pinned n-gram rows. During eager
-  // execution and capture, Ple performs this wait at the same boundary.
-  if (graph && session.graphs_.contains(key) && ple_pending_ &&
-      !WaitPle(error_msg)) {
+  // The prefix is already queued. Wait once before the suffix so recording
+  // its graph can reuse these pinned rows while the eager pass executes.
+  if (graph && ple_pending_ && !WaitPle(error_msg)) {
     return false;
   }
   // With Tuning::flag_waits a decode-sized pass waits on a completion flag
@@ -3246,7 +3360,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            std::uint32_t start_pos, std::uint32_t pool_grid,
                            std::uint32_t first_layer, std::uint32_t end_layer,
                            std::string* error_msg,
-                           PrefillCheckpoint* checkpoint) const {
+                           PrefillCheckpoint* checkpoint,
+                           bool embeddings_ready) const {
   const Config& c = config();
   if (first_layer == 0) {
     if (!CopyPinned(control_host_, session.control_, sizeof(Session::Control),
@@ -3269,7 +3384,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return false;
     const DeviceLayer& l = layers[il];
     if (c.IsPleLayer(il) && !Ple(l, session, n, s_.res, speculative, error_msg,
-                                 false, checkpoint)) {
+                                 embeddings_ready, checkpoint)) {
       return false;
     }
     // Both stacked SSM projections consume the same F16 input. Avoid writing
@@ -4451,18 +4566,22 @@ bool Executor::MtpForward(Session& session,
   const bool graph = output.trace == nullptr && hidden_source == nullptr &&
                      n <= kVecBatch && pool <= graph_pool &&
                      pos + 1 >= session.VisionLayout().PrefixLength();
+  // Captured graphs bake in the head; key on the one this draft reads.
+  const bool subset = UseDraftSubset(session, output.draft_subset) &&
+                      (output.token != nullptr || output.candidates != nullptr);
   const std::uint64_t key =
       static_cast<std::uint64_t>(n) |
       (static_cast<std::uint64_t>(hidden_row < 0) << 32) |
       (std::uint64_t{1} << 40) |
       (std::uint64_t{output.token != nullptr} << 41) |
       (std::uint64_t{output.candidates != nullptr} << 43) |
-      (std::uint64_t{sparse} << 44) | (std::uint64_t{output.kv_only} << 45);
+      (std::uint64_t{sparse} << 44) | (std::uint64_t{output.kv_only} << 45) |
+      (std::uint64_t{subset} << 46);
   const auto body = [&] {
     return MtpBody(session, n, pos, output.token != nullptr,
                    output.candidates != nullptr, error_msg,
                    graph ? graph_pool : pool, hidden_source, output.trace,
-                   output.kv_only);
+                   output.kv_only, subset);
   };
   // With Tuning::flag_waits a draft step waits on a completion flag instead
   // of synchronizing the stream (see Wait).
@@ -4499,7 +4618,7 @@ bool Executor::MtpForward(Session& session,
 bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                        bool token, bool candidates, std::string* error_msg,
                        std::uint32_t pool_grid, const float* hidden_source,
-                       MtpTrace* trace, bool kv_only) const {
+                       MtpTrace* trace, bool kv_only, bool draft_subset) const {
   const Config& c = config();
   const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
@@ -4697,7 +4816,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     return false;
   }
   return (!token && !candidates) ||
-         MtpHead(l.nextn_head, last, token, candidates, error_msg);
+         MtpHead(l.nextn_head, last, token, candidates,
+                 draft_subset ? &session : nullptr, error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

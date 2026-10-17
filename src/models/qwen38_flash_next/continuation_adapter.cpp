@@ -12,6 +12,7 @@
 
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/snapshot_copy.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 namespace {
@@ -33,7 +34,7 @@ bool Pool(ContinuationPart part) {
          part == ContinuationPart::kDraftPooledKeys;
 }
 struct Metadata {
-  std::uint32_t version{1};
+  std::uint32_t version{2};
   std::uint32_t target{}, draft{}, blocks{}, draft_blocks{}, hidden_base{};
   std::uint32_t residual_valid{}, image_bytes{};
   NgramHistory ngram;
@@ -421,6 +422,7 @@ void ContinuationAdapter::BeginRestore(
   state.restoring = true;
   state.session->valid_ = false;
   state.session->tokens_.resize(target);
+  state.session->ForgetDraftVocab();
   state.session->logits_.resize(model_->VocabSize());
 }
 
@@ -608,8 +610,8 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
           if (piece.host)
             std::memcpy(destination, source, end - first);
           else
-            Check(hipMemcpyAsync(destination, source, end - first,
-                                 hipMemcpyDeviceToHost, transfer.Native()));
+            Check(rocm::CopySnapshotToHost(destination, source, end - first,
+                                           transfer.Native()));
         }
       });
 }
@@ -695,8 +697,8 @@ cache::Completion ContinuationAdapter::CopyRowsOut(const cache::Slot& slot,
         if (component.part == ContinuationPart::kTokens && !bytes.empty())
           std::memcpy(bytes.data(), source, bytes.size());
         else if (!bytes.empty())
-          Check(hipMemcpyAsync(bytes.data(), source, bytes.size(),
-                               hipMemcpyDeviceToHost, transfer.Native()));
+          Check(rocm::CopySnapshotToHost(bytes.data(), source, bytes.size(),
+                                         transfer.Native()));
       });
 }
 std::span<const std::byte> ContinuationAdapter::BorrowRowsView(
@@ -784,7 +786,7 @@ bool ContinuationAdapter::Validate(
   auto& session = *state.session;
   auto& native = *session.session_;
   auto policy = session.draft_length_;
-  if (metadata.version != 1 || metadata.hidden_base > metadata.target ||
+  if (metadata.version != 2 || metadata.hidden_base > metadata.target ||
       metadata.target - metadata.hidden_base >
           model_->executor_->max_speculative() ||
       metadata.residual_valid > 1 ||
@@ -845,7 +847,9 @@ bool ContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
       ~ResetScope() { active = false; }
     } reset_scope{state.invalidating};
     state.invalidating = true;
-    state.session->Reset();
+    // Reassign a healthy resident slot without rebuilding its MTP graphs.
+    // Failed state and explicit Session::Reset still release all scratch.
+    state.session->ResetImpl(!state.failed && state.session->IsValid());
     state.failed = false;
     state.restoring = false;
     state.expected.clear();

@@ -118,11 +118,10 @@ bool RetentionPolicy::Branch(std::size_t candidate) const {
   std::optional<Token> next;
   for (std::size_t i = 0; i < limit_; ++i) {
     const auto& peer = records_[i];
-    if (i == candidate || !peer.checkpoint || !Continuation(peer.purpose) ||
-        peer.checkpoint->Compatibility() != e.checkpoint->Compatibility() ||
-        peer.checkpoint->Input() != e.checkpoint->Input() ||
-        peer.checkpoint->Boundary() <= e.checkpoint->Boundary() ||
-        !Prefix(e.checkpoint->Tokens(), peer.checkpoint->Tokens()))
+    // Relate records the same immutable compatibility/input/strict-prefix
+    // relation. Rechecking long token arrays for every priority query adds no
+    // information; Erase removes the corresponding relation bits.
+    if (!e.below[i] || !peer.checkpoint || !Continuation(peer.purpose))
       continue;
     if (peer.purpose == RetentionPurpose::kBranchPoint)
       learned = false;
@@ -148,8 +147,14 @@ std::uint32_t RetentionPolicy::Priority(
                                                      : 2;
   for (std::size_t i = 0; i < limit_; ++i) {
     const auto& peer = records_[i];
-    if (i == candidate || !peer.checkpoint || !Continuation(peer.purpose) ||
-        peer.checkpoint->Compatibility() != e.checkpoint->Compatibility() ||
+    if (i == candidate || !peer.checkpoint || !Continuation(peer.purpose))
+      continue;
+    if (Continuation(e.purpose)) {
+      if (e.below[i])
+        return 2;
+      continue;
+    }
+    if (peer.checkpoint->Compatibility() != e.checkpoint->Compatibility() ||
         peer.checkpoint->Input() != e.checkpoint->Input())
       continue;
     if (e.purpose == RetentionPurpose::kRetry &&
@@ -159,10 +164,6 @@ std::uint32_t RetentionPolicy::Priority(
     if (e.purpose == RetentionPurpose::kHistory &&
         Prefix(e.checkpoint->Tokens(), peer.checkpoint->Tokens()))
       return 1;
-    if (Continuation(e.purpose) &&
-        peer.checkpoint->Boundary() > e.checkpoint->Boundary() &&
-        Prefix(e.checkpoint->Tokens(), peer.checkpoint->Tokens()))
-      return 2;
   }
   return 3;
 }
@@ -197,9 +198,9 @@ void RetentionPolicy::Relate(std::size_t added) {
         records_[parent].forked = true;
 }
 std::array<std::uint64_t, 4> RetentionPolicy::PressureOrder(
-    std::size_t i, const RetentionRequest& r) const {
+    std::size_t i, const RetentionRequest& r, std::uint32_t priority) const {
   const auto& e = records_[i];
-  if (!Priority(i, &r))
+  if (!priority)
     return {0, e.last_used, 0, 0};
   std::size_t rows = 0, state = 0;
   for (const auto& c : e.checkpoint->Components())
@@ -255,7 +256,8 @@ std::size_t RetentionPolicy::UniqueBytes(std::size_t i) const {
       bytes += c.private_state->Bytes();
     if (c.tail)
       bytes += c.tail->Bytes();
-    // Only one execution branch shares chunks, always from its first row.
+    // Admission age uses the longest shared-prefix estimate. Exact retained
+    // payload accounting below also handles sharing after a recreated hole.
     std::size_t shared = 0;
     for (std::size_t j = 0; j < limit_; ++j) {
       if (j == i || !records_[j].checkpoint)
@@ -265,12 +267,51 @@ std::size_t RetentionPolicy::UniqueBytes(std::size_t i) const {
         continue;
       std::size_t n = 0;
       while (n < c.chunks.size() && n < peers[k].chunks.size() &&
-             peers[k].chunks[n].Id() == c.chunks[n].Id())
+             c.chunks[n].SameChunk(peers[k].chunks[n]))
         ++n;
       shared = std::max(shared, n);
     }
     for (std::size_t n = shared; n < c.chunks.size(); ++n)
       bytes += c.chunks[n].Storage().Bytes();
+  }
+  return bytes;
+}
+std::size_t RetentionPolicy::UniquePayloadBytes(std::size_t i) const noexcept {
+  std::size_t bytes = 0;
+  for (const auto& c : records_[i].checkpoint->Components()) {
+    if (c.private_state)
+      bytes += c.private_state->Bytes();
+    if (c.tail)
+      bytes += c.tail->Bytes();
+    if (c.chunks.empty())
+      continue;
+    std::array<const CheckpointComponent*, kRecordLimit> peers;
+    std::size_t count = 0;
+    for (std::size_t j = 0; j < limit_; ++j) {
+      if (j == i || !records_[j].checkpoint)
+        continue;
+      for (const auto& peer : records_[j].checkpoint->Components())
+        if (peer.descriptor.id == c.descriptor.id && !peer.chunks.empty()) {
+          peers[count++] = &peer;
+          break;
+        }
+    }
+    // Try the longest peers first; shorter peers cannot own later rows.
+    std::sort(peers.begin(), peers.begin() + count,
+              [](const auto* a, const auto* b) {
+                return a->chunks.size() > b->chunks.size();
+              });
+    for (std::size_t n = 0; n < c.chunks.size(); ++n) {
+      const auto& chunk = c.chunks[n];
+      bool shared = false;
+      for (std::size_t j = 0; j < count && peers[j]->chunks.size() > n; ++j)
+        if (chunk.SameChunk(peers[j]->chunks[n])) {
+          shared = true;
+          break;
+        }
+      if (!shared)
+        bytes += chunk.Storage().Bytes();
+    }
   }
   return bytes;
 }
@@ -286,11 +327,28 @@ bool RetentionPolicy::Persisting(std::size_t i) const {
 std::size_t RetentionPolicy::Victim(const RetentionRequest& r,
                                     bool record_pressure) const {
   const auto source = Find(r.source);
+  // Records and the incoming request do not change during selection. Reuse
+  // each rank across eligibility, ordering and source-fallback decisions.
+  std::array<std::optional<std::uint32_t>, kRecordLimit> priorities{};
+  const auto priority = [&](std::size_t i) {
+    auto& value = priorities[i];
+    if (!value)
+      value = Priority(i, &r);
+    return *value;
+  };
   // An unchanged retry's full-prompt copy may replace the checkpoint it was
   // restored from when only the assistant framing separates them: the copy
   // covers every prompt the source did except an edit inside those few
   // tokens, and no other conversation loses a checkpoint.
   constexpr Rows kRetryFraming = 64;
+  const bool resumed_tail = r.reused && r.reused_tokens &&
+                            r.reused_tokens <= r.tokens.size() &&
+                            r.tokens.size() - r.reused_tokens <= kRetryFraming;
+  const bool reused_source =
+      !record_pressure && r.purpose == RetentionPurpose::kRetry && r.reused &&
+      !resumed_tail && source != limit_ &&
+      records_[source].checkpoint->Boundary() <= r.reused_tokens &&
+      Prefix(records_[source].checkpoint->Tokens(), r.tokens);
   const bool replaces_source =
       !record_pressure && r.purpose == RetentionPurpose::kRetry &&
       source != limit_ && !Persisting(source) &&
@@ -302,17 +360,35 @@ std::size_t RetentionPolicy::Victim(const RetentionRequest& r,
       Prefix(records_[source].checkpoint->Tokens(), r.tokens);
   const auto eligible = [&](std::size_t i) {
     // Byte admission for an edit boundary must not starve behind last copies
-    // of older families. Record-pressure guards and retry admission retain
-    // their existing rank limits. LRU still breaks ties within each rank.
+    // of older families. A short resumed tail may also replace covered history
+    // to retain its complete retry state; faster captures can otherwise fill
+    // the pool with older ancestors before this final boundary is reached.
+    // Retry admission still protects last copies, forks and current edit
+    // boundaries. A larger resumed turn can reclaim its own covered prefix
+    // history, without taking another conversation's history for compaction.
+    // Cold retries and record pressure keep their existing limits.
     const auto maximum =
-        !record_pressure && r.purpose == RetentionPurpose::kHistory
-            ? 3
+        !record_pressure && r.purpose == RetentionPurpose::kHistory ? 3
+        : !record_pressure && r.purpose == RetentionPurpose::kRetry &&
+                resumed_tail
+            ? 2
             : MaxRank(r.purpose);
-    return records_[i].checkpoint && !Persisting(i) &&
-           Priority(i, &r) <= maximum &&
-           std::ranges::find(r.protected_checkpoints,
-                             records_[i].checkpoint->Id()) ==
-               r.protected_checkpoints.end();
+    if (!records_[i].checkpoint || Persisting(i) ||
+        std::ranges::find(r.protected_checkpoints,
+                          records_[i].checkpoint->Id()) !=
+            r.protected_checkpoints.end())
+      return false;
+    const auto level = priority(i);
+    if (level <= maximum)
+      return true;
+    const auto& checkpoint = *records_[i].checkpoint;
+    return !record_pressure && r.purpose == RetentionPurpose::kRetry &&
+           r.reused && r.reused_tokens && r.reused_tokens <= r.tokens.size() &&
+           level <= 2 && checkpoint.Boundary() <= r.reused_tokens &&
+           checkpoint.Compatibility() == r.compatibility &&
+           checkpoint.Input() == r.input &&
+           (reused_source ? i == source || records_[i].below[source]
+                          : Prefix(checkpoint.Tokens(), r.tokens));
   };
   // Full-record publication first replaces an incompatible edited tail of the
   // leased source's family, as the current cache does.
@@ -342,14 +418,14 @@ std::size_t RetentionPolicy::Victim(const RetentionRequest& r,
     if (!eligible(i) || i == source)
       continue;
     if (!record_pressure) {
-      lowest = std::min(lowest, Priority(i, &r));
-      const auto candidate = PressureOrder(i, r);
+      lowest = std::min(lowest, priority(i));
+      const auto candidate = PressureOrder(i, r, priority(i));
       if (target == limit_ || candidate < order) {
         target = i;
         order = candidate;
       }
-    } else if (target == limit_ || Priority(i, &r) < Priority(target, &r) ||
-               (Priority(i, &r) == Priority(target, &r) &&
+    } else if (target == limit_ || priority(i) < priority(target) ||
+               (priority(i) == priority(target) &&
                 records_[i].last_used < records_[target].last_used)) {
       target = i;
     }
@@ -360,13 +436,12 @@ std::size_t RetentionPolicy::Victim(const RetentionRequest& r,
   // full-record publication, advance a redundant source before another
   // family's last copy regardless of that flag (ContinuationCache::Commit).
   if ((record_pressure || !r.preserve_source) && source != limit_ &&
-      eligible(source) && Continuation(r.purpose) && Priority(source, &r) < 3 &&
+      eligible(source) && Continuation(r.purpose) && priority(source) < 3 &&
       records_[source].checkpoint->Compatibility() == r.compatibility &&
       records_[source].checkpoint->Input() == r.input &&
       records_[source].checkpoint->Boundary() < r.tokens.size() &&
       Prefix(records_[source].checkpoint->Tokens(), r.tokens) &&
-      (target == limit_ ||
-       (record_pressure ? Priority(target, &r) : lowest) == 3))
+      (target == limit_ || (record_pressure ? priority(target) : lowest) == 3))
     return source;
   if (target == limit_ && source != limit_ && eligible(source) &&
       ((!record_pressure && !r.preserve_source) ||
@@ -395,6 +470,7 @@ void RetentionPolicy::Emit(RetentionAction action, RetentionReason reason,
 }
 void RetentionPolicy::Erase(std::size_t i, RetentionReason reason,
                             std::uint32_t rank) {
+  const auto unique = retained_payload_bytes_ ? UniquePayloadBytes(i) : 0;
   const auto before = ledger_.Snapshot().total_bytes;
   auto& e = records_[i];
   const auto id = e.checkpoint->Id();
@@ -406,7 +482,8 @@ void RetentionPolicy::Erase(std::size_t i, RetentionReason reason,
   for (auto& peer : records_)
     peer.below.reset(i);
   --size_;
-  retained_payload_bytes_.reset();
+  if (retained_payload_bytes_)
+    *retained_payload_bytes_ -= unique;
   const auto after = ledger_.Snapshot().total_bytes;
   Emit(RetentionAction::kRemoved, reason, id, boundary, purpose, rank, used,
        before > after ? before - after : 0);
@@ -501,7 +578,10 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
       auto& e = records_[target];
       e = {std::move(checkpoint), entry, purpose, r.stable, ++clock_};
       ++size_;
-      retained_payload_bytes_.reset();
+      // Keep each event's exact total without recounting every retained
+      // checkpoint after each individual eviction or insertion.
+      if (retained_payload_bytes_)
+        *retained_payload_bytes_ += UniquePayloadBytes(target);
       admitted_bytes_ += UniqueBytes(target);
       Relate(target);
       if (r.reused || reused_at)
@@ -546,24 +626,50 @@ std::size_t RetentionPolicy::RetainedPayloadBytes() const noexcept {
         bytes += c.tail->Bytes();
       if (c.chunks.empty())
         continue;
-      std::array<const CheckpointComponent*, kRecordLimit> peers;
-      std::size_t peer_count = 0;
-      for (std::size_t earlier = 0; earlier < i; ++earlier) {
+      // Count a component across all retained checkpoints once. Compare live
+      // references directly instead of reading IDs from cold chunk objects.
+      // Sharing need not be a prefix: a reader can keep a later chunk alive
+      // while earlier chunks are recreated.
+      bool counted = false;
+      for (std::size_t earlier = 0; earlier < i && !counted; ++earlier) {
         if (!records_[earlier].checkpoint)
           continue;
         for (const auto& peer : records_[earlier].checkpoint->Components())
-          if (peer.descriptor.id == c.descriptor.id) {
-            peers[peer_count++] = &peer;
+          if (peer.descriptor.id == c.descriptor.id && !peer.chunks.empty()) {
+            counted = true;
             break;
           }
       }
-      for (std::size_t n = 0; n < c.chunks.size(); ++n) {
-        bool shared = false;
-        for (std::size_t peer = 0; peer < peer_count && !shared; ++peer)
-          shared = peers[peer]->chunks.size() > n &&
-                   peers[peer]->chunks[n].Id() == c.chunks[n].Id();
-        if (!shared)
-          bytes += c.chunks[n].Storage().Bytes();
+      if (counted)
+        continue;
+      std::array<const CheckpointComponent*, kRecordLimit> peers;
+      std::size_t peer_count = 0;
+      std::size_t rows = 0;
+      for (std::size_t j = i; j < limit_; ++j) {
+        if (!records_[j].checkpoint)
+          continue;
+        for (const auto& peer : records_[j].checkpoint->Components())
+          if (peer.descriptor.id == c.descriptor.id) {
+            peers[peer_count++] = &peer;
+            rows = std::max(rows, peer.chunks.size());
+            break;
+          }
+      }
+      for (std::size_t n = 0; n < rows; ++n) {
+        std::array<const CheckpointChunk*, kRecordLimit> seen;
+        std::size_t seen_count = 0;
+        for (std::size_t peer = 0; peer < peer_count; ++peer) {
+          if (peers[peer]->chunks.size() <= n)
+            continue;
+          const auto& chunk = peers[peer]->chunks[n];
+          const auto end = seen.begin() + seen_count;
+          if (std::find_if(seen.begin(), end, [&](const auto* previous) {
+                return chunk.SameChunk(*previous);
+              }) == end) {
+            seen[seen_count++] = &chunk;
+            bytes += chunk.Storage().Bytes();
+          }
+        }
       }
     }
   }

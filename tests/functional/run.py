@@ -31,7 +31,7 @@ from metrics import compare, comparison_status, join_server_timings, timing_meas
 TESTS = Path(__file__).resolve().parent
 SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "structured", "structured-limits",
           "tool-reasoning", "tool-streaming", "reasoning-separator",
-          "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
+          "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
           "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix", "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "system-injection", "cache")
 SAMPLING = {
     "--temperature": ("temperature", float), "--top-p": ("top_p", float),
@@ -448,7 +448,7 @@ def main():
                             "--url", base_url, "--model", model, "--prefix-repetitions", "16",
                             "--output", str(output / (label + ".json")), *extra]):
                         ready_to_restore.append(label)
-                # Last, so the drained log after this offset belongs to it.
+                # Retain the window; checkpoint IDs identify fixture-owned writes.
                 spacing_offset = (output / "server.log").stat().st_size
                 spacing = run("disk-spacing", "cache_disk_spacing.py", [
                     "--url", base_url, "--model", model,
@@ -474,7 +474,8 @@ def main():
                 grown_log = log.read()
             report["disk_spacing"] = check_disk_spacing(
                 grown_log, (output / "server-restarted.log").read_text(),
-                json.loads((output / "disk-spacing.json").read_text())[0])
+                json.loads((output / "disk-spacing.json").read_text())[0],
+                json.loads((output / "disk-spacing-disk.json").read_text())[0])
     except Exception as error:
         report["error"] = str(error)
         report["traceback"] = traceback.format_exc()

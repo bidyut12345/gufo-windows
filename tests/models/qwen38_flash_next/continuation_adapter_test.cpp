@@ -5,12 +5,15 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "src/cache/slot.hpp"
+#include "src/models/qwen/chat_template.hpp"
+#include "tests/models/qwen38_flash_next/mtp_replay.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
 namespace cache = gufo::cache;
@@ -51,7 +54,7 @@ void Wait(cache::Completion done) {
   Require(done.Wait() == cache::TransferResult::kSucceeded, "transfer failed");
 }
 Checkpoint Capture(qfn::ContinuationAdapter& adapter, cache::Slot& slot,
-                   gufo::hip::TransferPool& streams) {
+                   gufo::hip::TransferPool& streams, bool registered = false) {
   Checkpoint result{adapter.Positions(slot), {}};
   constexpr std::size_t piece = (1 << 20) + 13;
   for (const auto& component : adapter.Components()) {
@@ -59,6 +62,16 @@ Checkpoint Capture(qfn::ContinuationAdapter& adapter, cache::Slot& slot,
     auto& bytes = result.bytes.emplace_back(component.row_bytes
                                                 ? rows * component.row_bytes
                                                 : component.state_bytes);
+    void* mapped{};
+    if (registered && !bytes.empty())
+      Require(hipHostMalloc(&mapped, bytes.size(), hipHostMallocDefault) ==
+                  hipSuccess,
+              "registered capture allocation failed");
+    const std::unique_ptr<void, decltype(&hipHostFree)> mapping(mapped,
+                                                                hipHostFree);
+    const auto buffer =
+        mapped ? std::span(static_cast<std::byte*>(mapped), bytes.size())
+               : std::span(bytes);
     if (component.row_bytes) {
       for (cache::Rows first = 0; first < rows;) {
         const auto end = std::min(rows, first + 97);
@@ -66,8 +79,8 @@ Checkpoint Capture(qfn::ContinuationAdapter& adapter, cache::Slot& slot,
         Require(bool(stream), "stream exhausted");
         Wait(adapter.CopyRowsOut(
             slot, component.id, first, end,
-            std::span(bytes).subspan(first * component.row_bytes,
-                                     (end - first) * component.row_bytes),
+            buffer.subspan(first * component.row_bytes,
+                           (end - first) * component.row_bytes),
             *stream));
         first = end;
       }
@@ -76,12 +89,14 @@ Checkpoint Capture(qfn::ContinuationAdapter& adapter, cache::Slot& slot,
         const auto count = std::min(piece, bytes.size() - offset);
         auto stream = streams.TryAcquire();
         Require(bool(stream), "stream exhausted");
-        Wait(adapter.CapturePrivatePiece(
-            slot, component.id, offset, std::span(bytes).subspan(offset, count),
-            *stream));
+        Wait(adapter.CapturePrivatePiece(slot, component.id, offset,
+                                         buffer.subspan(offset, count),
+                                         *stream));
         offset += count;
       }
     }
+    if (mapped)
+      std::memcpy(bytes.data(), mapped, bytes.size());
   }
   return result;
 }
@@ -212,6 +227,63 @@ void SameLogits(const qfn::Session& a, const qfn::Session& b) {
               std::memcmp(a.Logits().data(), b.Logits().data(),
                           a.Logits().size_bytes()) == 0,
           "restored next-step logits differ");
+}
+void CheckSlotReuse(const std::shared_ptr<qfn::Model>& model, bool mtp) {
+  const auto mode = mtp ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive;
+  qfn::ContinuationAdapter adapter(model, mode, 4096,
+                                   {'r', 'e', 'u', 's', 'e'});
+  Guard guard;
+  auto slot = adapter.CreateSlot(guard);
+  auto& reused = adapter.GetSession(*slot);
+  std::string error;
+  auto fresh = model->CreateSession(mode, 4096, &error);
+  Require(bool(fresh), error);
+  const auto empty_bytes = reused.AllocatedBytes();
+  const auto first = model->Tokenize("Continue: red, blue, red, blue,");
+  const auto next = model->Tokenize(
+      "Write a Python function that retries a failed request three times.");
+  Require(reused.Sync(first, &error), error);
+  (void)Decode(reused, 48);
+  for (const bool sampled : {false, true}) {
+    const auto warm_bytes = reused.AllocatedBytes();
+    Require(warm_bytes <= model->SessionBytes(mode, 4096),
+            "slot scratch exceeded its admission bound");
+    if (mtp)
+      Require(warm_bytes > empty_bytes && reused.Statistics().drafted > 0,
+              "slot reuse did not exercise MTP rollback");
+    Require(adapter.Invalidate(*slot), "slot reassignment failed");
+    Require(reused.Position() == 0 && reused.Tokens().empty(),
+            "slot reassignment retained logical state");
+    Require(reused.AllocatedBytes() == warm_bytes,
+            "slot reassignment discarded reusable rollback");
+    fresh->Reset();
+    Require(reused.Sync(next, &error) && fresh->Sync(next, &error), error);
+    SameLogits(reused, *fresh);
+    const auto reused_before = reused.Statistics();
+    const auto fresh_before = fresh->Statistics();
+    Require(Decode(reused, 48, sampled) == Decode(*fresh, 48, sampled),
+            "retained slot scratch changed continuation tokens");
+    SameLogits(reused, *fresh);
+    Require(reused.Statistics().drafted - reused_before.drafted ==
+                    fresh->Statistics().drafted - fresh_before.drafted &&
+                reused.Statistics().accepted - reused_before.accepted ==
+                    fresh->Statistics().accepted - fresh_before.accepted,
+            "retained slot scratch changed draft acceptance");
+  }
+  reused.SetCancellationCheck([] { return true; });
+  Require(!reused.Evaluate(first.front(), &error) && !reused.IsValid(),
+          "cancelled slot remained valid");
+  reused.SetCancellationCheck({});
+  Require(adapter.Invalidate(*slot) && reused.AllocatedBytes() == empty_bytes,
+          "failed slot retained rollback scratch");
+  Require(reused.Sync(next, &error), error);
+  (void)Decode(reused, 16);
+  reused.Reset();
+  Require(reused.AllocatedBytes() == empty_bytes,
+          "explicit reset retained rollback scratch");
+  std::cout << (mtp ? "MTP" : "AR")
+            << ",slot_reuse,sampled/greedy/cancellation/reset,PASS\n";
 }
 void CheckInPass(const std::shared_ptr<qfn::Model>& model, bool mtp,
                  std::span<const std::int32_t> prompt) {
@@ -521,8 +593,11 @@ void Check(const std::shared_ptr<qfn::Model>& model, bool mtp,
     std::cout << (mtp ? "MTP" : "AR") << ",boundary," << boundary << std::endl;
     Require(a.Sync(prompt.first(boundary), &error), error);
     const auto checkpoint = Capture(adapter, *source, streams);
+    const auto registered = Capture(adapter, *source, streams, true);
+    Require(registered.bytes == checkpoint.bytes,
+            "registered capture differs from pageable HIP capture");
     source_guard.Borrow(checkpoint);
-    Load(adapter, *destination, checkpoint, streams);
+    Load(adapter, *destination, registered, streams);
     Require(adapter.Validate(*destination, checkpoint.positions),
             "complete restore rejected");
     Require(Capture(adapter, *destination, streams).bytes == checkpoint.bytes,
@@ -787,6 +862,44 @@ void CheckImages(const std::shared_ptr<qfn::Model>& model, bool mtp) {
   }
   std::cout << (mtp ? "MTP" : "AR") << ",image_restore,PASS\n";
 }
+void CheckLearnedDraftPolicy(const std::shared_ptr<qfn::Model>& model) {
+  namespace qt = gufo::tokenization;
+  gufo::hip::TransferPool streams(2);
+  qfn::ContinuationAdapter adapter(model, gufo::core::SessionMode::kSpeculative,
+                                   4096, {'p', 'o', 'l', 'i', 'c', 'y'});
+  Guard source_guard, destination_guard;
+  auto source = adapter.CreateSlot(source_guard);
+  auto destination = adapter.CreateSlot(destination_guard);
+  auto& live = adapter.GetSession(*source);
+  auto& restored = adapter.GetSession(*destination);
+  const std::array messages{
+      qt::ChatMessage{qt::ChatRole::kUser,
+                      "Write a Python LRU cache implementation with get, "
+                      "put, eviction and tests. Explain the edge cases."}};
+  std::string error;
+  const auto encoded = qt::QwenChatTemplate::RenderAndTokenize(
+      model->tokenizer(), messages, {.enable_thinking = false}, &error);
+  Require(encoded.has_value(), error);
+  const std::vector<std::int32_t> prompt(encoded->begin(), encoded->end());
+  Require(live.Sync(prompt, &error) && restored.Sync(prompt, &error), error);
+  sampling::SamplerState sampler(
+      {.temperature = 0.8F, .top_k = 20, .top_p = 0.95F, .seed = 73},
+      std::vector<sampling::TokenId>(prompt.begin(), prompt.end()));
+  auto stale_sampler = sampler;
+  (void)gufo::test::DecodeMtpReplay(restored, stale_sampler, 32);
+  (void)gufo::test::DecodeMtpReplay(live, sampler, 128);
+  const auto checkpoint = Capture(adapter, *source, streams);
+  Load(adapter, *destination, checkpoint, streams);
+  Require(adapter.Validate(*destination, checkpoint.positions),
+          "learned MTP policy checkpoint rejected");
+  SameLogits(live, restored);
+  auto replay_sampler = sampler;
+  Require(gufo::test::DecodeMtpReplay(live, sampler, 64) ==
+              gufo::test::DecodeMtpReplay(restored, replay_sampler, 64),
+          "component restore lost learned MTP acceptance history");
+  SameLogits(live, restored);
+  std::cout << "MTP,learned_draft_policy,PASS\n";
+}
 }  // namespace
 int main(int argc, char** argv) {
   const bool guard_only =
@@ -795,12 +908,18 @@ int main(int argc, char** argv) {
       argc == 6 && std::string_view(argv[5]) == "--image-only";
   const bool in_pass_only =
       argc == 6 && std::string_view(argv[5]) == "--in-pass-only";
-  if ((argc != 5 && !guard_only && !image_only && !in_pass_only) ||
+  const bool policy_only =
+      argc == 6 && std::string_view(argv[5]) == "--policy-only";
+  const bool reuse_only =
+      argc == 6 && std::string_view(argv[5]) == "--reuse-only";
+  if ((argc != 5 && !guard_only && !image_only && !in_pass_only &&
+       !policy_only && !reuse_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr
-        << "Usage: continuation_adapter_test --model FIRST.gguf "
-           "--mtp-model MTP.gguf [--guard-only|--image-only|--in-pass-only]\n";
+    std::cerr << "Usage: continuation_adapter_test --model FIRST.gguf "
+                 "--mtp-model MTP.gguf "
+                 "[--guard-only|--image-only|--in-pass-only|--policy-only|"
+                 "--reuse-only]\n";
     return 77;
   }
   try {
@@ -808,6 +927,15 @@ int main(int argc, char** argv) {
     auto model = qfn::Model::Load(
         argv[2], {.max_context = 16384, .mtp_model_path = argv[4]}, &error);
     Require(bool(model), error);
+    if (policy_only) {
+      CheckLearnedDraftPolicy(model);
+      return 0;
+    }
+    if (reuse_only) {
+      CheckSlotReuse(model, false);
+      CheckSlotReuse(model, true);
+      return 0;
+    }
     const auto pattern = model->Tokenize(
         "The quick brown fox jumps over the lazy dog. Strix Halo executes this "
         "deterministic benchmark sequence. ");
@@ -815,6 +943,19 @@ int main(int argc, char** argv) {
     std::vector<std::int32_t> prompt(10000);
     for (std::size_t i = 0; i < prompt.size(); ++i)
       prompt[i] = pattern[i % pattern.size()];
+    // The repeated prefix can accept every draft. End the
+    // sampled boundary with real code generation to exercise rejection and
+    // residual replay as well as the long recurrent/KV state.
+    namespace qt = gufo::tokenization;
+    const std::array messages{
+        qt::ChatMessage{qt::ChatRole::kUser,
+                        "Write a Python LRU cache implementation with get, "
+                        "put, eviction and tests. Explain the edge cases."}};
+    const auto sampled_tail = qt::QwenChatTemplate::RenderAndTokenize(
+        model->tokenizer(), messages, {.enable_thinking = false}, &error);
+    Require(sampled_tail && sampled_tail->size() < 8203, error);
+    std::copy(sampled_tail->begin(), sampled_tail->end(),
+              prompt.begin() + 8203 - sampled_tail->size());
     if (!image_only && !in_pass_only) {
       CheckTransferAndGuardLifetime(model, false, prompt);
       CheckTransferAndGuardLifetime(model, true, prompt);
@@ -830,6 +971,9 @@ int main(int argc, char** argv) {
     if (!image_only) {
       Check(model, false, prompt);
       Check(model, true, prompt);
+      CheckLearnedDraftPolicy(model);
+      CheckSlotReuse(model, false);
+      CheckSlotReuse(model, true);
     }
     CheckImages(model, false);
     CheckImages(model, true);

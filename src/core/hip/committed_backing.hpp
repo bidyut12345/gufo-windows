@@ -92,10 +92,16 @@ public:
   // pinned host memory on the calling thread.
   [[nodiscard]] std::optional<BackingBlock> TryAcquire(
       cache::ResourceCategory, std::size_t payload_bytes = 0);
+  // Reject a whole capture only when rounded payloads exceed free plus
+  // uncommitted capacity. Does not allocate or change the search cursor.
+  // Fragmentation, growth limits and races still need TryAcquire's checks.
+  [[nodiscard]] bool CanFit(std::span<const cache::PayloadRequest>) const;
   // Starts committing the next on-demand segment on a background thread when
   // less than one segment of free backing remains, so a later TryAcquire
   // finds it ready instead of allocating on its own thread. Returns at once.
-  void GrowAhead();
+  // The count is the desired free-segment reserve, bounded by capacity.
+  void GrowAhead(std::size_t segments = 1);
+  void WaitForGrowth();
   // Committed blocks and bytes; both grow with on-demand segments.
   [[nodiscard]] std::size_t BlockCount() const noexcept;
   [[nodiscard]] std::size_t CommittedBytes() const noexcept;

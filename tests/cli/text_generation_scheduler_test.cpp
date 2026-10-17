@@ -63,6 +63,39 @@ void Expect(bool condition, std::string_view message) {
   }
 }
 
+void TestPublicationWaitUsesRecentSubstantialPrefill() {
+  using gufo::server::detail::PublicationWaitEstimate;
+  PublicationWaitEstimate estimate;
+  Expect(!estimate.Limit(55000),
+         "an uncalibrated model must not park admission");
+  for (const auto milliseconds :
+       {0.0, -1.0, std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::quiet_NaN()})
+    estimate.Observe(4096, milliseconds);
+  estimate.Observe(32, 500);
+  estimate.Observe(4096, 0.1);
+  Expect(!estimate.Limit(55000),
+         "invalid timings and tiny/overhead-dominated work cannot calibrate");
+
+  estimate.Observe(55022, 32643.778743);
+  const auto limit = estimate.Limit(55017);
+  Expect(limit && limit->count() > 32640 && limit->count() < 32644,
+         "the reproduced prefix gain costs about 32.64s, not 120s");
+  Expect(estimate.Limit(0)->count() == 0,
+         "no remaining saved prefill work permits no wait");
+  Expect(estimate.Limit(10000000) == PublicationWaitEstimate::kMaximumWait,
+         "large recomputation estimates retain the absolute ceiling");
+
+  // Recent fast prefill must displace slow startup work rather than retain a
+  // process-lifetime average. Token/time weighting ignores sample boundaries.
+  for (int i = 0; i < 16; ++i)
+    estimate.Observe(4096, 100);
+  Expect(estimate.Limit(8192)->count() == 200,
+         "recent prefill replaces stale startup measurements");
+  PublicationWaitEstimate other_model;
+  Expect(!other_model.Limit(8192), "another model/pool starts uncalibrated");
+}
+
 enum class EventKind : std::uint8_t {
   kPrefill,
   kAdvance,
@@ -2869,6 +2902,7 @@ void TestEmptyTokenIsPublished() {
 }
 
 int main() {
+  TestPublicationWaitUsesRecentSubstantialPrefill();
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.
   ::setenv("NO_COLOR", "1", 1);

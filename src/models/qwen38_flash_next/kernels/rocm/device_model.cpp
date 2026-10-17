@@ -449,6 +449,30 @@ DeviceModel::~DeviceModel() {
   }
 }
 
+bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
+                                std::vector<std::int32_t> specials,
+                                std::string* error_msg) {
+  const auto fail = [&](const std::string& message) {
+    if (error_msg != nullptr)
+      *error_msg = message;
+    return false;
+  };
+  if (output_.empty() || output_.rows == 0 || output_bytes_ % output_.rows != 0)
+    return fail("draft vocabulary needs a row-addressable output head");
+  if (prefix_rows == 0 || prefix_rows >= output_.rows)
+    return fail("draft vocabulary prefix must leave rows out");
+  for (const auto id : specials) {
+    if (id < static_cast<std::int32_t>(prefix_rows) ||
+        static_cast<std::uint32_t>(id) >= output_.rows)
+      return fail("draft special tokens must lie above the prefix");
+  }
+  // The prefix is the head's own leading rows: no copy.
+  draft_output_ = output_;
+  draft_output_.rows = prefix_rows;
+  draft_specials_ = std::move(specials);
+  return true;
+}
+
 std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
@@ -519,6 +543,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   assert(up.requested == measured);
   m->token_embd_ = uploaded.token_embd;
   m->output_ = uploaded.output;
+  m->output_bytes_ = w.output.SizeBytes();
   m->hc_head_ = uploaded.hc_head;
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;

@@ -9,6 +9,7 @@
 #include "src/cache/streaming.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
+#include "src/cli/serve/text_publication_wait.hpp"
 
 namespace gufo::server {
 class TextModelRunner;
@@ -36,6 +37,11 @@ struct ComponentCacheResources {
   cache::StreamLease stream;
   std::function<ComponentCaptureBuffer(const cache::PayloadRequest&)> allocate;
   cache::StagingAllocator staging;
+  // Prepare on-demand backing while a substantial prefill can hide pinning.
+  std::function<void()> prepare_prefill;
+  // Optional capacity bound before assigning a complete capture. False takes
+  // the ordinary reclamation path; true still requires every allocation.
+  std::function<bool(std::span<const cache::PayloadRequest>)> can_capture;
   // Optional initialization step after slots allocate. The provider leaves
   // payload backing uncommitted until serving selects the post-slot budget.
   std::function<void(std::size_t)> commit_backing;
@@ -78,6 +84,7 @@ public:
     [[nodiscard]] std::size_t CaptureBytes() const;
     [[nodiscard]] std::size_t CaptureBytes(std::size_t boundary) const;
     [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
+    void PreparePrefill();
     [[nodiscard]] ComponentCacheMetrics Metrics() const;
     [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
         std::size_t stable) const;
@@ -97,9 +104,11 @@ public:
       std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool);
   // A disk job is writing a prefix of the prompt much deeper than any
   // restorable boundary; admission may wait for it instead of prefilling.
-  [[nodiscard]] bool PublicationPending(
+  // A nonzero checkpoint ID follows that one job, even if another deeper job
+  // is submitted later. Its current gain may shrink as usable cache improves.
+  [[nodiscard]] std::optional<TextPendingPublication> PendingPublication(
       std::span<const ContinuationToken> prompt,
-      const TextPromptContext* context) const;
+      const TextPromptContext* context, std::uint64_t checkpoint_id = 0) const;
   [[nodiscard]] std::size_t CachedPrefixTokens(
       std::span<const ContinuationToken>, const TextPromptContext*,
       bool common = false) const;
@@ -147,6 +156,7 @@ public:
   [[nodiscard]] std::size_t CaptureBytes() const;
   [[nodiscard]] std::size_t CaptureBytes(std::size_t boundary) const;
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
+  void PreparePrefill();
   [[nodiscard]] std::optional<ComponentCacheMetrics> Metrics() const;
   [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
       std::size_t stable) const;

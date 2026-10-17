@@ -106,6 +106,9 @@ struct RetentionRequest {
   // The turn restored or continued a cached prefix. Its admitted checkpoint
   // marks the conversation as reused (see RetentionPolicy byte pressure).
   bool reused{false};
+  // Frontier actually reused by this turn, before its new prefill. This
+  // distinguishes a short retry tail from a larger continuation/compaction.
+  Rows reused_tokens{};
 };
 // Caller serializes policy, index and history operations. Ledger and index
 // outlive this object; sink, if present, does too. Callbacks/sinks cannot
@@ -170,8 +173,10 @@ private:
   bool Related(std::size_t, std::size_t) const;
   void Relate(std::size_t);
   std::array<std::uint64_t, 4> PressureOrder(std::size_t,
-                                             const RetentionRequest&) const;
+                                             const RetentionRequest&,
+                                             std::uint32_t priority) const;
   std::size_t UniqueBytes(std::size_t) const;
+  std::size_t UniquePayloadBytes(std::size_t) const noexcept;
   bool Persisting(std::size_t) const;
   std::size_t Victim(const RetentionRequest&, bool records) const;
   void Erase(std::size_t, RetentionReason, std::uint32_t rank);

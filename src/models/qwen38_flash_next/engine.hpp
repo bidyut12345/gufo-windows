@@ -16,6 +16,7 @@
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/prompt_lookup.hpp"
@@ -136,6 +137,12 @@ private:
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
   MtpBatchController batch_policy_;
+  /// MTP drafts may use the small head (draft_vocab.hpp).
+  bool draft_subset_{false};
+  /// Special tokens at the start of every session's draft table.
+  std::uint32_t draft_specials_{0};
+  /// Prefix and special tokens: always in the small head.
+  [[nodiscard]] bool InDraftSubset(std::int32_t token) const;
 
   friend class Session;
   friend class ContinuationAdapter;
@@ -238,17 +245,18 @@ public:
   struct SpeculativeStats {
     std::uint64_t cycles{0};
     std::uint64_t drafted{0};
-    std::uint64_t accepted{0};
     /// Of drafted/accepted: proposals copied from the context.
     std::uint64_t lookup{0};
     std::uint64_t lookup_accepted{0};
+    /// Cycles whose draft scored the small head (draft_vocab.hpp).
+    std::uint64_t small_head_cycles{0};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
   }
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 16;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 17;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(
@@ -275,6 +283,7 @@ private:
   friend class Model;
   friend class ContinuationAdapter;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
+  void ResetImpl(bool reuse_mtp);
 
   using PrefillCapture = std::function<void(const rocm::PrefillCheckpoint&)>;
   bool SyncThroughComponents(std::span<const std::int32_t>, std::uint32_t,
@@ -303,7 +312,8 @@ private:
   [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg,
-                    MtpCandidateLogits* candidates = nullptr);
+                    MtpCandidateLogits* candidates = nullptr,
+                    bool draft_subset = false);
   bool DraftReplay(std::int32_t next_token, std::vector<std::int32_t>* replay,
                    std::int32_t* hidden_row, std::string* error_msg) const;
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
@@ -349,6 +359,14 @@ private:
       std::size_t token_count) const;
   bool valid_{true};
   ContinuationHooks* continuation_hooks_{nullptr};
+  /// This request's draft vocabulary; the device table follows it.
+  MtpDraftVocab draft_vocab_;
+  bool draft_vocab_stale_{false};
+  std::vector<std::int32_t> draft_added_;
+  /// After the token history is replaced: the table restarts from it.
+  void ForgetDraftVocab() noexcept { draft_vocab_stale_ = true; }
+  /// Brings the draft table up to the committed tokens.
+  bool SyncDraftVocab(std::string* error_msg);
   [[nodiscard]] bool MtpEnabled() const noexcept;
 };
 

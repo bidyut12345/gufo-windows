@@ -496,8 +496,6 @@ private:
     options.reasoning_effort = tokenization::QwenReasoningEffort::kMedium;
     options.preserve_thinking =
         request.reasoning.preserve_thinking.value_or(false);
-    options.require_tool_call =
-        request.tool_choice == server::ChatRequest::ToolChoice::kRequired;
     options.max_output_bytes =
         tokenization::RenderedPromptBoundBytes(m_->limit);
     return options;

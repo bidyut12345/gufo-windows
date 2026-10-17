@@ -764,6 +764,11 @@ struct TextRunnerPool::Request::Impl {
     }
     if (lease.restored_from_disk() && prefill_offset == prompt.size())
       count = prompt.size();
+    // Cancellation can leave a component live frontier past the stable
+    // checkpoint. That earlier state cannot be captured here; keep its
+    // immutable fallback and freeze the complete prompt before decoding.
+    if (lease.component() && prefill_offset > count)
+      count = prompt.size();
     snapshot_tokens.reserve(prompt.size());
     snapshot_tokens.assign(prompt.begin(), prompt.begin() + count);
     // A live continuation can already be beyond the desired snapshot point.
@@ -776,8 +781,11 @@ struct TextRunnerPool::Request::Impl {
           std::span<const TextRunnerToken>(prompt).first(prefill_offset));
     }
     const auto capabilities = runner->Descriptor().capabilities;
-    if (capabilities.incremental_prefill && capabilities.prefix_reuse &&
-        capabilities.snapshot && capabilities.fork) {
+    // Component adapters supply their own pass boundaries below. Building the
+    // generic plan first only repeats prefix lookups before discarding it.
+    if (!lease.component() && capabilities.incremental_prefill &&
+        capabilities.prefix_reuse && capabilities.snapshot &&
+        capabilities.fork) {
       // A reused frontier already bounds the work lost on an edit. Do not
       // split a short continuation just to copy a nearby grid checkpoint.
       // Cold long prompts still retain the last grid point for late edits.
@@ -1330,6 +1338,11 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
     throw std::invalid_argument(
         "text runner prefill budget must be at least one token");
   }
+
+  // Start pinning before prefill, while at least 512 tokens of GPU work
+  // remain. Cached decode and short final tails must not start registration.
+  if (impl_->prompt.size() - impl_->prefill_offset >= 512)
+    impl_->lease.PreparePrefill();
 
   // Stop exactly on the next shared-prefix boundary so it can be persisted.
   // Direct callers join any capture before mutating its borrowed state.
@@ -2080,11 +2093,12 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   return Acquire(std::move(prompt), sampling::SamplingConfig{}, is_cancelled);
 }
 
-bool TextRunnerPool::PublicationPending(
-    std::span<const TextRunnerToken> prompt,
-    const TextPromptContext* context) const {
-  return impl_->component_cache &&
-         impl_->component_cache->PublicationPending(prompt, context);
+std::optional<TextPendingPublication> TextRunnerPool::PendingPublication(
+    std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
+    std::uint64_t checkpoint_id) const {
+  return impl_->component_cache ? impl_->component_cache->PendingPublication(
+                                      prompt, context, checkpoint_id)
+                                : std::nullopt;
 }
 
 std::size_t TextRunnerPool::CachedPrefixTokens(

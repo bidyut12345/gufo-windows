@@ -81,6 +81,21 @@ python3 -m unittest discover -s tests/functional -p test_report.py
 ```
 
 
+The startup-loading runner polls health, readiness and generation from process
+start. Every answer during the load must be 503 `Loading model`, `/health`
+included, and the real server must answer all three after the listener handoff:
+
+```sh
+nix develop -c python3 tests/functional/startup_loading.py \
+  --output /tmp/startup-loading -- \
+  /path/to/production/gufo serve llm --model /path/to/model.gguf \
+  --cache-disk /tmp/startup-loading-disk
+```
+
+It fails if no loading answer was observed, so an instant load is not a pass.
+`observations.json` keeps every probe with its time; this check stays outside
+hosted model CI and `--suite all`.
+
 Device-loss process tests use a separate opt-in runner because each lost-device
 case must terminate its server. Build its CMake-owned preload helper, then run
 against a production binary and one explicitly selected model/mode:
@@ -182,6 +197,7 @@ RAM, disk and restart settings once their contracts pass.
 | `tool-untyped` | Open/typed tools, refs and finite values: framing, arguments, streaming, turns, limits, stops/retry and sampled peers |
 | `tool-mixed` | JSON-only neighbors, annotated refs, extra keys, URI and nullable arguments across Chat/Responses; images, stops/retry and sampled peers; a union neighbor keeps native calls, so a replayed reasoning/call turn is reused in full |
 | `tool-native-schemas` | opencode's tool set beside each schema family that used to force a JSON envelope (pattern, oneOf, allOf, not, open objects), auto and required, strict: native calls, no prompt instruction, typed arguments and full reuse of the generated call; Chat/Responses |
+| `tool-choice-cache` | Required/auto/omitted transitions preserve the complete generated call, unchanged-choice controls, prompt-token equality and zero-prefill retries |
 | `tool-native-types` | Focused subset: enum/const/inferred string types, literal delimiters and exact continuation reuse after new literal tool markers; Chat/Responses, text/images |
 | `tool-schema-edges` | Wildcard JSON types, conditional fields, impossible schemas, nested metadata and required-call timing; both APIs, cache, stops and sampled peers |
 | `state-edges` | Actual AR/draft execution, tiny thinking budgets, zero-argument tools, schema changes, stops (including inside quoted calls), image retry and failed-request recovery |
@@ -335,10 +351,19 @@ Cache checks use real assistant replies and run cold controls after the warm
 history, so the controls cannot hide a missed checkpoint. `cache-edits` checks
 latest-message edits, shortened tool results and rewinds. `cache-growth` checks
 omitted, preserved and explicitly discarded reasoning, plus thinking off.
-Unchanged retries in `cache-growth` and `cache-depth` must prefill nothing,
+Unchanged retries in `cache-growth`, `cache-depth`, `long-context`, reasoning-separator,
+tool-history, schema edges, state edges, progress and metrics must prefill nothing,
 unless the runner's server log shows that memory pressure refused the retry
 copy; the retry may then prefill only the assistant opening after the stable
-boundary.
+boundary. In agent histories the mutable suffix includes the final user turn;
+`tool-history` bounds it with an independent count-tokens request rather than
+extra slack. Generic capture failures do not qualify for this exception.
+Run `nix develop -c python3 tests/functional/test_long_context.py` to check
+that only a capacity refusal in the preceding request's log window permits
+the framing suffix; lost context, changed output and unrelated refusals fail.
+Component disk-spacing checks correlate drained publication logs with the
+checkpoint IDs captured by their own requests, excluding delayed writes from
+earlier suites even when their token counts match.
 `cache-rotation` visits four conversations and eight small side requests; use
 `--sessions 1` to verify retention is independent of execution slots. It also
 checks the startup RAM cap; byte/record pressure is covered by CPU tests.
@@ -433,6 +458,28 @@ short-peer/deep-history pattern reported in #542; the system-only oversized
 fixture cannot establish that behavior.
 Known cache-work failures exit nonzero and retain controls/evidence; they are
 not skipped, marked as expected passes, or fixed in this test-only card.
+
+Publication-wait regression #617 uses the same process-local fault library,
+filtered to hold a manifest after its payload is written. It checks both an
+expired recomputation budget and publication before that budget expires:
+
+```sh
+nix develop -c python3 tests/functional/publication_wait.py \
+  --output /tmp/publication-wait --fault-library build/cpu-test/libcache_disk_faults.so -- \
+  /path/to/production/gufo serve llm --model /path/to/flash-next.gguf \
+  --mtp-model /path/to/mtp.gguf --speculative mtp --sessions 1 --context 65536
+```
+
+The runner uses a fresh 8 GiB disk tier and a 1 GiB RAM budget unless explicitly
+set, requires an actual over-RAM publication and disk restore, and retains all
+HTTP requests/responses and timings. It removes its own cache after each case.
+Use `--case bound --expect cap` only for a matched pre-fix main timing control;
+candidate correctness uses the default `bounded` expectation. The bound case
+schedules release after 130 seconds and releases earlier if the waiter finishes;
+the child-only helper has a longer safety timeout. The publication case waits
+for the scheduler's actual park before starting its 250 ms release timer, then
+checks the matching request/checkpoint release before its deadline and a disk
+restore. These checks stay outside hosted CI and the routine API suites.
 
 Unchanged retries must reproduce the complete output with zero prefill. After a
 restart, disk restores may re-prefill less than one 2048-token disk step;

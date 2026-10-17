@@ -212,6 +212,12 @@ void TestMixedEnumValues() {
     assert(Accepts(*grammar, R"({"x":1})"));
     assert(!Accepts(*grammar, R"({"x":2})"));
   }
+  // Enum literals spell integers as decimals, so the model is never forced
+  // into 1e+05.
+  auto large = parse(R"({"type":"object","properties":{"x":{
+    "type":"integer"}},"required":["x"],"additionalProperties":false})");
+  large["enum"] = parse(R"([{"x":100000}])");
+  assert(Accepts(*JsonConstraint::Compile(large, true), R"({"x":100000})"));
   const auto list = JsonConstraint::Compile(
       parse(R"({"type":"object","properties":{"l":{"type":"array","items":{
         "anyOf":[{"type":"string"},{"type":"number"}]},"enum":[["a",1]]}},

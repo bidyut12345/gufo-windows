@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -83,6 +84,17 @@ cache::RetentionPurpose Purpose(SnapshotPurpose purpose) {
 void Check(cache::Completion completion) {
   if (completion.Wait() != cache::TransferResult::kSucceeded)
     throw std::runtime_error("component cache transfer failed");
+}
+// A published checkpoint that is still resident restores from RAM, so its
+// candidate carries no disk description; its availability still marks every
+// component durable.
+bool Published(const cache::PrefixCandidate& candidate) {
+  if (candidate.durable)
+    return true;
+  return candidate.availability &&
+         !candidate.availability->components.empty() &&
+         std::ranges::all_of(candidate.availability->components,
+                             &cache::ComponentAvailability::durable);
 }
 bool SameOwner(const std::shared_ptr<const void>& a,
                const std::shared_ptr<const void>& b) {
@@ -327,7 +339,9 @@ struct ComponentTextCache::Impl {
             if (!success) {
               Logger::Info(
                   "cache",
-                  "schema=component-cache-v1 event=persistence_incomplete");
+                  "schema=component-cache-v1 event=persistence_incomplete "
+                  "checkpoint_id=" +
+                      std::to_string(id.value));
               return;
             }
             catalog->Track(id);
@@ -356,6 +370,7 @@ struct ComponentTextCache::Impl {
                   "cache",
                   "schema=component-cache-v1 event=published tokens=" +
                       std::to_string(description->Manifest().tokens.size()) +
+                      " checkpoint_id=" + std::to_string(id.value) +
                       " payload_bytes=" +
                       std::to_string(PayloadBytes(description->Manifest())));
             }
@@ -366,6 +381,17 @@ struct ComponentTextCache::Impl {
             const auto bytes = PayloadBytes(manifest);
             if (bytes > disk_capacity)
               return false;
+            // Startup orphan reclamation holds the store lock asynchronously
+            // and eviction only tries that lock, so a write racing it would
+            // be dropped. Only this worker joins it once the queue exists.
+            try {
+              disk->WaitForReclamation();
+            } catch (const std::exception& error) {
+              Logger::Warn("cache", std::string("schema=component-cache-v1 "
+                                                "event=disk_reclamation_failed "
+                                                "reason=") +
+                                        error.what());
+            }
             const std::lock_guard lock(mutex);
             return catalog->EvictOne();
           });
@@ -427,7 +453,7 @@ struct ComponentTextCache::Impl {
                                                         checkpoint->Input())});
         std::size_t prior = 0;
         for (const auto& candidate : found.candidates)
-          if (candidate.durable)
+          if (Published(candidate))
             prior =
                 std::max(prior, static_cast<std::size_t>(candidate.boundary));
         for (const auto& queued : pending)
@@ -439,10 +465,12 @@ struct ComponentTextCache::Impl {
                                           queued->manifest.input))
             prior = std::max(prior, queued->manifest.tokens.size());
         if (prior && checkpoint->Boundary() - prior < disk_step) {
-          Logger::Info("cache",
-                       "schema=component-cache-v1 event=persistence_refused "
-                       "reason=min_step tokens=" +
-                           std::to_string(checkpoint->Boundary()));
+          Logger::Info(
+              "cache",
+              "schema=component-cache-v1 event=persistence_refused "
+              "reason=min_step tokens=" +
+                  std::to_string(checkpoint->Boundary()) +
+                  " checkpoint_id=" + std::to_string(checkpoint->Id().value));
           return 0;
         }
       }
@@ -536,7 +564,7 @@ struct ComponentTextCache::Impl {
         {identity, tokens, cache::InputIdentity(tokens.size(), input)});
     std::size_t prior = 0;
     for (const auto& candidate : found.candidates)
-      if (candidate.durable)
+      if (Published(candidate))
         prior = std::max(prior, static_cast<std::size_t>(candidate.boundary));
     const auto compatible = [&](auto prefix, const auto& prefix_input) {
       return prefix_input == input && prefix.size() <= tokens.size() &&
@@ -615,19 +643,26 @@ struct ComponentTextCache::Lease::Impl {
                           .Reserve(cache::ResourceCategory::kMetadata,
                                    sizeof(edit_boundaries))
                           .Convert()) {}
-  cache::RetentionRequest Retain(std::span<const cache::Token> tokens) const {
-    return {.tokens = tokens,
-            .compatibility = cache->identity,
-            .input = At(input, std::min(tokens.size(), prompt.size())),
-            .purpose = Purpose(purpose),
-            .stable = std::min(stable, tokens.size()),
-            .source = source,
-            .preserve_source = preserve_source,
-            .new_payload_bytes = entry->history->NewPayloadBytes(
-                cache->resources->adapter->Positions(slot.Execution())),
-            .protected_checkpoints =
-                std::span(edit_boundaries).first(edit_boundary_count),
-            .reused = cached != 0};
+  cache::RetentionRequest Retain(
+      std::span<const cache::Token> tokens,
+      std::optional<std::size_t> new_payload_bytes = {}) const {
+    return {
+        .tokens = tokens,
+        .compatibility = cache->identity,
+        .input = At(input, std::min(tokens.size(), prompt.size())),
+        .purpose = Purpose(purpose),
+        .stable = std::min(stable, tokens.size()),
+        .source = source,
+        .preserve_source = preserve_source,
+        .new_payload_bytes =
+            new_payload_bytes
+                ? *new_payload_bytes
+                : entry->history->NewPayloadBytes(
+                      cache->resources->adapter->Positions(slot.Execution())),
+        .protected_checkpoints =
+            std::span(edit_boundaries).first(edit_boundary_count),
+        .reused = cached != 0,
+        .reused_tokens = cached};
   }
   std::unique_ptr<TextRunnerSnapshot> CaptureDurable();
 };
@@ -808,6 +843,7 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
         });
   }
   ++metrics.captures;
+  metrics.captured_checkpoint_ids.push_back(durable->manifest.checkpoint.value);
   auto snapshot = std::make_unique<ComponentSnapshot>();
   snapshot->bytes = entry->history->NewPayloadBytes(positions);
   snapshot->durable = std::move(durable);
@@ -861,8 +897,10 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       // whose captures are refused: take it last. Then completed
       // preservation first: it needs no foreground copy. Among those, a live
       // frontier holds generated tokens no checkpoint covers, such as the
-      // tool call the next turn replays, so take a slot without one, then
-      // the least recently used.
+      // tool call the next turn replays. Take a slot without one, then a
+      // shallow frontier before a deep one, then the least recently used.
+      // Faster idle preservation must not make short side requests evict a
+      // deep conversation merely because its backing copy finished earlier.
       constexpr std::size_t kUncoveredTokens = 4096;
       const auto uncovered = [&](const Impl::Entry& e) {
         if (!e.live || e.live_tokens.size() <= kUncoveredTokens)
@@ -879,7 +917,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       };
       const auto rank = [&](const Impl::Entry& e) {
         return std::tuple{uncovered(e), !e.slot->PreservationComplete(),
-                          bool(e.live), e.used};
+                          bool(e.live),
+                          e.live_tokens.size() >= kUncoveredTokens, e.used};
       };
       for (auto& candidate : impl_->entries)
         if (!candidate->busy && (!entry || rank(*candidate) < rank(*entry)))
@@ -1133,29 +1172,38 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   }
 }
 
-bool ComponentTextCache::PublicationPending(
-    std::span<const ContinuationToken> prompt,
-    const TextPromptContext* context) const {
-  // A disk job still writing a much deeper prefix of this prompt usually
-  // finishes sooner than prefilling the difference again (#562, step E2):
-  // a conversation larger than the RAM budget has no RAM copy.
-  constexpr std::size_t kWaitGainTokens = 4096;
+std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
+    std::span<const ContinuationToken> prompt, const TextPromptContext* context,
+    std::uint64_t checkpoint_id) const {
   if (!impl_->queue)
-    return false;
+    return std::nullopt;
   const auto input = Inputs(prompt.size(), context);
   const std::lock_guard lock(impl_->mutex);
   const auto found =
       impl_->index.Lookup({impl_->identity, prompt, input, 0, true});
   const std::size_t best = found.selected ? found.selected->boundary : 0;
-  return std::ranges::any_of(impl_->pending_durable, [&](const auto& capture) {
+  std::optional<TextPendingPublication> selected;
+  for (const auto& capture : impl_->pending_durable) {
     if (!capture)
-      return false;
+      continue;
+    const auto id = capture->manifest.checkpoint.value;
+    if (checkpoint_id && id != checkpoint_id)
+      continue;
     const auto& tokens = capture->manifest.tokens;
-    return tokens.size() > best + kWaitGainTokens &&
-           tokens.size() <= prompt.size() &&
-           capture->manifest.input == At(input, tokens.size()) &&
-           std::equal(tokens.begin(), tokens.end(), prompt.begin());
-  });
+    if (tokens.size() > prompt.size() ||
+        capture->manifest.input != At(input, tokens.size()) ||
+        !std::equal(tokens.begin(), tokens.end(), prompt.begin()))
+      continue;
+    TextPendingPublication candidate{id, best, tokens.size()};
+    if (!checkpoint_id &&
+        candidate.Gain() <= TextPendingPublication::kMinimumGainTokens)
+      continue;
+    if (!selected || candidate.pending_tokens > selected->pending_tokens ||
+        (candidate.pending_tokens == selected->pending_tokens &&
+         id < selected->checkpoint_id))
+      selected = candidate;
+  }
+  return selected;
 }
 
 std::size_t ComponentTextCache::CachedPrefixTokens(
@@ -1231,6 +1279,11 @@ void ComponentTextCache::Lease::SkipSnapshot(SnapshotEventReason reason,
   } catch (...) {
   }
 }
+void ComponentTextCache::Lease::PreparePrefill() {
+  if (impl_->cache->resources->prepare_prefill)
+    impl_->cache->resources->prepare_prefill();
+}
+
 std::size_t ComponentTextCache::Lease::CaptureBytes() const {
   return impl_->entry->history->NewPayloadBytes(
       impl_->cache->resources->adapter->Positions(impl_->slot.Execution()));
@@ -1246,10 +1299,14 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
   auto& cache = *request.cache;
   auto positions =
       cache.resources->adapter->Positions(request.slot.Execution());
-  const auto bytes = CaptureBytes();
-  const auto retain = request.Retain(request.capture_tokens);
+  const auto bytes = request.entry->history->NewPayloadBytes(positions);
+  const auto retain = request.Retain(request.capture_tokens, bytes);
   if (bytes > cache.ledger.Limits().ram_bytes)
     return request.CaptureDurable();
+  const auto reclaim = [&] {
+    const std::lock_guard lock(cache.mutex);
+    return cache.retention.Reclaim(retain);
+  };
   std::shared_ptr<const cache::Checkpoint> checkpoint;
   std::size_t captured_capacity = 0;
   std::size_t borrowed_capacity = 0, copied_payload = 0;
@@ -1263,8 +1320,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
       std::size_t next_buffer = 0;
       checkpoint = request.entry->history->Capture(
           {request.capture_tokens,
-           cache::InputIdentity(request.capture_tokens.size(), retain.input),
-           positions,
+           request.input.Through(request.capture_tokens.size()), positions,
            request.purpose == SnapshotPurpose::kHistory
                ? cache::CheckpointPurpose::kGrid
            : request.purpose == SnapshotPurpose::kBranchPoint
@@ -1285,20 +1341,51 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
           [&](std::span<const cache::PayloadRequest> payloads) {
             buffer_metadata = cache.ledger.Reserve(
                 cache::ResourceCategory::kMetadata,
-                payloads.size() * (sizeof(ComponentCaptureBuffer) +
-                                   sizeof(std::span<const std::byte>)));
+                payloads.size() *
+                    (sizeof(ComponentCaptureBuffer) +
+                     sizeof(std::span<const std::byte>) + sizeof(std::size_t)));
             buffers.reserve(payloads.size());
             borrowed.reserve(payloads.size());
-            for (const auto& payload : payloads) {
-              buffers.push_back(cache.resources->allocate(payload));
-              borrowed.push_back(
-                  buffers.back().borrow &&
-                          payload.category ==
-                              cache::ResourceCategory::kBackingAssigned
-                      ? cache.resources->adapter->BorrowRowsView(
-                            request.slot.Execution(), payload.component,
-                            payload.first, payload.end)
-                      : std::span<const std::byte>{});
+            // Small row/tail allocations must not split the remaining runs
+            // that larger private states require. Keep equal-size requests
+            // in their original order; transfers still follow component order.
+            std::vector<std::size_t> allocation_order(payloads.size());
+            std::iota(allocation_order.begin(), allocation_order.end(), 0);
+            std::ranges::sort(allocation_order, [&](auto a, auto b) {
+              return payloads[a].bytes != payloads[b].bytes
+                         ? payloads[a].bytes > payloads[b].bytes
+                         : a < b;
+            });
+            while (true) {
+              try {
+                if (cache.resources->can_capture &&
+                    !cache.resources->can_capture(payloads))
+                  throw cache::ResourceExhausted();
+                buffers.resize(payloads.size());
+                borrowed.resize(payloads.size());
+                for (const auto i : allocation_order) {
+                  const auto& payload = payloads[i];
+                  buffers[i] = cache.resources->allocate(payload);
+                  borrowed[i] =
+                      buffers[i].borrow &&
+                              payload.category ==
+                                  cache::ResourceCategory::kBackingAssigned
+                          ? cache.resources->adapter->BorrowRowsView(
+                                request.slot.Execution(), payload.component,
+                                payload.first, payload.end)
+                          : std::span<const std::byte>{};
+                }
+                break;
+              } catch (const cache::ResourceExhausted&) {
+                // No transfer has started. Release partial allocations before
+                // eviction, but keep the plan's shared chunks alive. Rebuilding
+                // the whole checkpoint can otherwise lose those predecessors
+                // and allocate their rows again after their last owner leaves.
+                borrowed.clear();
+                buffers.clear();
+                if (!reclaim())
+                  throw;
+              }
             }
             TransferBatch transfers(cache.resources->transfer_batch_size);
             for (std::size_t i = 0; i < payloads.size();) {
@@ -1345,12 +1432,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
           });
       break;
     } catch (const cache::ResourceExhausted&) {
-      bool reclaimed;
-      {
-        const std::lock_guard lock(cache.mutex);
-        reclaimed = cache.retention.Reclaim(retain);
-      }
-      if (!reclaimed) {
+      if (!reclaim()) {
         if (cache.queue && request.purpose != SnapshotPurpose::kHistory)
           if (auto durable = request.CaptureDurable())
             return durable;
@@ -1372,6 +1454,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
     }
   }
   ++request.metrics.captures;
+  request.metrics.captured_checkpoint_ids.push_back(checkpoint->Id().value);
   request.metrics.captured_bytes += captured_capacity;
   request.metrics.borrowed_capacity_bytes += borrowed_capacity;
   request.metrics.copied_payload_bytes += copied_payload;
@@ -1561,6 +1644,11 @@ void ServingCacheLease::AdoptRestoredPrefix(std::size_t tokens,
     throw std::logic_error("component restore is owned by the component cache");
   legacy_.AdoptRestoredPrefix(tokens, bytes, ms);
 }
+void ServingCacheLease::PreparePrefill() {
+  if (component_)
+    component_->PreparePrefill();
+}
+
 std::size_t ServingCacheLease::CaptureBytes() const {
   return component_->CaptureBytes();
 }

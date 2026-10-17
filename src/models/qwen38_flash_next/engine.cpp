@@ -14,6 +14,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/platform/tuning.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -200,6 +201,22 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->device_) {
     return nullptr;
   }
+  if (m->mtp_weights_ && m->device_->output().rows > kMtpDraftVocab) {
+    std::vector<std::int32_t> specials;
+    for (std::uint32_t id = kMtpDraftVocab; id < m->device_->output().rows;
+         ++id)
+      if (m->tokenizer_->IsSpecialToken(id))
+        specials.push_back(static_cast<std::int32_t>(id));
+    // A vocabulary with more special tokens than table rows drafts over the
+    // full head.
+    if (specials.size() < kMtpDraftExtraRows) {
+      m->draft_specials_ = static_cast<std::uint32_t>(specials.size());
+      if (!m->device_->SetDraftVocab(kMtpDraftVocab, std::move(specials),
+                                     error_msg))
+        return nullptr;
+      m->draft_subset_ = true;
+    }
+  }
   rocm::Executor::Options exec;
   exec.max_batch = m->PrefillThroughCapacity();
   exec.max_logit_rows =
@@ -277,6 +294,12 @@ bool Model::HasMtp() const noexcept {
   return device_->has_mtp();
 }
 
+bool Model::InDraftSubset(std::int32_t token) const {
+  return token >= 0 && (static_cast<std::uint32_t>(token) < kMtpDraftVocab ||
+                        tokenizer_->IsSpecialToken(
+                            static_cast<tokenization::TokenId>(token)));
+}
+
 std::string Model::ModelName() const {
   return std::string(reader_->GetMetadataString("general.name")
                          .value_or("Qwen3.8-Flash-Next"));
@@ -321,8 +344,29 @@ Session::Session(std::shared_ptr<Model> model,
     : model_(std::move(model)),
       session_(std::move(session)),
       draft_length_(model_->options_.max_draft_tokens,
-                    model_->DecodeConcurrency()) {
+                    model_->DecodeConcurrency()),
+      draft_vocab_(kMtpDraftExtraRows - model_->draft_specials_) {
   logits_.resize(model_->VocabSize());
+}
+
+bool Session::SyncDraftVocab(std::string* error_msg) {
+  if (!model_->draft_subset_ || !MtpEnabled())
+    return true;
+  auto& exec = *model_->executor_;
+  const auto first = model_->draft_specials_;
+  if (draft_vocab_stale_ || draft_vocab_.scanned() > tokens_.size()) {
+    if (!exec.ClearDraftRows(*session_, first, error_msg))
+      return false;
+    draft_vocab_.Reset();
+    draft_vocab_stale_ = false;
+  }
+  const auto tabled = static_cast<std::uint32_t>(draft_vocab_.rare().size());
+  draft_added_.clear();
+  draft_vocab_.CatchUp(
+      tokens_, [&](std::int32_t token) { return model_->InDraftSubset(token); },
+      &draft_added_);
+  return exec.AppendDraftRows(*session_, first + tabled, draft_added_,
+                              error_msg);
 }
 
 Session::~Session() = default;
@@ -349,13 +393,18 @@ bool Session::EnsureFrontier(std::string* error_msg) const {
 }
 
 void Session::Reset() {
+  ResetImpl(false);
+}
+
+void Session::ResetImpl(bool reuse_mtp) {
   (void)EnsureFrontier();
   if (continuation_hooks_)
     continuation_hooks_->BeforeReset();
   valid_ = false;
-  session_->Reset();
+  session_->Reset(reuse_mtp);
   tokens_.clear();
   lookup_.Clear();
+  ForgetDraftVocab();
   hidden_base_ = 0;
   draft_length_.Reset();
   model_->executor_->MtpRewind(*session_, 0);
@@ -572,6 +621,7 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   }
   tokens_ = std::move(tokens);
   lookup_.Clear();
+  ForgetDraftVocab();
   logits_ = std::move(logits);
   anchor_candidates_valid_ = false;
   hidden_base_ = info.position - info.hidden_rows;
@@ -635,7 +685,7 @@ bool Session::DraftReplay(std::int32_t next_token,
 
 bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
                            std::string* error_msg,
-                           MtpCandidateLogits* candidates) {
+                           MtpCandidateLogits* candidates, bool draft_subset) {
   std::vector<std::int32_t> replay;
   std::int32_t hidden_row = 0;
   if (!DraftReplay(next_token, &replay, &hidden_row, error_msg))
@@ -646,7 +696,8 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
   if (!exec.MtpForward(
           *session_, replay, hidden_row,
           {.token = propose && candidates == nullptr ? &draft_token_ : nullptr,
-           .candidates = candidates},
+           .candidates = candidates,
+           .draft_subset = draft_subset},
           error_msg)) {
     return false;
   }
@@ -901,6 +952,7 @@ struct Session::PendingDecode {
   std::int32_t draft{0};
   /// Trailing chain tokens copied by prompt lookup (after the MTP drafts).
   std::uint32_t lookup{0};
+  bool draft_subset{false};  ///< this cycle drafts through the subset head
 };
 
 namespace {
@@ -1031,6 +1083,18 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // the width is an upper bound.
   const bool survival = model_->options_.mtp_survival && !batch_drafts &&
                         !defer_head && sampler.config().uses_random_sampling();
+  const auto concurrency = model_->DecodeConcurrency();
+  // C1 sampled requests use the subset, including penalties and constraints;
+  // verification corrects their proposals against the full target distribution.
+  // Greedy penalties/constraints retain the full head. Unplanned multi-session
+  // requests also retain it so changed proposal chains cannot delay peers.
+  // Every request keeps the established length controller and AR backoff.
+  const bool unmodified = !sampler.config().uses_random_sampling() &&
+                          !sampler.config().penalties_enabled() &&
+                          !sampler.config().constraint;
+  const bool allow_subset =
+      (unmodified && (concurrency == 1 || batch_drafts.has_value())) ||
+      (concurrency == 1 && sampler.config().uses_random_sampling());
   const std::size_t width =
       MtpEnabled() && cap > 1
           ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
@@ -1082,8 +1146,15 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const bool sampled = sampler.config().uses_random_sampling();
   const bool gpu_greedy = sampler.config().temperature == 0.0F;
   const bool gpu_verification = gpu_greedy;
+  if (allow_subset && !SyncDraftVocab(error_msg))
+    return false;
+  pending->draft_subset = allow_subset && model_->draft_subset_ &&
+                          draft_vocab_.Fits(anchor, [&](std::int32_t token) {
+                            return model_->InDraftSubset(token);
+                          });
   if (!defer_head && !DraftCatchUp(anchor, true, error_msg,
-                                   sampled ? &pending->candidates : nullptr)) {
+                                   sampled ? &pending->candidates : nullptr,
+                                   pending->draft_subset)) {
     return false;
   }
   // A cycle-local proposal stream needs no pending RNG state in snapshots.
@@ -1134,7 +1205,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
           !exec.MtpForward(
               *session_, std::span<const std::int32_t>(&pending->draft, 1), -1,
               {.token = sampled ? nullptr : &pending->draft,
-               .candidates = sampled ? &pending->candidates : nullptr},
+               .candidates = sampled ? &pending->candidates : nullptr,
+               .draft_subset = pending->draft_subset},
               error_msg)) {
         return false;
       }
@@ -1305,6 +1377,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
   stats_.cycles += 1;
   stats_.drafted += k - 1;
   stats_.accepted += keep - 1;
+  stats_.small_head_cycles += pending.draft_subset;
   // Copied proposals trail the MTP drafts; the length controller sees only
   // the MTP part.
   const std::uint32_t mtp_drafts = k - 1 - pending.lookup;
@@ -1567,7 +1640,8 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
           p.chain.size() < p.width) {
         heads.push_back({requests[i].session->session_.get(),
                          {.token = p.sampled ? nullptr : &p.draft,
-                          .candidates = p.sampled ? &p.candidates : nullptr}});
+                          .candidates = p.sampled ? &p.candidates : nullptr,
+                          .draft_subset = p.draft_subset}});
       }
     }
     if (heads.empty())

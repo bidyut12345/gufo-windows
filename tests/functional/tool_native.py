@@ -188,6 +188,23 @@ def check_native_tool_schemas(client, model, checks, chat_result, sampling_prese
             first = record(label, chat_result(client, request, stream))
             assert_bash(first, label)
 
+            # The call the model generated is the call history renders, so the
+            # immediate next turn reuses it from cache instead of re-prefilling
+            # it. Run the unrelated schema control afterwards: it may replace
+            # the live generated frontier while retaining only prompt snapshots.
+            call = first["tools"][0]
+            continued = {**request, "tool_choice": "auto", "messages": [
+                *request["messages"],
+                {"role": "assistant", "content": first["text"] or None, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": call["id"], "content": "native-schemas\n"},
+                {"role": "user", "content": "Reply with the single word DONE."}]}
+            done = record(label + "_continued", chat_result(client, continued, not stream))
+            assert done["finish"] == "stop" and not done["tools"], (label, done)
+            assert cached(done["usage"]) > first["usage"]["prompt_tokens"], (
+                label, "the generated call was not reused on the next turn",
+                first["usage"], done["usage"])
+            assert_native(done, label + "_continued")
+
             # No instruction is added: the prompt matches the control within
             # the spelling of the renamed keyword. The JSON instruction alone
             # was about 45 tokens.
@@ -201,21 +218,6 @@ def check_native_tool_schemas(client, model, checks, chat_result, sampling_prese
             assert tolerance < 30 and abs(delta) <= tolerance, (
                 label, "prompt changed beyond the schema text", delta, tolerance,
                 first["usage"], baseline["usage"])
-
-            # The call the model generated is the call history renders, so the
-            # next turn reuses it from cache instead of re-prefilling it.
-            call = first["tools"][0]
-            continued = {**request, "tool_choice": "auto", "messages": [
-                *request["messages"],
-                {"role": "assistant", "content": first["text"] or None, "tool_calls": [call]},
-                {"role": "tool", "tool_call_id": call["id"], "content": "native-schemas\n"},
-                {"role": "user", "content": "Reply with the single word DONE."}]}
-            done = record(label + "_continued", chat_result(client, continued, not stream))
-            assert done["finish"] == "stop" and not done["tools"], (label, done)
-            assert cached(done["usage"]) > first["usage"]["prompt_tokens"], (
-                label, "the generated call was not reused on the next turn",
-                first["usage"], done["usage"])
-            assert_native(done, label + "_continued")
 
     # Calls to the neighbor itself keep their declared JSON types.
     typed = (
@@ -339,6 +341,44 @@ def check_finite_argument_types(client, model, checks, chat_result, image=None):
                 assert_native(result, label)
                 print(f"CHECK {label}", file=sys.stderr, flush=True)
     check_literal_history(client, model, checks, chat_result, image)
+    check_integer_history(client, model, checks, chat_result)
+
+
+def check_integer_history(client, model, checks, chat_result):
+    """Integers keep their decimal spelling, so replayed calls are reused (#611)."""
+    function = {"name": "read", "description": "Read a local text file.",
+                "parameters": {"type": "object", "properties": {
+                    "path": {"type": "string"}, "limit": {"type": "integer"}},
+                    "required": ["path", "limit"], "additionalProperties": False}}
+    # Both have a shorter exponent spelling (1e+05, 1e+06) than their decimal.
+    for limit in (100000, 1000000):
+        for stream in (False, True):
+            label = f"integer_history_{limit}_{stream}"
+            messages = [{"role": "user", "content":
+                         f"Call read once with path archive-01.txt and limit {limit}."}]
+            request = dict(model=model, messages=messages, temperature=0,
+                           reasoning_effort="none", max_completion_tokens=96,
+                           tools=[{"type": "function", "function": function}],
+                           tool_choice="required", parallel_tool_calls=False)
+            first = chat_result(client, request, stream)
+            checks[label + "_call"] = first
+            assert len(first["tools"]) == 1, (label, first)
+            call = first["tools"][0]
+            arguments = call["function"]["arguments"]
+            assert f'"limit":{limit}' in arguments, (label, arguments)
+            assert type(json.loads(arguments)["limit"]) is int, (label, arguments)
+            # Replay the call exactly as received, as an agent client does.
+            request["messages"] = [*messages, {
+                "role": "assistant", "content": first["text"] or None,
+                "reasoning_content": first["reasoning"], "tool_calls": [call]}, {
+                "role": "tool", "tool_call_id": call["id"], "content": "line 1"}]
+            # Keep tool_choice: changing it alone loses reuse (#619).
+            done = chat_result(client, request, True)
+            checks[label + "_continued"] = done
+            details = done["usage"].get("prompt_tokens_details") or {}
+            assert details.get("cached_tokens", 0) >= first["usage"]["total_tokens"], (
+                label, "replayed integer arguments invalidated the generated call", first, done)
+            print(f"CHECK {label}", file=sys.stderr, flush=True)
 
 
 def check_read_arguments(client, model, checks, chat_result):
@@ -442,7 +482,10 @@ def check_literal_history(client, model, checks, chat_result, image=None):
             assert done["text"].strip() == "DONE" and not done["tools"], done
             details = done["usage"].get("input_tokens_details",
                                        done["usage"].get("prompt_tokens_details"))
-            assert details["cached_tokens"] == first["usage"]["total_tokens"], (
+            # A repeated suite can retain a deeper checkpoint containing the
+            # tool result too. Require the entire generated call to survive;
+            # additional reuse of this identical history is valid.
+            assert details["cached_tokens"] >= first["usage"]["total_tokens"], (
                 label, "literal tool data invalidated unchanged history", first, done)
             print(f"CHECK {label}", file=sys.stderr, flush=True)
 
@@ -529,7 +572,7 @@ def check_llama_cpp_parity(client, model, checks, chat_result, common, deepseek)
     # required tool choice.
     typing = (
         ("str_null", {"type": ["string", "null"]}, "null", None,
-         "Call record with value set to the JSON null."),
+         "Call record with value set to the JSON null literal, not an empty string."),
         ("union_integer", {"anyOf": [{"type": "string"}, {"type": "integer"}]}, "7", 7,
          "Call record with value set to the integer 7."),
         ("all_of_string", {"allOf": [{"type": "string"}, {"minLength": 1}]}, "42", "42",
