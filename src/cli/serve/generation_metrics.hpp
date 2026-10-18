@@ -64,6 +64,14 @@ inline std::atomic<double>& LastGenSpeed() {
   static std::atomic<double> val{0.0};
   return val;
 }
+inline std::atomic<std::uint64_t>& LastPromptTokens() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<std::uint64_t>& LastGenTokens() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
 // Schedulers add their own deltas, so a draining scheduler and its
 // replacement can both contribute during a model reload.
 inline std::atomic<std::int64_t>& RequestsProcessing() {
@@ -112,6 +120,10 @@ inline void RecordRequestMetrics(const TextGenerationBackend::Result& result) {
                                        std::memory_order_relaxed);
   detail::TotalDraftAcceptedTokens().fetch_add(result.draft_accepted_tokens,
                                                std::memory_order_relaxed);
+  detail::LastPromptTokens().store(result.prompt_tokens,
+                                  std::memory_order_relaxed);
+  detail::LastGenTokens().store(result.completion_tokens,
+                                std::memory_order_relaxed);
   const double prompt_per_second = PrefillTokensPerSecond(result);
   const double tok_per_sec =
       (result.decode_ms > 0.0 && result.completion_tokens > 0)

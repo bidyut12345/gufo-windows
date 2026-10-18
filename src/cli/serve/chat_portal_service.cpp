@@ -4,6 +4,8 @@
 
 #include "src/cli/serve/chat_portal_html.hpp"
 #include "src/cli/serve/chat_portal_tools.hpp"
+#include "src/cli/serve/generation_metrics.hpp"
+#include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::server {
@@ -336,6 +338,37 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
         return JsonErr(400, "Bad Request", "Invalid JSON payload");
       }
     }
+  }
+
+  // --- Model Live Monitoring API ---
+  if (req.path == "/api/monitor" && req.method == "GET") {
+    json::Value res = json::Value::object();
+    res["messages_processing"] = static_cast<std::int64_t>(
+        detail::RequestsProcessing().load(std::memory_order_relaxed));
+    res["messages_deferred"] = static_cast<std::int64_t>(
+        detail::RequestsDeferred().load(std::memory_order_relaxed));
+    res["last_prompt_speed"] =
+        detail::LastPromptSpeed().load(std::memory_order_relaxed);
+    res["last_gen_speed"] =
+        detail::LastGenSpeed().load(std::memory_order_relaxed);
+    res["last_prompt_tokens"] = static_cast<std::uint64_t>(
+        detail::LastPromptTokens().load(std::memory_order_relaxed));
+    res["last_gen_tokens"] = static_cast<std::uint64_t>(
+        detail::LastGenTokens().load(std::memory_order_relaxed));
+    res["total_prompt_tokens"] = static_cast<std::uint64_t>(
+        detail::TotalPromptTokens().load(std::memory_order_relaxed));
+    res["total_gen_tokens"] = static_cast<std::uint64_t>(
+        detail::TotalGenTokens().load(std::memory_order_relaxed));
+    res["total_cached_prompt_tokens"] = static_cast<std::uint64_t>(
+        detail::TotalCachedPromptTokens().load(std::memory_order_relaxed));
+    res["total_draft_tokens"] = static_cast<std::uint64_t>(
+        detail::TotalDraftTokens().load(std::memory_order_relaxed));
+    res["total_draft_accepted_tokens"] = static_cast<std::uint64_t>(
+        detail::TotalDraftAcceptedTokens().load(std::memory_order_relaxed));
+    res["total_draft_rounds"] = static_cast<std::uint64_t>(
+        detail::TotalDraftRounds().load(std::memory_order_relaxed));
+    res["memory_status"] = Logger::MemoryStatus();
+    return JsonResponse(200, "OK", res.dump());
   }
 
   // --- Tools & MCP APIs ---

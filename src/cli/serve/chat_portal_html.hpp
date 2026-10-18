@@ -754,6 +754,178 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       cursor: pointer;
     }
 
+    /* Monitor View */
+    .monitor-view {
+      display: none;
+      flex: 1;
+      flex-direction: column;
+      padding: 20px 24px;
+      max-width: 1040px;
+      width: 100%;
+      margin: 0 auto;
+      gap: 16px;
+      overflow-y: auto;
+    }
+    .monitor-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .monitor-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .monitor-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .monitor-live-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.72rem;
+      color: var(--success);
+      background: rgba(34, 197, 94, 0.1);
+      border: 1px solid rgba(34, 197, 94, 0.25);
+      border-radius: var(--radius-sm);
+      padding: 3px 8px;
+      font-family: var(--font-mono);
+    }
+    .monitor-pulse-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--success);
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 0.4; }
+      50% { opacity: 1; transform: scale(1.15); }
+      100% { opacity: 0.4; }
+    }
+    .monitor-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
+    }
+    .monitor-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: border-color 0.15s ease, transform 0.15s ease;
+    }
+    .monitor-card:hover {
+      border-color: var(--border-strong);
+      transform: translateY(-1px);
+    }
+    .monitor-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.76rem;
+      color: var(--text-dim);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .monitor-card-value {
+      font-size: 1.85rem;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      color: var(--text);
+      line-height: 1.1;
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+    }
+    .monitor-card-unit {
+      font-size: 0.82rem;
+      font-weight: 500;
+      color: var(--text-muted);
+    }
+    .monitor-card-footer {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 2px;
+    }
+    .monitor-slots-container {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .monitor-slots-title {
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--text);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .slot-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-size: 0.82rem;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .slot-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      font-size: 0.75rem;
+      padding: 2px 8px;
+      border-radius: 4px;
+    }
+    .slot-badge.idle {
+      background: rgba(113, 113, 122, 0.15);
+      color: var(--text-muted);
+    }
+    .slot-badge.busy {
+      background: rgba(59, 130, 246, 0.18);
+      color: #93c5fd;
+      border: 1px solid rgba(59, 130, 246, 0.4);
+    }
+    .progress-bar-bg {
+      background: var(--bg-elevated);
+      border-radius: 4px;
+      height: 6px;
+      width: 100%;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .progress-bar-fill {
+      background: var(--accent);
+      height: 100%;
+      transition: width 0.3s ease;
+    }
+
     /* Settings Drawer */
     .drawer-backdrop {
       display: none;
@@ -900,14 +1072,160 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       color: #fca5a5;
     }
 
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      backdrop-filter: blur(4px);
+      z-index: 95;
+    }
+    .sidebar-backdrop.show { display: block; }
+    .btn-close-sidebar-mobile {
+      display: none;
+      background: transparent;
+      border: none;
+      color: var(--text-dim);
+      font-size: 1.3rem;
+      cursor: pointer;
+      padding: 4px 8px;
+      line-height: 1;
+    }
+
     @media (max-width: 768px) {
-      aside#sidebar {
-        position: absolute;
-        left: 0; top: 0; bottom: 0;
-        transform: translateX(-100%);
+      header.top-nav {
+        padding: 0 10px;
+        height: 52px;
       }
-      aside#sidebar.open { transform: translateX(0); }
-      .nav-tabs { display: none; }
+      .nav-left {
+        gap: 6px;
+        min-width: 0;
+        flex: 1;
+      }
+      .brand-llama {
+        font-size: 0.92rem;
+        gap: 5px;
+      }
+      .brand-badge {
+        display: none;
+      }
+      .nav-tabs {
+        margin-left: 4px;
+        padding: 2px;
+        display: flex;
+      }
+      .tab-item {
+        padding: 4px 8px;
+        font-size: 0.75rem;
+      }
+      .nav-right {
+        gap: 6px;
+      }
+      .nav-right .btn-top span {
+        display: none;
+      }
+      .nav-right .btn-top {
+        padding: 6px 8px;
+        min-width: 32px;
+        height: 32px;
+      }
+      #slot-indicator {
+        padding: 3px 6px;
+      }
+      #slot-text {
+        display: none;
+      }
+      #model-pill {
+        max-width: 80px;
+        padding: 3px 6px;
+        font-size: 0.68rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .btn-close-sidebar-mobile {
+        display: block;
+      }
+      aside#sidebar {
+        position: fixed;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: 290px;
+        max-width: 85vw;
+        z-index: 100;
+        transform: translateX(-100%);
+        transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+        box-shadow: none;
+      }
+      aside#sidebar.open {
+        transform: translateX(0);
+        box-shadow: 0 0 30px rgba(0, 0, 0, 0.8);
+      }
+      .chat-bottom {
+        padding: 0 8px 8px;
+      }
+      .input-box {
+        padding: 6px 10px;
+        border-radius: 10px;
+      }
+      #chat-input {
+        font-size: 16px;
+      }
+      .chat-messages {
+        padding: 12px 10px;
+      }
+      .msg-group {
+        max-width: 100%;
+      }
+      .chat-stats-footer {
+        flex-direction: column;
+        gap: 2px;
+        align-items: flex-start;
+      }
+      .tools-pill {
+        padding: 3px 6px;
+        font-size: 0.7rem;
+      }
+      #quick-tools-label {
+        font-size: 0.7rem;
+      }
+      .monitor-view {
+        padding: 12px 10px;
+        gap: 12px;
+      }
+      .monitor-grid {
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .monitor-card {
+        padding: 12px 10px;
+      }
+      .monitor-card-value {
+        font-size: 1.35rem;
+      }
+      .completion-view {
+        padding: 12px 10px;
+      }
+      .drawer-panel {
+        width: 100vw;
+        max-width: 100%;
+      }
+      .tools-dialog-box {
+        width: 95%;
+        max-height: 90vh;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .monitor-grid {
+        grid-template-columns: 1fr;
+      }
+      .nav-tabs .tab-item {
+        padding: 3px 6px;
+        font-size: 0.7rem;
+      }
     }
     /* Tools & MCP Styles */
     .tools-pill {
@@ -1142,6 +1460,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       <div class="nav-tabs">
         <button id="tab-nav-chat" class="tab-item active">Chat</button>
         <button id="tab-nav-comp" class="tab-item">Completion</button>
+        <button id="tab-nav-monitor" class="tab-item">Monitor</button>
       </div>
     </div>
 
@@ -1171,10 +1490,13 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     <!-- Left Sidebar -->
     <aside id="sidebar">
       <div class="sidebar-top">
-        <button id="btn-new-chat" class="btn-new-chat">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-          <span>New chat</span>
-        </button>
+        <div style="display:flex; align-items:center; gap:8px; width:100%;">
+          <button id="btn-new-chat" class="btn-new-chat" style="flex:1;">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            <span>New chat</span>
+          </button>
+          <button id="btn-close-sidebar-mobile" class="btn-close-sidebar-mobile" title="Close sidebar">&times;</button>
+        </div>
         <input type="text" id="conv-search-input" class="search-input" placeholder="Search chats...">
       </div>
 
@@ -1192,6 +1514,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         </div>
       </div>
     </aside>
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
 
     <!-- Main Viewport -->
     <main class="content-area">
@@ -1240,6 +1563,130 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           <button id="btn-comp-generate" class="btn-completion-run">Generate</button>
           <button id="btn-comp-clear" class="btn-top">Clear</button>
           <span id="comp-status" style="font-size:0.8rem; color:var(--text-dim); font-family:var(--font-mono);"></span>
+        </div>
+      </div>
+
+      <!-- Monitor Interface -->
+      <div id="monitor-interface" class="monitor-view">
+        <div class="monitor-header">
+          <div class="monitor-title">
+            <span>📊</span>
+            <span>Model Telemetry &amp; System Monitor</span>
+          </div>
+          <div class="monitor-actions">
+            <span class="monitor-live-tag">
+              <span class="monitor-pulse-dot"></span>
+              <span id="monitor-live-status">Live Telemetry</span>
+            </span>
+            <button id="btn-refresh-monitor" class="btn-top" title="Refresh metrics" style="padding:4px 10px;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+              <span>Refresh</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 6 Main KPI Stat Cards -->
+        <div class="monitor-grid">
+          <!-- Card 1: Active Messages Handled -->
+          <div class="monitor-card">
+            <div class="monitor-card-header">
+              <span>Active Messages Handled</span>
+              <span>⚡</span>
+            </div>
+            <div class="monitor-card-value">
+              <span id="mon-val-active-msg">0</span>
+              <span class="monitor-card-unit">in-flight</span>
+            </div>
+            <div class="monitor-card-footer">
+              <span id="mon-sub-queue">Queue: 0 deferred</span> &bull; <span id="mon-sub-slots">1/1 slots idle</span>
+            </div>
+          </div>
+
+          <!-- Card 2: Generation Speed -->
+          <div class="monitor-card">
+            <div class="monitor-card-header">
+              <span>Token Generation Speed</span>
+              <span>🚀</span>
+            </div>
+            <div class="monitor-card-value">
+              <span id="mon-val-gen-spd">0.0</span>
+              <span class="monitor-card-unit">t/s</span>
+            </div>
+            <div class="monitor-card-footer">
+              <span id="mon-sub-gen-type">Current / Last decode speed</span>
+            </div>
+          </div>
+
+          <!-- Card 3: Prompt Speed -->
+          <div class="monitor-card">
+            <div class="monitor-card-header">
+              <span>Prompt Processing Speed</span>
+              <span>🏎️</span>
+            </div>
+            <div class="monitor-card-value">
+              <span id="mon-val-prompt-spd">0.0</span>
+              <span class="monitor-card-unit">prompt t/s</span>
+            </div>
+            <div class="monitor-card-footer">
+              <span id="mon-sub-prompt-type">Prefill &amp; prompt throughput</span>
+            </div>
+          </div>
+
+          <!-- Card 4: Generated Tokens Count -->
+          <div class="monitor-card">
+            <div class="monitor-card-header">
+              <span>Tokens Generated</span>
+              <span>✍️</span>
+            </div>
+            <div class="monitor-card-value">
+              <span id="mon-val-gen-tokens">0</span>
+              <span class="monitor-card-unit">tokens</span>
+            </div>
+            <div class="monitor-card-footer">
+              <span>Total session: </span><b id="mon-sub-total-gen">0</b>
+            </div>
+          </div>
+
+          <!-- Card 5: Prompt Tokens Count -->
+          <div class="monitor-card">
+            <div class="monitor-card-header">
+              <span>Prompt Tokens Count</span>
+              <span>📥</span>
+            </div>
+            <div class="monitor-card-value">
+              <span id="mon-val-prompt-tokens">0</span>
+              <span class="monitor-card-unit">prompt</span>
+            </div>
+            <div class="monitor-card-footer">
+              <span>Total: </span><b id="mon-sub-total-prompt">0</b> &bull; <span style="color:var(--success);">Cached: </span><b id="mon-sub-cached-prompt" style="color:var(--success);">0</b>
+            </div>
+          </div>
+
+          <!-- Card 6: Speculative Decoding & Hardware -->
+          <div class="monitor-card">
+            <div class="monitor-card-header">
+              <span>Speculative Decoding &amp; RAM</span>
+              <span>🧠</span>
+            </div>
+            <div class="monitor-card-value">
+              <span id="mon-val-spec-acc">0%</span>
+              <span class="monitor-card-unit">draft acc</span>
+            </div>
+            <div class="monitor-card-footer">
+              <span id="mon-sub-drafts">Drafts: 0/0</span> &bull; <span id="mon-sub-mem">gfx1151</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Real-Time Slot Activity Card -->
+        <div class="monitor-slots-container">
+          <div class="monitor-slots-title">
+            <span>Hardware Execution Slots</span>
+            <span id="mon-slots-summary" style="font-size:0.75rem; color:var(--text-muted); font-family:var(--font-mono);">1 slot allocated</span>
+          </div>
+          <div id="mon-slots-list" style="display:flex; flex-direction:column; gap:8px;">
+            <!-- Rendered dynamically -->
+          </div>
         </div>
       </div>
     </main>
@@ -1440,12 +1887,34 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     const UI = {
       tabNavChat: $('tab-nav-chat'),
       tabNavComp: $('tab-nav-comp'),
+      tabNavMonitor: $('tab-nav-monitor'),
       chatInterface: $('chat-interface'),
       completionInterface: $('completion-interface'),
+      monitorInterface: $('monitor-interface'),
       slotText: $('slot-text'),
       modelPill: $('model-pill'),
       btnToggleSidebar: $('btn-toggle-sidebar'),
       sidebar: $('sidebar'),
+      sidebarBackdrop: $('sidebar-backdrop'),
+      btnCloseSidebarMobile: $('btn-close-sidebar-mobile'),
+      btnRefreshMonitor: $('btn-refresh-monitor'),
+      monValActiveMsg: $('mon-val-active-msg'),
+      monSubQueue: $('mon-sub-queue'),
+      monSubSlots: $('mon-sub-slots'),
+      monValGenSpd: $('mon-val-gen-spd'),
+      monSubGenType: $('mon-sub-gen-type'),
+      monValPromptSpd: $('mon-val-prompt-spd'),
+      monSubPromptType: $('mon-sub-prompt-type'),
+      monValGenTokens: $('mon-val-gen-tokens'),
+      monSubTotalGen: $('mon-sub-total-gen'),
+      monValPromptTokens: $('mon-val-prompt-tokens'),
+      monSubTotalPrompt: $('mon-sub-total-prompt'),
+      monSubCachedPrompt: $('mon-sub-cached-prompt'),
+      monValSpecAcc: $('mon-val-spec-acc'),
+      monSubDrafts: $('mon-sub-drafts'),
+      monSubMem: $('mon-sub-mem'),
+      monSlotsList: $('mon-slots-list'),
+      monSlotsSummary: $('mon-slots-summary'),
       btnNewChat: $('btn-new-chat'),
       convSearchInput: $('conv-search-input'),
       chatList: $('chat-list'),
@@ -1594,37 +2063,154 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       });
     };
 
-    // Mode Switching (Chat vs Completion)
-    if (UI.tabNavChat) {
-      UI.tabNavChat.addEventListener('click', () => {
-        APP.mode = 'chat';
-        UI.tabNavChat.classList.add('active');
-        if (UI.tabNavComp) UI.tabNavComp.classList.remove('active');
-        if (UI.chatInterface) UI.chatInterface.style.display = 'flex';
-        if (UI.completionInterface) UI.completionInterface.style.display = 'none';
-      });
+    // Mode Switching (Chat vs Completion vs Monitor)
+    function switchTab(mode) {
+      APP.mode = mode;
+      if (UI.tabNavChat) UI.tabNavChat.classList.toggle('active', mode === 'chat');
+      if (UI.tabNavComp) UI.tabNavComp.classList.toggle('active', mode === 'comp');
+      if (UI.tabNavMonitor) UI.tabNavMonitor.classList.toggle('active', mode === 'monitor');
+
+      if (UI.chatInterface) UI.chatInterface.style.display = mode === 'chat' ? 'flex' : 'none';
+      if (UI.completionInterface) UI.completionInterface.style.display = mode === 'comp' ? 'flex' : 'none';
+      if (UI.monitorInterface) UI.monitorInterface.style.display = mode === 'monitor' ? 'flex' : 'none';
+
+      if (mode === 'monitor') {
+        refreshMonitorStats();
+        if (!APP.monitorInterval) {
+          APP.monitorInterval = setInterval(refreshMonitorStats, 2000);
+        }
+      } else {
+        if (APP.monitorInterval) {
+          clearInterval(APP.monitorInterval);
+          APP.monitorInterval = null;
+        }
+      }
     }
 
-    if (UI.tabNavComp) {
-      UI.tabNavComp.addEventListener('click', () => {
-        APP.mode = 'comp';
-        UI.tabNavComp.classList.add('active');
-        if (UI.tabNavChat) UI.tabNavChat.classList.remove('active');
-        if (UI.chatInterface) UI.chatInterface.style.display = 'none';
-        if (UI.completionInterface) UI.completionInterface.style.display = 'flex';
-      });
-    }
+    if (UI.tabNavChat) UI.tabNavChat.addEventListener('click', () => switchTab('chat'));
+    if (UI.tabNavComp) UI.tabNavComp.addEventListener('click', () => switchTab('comp'));
+    if (UI.tabNavMonitor) UI.tabNavMonitor.addEventListener('click', () => switchTab('monitor'));
+    if (UI.btnRefreshMonitor) UI.btnRefreshMonitor.addEventListener('click', () => refreshMonitorStats());
 
     // Sidebar Toggle
+    function toggleSidebar(forceState) {
+      if (!UI.sidebar) return;
+      const isOpen = typeof forceState === 'boolean' ? forceState : !UI.sidebar.classList.contains('open');
+      if (isOpen) {
+        UI.sidebar.classList.add('open');
+        if (UI.sidebarBackdrop) UI.sidebarBackdrop.classList.add('show');
+      } else {
+        UI.sidebar.classList.remove('open');
+        if (UI.sidebarBackdrop) UI.sidebarBackdrop.classList.remove('show');
+      }
+      if (window.innerWidth > 768) {
+        UI.sidebar.style.display = isOpen ? 'flex' : 'none';
+      }
+    }
+
     if (UI.btnToggleSidebar) {
-      UI.btnToggleSidebar.addEventListener('click', () => {
-        if (UI.sidebar) {
-          UI.sidebar.classList.toggle('open');
-          if (window.innerWidth > 768) {
-            UI.sidebar.style.display = UI.sidebar.style.display === 'none' ? 'flex' : 'none';
+      UI.btnToggleSidebar.addEventListener('click', () => toggleSidebar());
+    }
+    if (UI.sidebarBackdrop) {
+      UI.sidebarBackdrop.addEventListener('click', () => toggleSidebar(false));
+    }
+    if (UI.btnCloseSidebarMobile) {
+      UI.btnCloseSidebarMobile.addEventListener('click', () => toggleSidebar(false));
+    }
+
+    // Model Live Telemetry & Monitoring
+    async function refreshMonitorStats() {
+      const headers = APP.token ? { 'Authorization': `Bearer ${APP.token}` } : {};
+      try {
+        const [monRes, slotsRes] = await Promise.all([
+          fetch('/api/monitor', { headers }).catch(() => null),
+          fetch('/slots', { headers }).catch(() => null)
+        ]);
+
+        if (monRes && monRes.ok) {
+          const d = await monRes.json();
+          if (UI.monValActiveMsg) UI.monValActiveMsg.textContent = d.messages_processing || 0;
+          if (UI.monSubQueue) UI.monSubQueue.textContent = `Queue: ${d.messages_deferred || 0} deferred`;
+
+          const genSpd = d.last_gen_speed > 0
+            ? Number(d.last_gen_speed).toFixed(1)
+            : (APP.lastSeenGenSpeed ? Number(APP.lastSeenGenSpeed).toFixed(1) : '0.0');
+          if (UI.monValGenSpd) UI.monValGenSpd.textContent = genSpd;
+
+          const promptSpd = d.last_prompt_speed > 0
+            ? Number(d.last_prompt_speed).toFixed(1)
+            : (APP.lastSeenPromptSpeed ? Number(APP.lastSeenPromptSpeed).toFixed(1) : '0.0');
+          if (UI.monValPromptSpd) UI.monValPromptSpd.textContent = promptSpd;
+
+          const genTok = d.last_gen_tokens || (APP.lastSeenGenTokens || 0);
+          if (UI.monValGenTokens) UI.monValGenTokens.textContent = Number(genTok).toLocaleString();
+          if (UI.monSubTotalGen) UI.monSubTotalGen.textContent = (d.total_gen_tokens || 0).toLocaleString();
+
+          const promptTok = d.last_prompt_tokens || (APP.lastSeenPromptTokens || 0);
+          if (UI.monValPromptTokens) UI.monValPromptTokens.textContent = Number(promptTok).toLocaleString();
+          if (UI.monSubTotalPrompt) UI.monSubTotalPrompt.textContent = (d.total_prompt_tokens || 0).toLocaleString();
+          if (UI.monSubCachedPrompt) UI.monSubCachedPrompt.textContent = (d.total_cached_prompt_tokens || 0).toLocaleString();
+
+          if (d.total_draft_tokens > 0) {
+            const acc = ((d.total_draft_accepted_tokens / d.total_draft_tokens) * 100).toFixed(1) + '%';
+            if (UI.monValSpecAcc) UI.monValSpecAcc.textContent = acc;
+            if (UI.monSubDrafts) UI.monSubDrafts.textContent = `Drafts: ${d.total_draft_accepted_tokens}/${d.total_draft_tokens} (${d.total_draft_rounds || 0} rds)`;
+          } else {
+            if (UI.monValSpecAcc) UI.monValSpecAcc.textContent = '100%';
+            if (UI.monSubDrafts) UI.monSubDrafts.textContent = 'Standard Decode';
+          }
+
+          if (d.memory_status && UI.monSubMem) {
+            UI.monSubMem.textContent = d.memory_status;
           }
         }
-      });
+
+        if (slotsRes && slotsRes.ok) {
+          const slots = await slotsRes.json();
+          if (Array.isArray(slots)) {
+            const busyCount = slots.filter(s => s.is_processing).length;
+            if (UI.monSubSlots) UI.monSubSlots.textContent = `${slots.length - busyCount}/${slots.length} slots idle`;
+            if (UI.monSlotsSummary) UI.monSlotsSummary.textContent = `${slots.length} total slot(s) &bull; ${busyCount} active`;
+
+            if (UI.monSlotsList) {
+              UI.monSlotsList.innerHTML = '';
+              slots.forEach(slot => {
+                const isBusy = slot.is_processing;
+                const promptTokens = slot.n_prompt_tokens || 0;
+                const cachedTokens = slot.n_prompt_tokens_cache || 0;
+                const nextTok = (slot.next_token && slot.next_token[0]) || {};
+                const decodedTokens = nextTok.n_decoded || 0;
+                const maxCtx = slot.n_ctx || 4096;
+                const usedCtx = promptTokens + decodedTokens;
+                const ctxPct = Math.min(100, Math.round((usedCtx / maxCtx) * 100));
+
+                const row = document.createElement('div');
+                row.className = 'slot-row';
+                row.innerHTML = `
+                  <div style="display:flex; align-items:center; gap:8px;">
+                    <span class="slot-badge ${isBusy ? 'busy' : 'idle'}">
+                      <span style="display:inline-block; width:6px; height:6px; border-radius:50%; background:${isBusy ? '#60a5fa' : '#71717a'};"></span>
+                      Slot #${slot.id} ${isBusy ? 'Processing' : 'Idle'}
+                    </span>
+                    <span style="color:var(--text-dim); font-size:0.75rem;">${escapeHtml(slot.model || APP.modelId || 'gufo')}</span>
+                  </div>
+                  <div style="display:flex; align-items:center; gap:12px; font-family:var(--font-mono); font-size:0.75rem;">
+                    <span>Prompt: <b style="color:var(--text);">${promptTokens}</b> <span style="color:var(--success); font-size:0.7rem;">(${cachedTokens} cached)</span></span>
+                    <span>Decoded: <b style="color:var(--accent);">${decodedTokens}</b></span>
+                    <span>Context: <b>${usedCtx}/${maxCtx}</b> (${ctxPct}%)</span>
+                  </div>
+                  <div class="progress-bar-bg">
+                    <div class="progress-bar-fill" style="width: ${ctxPct}%;"></div>
+                  </div>
+                `;
+                UI.monSlotsList.appendChild(row);
+              });
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Failed to update monitor stats', e);
+      }
     }
 
     // Auth Dialog Handling
@@ -2187,6 +2773,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           APP.conversations.unshift(created);
           renderChatList();
           selectChat(created.id);
+          if (window.innerWidth <= 768) toggleSidebar(false);
           return created.id;
         }
       } catch (err) {}
@@ -2208,6 +2795,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     if (UI.btnNewChat) UI.btnNewChat.addEventListener('click', newChat);
 
     async function selectChat(id) {
+      if (window.innerWidth <= 768) toggleSidebar(false);
       APP.activeId = id;
       renderChatList();
       try {
@@ -2704,6 +3292,11 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               ? Number(accumulatedTimings.prompt_per_second).toFixed(1)
               : null;
 
+          APP.lastSeenGenTokens = finalCompTokens;
+          APP.lastSeenPromptTokens = finalPromptTokens;
+          if (evalTps) APP.lastSeenGenSpeed = Number(evalTps);
+          if (promptTps) APP.lastSeenPromptSpeed = Number(promptTps);
+
           if (finalCompTokens > 0 || finalPromptTokens > 0) {
             const usageBadge = document.createElement('div');
             usageBadge.className = 'msg-usage-badge';
@@ -2931,6 +3524,11 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           if (evalTps) statusText += ` | eval: ${evalTps} t/s`;
           if (promptTps) statusText += ` | prompt: ${promptTps} t/s`;
           UI.compStatus.textContent = statusText;
+
+          APP.lastSeenGenTokens = genT;
+          APP.lastSeenPromptTokens = promptT;
+          if (evalTps) APP.lastSeenGenSpeed = Number(evalTps);
+          if (promptTps) APP.lastSeenPromptSpeed = Number(promptTps);
         }
       } catch (err) {
         UI.compStatus.textContent = 'Error: ' + err.message;
