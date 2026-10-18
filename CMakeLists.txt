@@ -62,6 +62,13 @@ else()
   pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
 endif()
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+find_package(unofficial-sqlite3 CONFIG QUIET)
+if (TARGET unofficial::sqlite3::sqlite3)
+  set(SQLITE3_TARGET unofficial::sqlite3::sqlite3)
+else()
+  find_package(SQLite3 REQUIRED)
+  set(SQLITE3_TARGET SQLite::SQLite3)
+endif()
 set(GUFO_FFMPEG_EXECUTABLE "ffmpeg" CACHE STRING
   "FFmpeg executable used for generated media")
 set(GUFO_FFPROBE_EXECUTABLE "ffprobe" CACHE STRING
@@ -283,11 +290,14 @@ add_library(gufo_http STATIC
   src/cli/serve/asr_websocket.cpp
   src/cli/serve/tts_websocket.cpp
   src/cli/serve/openai_chat.cpp
+  src/cli/serve/chat_portal_db.cpp
+  src/cli/serve/chat_portal_tools.cpp
+  src/cli/serve/chat_portal_service.cpp
   # The DeepSeek tool-call scanner lives with its model; its renderer stays in
   # the engine library, so no translation unit is linked twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21)
+target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21 ${SQLITE3_TARGET} CURL::libcurl)
 
 add_executable(gufo
   src/cli/main.cpp
@@ -351,8 +361,7 @@ if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
   )
   target_compile_definitions(gufo-kernel-bench PRIVATE
     GUFO_REVISION="${GUFO_REVISION}")
-  target_include_directories(gufo-kernel-bench SYSTEM PRIVATE
-    ${ROCTX_INCLUDE_DIR})
+
   target_link_libraries(gufo-kernel-bench PRIVATE
     gufo_kernel_bench_support
     gufo_diagnostics
@@ -513,6 +522,11 @@ if (BUILD_TESTING)
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)
   set_tests_properties(http_server_test PROPERTIES LABELS "cpu;server;http" TIMEOUT 30)
+
+  add_executable(chat_portal_test tests/cli/chat_portal_test.cpp)
+  target_link_libraries(chat_portal_test PRIVATE gufo_http)
+  add_test(NAME chat_portal_test COMMAND chat_portal_test)
+  set_tests_properties(chat_portal_test PROPERTIES LABELS "cpu;server;chat_portal" TIMEOUT 30)
   add_executable(audio_websocket_test tests/cli/audio_websocket_test.cpp)
   target_link_libraries(audio_websocket_test PRIVATE gufo_http)
   add_test(NAME audio_websocket_test COMMAND audio_websocket_test)

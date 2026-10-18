@@ -89,6 +89,8 @@ function Start-Plan($Plan) {
   Write-Host $Plan.Title -ForegroundColor Cyan
   Write-Host "$envText`"$exe`" $shown" -ForegroundColor DarkGray
   if ($DryRun) { return }
+  Write-Host ("Web Chat:   http://{0}:{1}/   (Chat portal with multi-device history)" -f
+    $(if ($Plan.Host -eq "0.0.0.0") { "<this-pc>" } else { "127.0.0.1" }), $port) -ForegroundColor Cyan
   Write-Host ("OpenAI API: http://{0}:{1}/v1  model `"{2}`"   (ready at event=listening; Ctrl+C stops)" -f
     $(if ($Plan.Host -eq "0.0.0.0") { "<this-pc>" } else { "127.0.0.1" }), $port, $Plan.ServedName) -ForegroundColor Green
   Write-Host ""

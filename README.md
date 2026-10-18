@@ -13,7 +13,40 @@ See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-
 for user-facing changes and release history.
 
 > [!NOTE]
-> This repository provides native Windows 11 x64 support (`gfx1151`) with AMD TheRock ROCm, fully updated with the latest upstream Gufo features and optimizations. For multi-node environments, see [Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo).
+> This repository provides native Windows 11 x64 support (`gfx1151`) with AMD TheRock ROCm, fully updated with the latest upstream Gufo features, a complete llama.cpp-style Gufo Chat Web UI with SQLite multi-device persistence, all 9 built-in llama.cpp tools, and Model Context Protocol (MCP) server support. For multi-node environments, see [Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo).
+
+## Gufo Windows Edition (`gufo-windows`)
+
+This fork delivers full native Windows 11 AMD Strix Halo (`gfx1151`) support, featuring:
+
+- **Native Strix Halo Acceleration**: Compiles directly for AMD Radeon 8060S (`gfx1151`) on Windows 11 with AMD TheRock ROCm 10.0.0 and MSVC C++20 without WSL or virtual machines.
+- **Gufo Chat Web UI**:
+  - Full-featured web interface accessible at `http://localhost:8080/`.
+  - **SQLite Server Database** (`%LOCALAPPDATA%\gufo\chat_portal.db`) with multi-device cross-browser chat synchronization.
+  - **User Authentication**: Multi-user registration, secure password hashing, and persistent JWT session tokens.
+  - **Real-Time Streaming**: Live token-by-token SSE streaming, evaluation throughput metrics (`t/s`), and interactive thought/reasoning accordions (`<think>`).
+  - **Multimodal Support**: Drag-and-drop / file upload / paste image attachments for vision-capable models.
+  - **Sampling Controls & Settings**: Temperature, Top-P, and Max Tokens configuration drawer.
+  - **Raw Text Completion**: Dedicated interface for raw prompt continuation.
+- **Built-in System Tools (all 9 from llama.cpp)**:
+  - `get_datetime`: Current ISO-8601 date, time, timezone, and weekday.
+  - `read_file`: Filesystem reader with offset and limit safety controls.
+  - `write_file`: File creation and overwriting.
+  - `edit_file`: Exact string search-and-replace within files.
+  - `apply_diff`: Unified diff patch application.
+  - `file_glob_search`: Recursive workspace glob search.
+  - `grep_search`: Regex and substring content search.
+  - `exec_shell_command`: Command execution on host (PowerShell / Windows CMD).
+  - `fetch_web_page`: HTTP/HTTPS web fetcher with automatic markdown extraction.
+  - Per-user toggle switches, **Enable All**, and **Disable All** controls saved in SQLite.
+- **Model Context Protocol (MCP) & Custom Tools**:
+  - Connect external Model Context Protocol (MCP) servers via `SSE` or `HTTP` stream.
+  - One-click tool discovery & synchronization (`tools/list`).
+  - Custom function tool definitions with JSON Schema parameter validation and optional webhook handlers.
+  - Multi-turn autonomous agentic execution loop with interactive running/completion cards.
+- **One-Click Windows Launcher**:
+  - `start.cmd` and `tools\windows\launcher.ps1` for automatic model detection, draft selection, and context sizing.
+
 
 ## Models and benchmarks
 

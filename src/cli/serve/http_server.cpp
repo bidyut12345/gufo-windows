@@ -38,6 +38,8 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
+#include "src/cli/serve/chat_portal_db.hpp"
+#include "src/cli/serve/chat_portal_service.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
@@ -353,7 +355,7 @@ std::string BuildResponseHead(const HttpResponse& resp,
     out += "Content-Length: " + std::to_string(*content_length) + "\r\n";
   }
   out += "Access-Control-Allow-Origin: *\r\n";
-  out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
+  out += "Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS\r\n";
   out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
   for (const auto& [name, value] : resp.headers) {
     out += name;
@@ -689,7 +691,9 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
   if (const auto* model = body.find("model"); model != nullptr) {
     if (!model->is_string())
       return InvalidCompatibilityRequest("'model' must be a string");
-    if (model->str() != backend.model_id())
+    if (!model->str().empty() && model->str() != "default" &&
+        model->str() != "loading model..." &&
+        model->str() != backend.model_id())
       return Err(404, "Not Found", "requested model is not loaded",
                  "invalid_request_error", "model_not_found");
   }
@@ -1901,6 +1905,11 @@ void HttpServer::run(bool handle_signals) {
           " auth=" + (options_.api_key.empty() ? "off" : "bearer") +
           " max_connections=" + std::to_string(options_.max_connections) +
           " max_body_bytes=" + std::to_string(options_.max_request_body_bytes));
+  Logger::Info(
+      "server",
+      "event=chat_portal web_ui=http://" +
+          (host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") +
+          ":" + std::to_string(port_) + "/");
   while (!stopped_.load(std::memory_order_acquire)) {
     (void)device_lost();
     if (handle_signals) {
@@ -2015,11 +2024,19 @@ void HttpServer::reap_workers() {
 }
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
+  if (ChatPortalService::IsPortalRoute(req)) {
+    return ChatPortalService::Handle(req, ChatDatabase::Instance());
+  }
+
   if (!IsAuthorized(req, api_key_hash_)) {
-    auto response = Err(401, "Unauthorized", "missing or invalid API key",
-                        "authentication_error", "invalid_api_key");
-    response.headers.emplace_back("WWW-Authenticate", "Bearer");
-    return response;
+    const auto portal_token = ChatPortalService::ExtractBearerToken(req);
+    if (portal_token.empty() ||
+        !ChatDatabase::Instance().AuthenticateToken(portal_token).has_value()) {
+      auto response = Err(401, "Unauthorized", "missing or invalid API key",
+                          "authentication_error", "invalid_api_key");
+      response.headers.emplace_back("WWW-Authenticate", "Bearer");
+      return response;
+    }
   }
   // `/health` and `/ready` are the native spelling and match llama-server's
   // `/health`. `/healthz` and `/readyz` are aliases so Kubernetes-style probe

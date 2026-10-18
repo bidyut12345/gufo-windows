@@ -834,8 +834,9 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                  "invalid_model");
   }
   output->model = body.member_str("model");
-  if (output->model.empty()) {
-    return Error(400, "Bad Request", "'model' is required", "missing_model");
+  if (output->model.empty() || output->model == "default" ||
+      output->model == "loading model...") {
+    output->model = backend.model_id();
   }
   if (output->model != backend.model_id()) {
     return Error(404, "Not Found",
