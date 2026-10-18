@@ -530,27 +530,57 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     }
     .md-content th { background: var(--bg-elevated); }
 
-    /* Message Actions */
+    /* Message Actions & Usage Badge */
     .msg-actions {
       display: flex;
-      gap: 6px;
+      align-items: center;
+      gap: 8px;
       margin-top: 6px;
+      flex-wrap: wrap;
     }
     .btn-msg-action {
       background: transparent;
-      border: none;
+      border: 1px solid var(--border);
       color: var(--text-dim);
       font-size: 0.72rem;
       cursor: pointer;
       display: flex;
       align-items: center;
       gap: 4px;
-      padding: 2px 6px;
+      padding: 2px 8px;
       border-radius: var(--radius-sm);
+      transition: all 0.15s ease;
     }
     .btn-msg-action:hover {
       background: var(--bg-card);
       color: var(--text-muted);
+      border-color: var(--border-strong);
+    }
+    .msg-usage-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 2px 8px;
+      font-family: var(--font-mono);
+      white-space: nowrap;
+    }
+    .msg-usage-badge .usage-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+    }
+    .msg-usage-badge .usage-val {
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+    .msg-usage-badge .usage-accent {
+      color: var(--accent);
+      font-weight: 600;
     }
 
     /* Chat Input Area */
@@ -2521,6 +2551,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           let startTime = performance.now();
           let genTokens = 0;
           let accumulatedToolCalls = [];
+          let accumulatedUsage = null;
+          let accumulatedTimings = null;
 
           APP.abortController = new AbortController();
 
@@ -2530,6 +2562,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               model: reqModel,
               messages: msgs,
               stream: true,
+              stream_options: { include_usage: true },
+              include_usage: true,
               temperature: Number(APP.settings.temperature) || 0.6,
               top_p: Number(APP.settings.top_p) || 0.95,
               max_tokens: parseInt(APP.settings.max_tokens, 10) || 4096
@@ -2580,6 +2614,13 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
                 try {
                   const chunk = JSON.parse(dataStr);
+                  if (chunk.usage) {
+                    accumulatedUsage = chunk.usage;
+                  }
+                  if (chunk.timings) {
+                    accumulatedTimings = chunk.timings;
+                  }
+
                   const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
                   if (delta) {
                     if (delta.reasoning_content || delta.thought) {
@@ -2635,6 +2676,67 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             }
             break;
           }
+
+          // Add Message Actions & Token Usage Badge to the completed assistant turn
+          const actions = document.createElement('div');
+          actions.className = 'msg-actions';
+
+          const btnCopy = document.createElement('button');
+          btnCopy.className = 'btn-msg-action';
+          btnCopy.innerHTML = '&#128203; Copy';
+          btnCopy.onclick = () => navigator.clipboard.writeText(assistantText || '');
+          actions.appendChild(btnCopy);
+
+          const finalCompTokens = accumulatedUsage ? (accumulatedUsage.completion_tokens ?? genTokens) : genTokens;
+          const finalPromptTokens = accumulatedUsage ? (accumulatedUsage.prompt_tokens ?? 0) : 0;
+          const finalCachedTokens = accumulatedUsage ? (accumulatedUsage.cached_tokens ?? (accumulatedUsage.prompt_tokens_details && accumulatedUsage.prompt_tokens_details.cached_tokens ? accumulatedUsage.prompt_tokens_details.cached_tokens : 0)) : 0;
+          const finalTotalTokens = accumulatedUsage ? (accumulatedUsage.total_tokens ?? (finalPromptTokens + finalCompTokens)) : (finalPromptTokens + finalCompTokens);
+
+          const evalTps = (accumulatedUsage && accumulatedUsage.completion_tokens_per_second)
+            ? Number(accumulatedUsage.completion_tokens_per_second).toFixed(1)
+            : (accumulatedTimings && accumulatedTimings.predicted_per_second)
+              ? Number(accumulatedTimings.predicted_per_second).toFixed(1)
+              : (finalCompTokens > 0 ? (finalCompTokens / Math.max(0.001, (performance.now() - startTime) / 1000)).toFixed(1) : null);
+
+          const promptTps = (accumulatedUsage && accumulatedUsage.prompt_tokens_per_second)
+            ? Number(accumulatedUsage.prompt_tokens_per_second).toFixed(1)
+            : (accumulatedTimings && accumulatedTimings.prompt_per_second)
+              ? Number(accumulatedTimings.prompt_per_second).toFixed(1)
+              : null;
+
+          if (finalCompTokens > 0 || finalPromptTokens > 0) {
+            const usageBadge = document.createElement('div');
+            usageBadge.className = 'msg-usage-badge';
+            let badgeHtml = `<span class="usage-item" title="Completion tokens"><span class="usage-accent">${finalCompTokens}</span> tokens</span>`;
+            if (finalPromptTokens > 0) {
+              badgeHtml += ` &bull; <span class="usage-item" title="Prompt tokens"><span class="usage-val">${finalPromptTokens}</span> prompt</span>`;
+              if (finalCachedTokens > 0) {
+                badgeHtml += ` <span class="usage-item" style="color:var(--success);" title="Cached prompt tokens">(${finalCachedTokens} cached)</span>`;
+              }
+            }
+            if (evalTps && Number(evalTps) > 0) {
+              badgeHtml += ` &bull; <span class="usage-item" title="Generation speed"><span class="usage-val">${evalTps}</span> t/s</span>`;
+            }
+            if (promptTps && Number(promptTps) > 0) {
+              badgeHtml += ` &bull; <span class="usage-item" title="Prefill speed"><span class="usage-val">${promptTps}</span> prompt t/s</span>`;
+            }
+            if (accumulatedUsage && accumulatedUsage.draft_tokens > 0) {
+              const accPct = ((accumulatedUsage.draft_tokens_accepted || 0) / accumulatedUsage.draft_tokens * 100).toFixed(0);
+              badgeHtml += ` &bull; <span class="usage-item" title="Draft acceptance rate"><span class="usage-val">${accPct}%</span> draft acc</span>`;
+            }
+            usageBadge.innerHTML = badgeHtml;
+            actions.appendChild(usageBadge);
+
+            // Update footer speed metrics
+            let footerText = `eval: ${evalTps || '0.0'} t/s`;
+            if (promptTps && Number(promptTps) > 0) footerText += ` | prompt: ${promptTps} t/s`;
+            if (finalCachedTokens > 0) footerText += ` | cached: ${finalCachedTokens}`;
+            footerText += ` | total: ${finalTotalTokens} tokens`;
+            UI.footerSpeedMetrics.textContent = footerText;
+          }
+
+          group.appendChild(actions);
+          scrollDown();
 
           // Check if model emitted text-based tool calls e.g. <tool_call>{"name":"...","arguments":{...}}</tool_call>
           if (accumulatedToolCalls.length === 0 && assistantText.includes('<tool_call>')) {
@@ -2803,6 +2905,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             prompt: prompt,
             model: reqModel,
             stream: false,
+            include_usage: true,
             n_predict: parseInt(APP.settings.max_tokens, 10) || 4096,
             temperature: Number(APP.settings.temperature) || 0.6,
             top_p: Number(APP.settings.top_p) || 0.95
@@ -2814,7 +2917,20 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         }
         if (data.content !== undefined) {
           UI.compInput.value += data.content;
-          UI.compStatus.textContent = `done: ${data.tokens_predicted || 0} tokens generated`;
+          const u = data.usage || {};
+          const t = data.timings || {};
+          const genT = data.tokens_predicted ?? u.completion_tokens ?? 0;
+          const promptT = data.tokens_evaluated ?? u.prompt_tokens ?? 0;
+          const cachedT = data.tokens_cached ?? u.cached_tokens ?? 0;
+          const evalTps = (t.predicted_per_second || u.completion_tokens_per_second) ? Number(t.predicted_per_second || u.completion_tokens_per_second).toFixed(1) : null;
+          const promptTps = (t.prompt_per_second || u.prompt_tokens_per_second) ? Number(t.prompt_per_second || u.prompt_tokens_per_second).toFixed(1) : null;
+
+          let statusText = `done: ${genT} tokens generated`;
+          if (promptT > 0) statusText += ` | ${promptT} prompt`;
+          if (cachedT > 0) statusText += ` (${cachedT} cached)`;
+          if (evalTps) statusText += ` | eval: ${evalTps} t/s`;
+          if (promptTps) statusText += ` | prompt: ${promptTps} t/s`;
+          UI.compStatus.textContent = statusText;
         }
       } catch (err) {
         UI.compStatus.textContent = 'Error: ' + err.message;

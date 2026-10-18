@@ -948,6 +948,10 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
       output->include_usage = include_usage->as_bool();
     }
   }
+  if (const json::Value* root_usage = body.find("include_usage");
+      root_usage != nullptr && root_usage->is_bool()) {
+    output->include_usage = root_usage->as_bool();
+  }
 
   const char* max_tokens_field = "max_completion_tokens";
   const json::Value* max_tokens = body.find(max_tokens_field);

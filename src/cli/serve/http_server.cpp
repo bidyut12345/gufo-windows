@@ -898,6 +898,10 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
       include_usage = value.as_bool();
     }
   }
+  if (const auto* root_usage = body.find("include_usage");
+      root_usage != nullptr && root_usage->is_bool()) {
+    include_usage = root_usage->as_bool();
+  }
   bool ignore_eos = false;
   if (const auto* value = body.find("ignore_eos")) {
     if (!value->is_bool())
