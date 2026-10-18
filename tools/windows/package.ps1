@@ -47,7 +47,7 @@ Copy-Item (Join-Path $root "tools\windows\launcher.ps1"), (Join-Path $root "tool
 Copy-Item (Join-Path $root "LICENSE") $stage
 Copy-Item (Join-Path $root "tools\windows\prebuilt\README.txt"), (Join-Path $root "tools\windows\prebuilt\THIRD-PARTY.txt") $stage
 $commit = (& git -C $root rev-parse --short HEAD 2>$null)
-Add-Content (Join-Path $stage "README.txt") "`r`nBuilt from https://github.com/pixmaate/gufo commit $commit ($Version)."
+Add-Content (Join-Path $stage "README.txt") "`r`nBuilt from https://github.com/bidyut12345/gufo-windows commit $commit ($Version)."
 
 $zip = Join-Path $Out "$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
