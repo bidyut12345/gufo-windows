@@ -177,6 +177,257 @@ std::string Logger::MemoryStatus() {
   return output.str();
 }
 
+namespace {
+
+std::size_t VisibleLength(std::string_view s) {
+  std::size_t len = 0;
+  bool in_escape = false;
+  for (std::size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '\033') {
+      in_escape = true;
+    } else if (in_escape) {
+      if (s[i] == 'm') {
+        in_escape = false;
+      }
+    } else {
+      const unsigned char c = static_cast<unsigned char>(s[i]);
+      if ((c & 0xc0) != 0x80) {
+        ++len;
+      }
+    }
+  }
+  return len;
+}
+
+std::string CommaNumber(std::string_view s) {
+  if (s.empty()) return "0";
+  bool all_digits = true;
+  for (char c : s) {
+    if (!std::isdigit(static_cast<unsigned char>(c))) {
+      all_digits = false;
+      break;
+    }
+  }
+  if (!all_digits) return std::string(s);
+  std::string res;
+  res.reserve(s.size() + s.size() / 3);
+  int count = 0;
+  for (int i = static_cast<int>(s.size()) - 1; i >= 0; --i) {
+    if (count > 0 && count % 3 == 0) {
+      res.push_back(',');
+    }
+    res.push_back(s[i]);
+    ++count;
+  }
+  std::reverse(res.begin(), res.end());
+  return res;
+}
+
+std::string FriendlyBytes(std::string_view s) {
+  if (s.empty()) return "0 B";
+  try {
+    double bytes = std::stod(std::string(s));
+    char buf[64];
+    if (bytes >= 1024.0 * 1024.0 * 1024.0) {
+      std::snprintf(buf, sizeof(buf), "%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+      return buf;
+    }
+    if (bytes >= 1024.0 * 1024.0) {
+      std::snprintf(buf, sizeof(buf), "%.1f MB", bytes / (1024.0 * 1024.0));
+      return buf;
+    }
+    if (bytes >= 1024.0) {
+      std::snprintf(buf, sizeof(buf), "%.1f KB", bytes / 1024.0);
+      return buf;
+    }
+    std::snprintf(buf, sizeof(buf), "%.0f B", bytes);
+    return buf;
+  } catch (...) {
+    return std::string(s);
+  }
+}
+
+std::string ExtractField(std::string_view text, std::string_view key) {
+  std::string needle = std::string(key) + "=";
+  std::size_t pos = text.find(needle);
+  if (pos == std::string_view::npos) return "";
+  pos += needle.size();
+  std::size_t end = text.find(' ', pos);
+  if (end == std::string_view::npos) end = text.size();
+  return std::string(text.substr(pos, end - pos));
+}
+
+std::string FormatRequestTable(
+    std::string_view id, std::string_view method, std::string_view path,
+    int status_code, double duration_ms, std::string_view outcome,
+    std::string_view details, std::string_view mem, bool color) {
+  std::string all_details = std::string(details) + " " + std::string(mem);
+
+  std::string prompt_tokens = ExtractField(all_details, "prompt_tokens");
+  std::string prefill_tokens = ExtractField(all_details, "prefill_tokens");
+  std::string generated_tokens = ExtractField(all_details, "generated_tokens");
+  std::string finish = ExtractField(all_details, "finish");
+  std::string cache = ExtractField(all_details, "cache");
+  std::string cached_tokens = ExtractField(all_details, "cached_tokens");
+  std::string cache_restore_ms = ExtractField(all_details, "cache_restore_ms");
+  std::string queue_depth = ExtractField(all_details, "queue_depth");
+  std::string resident_at_admission = ExtractField(all_details, "resident_at_admission");
+  std::string queue_ms = ExtractField(all_details, "queue_ms");
+  std::string shared_prefix_wait_ms = ExtractField(all_details, "shared_prefix_wait_ms");
+  std::string ttft_ms = ExtractField(all_details, "ttft_ms");
+  std::string prefill_tps = ExtractField(all_details, "prefill_tps");
+  std::string decode_tps = ExtractField(all_details, "decode_tps");
+  std::string batch_width = ExtractField(all_details, "batch_width");
+  std::string plan = ExtractField(all_details, "plan");
+  std::string draft_accepted = ExtractField(all_details, "draft_accepted");
+  std::string draft_proposed = ExtractField(all_details, "draft_proposed");
+  std::string draft_rounds = ExtractField(all_details, "draft_rounds");
+  std::string acceptance_pct = ExtractField(all_details, "acceptance_pct");
+  std::string lookup_accepted = ExtractField(all_details, "lookup_accepted");
+  std::string lookup_proposed = ExtractField(all_details, "lookup_proposed");
+  std::string cache_reuse = ExtractField(all_details, "cache_reuse");
+  std::string cache_captures = ExtractField(all_details, "cache_captures");
+  std::string cache_captured_capacity_bytes = ExtractField(all_details, "cache_captured_capacity_bytes");
+  std::string cache_global_ledger_bytes = ExtractField(all_details, "cache_global_ledger_bytes");
+  std::string cache_snapshot_bytes = ExtractField(all_details, "cache_snapshot_bytes");
+  std::string rss_mib = ExtractField(all_details, "rss_mib");
+  std::string host_available_mib = ExtractField(all_details, "host_available_mib");
+
+  constexpr int kWidth = 84;
+  std::string hline;
+  for (int i = 0; i < kWidth - 2; ++i) hline += "-";
+
+  auto make_line = [&](std::string_view left, std::string_view right = "") -> std::string {
+    std::string l(left);
+    std::string r(right);
+    const int total_chars = static_cast<int>(VisibleLength(l) + VisibleLength(r));
+    int space_needed = (kWidth - 4) - total_chars;
+    if (space_needed < 1) space_needed = 1;
+    std::string line = "| ";
+    line += l;
+    line.append(space_needed, ' ');
+    line += r;
+    line += " |";
+    return line;
+  };
+
+  auto make_section = [&](std::string_view title) -> std::string {
+    std::string s = "+- " + std::string(title) + " ";
+    int fill = (kWidth - 1) - static_cast<int>(title.size() + 4);
+    if (fill < 1) fill = 1;
+    for (int i = 0; i < fill; ++i) s += "-";
+    s += "+";
+    return s;
+  };
+
+  const char* c_reset = color ? "\033[0m" : "";
+  const char* c_green = color ? "\033[1;32m" : "";
+  const char* c_yellow = color ? "\033[1;33m" : "";
+  const char* c_red = color ? "\033[1;31m" : "";
+
+  std::ostringstream out;
+  out << "+" << hline << "+\n";
+
+  // Header Row
+  char title_left[128];
+  std::snprintf(title_left, sizeof(title_left), "GUFO REQUEST: %.*s (%s%d %.*s%s)",
+                static_cast<int>(id.size()), id.data(),
+                (status_code < 400 ? c_green : (status_code < 500 ? c_yellow : c_red)),
+                status_code,
+                static_cast<int>(outcome.size()), outcome.data(),
+                c_reset);
+  char title_right[128];
+  std::snprintf(title_right, sizeof(title_right), "Duration: %.1f ms", duration_ms);
+  out << make_line(title_left, title_right) << '\n';
+
+  char route_left[128];
+  std::snprintf(route_left, sizeof(route_left), "Endpoint: %.*s %.*s",
+                static_cast<int>(method.size()), method.data(),
+                static_cast<int>(path.size()), path.data());
+  char route_right[128];
+  std::snprintf(route_right, sizeof(route_right), "Plan: %s (width %s)",
+                plan.empty() ? "default" : plan.c_str(),
+                batch_width.empty() ? "1" : batch_width.c_str());
+  out << make_line(route_left, route_right) << '\n';
+
+  // Section: Token & Throughput
+  out << make_section("Token Metrics & Speed") << '\n';
+  char tok1_l[128], tok1_r[128];
+  std::snprintf(tok1_l, sizeof(tok1_l), "Prompt Tokens:    %s", CommaNumber(prompt_tokens).c_str());
+  std::snprintf(tok1_r, sizeof(tok1_r), "Prefill Speed:  %s tok/s", prefill_tps.empty() ? "0.0" : prefill_tps.c_str());
+  out << make_line(tok1_l, tok1_r) << '\n';
+
+  char tok2_l[128], tok2_r[128];
+  std::snprintf(tok2_l, sizeof(tok2_l), "Prefill Tokens:   %s", CommaNumber(prefill_tokens).c_str());
+  std::snprintf(tok2_r, sizeof(tok2_r), "Decode Speed:   %s tok/s", decode_tps.empty() ? "0.0" : decode_tps.c_str());
+  out << make_line(tok2_l, tok2_r) << '\n';
+
+  char tok3_l[128], tok3_r[128];
+  std::snprintf(tok3_l, sizeof(tok3_l), "Generated Tokens: %s (finish: %s)",
+                CommaNumber(generated_tokens).c_str(), finish.empty() ? "stop" : finish.c_str());
+  std::snprintf(tok3_r, sizeof(tok3_r), "Cached Tokens:  %s (%s)",
+                CommaNumber(cached_tokens).c_str(), cache.empty() ? "none" : cache.c_str());
+  out << make_line(tok3_l, tok3_r) << '\n';
+
+  // Section: Latency & Scheduling
+  out << make_section("Latency & Scheduling") << '\n';
+  char lat1_l[128], lat1_r[128];
+  std::snprintf(lat1_l, sizeof(lat1_l), "Time To First Token: %s ms", ttft_ms.empty() ? "0.0" : ttft_ms.c_str());
+  std::snprintf(lat1_r, sizeof(lat1_r), "Queue Wait:     %s ms (depth %s)",
+                queue_ms.empty() ? "0.0" : queue_ms.c_str(),
+                queue_depth.empty() ? "0" : queue_depth.c_str());
+  out << make_line(lat1_l, lat1_r) << '\n';
+
+  char lat2_l[128], lat2_r[128];
+  std::snprintf(lat2_l, sizeof(lat2_l), "KV Cache Restore:    %s ms", cache_restore_ms.empty() ? "0.0" : cache_restore_ms.c_str());
+  std::snprintf(lat2_r, sizeof(lat2_r), "Shared Prefix:  %s ms (resident %s)",
+                shared_prefix_wait_ms.empty() ? "0.0" : shared_prefix_wait_ms.c_str(),
+                resident_at_admission.empty() ? "0" : resident_at_admission.c_str());
+  out << make_line(lat2_l, lat2_r) << '\n';
+
+  // Section: Speculative & Lookup (if present)
+  if (!draft_proposed.empty() || !lookup_proposed.empty()) {
+    out << make_section("Speculative Decoding & Lookup") << '\n';
+    if (!draft_proposed.empty()) {
+      char draft_l[128], draft_r[128];
+      std::snprintf(draft_l, sizeof(draft_l), "Draft Tokens:     %s/%s accepted (%s%%)",
+                    draft_accepted.c_str(), draft_proposed.c_str(), acceptance_pct.c_str());
+      std::snprintf(draft_r, sizeof(draft_r), "Draft Rounds:   %s", draft_rounds.c_str());
+      out << make_line(draft_l, draft_r) << '\n';
+    }
+    if (!lookup_proposed.empty()) {
+      char look_l[128];
+      std::snprintf(look_l, sizeof(look_l), "Prompt Lookup:    %s/%s accepted",
+                    lookup_accepted.c_str(), lookup_proposed.c_str());
+      out << make_line(look_l) << '\n';
+    }
+  }
+
+  // Section: Memory & Cache Ledger
+  out << make_section("Memory & Cache Ledger") << '\n';
+  char mem1_l[128], mem1_r[128];
+  std::snprintf(mem1_l, sizeof(mem1_l), "Cache Ledger:     %s (%s)",
+                FriendlyBytes(cache_global_ledger_bytes).c_str(),
+                cache_reuse.empty() ? "ram" : cache_reuse.c_str());
+  std::snprintf(mem1_r, sizeof(mem1_r), "Captured Cap:   %s (%s caps)",
+                FriendlyBytes(cache_captured_capacity_bytes).c_str(),
+                cache_captures.empty() ? "0" : cache_captures.c_str());
+  out << make_line(mem1_l, mem1_r) << '\n';
+
+  char mem2_l[128], mem2_r[128];
+  std::snprintf(mem2_l, sizeof(mem2_l), "Cache Snapshot:   %s",
+                FriendlyBytes(cache_snapshot_bytes).c_str());
+  std::snprintf(mem2_r, sizeof(mem2_r), "Process RSS:    %s MB (free: %s MB)",
+                CommaNumber(rss_mib).c_str(),
+                CommaNumber(host_available_mib).c_str());
+  out << make_line(mem2_l, mem2_r) << '\n';
+
+  out << "+" << hline << "+";
+  return out.str();
+}
+
+}  // namespace
+
 void Logger::LogRequest(std::string_view id, std::string_view method,
                         std::string_view path, int status_code,
                         double duration_ms, std::string_view details,
@@ -192,6 +443,7 @@ void Logger::LogRequest(std::string_view id, std::string_view method,
   if (!Enabled(level)) {
     return;
   }
+  const std::string mem = MemoryStatus();
   std::ostringstream message;
   message << "request=" << id << " event=completed method=" << method
           << " path=" << path << " status=" << status_code
@@ -199,8 +451,18 @@ void Logger::LogRequest(std::string_view id, std::string_view method,
           << duration_ms << " outcome=" << outcome;
   if (!details.empty())
     message << ' ' << details;
-  message << ' ' << MemoryStatus();
+  message << ' ' << mem;
   Log(level, "http", message.str());
+
+  if (details.find("prompt_tokens=") != std::string_view::npos ||
+      details.find("generated_tokens=") != std::string_view::npos) {
+    static const bool color =
+        std::getenv("NO_COLOR") == nullptr && ::isatty(STDERR_FILENO) != 0;
+    const std::string table = FormatRequestTable(
+        id, method, path, status_code, duration_ms, outcome, details, mem, color);
+    const std::lock_guard lock(LogMutex());
+    std::clog << table << '\n' << std::flush;
+  }
 }
 
 }  // namespace gufo::server

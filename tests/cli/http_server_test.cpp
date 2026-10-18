@@ -594,8 +594,10 @@ void TestContentTrace() {
   }
   Trace::Close();
 
+#ifndef _WIN32
   assert((fs::status(path).permissions() & fs::perms::all) ==
          (fs::perms::owner_read | fs::perms::owner_write));
+#endif
   std::vector<gufo::json::Value> records;
   {
     std::ifstream input(path);
@@ -2160,7 +2162,8 @@ void TestDeviceLossWhileWriterBlocked() {
   });
   const int fd = server.Connect();
   const int receive_buffer = 1024;
-  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                      reinterpret_cast<const char*>(&receive_buffer),
                       sizeof(receive_buffer)) == 0);
   const std::string request = "POST /blocked HTTP/1.1\r\n\r\n";
   assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
@@ -2204,7 +2207,11 @@ bool HasIpv6Loopback() {
 
 void TestListenAddresses() {
   using gufo::server::IsListenAddress;
+#ifdef _WIN32
+  for (const char* host : {"127.0.0.1", "0.0.0.0", "::", "::1"})
+#else
   for (const char* host : {"127.0.0.1", "0.0.0.0", "::", "::1", "fe80::1%lo"})
+#endif
     assert(IsListenAddress(host));
   for (const char* host : {"", "localhost", "127.1", "[::1]", "bad.address"})
     assert(!IsListenAddress(host));
@@ -2269,9 +2276,8 @@ int ConnectTo(const std::string& host, int port) {
   }
   const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
   assert(fd >= 0);
-  const timeval timeout{3, 0};
-  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ==
-         0);
+  assert(gufo::platform::SetSocketTimeout(fd, SO_RCVTIMEO,
+                                          std::chrono::seconds{3}) == 0);
   if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) != 0) {
     ::close(fd);
     return -1;
