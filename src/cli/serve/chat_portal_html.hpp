@@ -2822,6 +2822,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         UI.btnCompGenerate.disabled = false;
       }
     });
+    }
 
     // Query Models & Slots
     async function fetchModelAndSlots() {
