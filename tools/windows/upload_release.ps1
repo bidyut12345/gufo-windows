@@ -1,9 +1,9 @@
 param(
-    [string]$Tag = "v0.1.0-windows",
+    [string]$Tag = "v0.1.1",
     [string]$Repo = "bidyut12345/gufo-windows",
     [string[]]$Files = @(
-        "dist\gufo-windows-v0.1.0-windows.zip",
-        "dist\gufo-windows-v0.1.0-bin.zip"
+        "dist\gufo-windows-v0.1.1-windows.zip",
+        "dist\gufo-windows-v0.1.1-bin.zip"
     ),
     [switch]$Force = $false
 )

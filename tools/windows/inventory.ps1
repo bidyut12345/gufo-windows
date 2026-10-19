@@ -16,6 +16,8 @@ function Get-GufoModelRoots([string[]]$Extra = @()) {
     @{ Path = $hub; Hub = $true },
     @{ Path = (Join-Path $GufoRoot "models"); Hub = $false },
     @{ Path = (Join-Path (Split-Path $GufoRoot) "models"); Hub = $false },
+    @{ Path = (Join-Path (Split-Path $GufoRoot) "gufo-data\models"); Hub = $false },
+    @{ Path = (Join-Path (Split-Path $GufoRoot) "Models"); Hub = $false },
     @{ Path = (Join-Path $env:USERPROFILE "models"); Hub = $false },
     @{ Path = (Join-Path $env:USERPROFILE ".lmstudio\models"); Hub = $false },
     @{ Path = (Join-Path $env:USERPROFILE ".cache\lm-studio\models"); Hub = $false },
