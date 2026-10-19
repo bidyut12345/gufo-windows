@@ -222,6 +222,7 @@ void ChatDatabase::InitSchema() {
       top_p REAL DEFAULT 0.95,
       max_tokens INTEGER DEFAULT 4096,
       system_prompt TEXT,
+      working_directory TEXT DEFAULT '',
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
@@ -265,6 +266,12 @@ void ChatDatabase::InitSchema() {
   if (err_msg) {
     sqlite3_free(err_msg);
   }
+
+  // Gracefully migrate existing databases if working_directory column is missing
+  sqlite3_exec(
+      db_,
+      "ALTER TABLE user_settings ADD COLUMN working_directory TEXT DEFAULT '';",
+      nullptr, nullptr, nullptr);
 }
 
 ChatDatabase::AuthResult ChatDatabase::Register(const std::string& username,
@@ -643,7 +650,7 @@ UserSettingsRecord ChatDatabase::GetSettings(const std::string& user_id) {
   if (!db_) return st;
 
   Stmt sel(db_,
-           "SELECT temperature, top_p, max_tokens, system_prompt FROM user_settings "
+           "SELECT temperature, top_p, max_tokens, system_prompt, working_directory FROM user_settings "
            "WHERE user_id = ?;");
   if (!sel.valid()) return st;
 
@@ -653,6 +660,7 @@ UserSettingsRecord ChatDatabase::GetSettings(const std::string& user_id) {
     st.top_p = sel.column_double(1);
     st.max_tokens = sel.column_int(2);
     st.system_prompt = sel.column_text(3);
+    st.working_directory = sel.column_text(4);
   }
 
   return st;
@@ -663,13 +671,14 @@ void ChatDatabase::SaveSettings(const UserSettingsRecord& settings) {
   if (!db_) return;
 
   Stmt ins(db_,
-           "INSERT INTO user_settings (user_id, temperature, top_p, max_tokens, system_prompt) "
-           "VALUES (?, ?, ?, ?, ?) "
+           "INSERT INTO user_settings (user_id, temperature, top_p, max_tokens, system_prompt, working_directory) "
+           "VALUES (?, ?, ?, ?, ?, ?) "
            "ON CONFLICT(user_id) DO UPDATE SET "
            "temperature = excluded.temperature, "
            "top_p = excluded.top_p, "
            "max_tokens = excluded.max_tokens, "
-           "system_prompt = excluded.system_prompt;");
+           "system_prompt = excluded.system_prompt, "
+           "working_directory = excluded.working_directory;");
   if (!ins.valid()) return;
 
   ins.bind_text(1, settings.user_id);
@@ -677,6 +686,7 @@ void ChatDatabase::SaveSettings(const UserSettingsRecord& settings) {
   ins.bind_double(3, settings.top_p);
   ins.bind_int(4, settings.max_tokens);
   ins.bind_text(5, settings.system_prompt);
+  ins.bind_text(6, settings.working_directory);
   sqlite3_step(ins);
 }
 

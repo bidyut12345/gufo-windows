@@ -55,6 +55,7 @@ struct UserSettingsRecord {
   int max_tokens{4096};
   std::string system_prompt{
       "You are Gufo, an ultra-fast, helpful AI assistant running locally on AMD Strix Halo gfx1151."};
+  std::string working_directory;
 };
 
 struct McpServerRecord {

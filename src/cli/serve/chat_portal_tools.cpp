@@ -144,6 +144,17 @@ bool WildcardMatch(std::string_view str, std::string_view pat) {
   return p == pat.size();
 }
 
+std::string ResolveTargetPath(const std::string& path_str,
+                              const std::string& base_dir) {
+  if (path_str.empty()) return "";
+  std::filesystem::path p(path_str);
+  if (base_dir.empty() || p.is_absolute()) {
+    return path_str;
+  }
+  const auto combined = std::filesystem::path(base_dir) / p;
+  return combined.lexically_normal().string();
+}
+
 }  // namespace
 
 const std::vector<InbuiltToolDefinition>& ToolEngine::GetInbuiltTools() {
@@ -381,7 +392,8 @@ const InbuiltToolDefinition* ToolEngine::FindInbuiltTool(const std::string& name
 }
 
 ToolExecutionResult ToolEngine::Execute(const std::string& name,
-                                       const json::Value& arguments) {
+                                       const json::Value& arguments,
+                                       const std::string& working_directory) {
   ToolExecutionResult res;
 
   if (name == "get_datetime") {
@@ -391,11 +403,12 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
   }
 
   if (name == "read_file") {
-    const std::string path = arguments.member_str("path");
-    if (path.empty()) {
+    const std::string raw_path = arguments.member_str("path");
+    if (raw_path.empty()) {
       res.error = "Missing required argument 'path'";
       return res;
     }
+    const std::string path = ResolveTargetPath(raw_path, working_directory);
     std::error_code ec;
     if (!std::filesystem::exists(path, ec) || std::filesystem::is_directory(path, ec)) {
       res.error = "File not found or is a directory: " + path;
@@ -431,13 +444,14 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
   }
 
   if (name == "write_file") {
-    const std::string path = arguments.member_str("path");
+    const std::string raw_path = arguments.member_str("path");
     const std::string content = arguments.member_str("content");
-    if (path.empty()) {
+    if (raw_path.empty()) {
       res.error = "Missing required argument 'path'";
       return res;
     }
 
+    const std::string path = ResolveTargetPath(raw_path, working_directory);
     const auto p = std::filesystem::path(path);
     if (p.has_parent_path()) {
       std::error_code ec;
@@ -457,14 +471,15 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
   }
 
   if (name == "edit_file") {
-    const std::string path = arguments.member_str("path");
+    const std::string raw_path = arguments.member_str("path");
     const std::string target = arguments.member_str("target");
     const std::string replacement = arguments.member_str("replacement");
-    if (path.empty() || target.empty()) {
+    if (raw_path.empty() || target.empty()) {
       res.error = "Missing required 'path' or 'target' parameter";
       return res;
     }
 
+    const std::string path = ResolveTargetPath(raw_path, working_directory);
     std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) {
       res.error = "Failed to open file for editing: " + path;
@@ -497,13 +512,14 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
   }
 
   if (name == "apply_diff") {
-    const std::string path = arguments.member_str("path");
+    const std::string raw_path = arguments.member_str("path");
     const std::string diff = arguments.member_str("diff");
-    if (path.empty() || diff.empty()) {
+    if (raw_path.empty() || diff.empty()) {
       res.error = "Missing required 'path' or 'diff' parameter";
       return res;
     }
 
+    const std::string path = ResolveTargetPath(raw_path, working_directory);
     // Simple line-based unified diff applier
     std::ifstream in(path);
     if (!in.is_open()) {
@@ -550,12 +566,16 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
 
   if (name == "file_glob_search") {
     const std::string pattern = arguments.member_str("pattern");
-    std::string dir = arguments.member_str("directory", ".");
+    std::string dir = arguments.member_str("directory", "");
     if (pattern.empty()) {
       res.error = "Missing required argument 'pattern'";
       return res;
     }
-    if (dir.empty()) dir = ".";
+    if (dir.empty() || dir == ".") {
+      dir = working_directory.empty() ? "." : working_directory;
+    } else {
+      dir = ResolveTargetPath(dir, working_directory);
+    }
 
     std::error_code ec;
     if (!std::filesystem::exists(dir, ec)) {
@@ -586,13 +606,20 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
 
   if (name == "grep_search") {
     const std::string query = arguments.member_str("query");
-    const std::string path = arguments.member_str("path");
+    std::string raw_path = arguments.member_str("path", "");
     const bool case_insensitive = arguments.contains("case_insensitive") && arguments.find("case_insensitive")->as_bool(false);
 
-    if (query.empty() || path.empty()) {
+    if (query.empty() || raw_path.empty()) {
       res.error = "Missing required 'query' or 'path' parameter";
       return res;
     }
+
+    if (raw_path == "." || raw_path.empty()) {
+      raw_path = working_directory.empty() ? "." : working_directory;
+    } else {
+      raw_path = ResolveTargetPath(raw_path, working_directory);
+    }
+    const std::string path = raw_path;
 
     std::error_code ec;
     std::vector<std::filesystem::path> files_to_search;
@@ -647,10 +674,16 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
 
   if (name == "exec_shell_command") {
     const std::string command = arguments.member_str("command");
-    const std::string cwd = arguments.member_str("cwd", "");
+    std::string cwd = arguments.member_str("cwd", "");
     if (command.empty()) {
       res.error = "Missing required argument 'command'";
       return res;
+    }
+
+    if (cwd.empty() && !working_directory.empty()) {
+      cwd = working_directory;
+    } else if (!cwd.empty() && !working_directory.empty()) {
+      cwd = ResolveTargetPath(cwd, working_directory);
     }
 
     std::string full_cmd;

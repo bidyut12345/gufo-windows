@@ -184,6 +184,7 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
     st_obj["top_p"] = st.top_p;
     st_obj["max_tokens"] = st.max_tokens;
     st_obj["system_prompt"] = st.system_prompt;
+    st_obj["working_directory"] = st.working_directory;
     out["settings"] = std::move(st_obj);
     return JsonOk(out);
   }
@@ -315,12 +316,13 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       obj["top_p"] = st.top_p;
       obj["max_tokens"] = st.max_tokens;
       obj["system_prompt"] = st.system_prompt;
+      obj["working_directory"] = st.working_directory;
       return JsonOk(obj);
     }
     if (req.method == "POST" || req.method == "PUT") {
       try {
         const auto body = json::parse(req.body);
-        UserSettingsRecord st;
+        UserSettingsRecord st = db.GetSettings(user->id);
         st.user_id = user->id;
         if (const auto* t = body.find("temperature"); t && t->is_number())
           st.temperature = t->as_double();
@@ -328,7 +330,10 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
           st.top_p = p->as_double();
         if (const auto* m = body.find("max_tokens"); m && m->is_number())
           st.max_tokens = static_cast<int>(m->as_double());
-        st.system_prompt = body.member_str("system_prompt");
+        if (const auto* s = body.find("system_prompt"); s && s->is_string())
+          st.system_prompt = s->str();
+        if (const auto* w = body.find("working_directory"); w && w->is_string())
+          st.working_directory = w->str();
         db.SaveSettings(st);
 
         json::Value out = json::Value::object();
@@ -380,6 +385,20 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
     json::Value user_conf = json::Value::object();
     try { user_conf = json::parse(conf_str); } catch (...) {}
 
+    bool has_enabled_list = false;
+    std::vector<std::string> enabled_list;
+    if (const auto* arr = user_conf.find("enabled"); arr && arr->is_array()) {
+      has_enabled_list = true;
+      for (const auto& item : arr->items()) {
+        enabled_list.push_back(item.str());
+      }
+    }
+
+    bool master_enabled = true;
+    if (const auto* me = user_conf.find("master_enabled"); me && me->is_bool()) {
+      master_enabled = me->as_bool();
+    }
+
     json::Value inbuilt_arr = json::Value::array();
     for (const auto& t : ToolEngine::GetInbuiltTools()) {
       json::Value tobj = json::Value::object();
@@ -388,13 +407,19 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       tobj["parameters"] = t.parameters;
       tobj["dangerous"] = t.dangerous;
       bool enabled = t.enabled_by_default;
-      if (const auto* p = user_conf.find(t.name); p && p->is_bool()) {
+      if (has_enabled_list) {
+        enabled = std::find(enabled_list.begin(), enabled_list.end(), t.name) != enabled_list.end();
+      } else if (const auto* p = user_conf.find(t.name); p && p->is_bool()) {
         enabled = p->as_bool();
       }
       tobj["enabled"] = enabled;
       inbuilt_arr.push_back(std::move(tobj));
     }
     out["inbuilt"] = std::move(inbuilt_arr);
+    out["master_enabled"] = master_enabled;
+    std::error_code ec;
+    out["server_current_directory"] = std::filesystem::current_path(ec).string();
+    out["working_directory"] = db.GetSettings(user->id).working_directory;
 
     // 2. MCP servers
     const auto servers = db.ListMcpServers(user->id);
@@ -447,16 +472,22 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
   if (req.path == "/api/tools/execute" && req.method == "POST") {
     try {
       const auto body = json::parse(req.body);
-      const std::string name = body.member_str("name");
+      const std::string name = body.contains("name") ? body.member_str("name") : body.member_str("tool_name");
       const auto* args_ptr = body.find("arguments");
       json::Value args = (args_ptr && args_ptr->is_object()) ? *args_ptr : json::Value::object();
+      std::string working_dir = body.member_str("working_directory");
+      if (working_dir.empty()) {
+        const auto st = db.GetSettings(user->id);
+        working_dir = st.working_directory;
+      }
 
       // Check if inbuilt tool
       if (ToolEngine::FindInbuiltTool(name) != nullptr) {
-        const auto res = ToolEngine::Execute(name, args);
+        const auto res = ToolEngine::Execute(name, args, working_dir);
         json::Value out = json::Value::object();
         out["success"] = res.success;
         out["output"] = res.output;
+        out["result"] = res.output.empty() ? res.error : res.output;
         out["error"] = res.error;
         return JsonOk(out);
       }

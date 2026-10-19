@@ -27,8 +27,9 @@ class ToolEngine {
   static const std::vector<InbuiltToolDefinition>& GetInbuiltTools();
   static const InbuiltToolDefinition* FindInbuiltTool(const std::string& name);
 
-  static ToolExecutionResult Execute(const std::string& name,
-                                     const json::Value& arguments);
+  static ToolExecutionResult Execute(
+      const std::string& name, const json::Value& arguments,
+      const std::string& working_directory = "");
 
   static ToolExecutionResult ExecuteMcpProxy(const std::string& url,
                                             const std::string& headers_json,

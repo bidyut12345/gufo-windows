@@ -46,6 +46,31 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* Modern sleek minimalist dark scrollbar */
+    * {
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+    }
+    *::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    *::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    *::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.18);
+      border-radius: 9999px;
+      transition: background-color 0.2s ease;
+    }
+    *::-webkit-scrollbar-thumb:hover {
+      background: rgba(255, 255, 255, 0.35);
+    }
+    *::-webkit-scrollbar-corner {
+      background: transparent;
+    }
+
     body {
       font-family: var(--font-sans);
       background-color: var(--bg);
@@ -211,6 +236,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       flex-shrink: 0;
       transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
       z-index: 20;
+    }
+    aside#sidebar.collapsed {
+      display: none !important;
     }
 
     .sidebar-top {
@@ -1073,14 +1101,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     }
 
     .sidebar-backdrop {
-      display: none;
-      position: fixed;
-      inset: 0;
-      background: rgba(0, 0, 0, 0.65);
-      backdrop-filter: blur(4px);
-      z-index: 95;
+      display: none !important;
     }
-    .sidebar-backdrop.show { display: block; }
     .btn-close-sidebar-mobile {
       display: none;
       background: transparent;
@@ -1146,6 +1168,16 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
       .btn-close-sidebar-mobile {
         display: block;
+      }
+      .sidebar-backdrop {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.45);
+        z-index: 95;
+      }
+      .sidebar-backdrop.show {
+        display: block !important;
       }
       aside#sidebar {
         position: fixed;
@@ -1251,11 +1283,56 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       color: #93c5fd;
       background: rgba(59, 130, 246, 0.12);
     }
+    .tools-pill.disabled {
+      opacity: 0.6;
+      border-color: var(--border);
+      color: var(--text-dim);
+      background: var(--bg-card);
+    }
     .tools-pill-dot {
       width: 6px;
       height: 6px;
       border-radius: 50%;
       background: #3b82f6;
+    }
+    .tools-pill.disabled .tools-pill-dot {
+      background: var(--text-dim);
+    }
+    .switch-toggle-mini {
+      position: relative;
+      display: inline-block;
+      width: 26px;
+      height: 14px;
+      flex-shrink: 0;
+    }
+    .switch-toggle-mini input { opacity: 0; width: 0; height: 0; }
+    .slider-mini {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: var(--bg-hover);
+      border-radius: 14px;
+      transition: .2s;
+      border: 1px solid var(--border);
+    }
+    .slider-mini:before {
+      position: absolute;
+      content: "";
+      height: 8px;
+      width: 8px;
+      left: 2px;
+      bottom: 2px;
+      background-color: #a1a1aa;
+      border-radius: 50%;
+      transition: .2s;
+    }
+    input:checked + .slider-mini {
+      background-color: #22c55e;
+      border-color: #22c55e;
+    }
+    input:checked + .slider-mini:before {
+      background-color: white;
+      transform: translateX(12px);
     }
     .tools-dialog-box {
       background: var(--bg-card);
@@ -1470,6 +1547,10 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <span id="slot-text">1/1 slots (idle)</span>
       </div>
       <div id="model-pill" class="model-pill" title="Loaded Model">loading model...</div>
+      <button id="btn-nav-workdir" class="btn-top" title="Configured Working Directory">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+        <span id="nav-workdir-label" style="max-width:130px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">.</span>
+      </button>
       <button id="btn-open-tools" class="btn-top" title="Tools & MCP Servers">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>
         <span id="nav-tools-label">Tools & MCP</span>
@@ -1535,10 +1616,14 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               <button id="btn-upload-file" class="btn-icon-input" title="Attach file / image">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
               </button>
-              <button id="btn-quick-tools" class="tools-pill active" title="Toggle tools or configure MCP" style="flex-shrink:0;">
-                <span class="tools-pill-dot"></span>
-                <span id="quick-tools-label">Tools: 8</span>
-              </button>
+              <div id="quick-tools-container" class="tools-pill active" title="Autonomous tools status" style="flex-shrink:0;">
+                <label class="switch-toggle-mini" title="Toggle tools ON / OFF" style="cursor:pointer; display:flex; align-items:center; margin:0;" onclick="event.stopPropagation();">
+                  <input type="checkbox" id="chk-master-tools" checked>
+                  <span class="slider-mini"></span>
+                </label>
+                <span id="quick-tools-label" style="cursor:pointer;" title="Click to open tools settings">Tools: 8</span>
+                <span id="btn-quick-tools-gear" style="cursor:pointer; opacity:0.75; font-size:0.8rem;" title="Configure tools & MCP">⚙️</span>
+              </div>
               <textarea id="chat-input" rows="1" placeholder="Say something... (Shift+Enter for newline)"></textarea>
               <button id="btn-stop" class="btn-stop-stream" title="Stop generating">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"></rect></svg>
@@ -1735,6 +1820,15 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <input type="number" id="inp-max-tokens" class="setting-input" value="4096" min="64" max="32768" step="128">
       </div>
 
+      <div class="setting-group">
+        <div class="setting-label">
+          <span>Working Directory</span>
+          <button id="btn-drawer-reset-cwd" class="btn-top" type="button" style="font-size:0.7rem; padding:1px 6px;">Reset to Server CWD</button>
+        </div>
+        <input type="text" id="set-working-dir" class="setting-input" placeholder="e.g. C:\Projects or . for server cwd">
+        <span class="setting-desc">Base directory for filesystem tools (read, write, edit, apply_diff, shell exec).</span>
+      </div>
+
       <div class="setting-group" style="margin-top:10px;">
         <div style="font-weight:600; font-size:0.85rem; color:var(--text); margin-bottom:4px;">Server & Storage</div>
         <div style="font-size:0.75rem; color:var(--text-dim); line-height:1.4;">
@@ -1794,6 +1888,35 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
       <!-- Inbuilt Tools Pane -->
       <div id="pane-inbuilt-tools" class="tools-content-pane">
+        <!-- Master Autonomous Tool Execution Switch & Working Directory Card -->
+        <div style="background:var(--bg-elevated); border:1px solid var(--border-strong); border-radius:var(--radius); padding:10px 14px; margin-bottom:8px; display:flex; flex-direction:column; gap:10px;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div>
+              <div style="font-weight:600; font-size:0.86rem; color:var(--text); display:flex; align-items:center; gap:6px;">
+                <span>⚡ Autonomous Tool Execution</span>
+              </div>
+              <div style="font-size:0.75rem; color:var(--text-dim); margin-top:2px;">Turn off to disable all tool calling and run pure conversation mode.</div>
+            </div>
+            <label class="switch-toggle" title="Enable or disable autonomous tools">
+              <input type="checkbox" id="modal-chk-master-tools" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div style="border-top:1px solid var(--border); padding-top:8px; display:flex; flex-direction:column; gap:6px;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="font-size:0.78rem; font-weight:600; color:var(--text-muted); display:flex; align-items:center; gap:5px;">
+                <span>📁</span> Working Directory
+              </span>
+              <span id="tools-server-cwd-hint" style="font-size:0.72rem; color:var(--text-dim); font-family:var(--font-mono);"></span>
+            </div>
+            <div style="display:flex; gap:6px;">
+              <input type="text" id="tools-working-dir-inp" class="setting-input" style="flex:1; font-size:0.8rem; padding:5px 8px;" placeholder="Server working directory (.)">
+              <button id="btn-tools-save-workdir" class="btn-top" type="button" style="font-size:0.75rem; padding:4px 10px; font-weight:500;">Set</button>
+              <button id="btn-tools-reset-workdir" class="btn-top" type="button" style="font-size:0.75rem; padding:4px 8px;">Reset</button>
+            </div>
+          </div>
+        </div>
+
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
           <span style="font-size:0.8rem; color:var(--text-muted);">Standard built-in system tools executed securely on the host server.</span>
           <div style="display:flex; gap:6px;">
@@ -1868,11 +1991,14 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       isGenerating: false,
       abortController: null,
       mode: 'chat', // 'chat' or 'comp'
+      toolsEnabled: localStorage.getItem('gufo_tools_enabled') !== 'false',
+      serverCurrentDirectory: '.',
       settings: {
         system_prompt: 'You are a helpful, respectful and honest assistant.',
         temperature: 0.6,
         top_p: 0.95,
-        max_tokens: 4096
+        max_tokens: 4096,
+        working_directory: ''
       },
       tools: {
         inbuilt: [],
@@ -1893,6 +2019,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       monitorInterface: $('monitor-interface'),
       slotText: $('slot-text'),
       modelPill: $('model-pill'),
+      btnNavWorkdir: $('btn-nav-workdir'),
+      navWorkdirLabel: $('nav-workdir-label'),
       btnToggleSidebar: $('btn-toggle-sidebar'),
       sidebar: $('sidebar'),
       sidebarBackdrop: $('sidebar-backdrop'),
@@ -1947,6 +2075,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       rangeTopP: $('range-top-p') || $('range-topp'),
       valTopP: $('val-top-p') || $('val-topp'),
       inpMaxTokens: $('inp-max-tokens'),
+      setWorkingDir: $('set-working-dir'),
+      btnDrawerResetCwd: $('btn-drawer-reset-cwd'),
       btnSaveDrawer: $('btn-save-drawer'),
       // Auth Dialog
       authDialog: $('auth-dialog'),
@@ -1960,10 +2090,17 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       // Tools & MCP
       btnOpenTools: $('btn-open-tools'),
       navToolsLabel: $('nav-tools-label'),
-      btnQuickTools: $('btn-quick-tools'),
+      quickToolsContainer: $('quick-tools-container'),
+      chkMasterTools: $('chk-master-tools'),
       quickToolsLabel: $('quick-tools-label'),
+      btnQuickToolsGear: $('btn-quick-tools-gear'),
       toolsDialog: $('tools-dialog'),
       btnCloseTools: $('btn-close-tools'),
+      modalChkMasterTools: $('modal-chk-master-tools'),
+      toolsWorkingDirInp: $('tools-working-dir-inp'),
+      toolsServerCwdHint: $('tools-server-cwd-hint'),
+      btnToolsSaveWorkdir: $('btn-tools-save-workdir'),
+      btnToolsResetWorkdir: $('btn-tools-reset-workdir'),
       tabInbuiltTools: $('tab-inbuilt-tools'),
       tabMcpServers: $('tab-mcp-servers'),
       tabCustomTools: $('tab-custom-tools'),
@@ -2095,16 +2232,30 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     // Sidebar Toggle
     function toggleSidebar(forceState) {
       if (!UI.sidebar) return;
-      const isOpen = typeof forceState === 'boolean' ? forceState : !UI.sidebar.classList.contains('open');
-      if (isOpen) {
-        UI.sidebar.classList.add('open');
-        if (UI.sidebarBackdrop) UI.sidebarBackdrop.classList.add('show');
+      const isMobile = window.innerWidth <= 768;
+      if (isMobile) {
+        const isOpen = typeof forceState === 'boolean' ? forceState : !UI.sidebar.classList.contains('open');
+        UI.sidebar.classList.toggle('open', isOpen);
+        if (UI.sidebarBackdrop) UI.sidebarBackdrop.classList.toggle('show', isOpen);
       } else {
-        UI.sidebar.classList.remove('open');
+        // Desktop: cleanly toggle collapsed state, never show backdrop or blur screen
         if (UI.sidebarBackdrop) UI.sidebarBackdrop.classList.remove('show');
+        const isCollapsed = typeof forceState === 'boolean' ? !forceState : (UI.sidebar.style.display !== 'none' && !UI.sidebar.classList.contains('collapsed'));
+        if (isCollapsed) {
+          UI.sidebar.classList.add('collapsed');
+          UI.sidebar.style.display = 'none';
+        } else {
+          UI.sidebar.classList.remove('collapsed');
+          UI.sidebar.style.display = 'flex';
+        }
+        localStorage.setItem('gufo_sidebar_collapsed', isCollapsed ? 'true' : 'false');
       }
-      if (window.innerWidth > 768) {
-        UI.sidebar.style.display = isOpen ? 'flex' : 'none';
+    }
+
+    if (window.innerWidth > 768 && localStorage.getItem('gufo_sidebar_collapsed') === 'true') {
+      if (UI.sidebar) {
+        UI.sidebar.classList.add('collapsed');
+        UI.sidebar.style.display = 'none';
       }
     }
 
@@ -2323,6 +2474,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         if (UI.rangeTopP) UI.rangeTopP.value = APP.settings.top_p;
         if (UI.valTopP) UI.valTopP.textContent = Number(APP.settings.top_p).toFixed(2);
         if (UI.inpMaxTokens) UI.inpMaxTokens.value = APP.settings.max_tokens;
+        if (UI.setWorkingDir) UI.setWorkingDir.value = APP.settings.working_directory || '';
 
         if (UI.drawerBackdrop) UI.drawerBackdrop.classList.add('show');
         if (UI.drawerPanel) UI.drawerPanel.classList.add('show');
@@ -2335,6 +2487,11 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     }
     if (UI.btnCloseDrawer) UI.btnCloseDrawer.addEventListener('click', closeDrawer);
     if (UI.drawerBackdrop) UI.drawerBackdrop.addEventListener('click', closeDrawer);
+    if (UI.btnDrawerResetCwd) {
+      UI.btnDrawerResetCwd.addEventListener('click', () => {
+        if (UI.setWorkingDir) UI.setWorkingDir.value = '';
+      });
+    }
 
     if (UI.rangeTemp) {
       UI.rangeTemp.addEventListener('input', e => {
@@ -2353,15 +2510,96 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         if (UI.rangeTemp) APP.settings.temperature = parseFloat(UI.rangeTemp.value);
         if (UI.rangeTopP) APP.settings.top_p = parseFloat(UI.rangeTopP.value);
         if (UI.inpMaxTokens) APP.settings.max_tokens = parseInt(UI.inpMaxTokens.value, 10);
+        if (UI.setWorkingDir) APP.settings.working_directory = UI.setWorkingDir.value.trim();
 
         try {
           await apiFetch('/api/settings', { method: 'POST', body: APP.settings });
+          updateWorkingDirUI();
         } catch (e) {}
         closeDrawer();
       });
     }
 
+    // Working Directory Helpers
+    function updateWorkingDirUI() {
+      const wd = (APP.settings.working_directory || '').trim();
+      const displayWd = wd || APP.serverCurrentDirectory || '.';
+
+      if (UI.navWorkdirLabel) {
+        let shortPath = displayWd;
+        if (shortPath.length > 22) {
+          const parts = shortPath.split(/[\\/]/).filter(Boolean);
+          shortPath = parts.length > 0 ? parts[parts.length - 1] : shortPath.slice(-20);
+        }
+        UI.navWorkdirLabel.textContent = shortPath;
+        UI.navWorkdirLabel.title = `Working Directory: ${displayWd}`;
+      }
+      if (UI.setWorkingDir) {
+        UI.setWorkingDir.value = wd;
+      }
+      if (UI.toolsWorkingDirInp) {
+        UI.toolsWorkingDirInp.value = wd;
+      }
+      if (UI.toolsServerCwdHint) {
+        UI.toolsServerCwdHint.textContent = `Server CWD: ${APP.serverCurrentDirectory || '.'}`;
+      }
+    }
+
+    async function saveWorkingDirectory(newWd) {
+      APP.settings.working_directory = (newWd || '').trim();
+      updateWorkingDirUI();
+      try {
+        await apiFetch('/api/settings', {
+          method: 'POST',
+          body: { working_directory: APP.settings.working_directory }
+        });
+      } catch (e) {
+        console.error('Failed to save working directory:', e);
+      }
+    }
+
+    if (UI.btnNavWorkdir) {
+      UI.btnNavWorkdir.addEventListener('click', () => openToolsModal('inbuilt'));
+    }
+    if (UI.btnToolsSaveWorkdir) {
+      UI.btnToolsSaveWorkdir.addEventListener('click', () => {
+        saveWorkingDirectory(UI.toolsWorkingDirInp ? UI.toolsWorkingDirInp.value : '');
+      });
+    }
+    if (UI.btnToolsResetWorkdir) {
+      UI.btnToolsResetWorkdir.addEventListener('click', () => {
+        if (UI.toolsWorkingDirInp) UI.toolsWorkingDirInp.value = '';
+        saveWorkingDirectory('');
+      });
+    }
+
     // Tools & MCP Management
+    function setMasterTools(enabled) {
+      APP.toolsEnabled = !!enabled;
+      localStorage.setItem('gufo_tools_enabled', APP.toolsEnabled ? 'true' : 'false');
+      if (UI.chkMasterTools) UI.chkMasterTools.checked = APP.toolsEnabled;
+      if (UI.modalChkMasterTools) UI.modalChkMasterTools.checked = APP.toolsEnabled;
+      updateToolsPill();
+      saveInbuiltTools();
+    }
+
+    if (UI.chkMasterTools) {
+      UI.chkMasterTools.addEventListener('change', (e) => {
+        setMasterTools(e.target.checked);
+      });
+    }
+    if (UI.modalChkMasterTools) {
+      UI.modalChkMasterTools.addEventListener('change', (e) => {
+        setMasterTools(e.target.checked);
+      });
+    }
+    if (UI.quickToolsLabel) {
+      UI.quickToolsLabel.addEventListener('click', () => openToolsModal('inbuilt'));
+    }
+    if (UI.btnQuickToolsGear) {
+      UI.btnQuickToolsGear.addEventListener('click', () => openToolsModal('inbuilt'));
+    }
+
     function openToolsModal(tab = 'inbuilt') {
       switchToolsTab(tab);
       if (UI.toolsDialog) UI.toolsDialog.classList.add('show');
@@ -2384,7 +2622,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     }
 
     if (UI.btnOpenTools) UI.btnOpenTools.addEventListener('click', () => openToolsModal('inbuilt'));
-    if (UI.btnQuickTools) UI.btnQuickTools.addEventListener('click', () => openToolsModal('inbuilt'));
     if (UI.btnCloseTools) UI.btnCloseTools.addEventListener('click', closeToolsModal);
     if (UI.toolsDialog) {
       UI.toolsDialog.addEventListener('click', (e) => {
@@ -2403,10 +2640,22 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           APP.tools.inbuilt = data.inbuilt || [];
           APP.tools.mcpServers = data.mcp_servers || [];
           APP.tools.customTools = data.custom_tools || [];
+          if (data.server_current_directory) {
+            APP.serverCurrentDirectory = data.server_current_directory;
+          }
+          if (data.working_directory !== undefined && data.working_directory !== null) {
+            APP.settings.working_directory = data.working_directory;
+          }
+          if (typeof data.master_enabled === 'boolean') {
+            if (localStorage.getItem('gufo_tools_enabled') === null) {
+              APP.toolsEnabled = data.master_enabled;
+            }
+          }
           renderInbuiltTools();
           renderMcpServers();
           renderCustomTools();
           updateToolsPill();
+          updateWorkingDirUI();
         }
       } catch (err) {
         console.error('Failed to load tools:', err);
@@ -2417,14 +2666,31 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.enabled).length;
       const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
       const total = activeInbuilt + activeCustom;
+
+      const isEnabled = APP.toolsEnabled && total > 0;
       if (UI.quickToolsLabel) {
-        UI.quickToolsLabel.textContent = `Tools: ${total}`;
+        if (!APP.toolsEnabled) {
+          UI.quickToolsLabel.textContent = 'Tools: OFF';
+        } else {
+          UI.quickToolsLabel.textContent = `Tools: ${total}`;
+        }
       }
       if (UI.navToolsLabel) {
-        UI.navToolsLabel.textContent = `Tools & MCP (${total})`;
+        if (!APP.toolsEnabled) {
+          UI.navToolsLabel.textContent = 'Tools: OFF';
+        } else {
+          UI.navToolsLabel.textContent = `Tools & MCP (${total})`;
+        }
       }
-      if (UI.btnQuickTools) {
-        UI.btnQuickTools.classList.toggle('active', total > 0);
+      if (UI.quickToolsContainer) {
+        UI.quickToolsContainer.classList.toggle('active', isEnabled);
+        UI.quickToolsContainer.classList.toggle('disabled', !APP.toolsEnabled);
+      }
+      if (UI.chkMasterTools) {
+        UI.chkMasterTools.checked = APP.toolsEnabled;
+      }
+      if (UI.modalChkMasterTools) {
+        UI.modalChkMasterTools.checked = APP.toolsEnabled;
       }
     }
 
@@ -2470,7 +2736,10 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       try {
         await apiFetch('/api/tools/inbuilt', {
           method: 'POST',
-          body: { enabled }
+          body: {
+            master_enabled: APP.toolsEnabled,
+            enabled: enabled
+          }
         });
       } catch (err) {
         console.error('Failed to save inbuilt tools config:', err);
@@ -2999,6 +3268,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     }
 
     function getActiveToolsList() {
+      if (!APP.toolsEnabled) return [];
       const tools = [];
       if (APP.tools.inbuilt) {
         for (const t of APP.tools.inbuilt) {
@@ -3097,6 +3367,12 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       }
 
       const activeTools = getActiveToolsList();
+      if (activeTools.length > 0 && APP.settings.working_directory) {
+        msgs.unshift({
+          role: 'system',
+          content: `Host server working directory: ${APP.settings.working_directory}`
+        });
+      }
       let turns = 0;
       const MAX_TURNS = 5;
 
@@ -3332,7 +3608,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           scrollDown();
 
           // Check if model emitted text-based tool calls e.g. <tool_call>{"name":"...","arguments":{...}}</tool_call>
-          if (accumulatedToolCalls.length === 0 && assistantText.includes('<tool_call>')) {
+          if (APP.toolsEnabled && activeTools.length > 0 && accumulatedToolCalls.length === 0 && assistantText.includes('<tool_call>')) {
             const matches = [...assistantText.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/g)];
             for (const m of matches) {
               try {
@@ -3364,8 +3640,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             }
           }
 
-          // If no tool calls were requested, we are done with the loop!
-          if (accumulatedToolCalls.length === 0) {
+          // If tools are disabled or no tool calls were requested, we are done with the loop!
+          if (!APP.toolsEnabled || activeTools.length === 0 || accumulatedToolCalls.length === 0) {
             break;
           }
 
@@ -3416,6 +3692,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                 body: {
                   tool_name: tc.name,
                   arguments: parsedArgs,
+                  working_directory: APP.settings.working_directory || '',
                   conversation_id: APP.activeId
                 }
               });
@@ -3579,6 +3856,13 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     // Init Session
     async function init() {
       await fetchModelAndSlots();
+      try {
+        const resSet = await apiFetch('/api/settings');
+        if (resSet.ok) {
+          const sData = await resSet.json();
+          if (sData) APP.settings = { ...APP.settings, ...sData };
+        }
+      } catch (e) {}
       await loadTools();
       if (APP.token) {
         try {
@@ -3593,6 +3877,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       } else {
         updateUserBadge();
       }
+      updateWorkingDirUI();
       await loadConversations();
     }
 
