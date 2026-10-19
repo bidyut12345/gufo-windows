@@ -970,23 +970,10 @@ Executor::~Executor() {
   }
   (void)hipFree(batch_logits_);
   (void)hipFree(verification_penalties_);
-  (void)hipHostFree(batch_gdn_host_);
-  (void)hipHostFree(batch_controls_);
-  (void)hipHostFree(batch_candidates_host_);
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
-  for (void* p :
-       {static_cast<void*>(host_emb_), static_cast<void*>(control_host_),
-        static_cast<void*>(tokens_host_), static_cast<void*>(logits_host_),
-        static_cast<void*>(mtp_token_host_), static_cast<void*>(counts_host_),
-        static_cast<void*>(mtp_candidates_host_),
-        static_cast<void*>(verify_candidates_host_),
-        static_cast<void*>(tiles_host_), static_cast<void*>(done_flag_)}) {
-    if (p != nullptr) {
-      (void)hipHostFree(p);
-    }
-  }
+  host_allocations_.Reset();
   if (blas_ != nullptr) {
     (void)hipblasDestroy(blas_);
   }
@@ -1018,6 +1005,13 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     AssignError(error_msg, "quantized GEMM tier initialization failed");
     return nullptr;
   }
+  if (!Check(PrepareW8A8GemmWave64(), "wide Q8 GEMM preparation", error_msg))
+    return nullptr;
+  // The first greedy verification otherwise resolves the shared argmax
+  // module on the decode path. Preparation launches no trial kernels.
+  if (e->has_mtp() && !Check(gufo::hip::PrepareBatchedGPUArgmax(),
+                             "MTP argmax preparation", error_msg))
+    return nullptr;
   if (!Check(hipStreamCreate(&e->primary_stream_), "hipStreamCreate",
              error_msg) ||
       !Check(hipStreamCreate(&e->alt_stream_), "hipStreamCreate", error_msg)) {
@@ -1038,6 +1032,24 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
   if (e->blaslt_ == nullptr) {
     return nullptr;
+  }
+  if (MatrixRows(T)) {
+    // The first indexer heuristic query also loads the library's code object.
+    // Do that before readiness instead of leaving a ~100 ms GPU idle gap in
+    // the first prefill. Exact geometry still determines every plan; no trial
+    // GEMM runs and no model activations or session state are touched.
+    for (const auto& layer : model.layers()) {
+      for (const auto* tensor : {&layer.indexer_k, &layer.indexer_q}) {
+        if (!tensor->empty() &&
+            (tensor->type == GgmlType::kBF16 ||
+             tensor->type == GgmlType::kF16) &&
+            !e->blaslt_->Prepare(
+                tensor->type == GgmlType::kBF16 ? HIP_R_16BF : HIP_R_16F,
+                tensor->rows, T, tensor->cols, error_msg)) {
+          return nullptr;
+        }
+      }
+    }
   }
   const std::size_t hc_dim = c.HcDim();
   const std::size_t hidden = c.hidden_size;
@@ -1159,8 +1171,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // allocation or upload. Its address stays fixed for graph replay; the
     // next-chunk prefetch uses separate storage until this forward finishes.
     void* pinned = nullptr;
-    if (!Check(hipHostMalloc(&pinned, T * c.PleEmbeddingDim() * sizeof(float),
-                             hipHostMallocMapped | hipHostMallocCoherent),
+    if (!Check(e->host_allocations_.Allocate(
+                   &pinned, T * c.PleEmbeddingDim() * sizeof(float),
+                   hipHostMallocMapped | hipHostMallocCoherent),
                "pinned n-gram buffer", error_msg)) {
       return nullptr;
     }
@@ -1171,6 +1184,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       return nullptr;
     }
     e->host_rows_.resize(T * c.ple_heads);
+    if (ngram)
+      ngram->ReserveGather(T * c.ple_heads);
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
@@ -1199,28 +1214,30 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     void* control = nullptr;
     void* tokens = nullptr;
     void* logits = nullptr;
-    if (!Check(hipHostMalloc(&control, sizeof(Session::Control)),
-               "pinned control buffer", error_msg) ||
-        !Check(hipHostMalloc(&tokens, T * sizeof(std::int32_t)),
+    if (!Check(
+            e->host_allocations_.Allocate(&control, sizeof(Session::Control)),
+            "pinned control buffer", error_msg) ||
+        !Check(e->host_allocations_.Allocate(&tokens, T * sizeof(std::int32_t)),
                "pinned token buffer", error_msg) ||
         !Check(
-            hipHostMalloc(&logits,
-                          static_cast<std::size_t>(e->options_.max_logit_rows) *
-                              c.vocab_size * sizeof(float),
-                          ResultHostFlags()),
+            e->host_allocations_.Allocate(
+                &logits, static_cast<std::size_t>(e->options_.max_logit_rows) *
+                             c.vocab_size * sizeof(float),
+                ResultHostFlags()),
             "pinned logits buffer", error_msg)) {
       return nullptr;
     }
     void* frontier = nullptr;
-    if (!Check(hipHostMalloc(&frontier, c.vocab_size * sizeof(float),
-                             ResultHostFlags()),
+    if (!Check(e->host_allocations_.Allocate(&frontier,
+                                             c.vocab_size * sizeof(float),
+                                             ResultHostFlags()),
                "pinned frontier buffer", error_msg)) {
       return nullptr;
     }
     e->frontier_host_ = static_cast<float*>(frontier);
     if (Tune().flag_waits) {
       void* done = nullptr;
-      if (!Check(hipHostMalloc(&done, 64, hipHostMallocCoherent),
+      if (!Check(e->host_allocations_.Allocate(&done, 64, hipHostMallocCoherent),
                  "pinned completion flag", error_msg)) {
         return nullptr;
       }
@@ -1228,14 +1245,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       *e->done_flag_ = 0;
     }
     void* counts = nullptr;
-    if (!Check(hipHostMalloc(&counts, c.num_experts * sizeof(std::uint32_t)),
+    if (!Check(e->host_allocations_.Allocate(
+                   &counts, c.num_experts * sizeof(std::uint32_t)),
                "pinned expert counts", error_msg)) {
       return nullptr;
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
-    if (!Check(hipHostMalloc(&tiles, 3 * RoutedTileCapacity(slots, c) *
-                                         sizeof(std::int32_t)),
+    if (!Check(e->host_allocations_.Allocate(
+                   &tiles,
+                   3 * RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
     }
@@ -1317,11 +1336,13 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                    ids.size(), out.rows,
                    static_cast<double>(ids.size() * row_bytes) / 1e6);
     }
-    if (!Check(hipHostMalloc(&e->mtp_token_host_, sizeof(std::int32_t),
-                             ResultHostFlags()),
+    if (!Check(e->host_allocations_.Allocate(&e->mtp_token_host_,
+                                             sizeof(std::int32_t),
+                                             ResultHostFlags()),
                "pinned draft token", error_msg) ||
-        !Check(hipHostMalloc(&e->mtp_candidates_host_,
-                             sizeof(MtpCandidateLogits), ResultHostFlags()),
+        !Check(e->host_allocations_.Allocate(&e->mtp_candidates_host_,
+                                             sizeof(MtpCandidateLogits),
+                                             ResultHostFlags()),
                "pinned draft candidates", error_msg)) {
       return nullptr;
     }
@@ -1331,9 +1352,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     if (Tune().fast_sampling) {
       const std::size_t verify_rows =
           std::max<std::uint32_t>(options.max_logit_rows, 1);
-      if (!Check(hipHostMalloc(&e->verify_candidates_host_,
-                               verify_rows * sizeof(MtpCandidateLogits),
-                               ResultHostFlags()),
+      if (!Check(e->host_allocations_.Allocate(
+                     &e->verify_candidates_host_,
+                     verify_rows * sizeof(MtpCandidateLogits),
+                     ResultHostFlags()),
                  "pinned verification candidates", error_msg)) {
         return nullptr;
       }

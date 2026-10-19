@@ -10,6 +10,7 @@ namespace qfn_mmq {
 #include "mmid.hpp"
 static int g_routed_max_expert_rows = 0;
 static int g_routed_tile_cols = 0;
+static int prepare_decode_kernels();
 extern "C" int qfn_mmq_init(int device) {
     if (device < 0) {
         fprintf(stderr, "qfn_mmq_init: invalid device %d\n", device);
@@ -28,7 +29,7 @@ extern "C" int qfn_mmq_init(int device) {
         return -1;
     }
 
-    return 0;
+    return prepare_decode_kernels();
 }
 
 extern "C" void qfn_mmq_set_routed_max_expert_rows(int rows) {
@@ -713,6 +714,26 @@ static bool g_hc_down_deep_prefetch = false;
 
 extern "C" void qfn_mmq_set_hc_down_deep_prefetch(int enabled) {
     g_hc_down_deep_prefetch = enabled != 0;
+}
+
+template<int tokens = 1>
+static int prepare_hc_down() {
+    hipFuncAttributes attributes{};
+    if (hipFuncGetAttributes(
+            &attributes,
+            reinterpret_cast<const void*>(qfn_q8_hc_down_kernel<tokens, false>)) != hipSuccess)
+        return -2;
+    if constexpr (tokens < MMVQ_MAX_BATCH_SIZE)
+        return prepare_hc_down<tokens + 1>();
+    return 0;
+}
+
+static int prepare_decode_kernels() {
+    // Resolving the first scalar HC function can leave a ~30 ms GPU idle
+    // gap after prefill. Load the AR/MTP functions before serving, without
+    // trial launches, temporary activations, or changes to session state.
+    const auto status = prepare_hc_down();
+    return status == 0 ? prepare_q8_decode() : status;
 }
 
 template<int tokens = 1, bool silu = false>
