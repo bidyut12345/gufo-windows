@@ -534,6 +534,96 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       display: none;
     }
 
+    /* Tool Execution Cards & Results */
+    .tool-call-card {
+      margin: 8px 0;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+      background: rgba(24, 24, 27, 0.65);
+      overflow: hidden;
+      font-size: 0.85rem;
+      max-width: 100%;
+    }
+    .tool-call-card.running {
+      border-color: rgba(59, 130, 246, 0.4);
+    }
+    .tool-call-header {
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      user-select: none;
+      background: rgba(39, 39, 42, 0.5);
+      border-bottom: 1px solid transparent;
+      transition: background 0.15s ease;
+    }
+    .tool-call-header:hover {
+      background: var(--bg-elevated);
+      color: var(--text);
+    }
+    .tool-call-name {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .tool-status-pill {
+      font-size: 0.7rem;
+      font-family: var(--font-mono);
+      padding: 2px 7px;
+      border-radius: 9999px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .tool-status-pill.tool-status-success {
+      background: rgba(34, 197, 94, 0.15);
+      color: #4ade80;
+      border: 1px solid rgba(34, 197, 94, 0.3);
+    }
+    .tool-status-pill.tool-status-error {
+      background: rgba(239, 68, 68, 0.15);
+      color: #f87171;
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+    .tool-status-pill.tool-status-running {
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+    .tool-output-box {
+      padding: 10px 14px;
+      color: var(--text-dim);
+      font-size: 0.84rem;
+      line-height: 1.5;
+      border-top: 1px solid var(--border);
+      background: rgba(9, 9, 11, 0.5);
+      max-width: 100%;
+      overflow-x: hidden;
+    }
+    .tool-output-box.collapsed {
+      display: none;
+    }
+    .tool-output-box pre,
+    .tool-result-display pre,
+    .approval-body pre {
+      margin: 0;
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      line-height: 1.45;
+      white-space: pre-wrap !important;
+      word-break: break-word !important;
+      overflow-wrap: break-word !important;
+      max-width: 100%;
+    }
+
     /* Markdown inside messages */
     .md-content p { margin-bottom: 8px; }
     .md-content p:last-child { margin-bottom: 0; }
@@ -4637,7 +4727,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             <span class="tool-status-pill tool-status-success">✓ completed</span>
           </div>
           <div class="tool-output-box collapsed">
-            <pre style="margin:0; color:var(--text);">${escapeHtml(m.content || '')}</pre>
+            <pre style="margin:0; color:var(--text); white-space:pre-wrap; word-break:break-word; overflow-wrap:break-word;">${escapeHtml(m.content || '')}</pre>
           </div>
         `;
         UI.messagesContainer.appendChild(card);
@@ -4679,7 +4769,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               <span class="tool-status-pill tool-status-success">tool call</span>
             </div>
             <div class="tool-output-box collapsed">
-              <pre style="margin:0; color:var(--text);">${escapeHtml(typeof fn.arguments === 'object' ? JSON.stringify(fn.arguments, null, 2) : (fn.arguments || ''))}</pre>
+              <pre style="margin:0; color:var(--text); white-space:pre-wrap; word-break:break-word; overflow-wrap:break-word;">${escapeHtml(typeof fn.arguments === 'object' ? JSON.stringify(fn.arguments, null, 2) : (fn.arguments || ''))}</pre>
             </div>
           `;
           body.appendChild(fnCard);
@@ -5454,7 +5544,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               </div>
               <div class="tool-output-box collapsed">
                 <div style="color:var(--text-dim); margin-bottom:4px; font-size:0.75rem;">Arguments:</div>
-                <pre style="margin:0 0 6px 0; color:var(--text);">${escapeHtml(JSON.stringify(parsedArgs, null, 2))}</pre>
+                <pre style="margin:0 0 6px 0; color:var(--text); white-space:pre-wrap; word-break:break-word; overflow-wrap:break-word;">${escapeHtml(JSON.stringify(parsedArgs, null, 2))}</pre>
                 <div class="tool-result-display" style="color:var(--text-dim); font-size:0.75rem;">Waiting for result...</div>
               </div>
             `;
@@ -5489,7 +5579,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             }
             const resultDisplay = toolCard.querySelector('.tool-result-display');
             if (resultDisplay) {
-              resultDisplay.innerHTML = `<div style="color:var(--text-dim); margin-bottom:4px; font-size:0.75rem;">Result:</div><pre style="margin:0; color:${isSuccess ? 'var(--text)' : 'var(--danger)'};">${escapeHtml(resultStr)}</pre>`;
+              resultDisplay.innerHTML = `<div style="color:var(--text-dim); margin-bottom:4px; font-size:0.75rem;">Result:</div><pre style="margin:0; color:${isSuccess ? 'var(--text)' : 'var(--danger)'}; white-space:pre-wrap; word-break:break-word; overflow-wrap:break-word;">${escapeHtml(resultStr)}</pre>`;
             }
 
             msgs.push({
