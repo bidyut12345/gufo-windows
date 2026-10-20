@@ -268,6 +268,40 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       background: var(--bg-elevated);
       border-color: #52525b;
     }
+    .sidebar-view-selector {
+      display: none;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 4px;
+      background: var(--bg-card);
+      padding: 3px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+    }
+    .sidebar-view-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-dim);
+      font-size: 0.72rem;
+      font-weight: 500;
+      padding: 6px 4px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      transition: all 0.15s;
+    }
+    .sidebar-view-btn.active {
+      background: var(--bg-elevated);
+      color: var(--text);
+      font-weight: 600;
+    }
+    @media (max-width: 768px) {
+      .sidebar-view-selector {
+        display: grid;
+      }
+    }
 
     .search-input {
       background: var(--bg);
@@ -1118,47 +1152,45 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       header.top-nav {
         padding: 0 10px;
         height: 52px;
+        justify-content: space-between;
       }
       .nav-left {
-        gap: 6px;
+        gap: 8px;
         min-width: 0;
-        flex: 1;
+        flex: 0 0 auto;
       }
       .brand-llama {
-        font-size: 0.92rem;
-        gap: 5px;
+        font-size: 0.95rem;
+        gap: 6px;
       }
       .brand-badge {
-        display: none;
+        display: none !important;
       }
+      /* Hide top header tabs on mobile to prevent overlap; accessible via sidebar */
       .nav-tabs {
-        margin-left: 4px;
-        padding: 2px;
-        display: flex;
-      }
-      .tab-item {
-        padding: 4px 8px;
-        font-size: 0.75rem;
+        display: none !important;
       }
       .nav-right {
         gap: 6px;
+        min-width: 0;
+        flex: 0 0 auto;
       }
       .nav-right .btn-top span {
-        display: none;
+        display: none !important;
       }
       .nav-right .btn-top {
-        padding: 6px 8px;
+        padding: 5px 7px;
         min-width: 32px;
         height: 32px;
       }
-      #slot-indicator {
-        padding: 3px 6px;
+      #btn-nav-workdir {
+        display: none !important;
       }
-      #slot-text {
-        display: none;
+      #slot-indicator {
+        display: none !important;
       }
       #model-pill {
-        max-width: 80px;
+        max-width: 90px;
         padding: 3px 6px;
         font-size: 0.68rem;
         white-space: nowrap;
@@ -1197,13 +1229,42 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       }
       .chat-bottom {
         padding: 0 8px 8px;
+        width: 100%;
+        max-width: 100%;
       }
       .input-box {
         padding: 6px 10px;
-        border-radius: 10px;
+        border-radius: 12px;
+        width: 100%;
+      }
+      .input-row {
+        gap: 6px;
+        align-items: center;
+      }
+      #quick-tools-container {
+        padding: 3px 6px;
+        gap: 4px;
+        border-radius: 14px;
+        flex-shrink: 0;
+      }
+      #btn-quick-tools-gear {
+        display: none !important;
+      }
+      .tools-label-prefix {
+        display: none !important;
       }
       #chat-input {
-        font-size: 16px;
+        font-size: 15px;
+        min-height: 24px;
+        line-height: 1.4;
+      }
+      .btn-icon-input {
+        width: 30px;
+        height: 30px;
+      }
+      .btn-submit, .btn-stop-stream {
+        width: 32px;
+        height: 32px;
       }
       .chat-messages {
         padding: 12px 10px;
@@ -1578,6 +1639,17 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           </button>
           <button id="btn-close-sidebar-mobile" class="btn-close-sidebar-mobile" title="Close sidebar">&times;</button>
         </div>
+        <div class="sidebar-view-selector">
+          <button id="side-nav-chat" class="sidebar-view-btn active" type="button">
+            <span>💬</span> Chat
+          </button>
+          <button id="side-nav-comp" class="sidebar-view-btn" type="button">
+            <span>📝</span> Completion
+          </button>
+          <button id="side-nav-monitor" class="sidebar-view-btn" type="button">
+            <span>📊</span> Monitor
+          </button>
+        </div>
         <input type="text" id="conv-search-input" class="search-input" placeholder="Search chats...">
       </div>
 
@@ -1621,7 +1693,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                   <input type="checkbox" id="chk-master-tools" checked>
                   <span class="slider-mini"></span>
                 </label>
-                <span id="quick-tools-label" style="cursor:pointer;" title="Click to open tools settings">Tools: 8</span>
+                <span id="quick-tools-label" style="cursor:pointer;" title="Click to open tools settings"><span class="tools-label-prefix">Tools: </span>8</span>
                 <span id="btn-quick-tools-gear" style="cursor:pointer; opacity:0.75; font-size:0.8rem;" title="Configure tools & MCP">⚙️</span>
               </div>
               <textarea id="chat-input" rows="1" placeholder="Say something... (Shift+Enter for newline)"></textarea>
@@ -2014,6 +2086,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       tabNavChat: $('tab-nav-chat'),
       tabNavComp: $('tab-nav-comp'),
       tabNavMonitor: $('tab-nav-monitor'),
+      sideNavChat: $('side-nav-chat'),
+      sideNavComp: $('side-nav-comp'),
+      sideNavMonitor: $('side-nav-monitor'),
       chatInterface: $('chat-interface'),
       completionInterface: $('completion-interface'),
       monitorInterface: $('monitor-interface'),
@@ -2206,6 +2281,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       if (UI.tabNavChat) UI.tabNavChat.classList.toggle('active', mode === 'chat');
       if (UI.tabNavComp) UI.tabNavComp.classList.toggle('active', mode === 'comp');
       if (UI.tabNavMonitor) UI.tabNavMonitor.classList.toggle('active', mode === 'monitor');
+      if (UI.sideNavChat) UI.sideNavChat.classList.toggle('active', mode === 'chat');
+      if (UI.sideNavComp) UI.sideNavComp.classList.toggle('active', mode === 'comp');
+      if (UI.sideNavMonitor) UI.sideNavMonitor.classList.toggle('active', mode === 'monitor');
 
       if (UI.chatInterface) UI.chatInterface.style.display = mode === 'chat' ? 'flex' : 'none';
       if (UI.completionInterface) UI.completionInterface.style.display = mode === 'comp' ? 'flex' : 'none';
@@ -2227,6 +2305,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     if (UI.tabNavChat) UI.tabNavChat.addEventListener('click', () => switchTab('chat'));
     if (UI.tabNavComp) UI.tabNavComp.addEventListener('click', () => switchTab('comp'));
     if (UI.tabNavMonitor) UI.tabNavMonitor.addEventListener('click', () => switchTab('monitor'));
+    if (UI.sideNavChat) UI.sideNavChat.addEventListener('click', () => { switchTab('chat'); toggleSidebar(false); });
+    if (UI.sideNavComp) UI.sideNavComp.addEventListener('click', () => { switchTab('comp'); toggleSidebar(false); });
+    if (UI.sideNavMonitor) UI.sideNavMonitor.addEventListener('click', () => { switchTab('monitor'); toggleSidebar(false); });
     if (UI.btnRefreshMonitor) UI.btnRefreshMonitor.addEventListener('click', () => refreshMonitorStats());
 
     // Sidebar Toggle
@@ -2593,11 +2674,11 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         setMasterTools(e.target.checked);
       });
     }
-    if (UI.quickToolsLabel) {
-      UI.quickToolsLabel.addEventListener('click', () => openToolsModal('inbuilt'));
-    }
-    if (UI.btnQuickToolsGear) {
-      UI.btnQuickToolsGear.addEventListener('click', () => openToolsModal('inbuilt'));
+    if (UI.quickToolsContainer) {
+      UI.quickToolsContainer.addEventListener('click', (e) => {
+        if (e.target.closest('.switch-toggle-mini')) return;
+        openToolsModal('inbuilt');
+      });
     }
 
     function openToolsModal(tab = 'inbuilt') {
@@ -2670,9 +2751,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       const isEnabled = APP.toolsEnabled && total > 0;
       if (UI.quickToolsLabel) {
         if (!APP.toolsEnabled) {
-          UI.quickToolsLabel.textContent = 'Tools: OFF';
+          UI.quickToolsLabel.innerHTML = '<span class="tools-label-prefix">Tools: </span>OFF';
         } else {
-          UI.quickToolsLabel.textContent = `Tools: ${total}`;
+          UI.quickToolsLabel.innerHTML = `<span class="tools-label-prefix">Tools: </span>${total}`;
         }
       }
       if (UI.navToolsLabel) {
