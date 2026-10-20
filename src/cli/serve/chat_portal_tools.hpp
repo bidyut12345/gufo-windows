@@ -29,7 +29,8 @@ class ToolEngine {
 
   static ToolExecutionResult Execute(
       const std::string& name, const json::Value& arguments,
-      const std::string& working_directory = "");
+      const std::string& working_directory = "",
+      const std::string& user_root_dir = "");
 
   static ToolExecutionResult ExecuteMcpProxy(const std::string& url,
                                             const std::string& headers_json,

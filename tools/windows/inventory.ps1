@@ -226,7 +226,7 @@ function Get-GufoFamilyInfo([string]$Family) {
   switch ($Family) {
     "fn" { @{
       Title = "Qwen3.8-Flash-Next"; ServedName = "flash-next"; DefaultContext = 262144
-      Download = 'hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" "mmproj-BF16.gguf"'
+      Download = 'hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-IQ4_XS/*" "UD-Q4_K_XL/*" "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" "mmproj-BF16.gguf"'
       DraftDownload = 'hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"'
       Overhead = 3.5 } }
     "27b" { @{
@@ -267,10 +267,10 @@ function Get-GufoCompanions($Target, $All, [string]$Kind) {
 }
 
 # Rough device memory for one server, in GiB: the weights the GPU holds, the
-# KV cache (fp16, full-attention layers only) for every session, the draft,
+# KV cache (fp16/q8/fp8/v4, full-attention layers only) for every session, the draft,
 # and a per-model allowance for recurrent state and scratch. Measured
-# reference: Flash-Next UD-Q4_K_XL at 262144 = ~89 GiB.
-function Get-GufoMemoryEstimate($Target, [int]$Context, [int]$Sessions = 1, $Draft = $null) {
+# reference: Flash-Next UD-Q4_K_XL at 262144 = ~89 GiB (f16), ~86 GiB (q8/fp8), ~85 GiB (K8V4).
+function Get-GufoMemoryEstimate($Target, [int]$Context, [int]$Sessions = 1, $Draft = $null, [string]$KvQuant = "f16") {
   $info = Get-GufoFamilyInfo $Target.Family
   $header = $Target.Header
   $arch = $Target.Arch
@@ -282,7 +282,14 @@ function Get-GufoMemoryEstimate($Target, [int]$Context, [int]$Sessions = 1, $Dra
   if ($interval -lt 1) { $interval = 1 }
   $kvHeads = [int](Get-HeaderValue $header "$arch.attention.head_count_kv" 0)
   $headBytes = [int](Get-HeaderValue $header "$arch.attention.key_length" 0) + [int](Get-HeaderValue $header "$arch.attention.value_length" 0)
-  $kvPerToken = [math]::Floor($blocks / $interval) * $kvHeads * $headBytes * 2
+
+  # KV cache footprint depending on precision (f16: 2048B/tok, q8/fp8: 1088B/tok, K8V4: 832B/tok, K4V4: 576B/tok)
+  $kvScale = 2.0
+  if ($env:GUFO_KV_V4 -eq "1" -and $env:GUFO_KV_Q4 -eq "1") { $kvScale = 0.5625 }
+  elseif ($env:GUFO_KV_V4 -eq "1") { $kvScale = 0.8125 }
+  elseif ($KvQuant -in @("q8", "fp8") -or $env:GUFO_KV_QUANT -in @("q8", "fp8")) { $kvScale = 1.0625 }
+
+  $kvPerToken = [math]::Floor($blocks / $interval) * $kvHeads * $headBytes * ($kvScale / 2.0) * 2
   $kv = $kvPerToken * $Context * $Sessions / 1GB
   $draftGiB = if ($Draft) { $Draft.Bytes / 1GB } else { 0 }
   [math]::Round($weights + $kv + $draftGiB + $info.Overhead, 1)

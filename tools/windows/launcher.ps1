@@ -179,13 +179,14 @@ function Show-Models {
 function Get-Features($o) {
   $saved = $settings.Features[$o.Key]
   $f = [ordered]@{ Spec = [bool]$o.DraftKind; Lookup = [bool]$o.DraftKind; Survival = $o.Target.Family -ne "27b" -and [bool]$o.DraftKind
-    Vocab = $false; Vision = [bool]$o.Vision; Think = $true; Context = $o.Context; Lan = $false }
+    Vocab = $false; Vision = [bool]$o.Vision; Think = $true; Context = $o.Context; Lan = $false; KvQuant = "f16" }
   if ($saved) {
     foreach ($name in @($f.Keys)) { if ($null -ne $saved.$name) { $f[$name] = $saved.$name } }
   }
   if (-not $o.DraftKind) { $f.Spec = $false }
   if (-not $o.Vision) { $f.Vision = $false }
   if ($o.Contexts -notcontains [int]$f.Context) { $f.Context = $o.Context }
+  if (-not $f.KvQuant) { $f.KvQuant = "f16" }
   $f
 }
 
@@ -204,12 +205,13 @@ function Show-Features($o, $f) {
     @("5", (& $box $f.Vision ([bool]$o.Vision)), "Images (vision)", $(if ($o.Vision) { $o.Vision.FileName } else { "no matching mmproj-BF16.gguf found" }), [bool]$o.Vision),
     @("6", (& $box $f.Think $true), "Thinking", "reasoning before the answer (clients can still turn it off per request)", $true),
     @("7", "   ", "Context", ("{0}K tokens per request  (press 7 to change)" -f ([int]$f.Context / 1024)), $true),
-    @("8", (& $box $f.Lan $true), "Open to the network", $(if ($f.Lan) { "0.0.0.0, asks for an API key" } else { "this PC only (127.0.0.1)" }), $true))
+    @("8", (& $box $f.Lan $true), "Open to the network", $(if ($f.Lan) { "0.0.0.0, asks for an API key" } else { "this PC only (127.0.0.1)" }), $true),
+    @("9", "   ", "KV cache quant", ("{0}  (press 9 to cycle f16/q8/fp8/K8V4)" -f $f.KvQuant), $true))
   foreach ($r in $rows) {
     $color = if (-not $r[4]) { "DarkGray" } elseif ($r[0] -eq "4" -and -not $f.Vocab) { "Yellow" } else { "White" }
     Write-Host ("  {0} {1} {2,-24} {3}" -f $r[0], $r[1], $r[2], $r[3]) -ForegroundColor $color
   }
-  $need = Get-GufoMemoryEstimate $o.Target ([int]$f.Context) 1 $(if ($f.Spec) { $o.Draft } else { $null })
+  $need = Get-GufoMemoryEstimate $o.Target ([int]$f.Context) 1 $(if ($f.Spec) { $o.Draft } else { $null }) $f.KvQuant
   Write-Host ""
   Write-Host ("  ~{0} of GPU memory: {1}" -f (Format-GufoGiB $need), (Get-GufoFit $need $memory)) -ForegroundColor DarkGray
   Write-Host "  Enter = start   B = back   D = show the command   Q = quit" -ForegroundColor DarkGray
@@ -230,6 +232,14 @@ function New-Plan($o, $f) {
     "--max-output-bytes", "8388608", "--think", $(if ($f.Think) { "on" } else { "off" })) + $sampling
   $vars = [ordered]@{}
   $labels = @()
+  if ($f.KvQuant -in @("q8", "fp8")) {
+    $llm += @("--kv-quant", $f.KvQuant)
+    $labels += "kv-$($f.KvQuant)"
+  } elseif ($f.KvQuant -eq "K8V4") {
+    $llm += @("--kv-quant", "q8")
+    $vars["GUFO_KV_V4"] = "1"
+    $labels += "kv-K8V4"
+  }
   if ($f.Spec -and $o.DraftKind) {
     $rest = @()
     switch ($family) {

@@ -14,6 +14,13 @@ struct sqlite3;
 
 namespace gufo::server {
 
+std::filesystem::path GetExecutableDirectory();
+std::filesystem::path GetUserRootWorkingDir(const std::string& user_id, const std::string& username);
+std::filesystem::path GetConversationDefaultWorkingDir(const std::string& user_id, const std::string& username,
+                                                      const std::string& conv_id, const std::string& title);
+std::filesystem::path GetConversationDefaultWorkingDir(const std::string& conv_id, const std::string& title);
+bool IsPathInsideDirectory(const std::filesystem::path& target, const std::filesystem::path& base);
+
 struct ChatMessageRecord {
   std::string id;
   std::string role;             // "user", "assistant", "system", "tool"

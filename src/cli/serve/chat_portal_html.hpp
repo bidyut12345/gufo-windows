@@ -1556,25 +1556,33 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       color: #fff;
     }
     .segmented-control {
-      display: flex;
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
       background: var(--bg-elevated);
       border-radius: var(--radius-sm);
       padding: 2px;
       gap: 2px;
       border: 1px solid var(--border);
     }
+    @media (max-width: 480px) {
+      .segmented-control {
+        grid-template-columns: repeat(3, 1fr);
+      }
+    }
     .seg-btn {
-      flex: 1;
       background: transparent;
       border: none;
       color: var(--text-dim);
-      font-size: 0.74rem;
+      font-size: 0.72rem;
       font-weight: 500;
-      padding: 5px 0;
+      padding: 5px 2px;
       border-radius: 3px;
       cursor: pointer;
       transition: all 0.15s ease;
       text-align: center;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      overflow: hidden;
     }
     .seg-btn:hover {
       color: var(--text);
@@ -1598,6 +1606,107 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       background: linear-gradient(90deg, #3b82f6, #8b5cf6);
       border-radius: 9999px;
       transition: width 0.3s ease;
+    }
+
+    /* Hero Attachment & Context Dashboard Grid */
+    .hero-attach-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 12px;
+      width: 100%;
+      max-width: 880px;
+      margin: 20px auto 0;
+      text-align: left;
+    }
+    .hero-attach-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      transition: all 0.2s ease;
+      position: relative;
+      cursor: pointer;
+    }
+    .hero-attach-card:hover {
+      border-color: var(--border-strong);
+      background: var(--bg-elevated);
+    }
+    .hero-attach-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .hero-attach-card-icon {
+      font-size: 1.25rem;
+    }
+    .hero-attach-card-title {
+      font-size: 0.86rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .hero-attach-card-sub {
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      line-height: 1.35;
+    }
+    .hero-card-badge {
+      font-size: 0.68rem;
+      font-weight: 500;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      background: var(--bg-hover);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+    }
+    .tag-pill {
+      font-size: 0.65rem;
+      padding: 1px 6px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+    }
+
+    /* Human-in-the-loop Model Inquiry Cards */
+    .inquiry-card {
+      border-color: rgba(59, 130, 246, 0.4) !important;
+      background: rgba(59, 130, 246, 0.05) !important;
+    }
+    .inquiry-opt-btn {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+      font-size: 0.82rem;
+      padding: 6px 14px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all 0.15s ease;
+      font-weight: 500;
+    }
+    .inquiry-opt-btn:hover {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    /* File Explorer Sidebar */
+    .file-item-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 8px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      font-size: 0.8rem;
+      transition: background 0.15s;
+    }
+    .file-item-row:hover {
+      background: var(--bg-hover);
     }
     .btn-compact-context {
       background: rgba(139, 92, 246, 0.18);
@@ -1911,10 +2020,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <span id="slot-text">1/1 slots (idle)</span>
       </div>
       <div id="model-pill" class="model-pill" title="Loaded Model">loading model...</div>
-      <button id="btn-open-tools" class="btn-top" title="Tools & MCP Settings">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>
-        <span id="nav-tools-label">Tools & MCP</span>
-      </button>
       <button id="btn-open-drawer" class="btn-top" title="Parameters & Settings">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
         <span>Settings</span>
@@ -1945,6 +2050,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           <button id="side-nav-comp" class="sidebar-view-btn" type="button">
             <span>📝</span> Completion
           </button>
+          <button id="side-nav-files" class="sidebar-view-btn" type="button">
+            <span>📁</span> Files
+          </button>
           <button id="side-nav-monitor" class="sidebar-view-btn" type="button">
             <span>📊</span> Monitor
           </button>
@@ -1954,6 +2062,20 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
       <div id="chat-list" class="sidebar-list">
         <!-- Injected dynamically -->
+      </div>
+
+      <!-- Sandboxed User Files Explorer Pane -->
+      <div id="files-pane" class="sidebar-list" style="display:none; flex-direction:column; padding:8px 10px;">
+        <div class="files-header-bar" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid var(--border);">
+          <div style="font-size:0.75rem; font-weight:600; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" id="files-cwd-label">UserData/</div>
+          <div style="display:flex; gap:4px;">
+            <button id="btn-files-up" class="btn-top" style="padding:2px 6px; font-size:0.72rem;" title="Up one folder">⬆️</button>
+            <button id="btn-files-refresh" class="btn-top" style="padding:2px 6px; font-size:0.72rem;" title="Refresh files">🔄</button>
+          </div>
+        </div>
+        <div id="files-list-container" style="flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:2px;">
+          <!-- Injected dynamically -->
+        </div>
       </div>
 
       <div class="sidebar-bottom">
@@ -2074,13 +2196,30 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
                   <div class="attach-popup-divider"></div>
 
-                  <!-- 6. Thinking level -->
+                  <!-- Tool Permission: Ask / Allow all -->
+                  <div class="attach-popup-card">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                      <div class="attach-card-label">Tool Permission</div>
+                      <span id="popup-perm-label" style="font-size:0.68rem; color:var(--text-dim);">Ask before run</span>
+                    </div>
+                    <div class="segmented-control" id="tool-perm-control" style="grid-template-columns:1fr 1fr; margin-top:4px;">
+                      <button type="button" class="seg-btn active" data-perm="ask" title="Prompt for approval before running tools">🛡️ Ask</button>
+                      <button type="button" class="seg-btn" data-perm="allow" title="Allow autonomous tool execution without asking">⚡ Allow all</button>
+                    </div>
+                  </div>
+
+                  <div class="attach-popup-divider"></div>
+
+                  <!-- 6. Thinking level (auto, minimum, low, medium, high, xhigh) -->
                   <div class="attach-popup-card">
                     <div class="attach-card-label">Thinking Level</div>
                     <div class="segmented-control" id="thinking-level-control">
-                      <button type="button" class="seg-btn" data-level="off">Off</button>
-                      <button type="button" class="seg-btn active" data-level="standard">Standard</button>
-                      <button type="button" class="seg-btn" data-level="deep">Deep</button>
+                      <button type="button" class="seg-btn active" data-level="auto" title="Default thinking budget">Auto</button>
+                      <button type="button" class="seg-btn" data-level="minimum" title="Fast/concise reasoning (512 tokens)">Min</button>
+                      <button type="button" class="seg-btn" data-level="low" title="Low reasoning budget (2,048 tokens)">Low</button>
+                      <button type="button" class="seg-btn" data-level="medium" title="Medium reasoning budget (4,096 tokens)">Med</button>
+                      <button type="button" class="seg-btn" data-level="high" title="High reasoning budget (8,192 tokens)">High</button>
+                      <button type="button" class="seg-btn" data-level="xhigh" title="Maximum reasoning budget (16,384 tokens)">XHigh</button>
                     </div>
                   </div>
 
@@ -2500,6 +2639,26 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- File Viewer Modal (View/Download sandboxed user files) -->
+  <div id="file-viewer-dialog" class="dialog-backdrop">
+    <div class="dialog-box" style="max-width:680px; width:90vw;">
+      <div class="dialog-header">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span>📄</span>
+          <span id="file-viewer-title" style="font-weight:700; font-size:0.95rem;">File Preview</span>
+        </div>
+        <button id="btn-close-file-viewer" class="btn-top" style="padding:2px 8px;">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <pre id="file-viewer-content" style="max-height:55vh; overflow-y:auto; font-family:var(--font-mono); font-size:0.75rem; background:var(--bg); padding:10px; border-radius:var(--radius-sm); border:1px solid var(--border); white-space:pre-wrap; word-break:break-all;"></pre>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
+          <span id="file-viewer-meta" style="font-size:0.72rem; color:var(--text-dim);"></span>
+          <button id="btn-file-viewer-download" class="btn-dialog-submit" style="padding:4px 14px; font-size:0.8rem;">Download</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
     // State management
     const APP = {
@@ -2510,7 +2669,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       activeConv: null,
       attachedImage: null,
       attachedFiles: [],
-      thinkingLevel: localStorage.getItem('gufo_thinking_level') || 'standard',
+      toolPermission: localStorage.getItem('gufo_tool_permission') || 'ask',
+      thinkingLevel: localStorage.getItem('gufo_thinking_level') || 'auto',
       customPrompts: JSON.parse(localStorage.getItem('gufo_custom_prompts') || '[]'),
       isGenerating: false,
       abortController: null,
@@ -2531,6 +2691,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         activeTab: 'inbuilt'
       }
     };
+    if (!['auto', 'minimum', 'low', 'medium', 'high', 'xhigh'].includes(APP.thinkingLevel)) {
+      APP.thinkingLevel = 'auto';
+    }
 
     // DOM references
     const $ = id => document.getElementById(id);
@@ -2540,7 +2703,21 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       tabNavMonitor: $('tab-nav-monitor'),
       sideNavChat: $('side-nav-chat'),
       sideNavComp: $('side-nav-comp'),
+      sideNavFiles: $('side-nav-files'),
       sideNavMonitor: $('side-nav-monitor'),
+      filesPane: $('files-pane'),
+      filesCwdLabel: $('files-cwd-label'),
+      btnFilesUp: $('btn-files-up'),
+      btnFilesRefresh: $('btn-files-refresh'),
+      filesListContainer: $('files-list-container'),
+      fileViewerDialog: $('file-viewer-dialog'),
+      fileViewerTitle: $('file-viewer-title'),
+      fileViewerContent: $('file-viewer-content'),
+      fileViewerMeta: $('file-viewer-meta'),
+      btnFileViewerDownload: $('btn-file-viewer-download'),
+      btnCloseFileViewer: $('btn-close-file-viewer'),
+      toolPermControl: $('tool-perm-control'),
+      popupPermLabel: $('popup-perm-label'),
       chatInterface: $('chat-interface'),
       completionInterface: $('completion-interface'),
       monitorInterface: $('monitor-interface'),
@@ -2772,6 +2949,12 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       if (UI.completionInterface) UI.completionInterface.style.display = mode === 'comp' ? 'flex' : 'none';
       if (UI.monitorInterface) UI.monitorInterface.style.display = mode === 'monitor' ? 'flex' : 'none';
 
+      if (mode === 'chat') {
+        if (UI.sideNavFiles) UI.sideNavFiles.classList.remove('active');
+        if (UI.filesPane) UI.filesPane.style.display = 'none';
+        if (UI.chatList) UI.chatList.style.display = 'flex';
+      }
+
       if (mode === 'monitor') {
         refreshMonitorStats();
         if (!APP.monitorInterval) {
@@ -2788,10 +2971,182 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     if (UI.tabNavChat) UI.tabNavChat.addEventListener('click', () => switchTab('chat'));
     if (UI.tabNavComp) UI.tabNavComp.addEventListener('click', () => switchTab('comp'));
     if (UI.tabNavMonitor) UI.tabNavMonitor.addEventListener('click', () => switchTab('monitor'));
-    if (UI.sideNavChat) UI.sideNavChat.addEventListener('click', () => { switchTab('chat'); toggleSidebar(false); });
+    if (UI.sideNavChat) UI.sideNavChat.addEventListener('click', () => {
+      if (UI.sideNavFiles) UI.sideNavFiles.classList.remove('active');
+      if (UI.filesPane) UI.filesPane.style.display = 'none';
+      if (UI.chatList) UI.chatList.style.display = 'flex';
+      switchTab('chat');
+      toggleSidebar(false);
+    });
     if (UI.sideNavComp) UI.sideNavComp.addEventListener('click', () => { switchTab('comp'); toggleSidebar(false); });
     if (UI.sideNavMonitor) UI.sideNavMonitor.addEventListener('click', () => { switchTab('monitor'); toggleSidebar(false); });
     if (UI.btnRefreshMonitor) UI.btnRefreshMonitor.addEventListener('click', () => refreshMonitorStats());
+
+    // User Sandboxed File Explorer Handlers
+    let currentFilesPath = '';
+
+    function openSidebarFiles() {
+      if (UI.sideNavChat) UI.sideNavChat.classList.remove('active');
+      if (UI.sideNavComp) UI.sideNavComp.classList.remove('active');
+      if (UI.sideNavFiles) UI.sideNavFiles.classList.add('active');
+      if (UI.chatList) UI.chatList.style.display = 'none';
+      if (UI.filesPane) UI.filesPane.style.display = 'flex';
+      toggleSidebar(true);
+      loadUserFiles('');
+    }
+
+    if (UI.sideNavFiles) {
+      UI.sideNavFiles.addEventListener('click', () => {
+        openSidebarFiles();
+      });
+    }
+
+    async function loadUserFiles(subpath = '') {
+      currentFilesPath = subpath;
+      if (!UI.filesListContainer) return;
+      UI.filesListContainer.innerHTML = '<div style="color:var(--text-dim); font-size:0.75rem; padding:8px;">Loading files...</div>';
+      if (UI.filesCwdLabel) {
+        UI.filesCwdLabel.textContent = 'UserData/' + (subpath ? subpath : '');
+        UI.filesCwdLabel.title = 'UserData/' + (subpath ? subpath : '');
+      }
+
+      try {
+        const url = `/api/user-files?path=${encodeURIComponent(subpath)}`;
+        const res = await apiFetch(url);
+        if (!res.ok) {
+          throw new Error(`Failed to load directory (HTTP ${res.status})`);
+        }
+        const data = await res.json();
+        const entries = data.entries || [];
+        if (entries.length === 0) {
+          UI.filesListContainer.innerHTML = '<div style="color:var(--text-dim); font-size:0.75rem; padding:12px; text-align:center;">Empty directory</div>';
+          return;
+        }
+
+        UI.filesListContainer.innerHTML = '';
+        entries.forEach(entry => {
+          const row = document.createElement('div');
+          row.className = 'file-item-row';
+          const icon = entry.is_directory ? '📁' : (entry.name.match(/\.(png|jpg|jpeg|webp|gif)$/i) ? '🖼️' : '📄');
+          const sizeStr = entry.is_directory ? '' : formatBytes(entry.size || 0);
+
+          row.innerHTML = `
+            <div class="file-tree-left" style="display:flex; align-items:center; gap:6px; flex:1; overflow:hidden; cursor:pointer;">
+              <span style="font-size:1rem;">${icon}</span>
+              <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.8rem; color:var(--text); font-weight:${entry.is_directory ? '600' : '400'};">${escapeHtml(entry.name)}</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:6px;">
+              ${sizeStr ? `<span style="font-size:0.7rem; color:var(--text-dim); font-family:var(--font-mono);">${sizeStr}</span>` : ''}
+              ${!entry.is_directory ? `<button class="btn-mini btn-file-preview" title="View / Preview" style="padding:1px 5px; font-size:0.72rem;">👁️</button>` : ''}
+              <button class="btn-mini btn-file-del" title="Delete" style="padding:1px 5px; font-size:0.72rem; color:var(--danger);">&times;</button>
+            </div>
+          `;
+
+          const left = row.querySelector('.file-tree-left');
+          left.addEventListener('click', () => {
+            if (entry.is_directory) {
+              const nextPath = subpath ? `${subpath}/${entry.name}` : entry.name;
+              loadUserFiles(nextPath);
+            } else {
+              const relPath = subpath ? `${subpath}/${entry.name}` : entry.name;
+              openFilePreviewModal(relPath, entry.name);
+            }
+          });
+
+          const previewBtn = row.querySelector('.btn-file-preview');
+          if (previewBtn) {
+            previewBtn.addEventListener('click', (e) => {
+              e.stopPropagation();
+              const relPath = subpath ? `${subpath}/${entry.name}` : entry.name;
+              openFilePreviewModal(relPath, entry.name);
+            });
+          }
+
+          const delBtn = row.querySelector('.btn-file-del');
+          if (delBtn) {
+            delBtn.addEventListener('click', async (e) => {
+              e.stopPropagation();
+              const relPath = subpath ? `${subpath}/${entry.name}` : entry.name;
+              if (confirm(`Delete "${entry.name}"?`)) {
+                try {
+                  const delRes = await apiFetch(`/api/user-files?path=${encodeURIComponent(relPath)}`, { method: 'DELETE' });
+                  if (delRes.ok) {
+                    loadUserFiles(subpath);
+                  } else {
+                    const d = await delRes.json();
+                    alert('Failed to delete: ' + (d.error || 'Server error'));
+                  }
+                } catch (err) {
+                  alert('Delete failed: ' + err.message);
+                }
+              }
+            });
+          }
+
+          UI.filesListContainer.appendChild(row);
+        });
+      } catch (err) {
+        UI.filesListContainer.innerHTML = `<div style="color:var(--danger); font-size:0.75rem; padding:8px;">${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    if (UI.btnFilesUp) {
+      UI.btnFilesUp.addEventListener('click', () => {
+        if (!currentFilesPath) return;
+        const parts = currentFilesPath.split(/[\\/]/).filter(Boolean);
+        parts.pop();
+        loadUserFiles(parts.join('/'));
+      });
+    }
+
+    if (UI.btnFilesRefresh) {
+      UI.btnFilesRefresh.addEventListener('click', () => loadUserFiles(currentFilesPath));
+    }
+
+    function formatBytes(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    async function openFilePreviewModal(relPath, fileName) {
+      if (!UI.fileViewerDialog) return;
+      if (UI.fileViewerTitle) UI.fileViewerTitle.textContent = fileName || relPath;
+      if (UI.fileViewerMeta) UI.fileViewerMeta.textContent = 'Path: UserData/' + relPath;
+      if (UI.fileViewerContent) UI.fileViewerContent.textContent = 'Loading file content...';
+      if (UI.btnFileViewerDownload) {
+        UI.btnFileViewerDownload.href = `/api/user-files/content?path=${encodeURIComponent(relPath)}`;
+        UI.btnFileViewerDownload.download = fileName;
+      }
+      UI.fileViewerDialog.classList.add('show');
+
+      try {
+        const res = await apiFetch(`/api/user-files/content?path=${encodeURIComponent(relPath)}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const cType = res.headers.get('content-type') || '';
+        if (cType.startsWith('image/')) {
+          const blob = await res.blob();
+          const imgUrl = URL.createObjectURL(blob);
+          UI.fileViewerContent.innerHTML = `<img src="${imgUrl}" style="max-width:100%; max-height:450px; object-fit:contain; border-radius:var(--radius-sm);" alt="preview">`;
+        } else {
+          const txt = await res.text();
+          UI.fileViewerContent.textContent = txt;
+        }
+      } catch (err) {
+        if (UI.fileViewerContent) UI.fileViewerContent.textContent = 'Error loading content: ' + err.message;
+      }
+    }
+
+    if (UI.btnCloseFileViewer) {
+      UI.btnCloseFileViewer.addEventListener('click', () => {
+        if (UI.fileViewerDialog) UI.fileViewerDialog.classList.remove('show');
+      });
+    }
+    if (UI.fileViewerDialog) {
+      UI.fileViewerDialog.addEventListener('click', (e) => {
+        if (e.target === UI.fileViewerDialog) UI.fileViewerDialog.classList.remove('show');
+      });
+    }
 
     // Sidebar Toggle
     function toggleSidebar(forceState) {
@@ -3169,6 +3524,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       // 6. Thinking level buttons
       renderThinkingLevelButtons();
 
+      // Tool permission buttons
+      renderToolPermissionButtons();
+
       // 7. Context size calculation
       calculateContextSize();
     }
@@ -3369,7 +3727,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       });
     }
 
-    // 6. Thinking Level Control
+    // 6. Thinking Level Control (auto, minimum, low, medium, high, xhigh)
     function renderThinkingLevelButtons() {
       if (!UI.thinkingLevelControl) return;
       const btns = UI.thinkingLevelControl.querySelectorAll('.seg-btn');
@@ -3382,9 +3740,31 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       UI.thinkingLevelControl.addEventListener('click', (e) => {
         const btn = e.target.closest('.seg-btn');
         if (!btn) return;
-        APP.thinkingLevel = btn.dataset.level || 'standard';
+        APP.thinkingLevel = btn.dataset.level || 'auto';
         localStorage.setItem('gufo_thinking_level', APP.thinkingLevel);
         renderThinkingLevelButtons();
+      });
+    }
+
+    // Tool Permission Control (Ask before running / Allow all)
+    function renderToolPermissionButtons() {
+      if (!UI.toolPermControl) return;
+      const btns = UI.toolPermControl.querySelectorAll('.seg-btn');
+      btns.forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.perm === APP.toolPermission);
+      });
+      if (UI.popupPermLabel) {
+        UI.popupPermLabel.textContent = APP.toolPermission === 'allow' ? 'Allow all' : 'Ask';
+      }
+    }
+
+    if (UI.toolPermControl) {
+      UI.toolPermControl.addEventListener('click', (e) => {
+        const btn = e.target.closest('.seg-btn');
+        if (!btn) return;
+        APP.toolPermission = btn.dataset.perm || 'ask';
+        localStorage.setItem('gufo_tool_permission', APP.toolPermission);
+        renderToolPermissionButtons();
       });
     }
 
@@ -4128,15 +4508,124 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     function renderMessages(messages) {
       UI.messagesContainer.innerHTML = '';
       if (!messages || messages.length === 0) {
-        UI.messagesContainer.innerHTML = `
-          <div class="llama-hero">
-            <div class="llama-hero-icon">&#x1F989;</div>
-            <div class="llama-hero-title">Gufo Chat</div>
-            <div class="llama-hero-subtitle">High-performance LLM inference running natively on AMD Strix Halo gfx1151. Multi-device chat history synced to SQLite database.</div>
-          </div>
-        `;
+        renderHeroDashboard();
         return;
       }
+
+      messages.forEach(m => appendMessage(m));
+      scrollDown();
+    }
+
+    function renderHeroDashboard() {
+      let wdName = 'UserData/...';
+      if (APP.activeConv && APP.activeConv.working_directory) {
+        const parts = APP.activeConv.working_directory.split(/[\\/]/).filter(Boolean);
+        wdName = parts.length > 0 ? parts[parts.length - 1] : APP.activeConv.working_directory;
+      }
+      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.enabled).length;
+      const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
+      const totalTools = activeInbuilt + activeCustom;
+      const toolsDesc = APP.toolsEnabled ? `${totalTools} tools active` : 'Tools disabled';
+      const permDesc = APP.toolPermission === 'allow' ? 'Allow all (autonomous)' : 'Ask before running';
+      const thinkDesc = `${APP.thinkingLevel} reasoning`;
+
+      UI.messagesContainer.innerHTML = `
+        <div class="llama-hero">
+          <div class="llama-hero-icon">&#x1F989;</div>
+          <div class="llama-hero-title">Gufo Chat</div>
+          <div class="llama-hero-subtitle">High-performance LLM inference running natively on AMD Strix Halo gfx1151. Multi-device chat history synced to SQLite database.</div>
+          <div class="hero-attach-grid">
+            <div class="hero-attach-card" onclick="if(UI.fileUploaderImage) UI.fileUploaderImage.click()">
+              <div class="hero-attach-card-header">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span class="hero-attach-card-icon">🖼️</span>
+                  <span class="hero-attach-card-title">Attach Images</span>
+                </div>
+                <span class="tag-pill">Vision</span>
+              </div>
+              <div class="hero-attach-card-sub">Add multimodal visual input to your conversation context</div>
+            </div>
+
+            <div class="hero-attach-card" onclick="if(UI.fileUploaderDoc) UI.fileUploaderDoc.click()">
+              <div class="hero-attach-card-header">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span class="hero-attach-card-icon">📄</span>
+                  <span class="hero-attach-card-title">Attach Files</span>
+                </div>
+                <span class="tag-pill">Context</span>
+              </div>
+              <div class="hero-attach-card-sub">Attach code, logs, documents, or data files directly to the prompt</div>
+            </div>
+
+            <div class="hero-attach-card" onclick="openConvWorkdirModal()">
+              <div class="hero-attach-card-header">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span class="hero-attach-card-icon">📁</span>
+                  <span class="hero-attach-card-title">Working Directory</span>
+                </div>
+                <span class="tag-pill">Per-Chat</span>
+              </div>
+              <div class="hero-attach-card-sub">${escapeHtml(wdName)}</div>
+            </div>
+
+            <div class="hero-attach-card" onclick="openSidebarFiles()">
+              <div class="hero-attach-card-header">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span class="hero-attach-card-icon">🗂️</span>
+                  <span class="hero-attach-card-title">File Explorer</span>
+                </div>
+                <span class="tag-pill">UserData</span>
+              </div>
+              <div class="hero-attach-card-sub">Explore and preview files inside your personal sandbox</div>
+            </div>
+
+            <div class="hero-attach-card" onclick="openDrawer('tools')">
+              <div class="hero-attach-card-header">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span class="hero-attach-card-icon">⚙️</span>
+                  <span class="hero-attach-card-title">Tools & MCP</span>
+                </div>
+                <span class="hero-card-badge">${escapeHtml(toolsDesc)}</span>
+              </div>
+              <div class="hero-attach-card-sub">Filesystem, shell, code search, web, and external MCP servers</div>
+            </div>
+
+            <div class="hero-attach-card" onclick="openAttachPopup()">
+              <div class="hero-attach-card-header">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span class="hero-attach-card-icon">🛡️</span>
+                  <span class="hero-attach-card-title">Tool Permission</span>
+                </div>
+                <span class="hero-card-badge">${escapeHtml(permDesc)}</span>
+              </div>
+              <div class="hero-attach-card-sub">Choose between human approval ("Ask") and autonomous execution ("Allow all")</div>
+            </div>
+
+            <div class="hero-attach-card" onclick="openAttachPopup()">
+              <div class="hero-attach-card-header">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span class="hero-attach-card-icon">🧠</span>
+                  <span class="hero-attach-card-title">Thinking Level</span>
+                </div>
+                <span class="hero-card-badge">${escapeHtml(thinkDesc)}</span>
+              </div>
+              <div class="hero-attach-card-sub">Configure reasoning depth: auto, minimum, low, medium, high, xhigh</div>
+            </div>
+
+            <div class="hero-attach-card" onclick="openAttachPopup()">
+              <div class="hero-attach-card-header">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span class="hero-attach-card-icon">📊</span>
+                  <span class="hero-attach-card-title">Context & Presets</span>
+                </div>
+                <span class="tag-pill">262k</span>
+              </div>
+              <div class="hero-attach-card-sub">Manage system prompt personas, compact history, and view context tokens</div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
 
       messages.forEach(m => appendMessage(m));
       scrollDown();
@@ -4377,6 +4866,144 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       return tools;
     }
 
+    // Interactive Model Clarification Question
+    function askUserInquiry(tc, parsedArgs) {
+      return new Promise((resolve) => {
+        const card = document.createElement('div');
+        card.className = 'tool-call-card inquiry-card';
+        card.style.borderColor = 'var(--accent)';
+        card.style.background = 'rgba(59, 130, 246, 0.08)';
+
+        const qText = parsedArgs.question || parsedArgs.q || 'Gufo is asking for your input:';
+        const options = Array.isArray(parsedArgs.options) ? parsedArgs.options : [];
+        const allowText = parsedArgs.allow_text_input !== false;
+
+        let optionsHtml = '';
+        if (options.length > 0) {
+          optionsHtml = `<div style="display:flex; flex-wrap:wrap; gap:8px; margin:10px 0;">` +
+            options.map((opt, i) => `<button type="button" class="inquiry-opt-btn" data-idx="${i}">${escapeHtml(opt)}</button>`).join('') +
+            `</div>`;
+        }
+
+        let inputHtml = '';
+        if (allowText) {
+          inputHtml = `
+            <div style="display:flex; gap:8px; margin-top:8px;">
+              <input type="text" class="popup-select inquiry-text-input" placeholder="Type your answer..." style="flex:1;">
+              <button type="button" class="btn-top inquiry-submit-btn" style="background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; padding:6px 14px;">Send Answer</button>
+            </div>
+          `;
+        }
+
+        card.innerHTML = `
+          <div class="tool-call-header" style="cursor:default;">
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span style="font-size:1.1rem;">❓</span>
+              <span class="tool-call-name" style="color:var(--text);">Model Clarification Question</span>
+            </div>
+            <span class="tool-status-pill tool-status-running" style="background:rgba(59, 130, 246, 0.2); color:#60a5fa; border:1px solid rgba(59, 130, 246, 0.4);">Awaiting User Response</span>
+          </div>
+          <div style="padding:10px 14px;">
+            <div style="font-size:0.92rem; color:var(--text); font-weight:500; margin-bottom:4px; line-height:1.5;">${escapeHtml(qText)}</div>
+            ${optionsHtml}
+            ${inputHtml}
+          </div>
+        `;
+
+        UI.messagesContainer.appendChild(card);
+        scrollDown();
+
+        const finishInquiry = (answer) => {
+          card.querySelectorAll('button, input').forEach(el => el.disabled = true);
+          const statusPill = card.querySelector('.tool-status-pill');
+          if (statusPill) {
+            statusPill.className = 'tool-status-pill tool-status-success';
+            statusPill.textContent = '✓ Answered';
+          }
+          const answerBadge = document.createElement('div');
+          answerBadge.style.margin = '8px 14px 10px 14px';
+          answerBadge.style.padding = '6px 10px';
+          answerBadge.style.borderRadius = 'var(--radius-sm)';
+          answerBadge.style.background = 'rgba(34, 197, 94, 0.1)';
+          answerBadge.style.border = '1px solid rgba(34, 197, 94, 0.3)';
+          answerBadge.style.fontSize = '0.82rem';
+          answerBadge.style.color = '#4ade80';
+          answerBadge.innerHTML = `✓ You answered: <b>${escapeHtml(answer)}</b>`;
+          card.appendChild(answerBadge);
+          scrollDown();
+          resolve(answer);
+        };
+
+        const optBtns = card.querySelectorAll('.inquiry-opt-btn');
+        optBtns.forEach(btn => {
+          btn.addEventListener('click', () => finishInquiry(btn.textContent.trim()));
+        });
+
+        const submitBtn = card.querySelector('.inquiry-submit-btn');
+        const textInp = card.querySelector('.inquiry-text-input');
+        if (submitBtn && textInp) {
+          submitBtn.addEventListener('click', () => {
+            const val = textInp.value.trim();
+            if (val) finishInquiry(val);
+          });
+          textInp.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+              const val = textInp.value.trim();
+              if (val) finishInquiry(val);
+            }
+          });
+          textInp.focus();
+        }
+      });
+    }
+
+    // Human Approval for Tool Execution (Ask before running)
+    function askToolApproval(tc, parsedArgs) {
+      return new Promise((resolve) => {
+        const card = document.createElement('div');
+        card.className = 'tool-call-card';
+        card.style.borderColor = 'rgba(234, 179, 8, 0.5)';
+        card.style.background = 'rgba(234, 179, 8, 0.05)';
+
+        card.innerHTML = `
+          <div class="tool-call-header" style="cursor:default;">
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span style="font-size:1.1rem;">🛡️</span>
+              <span class="tool-call-name">Tool Permission Request: <b>${escapeHtml(tc.name)}</b></span>
+            </div>
+            <span class="tool-status-pill" style="background:rgba(234, 179, 8, 0.2); color:#facc15; border:1px solid rgba(234, 179, 8, 0.4);">Permission Required</span>
+          </div>
+          <div style="padding:10px 14px;">
+            <div style="color:var(--text-dim); margin-bottom:4px; font-size:0.75rem;">Arguments requested by model:</div>
+            <pre style="margin:0 0 10px 0; max-height:160px; overflow-y:auto; background:rgba(0,0,0,0.4); padding:8px; border-radius:var(--radius-sm); font-size:0.75rem; color:var(--text); font-family:var(--font-mono);">${escapeHtml(JSON.stringify(parsedArgs, null, 2))}</pre>
+            <div style="display:flex; gap:8px;">
+              <button type="button" class="btn-top btn-approve-run" style="background:#22c55e; color:#fff; border-color:#22c55e; font-weight:600; padding:6px 14px;">✓ Approve & Run</button>
+              <button type="button" class="btn-top btn-deny-run" style="background:transparent; color:var(--danger); border-color:var(--danger); font-weight:600; padding:6px 14px;">✕ Deny</button>
+            </div>
+          </div>
+        `;
+        UI.messagesContainer.appendChild(card);
+        scrollDown();
+
+        const btnApprove = card.querySelector('.btn-approve-run');
+        const btnDeny = card.querySelector('.btn-deny-run');
+
+        btnApprove.addEventListener('click', () => {
+          card.remove();
+          resolve(true);
+        });
+
+        btnDeny.addEventListener('click', () => {
+          card.innerHTML = `
+            <div style="padding:8px 12px; display:flex; align-items:center; gap:6px; color:var(--danger); font-size:0.8rem;">
+              <span>✕</span> Tool <b>${escapeHtml(tc.name)}</b> execution denied by user.
+            </div>
+          `;
+          resolve(false);
+        });
+      });
+    }
+
     // Send Message with Live SSE Streaming & Autonomous Tool Execution
     async function sendMessage() {
       const rawText = UI.chatInput.value.trim();
@@ -4522,14 +5149,21 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               top_p: Number(APP.settings.top_p) || 0.95,
               max_tokens: parseInt(APP.settings.max_tokens, 10) || 4096
             };
-            if (APP.thinkingLevel === 'off') {
-              payload.think = false;
-              payload.chat_template_kwargs = { thinking: false };
-            } else if (APP.thinkingLevel === 'deep') {
+            let thinkBudget = null;
+            if (APP.thinkingLevel === 'minimum') thinkBudget = 512;
+            else if (APP.thinkingLevel === 'low') thinkBudget = 2048;
+            else if (APP.thinkingLevel === 'medium') thinkBudget = 4096;
+            else if (APP.thinkingLevel === 'high') thinkBudget = 8192;
+            else if (APP.thinkingLevel === 'xhigh') {
+              thinkBudget = 16384;
+              payload.max_tokens = Math.max(payload.max_tokens, 16384);
+            }
+
+            if (thinkBudget) {
               payload.think = true;
-              payload.chat_template_kwargs = { thinking: true, thinking_budget: 16384 };
-              payload.max_tokens = Math.max(payload.max_tokens, 8192);
+              payload.chat_template_kwargs = { thinking: true, thinking_budget: thinkBudget };
             } else {
+              // auto
               payload.think = true;
               payload.chat_template_kwargs = { thinking: true };
             }
@@ -4764,6 +5398,52 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               parsedArgs = JSON.parse(tc.args || '{}');
             } catch (_) {
               parsedArgs = { raw: tc.args };
+            }
+
+            // 1. Interactive Model Inquiry (ask_user)
+            if (tc.name === 'ask_user') {
+              const answer = await askUserInquiry(tc, parsedArgs);
+              const resultStr = JSON.stringify({ response: answer, answered: true });
+
+              msgs.push({
+                role: 'tool',
+                tool_call_id: tc.id,
+                name: tc.name,
+                content: resultStr
+              });
+
+              if (APP.activeId) {
+                try {
+                  await apiFetch(`/api/conversations/${APP.activeId}/messages`, {
+                    method: 'POST',
+                    body: { role: 'tool', content: `[${tc.name}]: ${resultStr}` }
+                  });
+                } catch (_) {}
+              }
+              continue;
+            }
+
+            // 2. Permission check: Ask before running
+            if (APP.toolPermission === 'ask') {
+              const approved = await askToolApproval(tc, parsedArgs);
+              if (!approved) {
+                const resultStr = JSON.stringify({ error: "Tool execution denied by user." });
+                msgs.push({
+                  role: 'tool',
+                  tool_call_id: tc.id,
+                  name: tc.name,
+                  content: resultStr
+                });
+                if (APP.activeId) {
+                  try {
+                    await apiFetch(`/api/conversations/${APP.activeId}/messages`, {
+                      method: 'POST',
+                      body: { role: 'tool', content: `[${tc.name}]: ${resultStr}` }
+                    });
+                  } catch (_) {}
+                }
+                continue;
+              }
             }
 
             const toolCard = document.createElement('div');

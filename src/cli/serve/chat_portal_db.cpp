@@ -73,12 +73,46 @@ std::filesystem::path GetExecutableDirectory() {
   return std::filesystem::current_path(ec);
 }
 
-std::filesystem::path GetConversationDefaultWorkingDir(const std::string& conv_id, const std::string& title) {
+std::filesystem::path GetUserRootWorkingDir(const std::string& user_id, const std::string& username) {
+  std::string user_folder = SanitizeFolderName(username);
+  if (user_folder.empty()) {
+    user_folder = user_id.empty() ? "default" : SanitizeFolderName(user_id);
+  } else if (!user_id.empty()) {
+    user_folder = SanitizeFolderName(user_id) + "_" + user_folder;
+  }
+  auto root = GetExecutableDirectory() / "UserData" / user_folder;
+  std::error_code ec;
+  std::filesystem::create_directories(root, ec);
+  auto norm = std::filesystem::weakly_canonical(root, ec);
+  return ec ? root.lexically_normal() : norm;
+}
+
+std::filesystem::path GetConversationDefaultWorkingDir(const std::string& user_id, const std::string& username,
+                                                      const std::string& conv_id, const std::string& title) {
+  auto user_root = GetUserRootWorkingDir(user_id, username);
   std::string folder_name = conv_id + " - " + SanitizeFolderName(title);
-  auto p = GetExecutableDirectory() / "UserData" / folder_name;
+  auto p = user_root / folder_name;
   std::error_code ec;
   std::filesystem::create_directories(p, ec);
-  return p;
+  auto norm = std::filesystem::weakly_canonical(p, ec);
+  return ec ? p.lexically_normal() : norm;
+}
+
+std::filesystem::path GetConversationDefaultWorkingDir(const std::string& conv_id, const std::string& title) {
+  return GetConversationDefaultWorkingDir("", "", conv_id, title);
+}
+
+bool IsPathInsideDirectory(const std::filesystem::path& target, const std::filesystem::path& base) {
+  std::error_code ec;
+  auto norm_target = std::filesystem::weakly_canonical(target, ec);
+  if (ec) norm_target = target.lexically_normal();
+  auto norm_base = std::filesystem::weakly_canonical(base, ec);
+  if (ec) norm_base = base.lexically_normal();
+
+  auto rel = std::filesystem::relative(norm_target, norm_base, ec);
+  if (ec || rel.empty()) return false;
+  const std::string s = rel.generic_string();
+  return !(s == ".." || s.rfind("../", 0) == 0 || s.rfind("..\\", 0) == 0);
 }
 
 namespace {

@@ -1,5 +1,6 @@
 #include "src/cli/serve/chat_portal_service.hpp"
 
+#include <fstream>
 #include <string_view>
 
 #include "src/cli/serve/chat_portal_html.hpp"
@@ -524,23 +525,26 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       json::Value args = (args_ptr && args_ptr->is_object()) ? *args_ptr : json::Value::object();
       std::string working_dir = body.member_str("working_directory");
       const std::string conv_id = body.member_str("conversation_id");
+      const auto user_root = GetUserRootWorkingDir(user->id, user->username);
       if (working_dir.empty() && !conv_id.empty()) {
         const auto conv = db.GetConversation(user->id, conv_id);
-        if (conv) {
+        if (conv && !conv->working_directory.empty()) {
           working_dir = conv->working_directory;
+        } else {
+          working_dir = GetConversationDefaultWorkingDir(user->id, user->username, conv_id, conv ? conv->title : "Chat").string();
         }
       }
       if (working_dir.empty()) {
         const auto st = db.GetSettings(user->id);
         working_dir = st.working_directory;
       }
-      if (working_dir.empty() && !conv_id.empty()) {
-        working_dir = GetConversationDefaultWorkingDir(conv_id, "default").string();
+      if (working_dir.empty() || !IsPathInsideDirectory(working_dir, user_root)) {
+        working_dir = user_root.string();
       }
 
       // Check if inbuilt tool
       if (ToolEngine::FindInbuiltTool(name) != nullptr) {
-        const auto res = ToolEngine::Execute(name, args, working_dir);
+        const auto res = ToolEngine::Execute(name, args, working_dir, user_root.string());
         json::Value out = json::Value::object();
         out["success"] = res.success;
         out["output"] = res.output;
@@ -744,6 +748,123 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
         return JsonOk(out);
       }
       return JsonErr(404, "Not Found", "Custom tool not found");
+    }
+  }
+
+  // -------------------------------------------------------------
+  // User Files API (Sandboxed to UserData/{user_id}_{username}/)
+  // -------------------------------------------------------------
+  if (req.path == "/api/user-files") {
+    const auto user_root = GetUserRootWorkingDir(user->id, user->username);
+
+    if (req.method == "GET") {
+      std::string subpath;
+      const auto q = req.query.find("subpath=");
+      if (q != std::string::npos) {
+        subpath = req.query.substr(q + 8);
+        const auto amp = subpath.find('&');
+        if (amp != std::string::npos) subpath = subpath.substr(0, amp);
+      }
+      auto target = user_root;
+      if (!subpath.empty()) {
+        target = user_root / std::filesystem::path(subpath);
+      }
+      std::error_code ec;
+      target = std::filesystem::weakly_canonical(target, ec);
+      if (ec || !IsPathInsideDirectory(target, user_root)) {
+        return JsonErr(403, "Forbidden", "Access outside user directory is prohibited");
+      }
+
+      json::Value arr = json::Value::array();
+      if (std::filesystem::exists(target, ec) && std::filesystem::is_directory(target, ec)) {
+        for (const auto& entry : std::filesystem::directory_iterator(target, ec)) {
+          json::Value item = json::Value::object();
+          item["name"] = entry.path().filename().string();
+          item["is_dir"] = entry.is_directory(ec);
+          item["size"] = entry.is_regular_file(ec) ? static_cast<double>(entry.file_size(ec)) : 0.0;
+          auto rel = std::filesystem::relative(entry.path(), user_root, ec);
+          item["rel_path"] = rel.generic_string();
+          arr.push_back(std::move(item));
+        }
+      }
+      json::Value out = json::Value::object();
+      auto cur_rel = std::filesystem::relative(target, user_root, ec);
+      out["current_path"] = cur_rel.empty() ? "" : cur_rel.generic_string();
+      out["user_root_name"] = user_root.filename().string();
+      out["entries"] = std::move(arr);
+      return JsonOk(out);
+    }
+
+    if (req.method == "DELETE") {
+      try {
+        const auto body = json::parse(req.body);
+        const std::string rel_path = body.member_str("path");
+        if (rel_path.empty()) return JsonErr(400, "Bad Request", "Missing 'path'");
+        auto target = user_root / std::filesystem::path(rel_path);
+        std::error_code ec;
+        target = std::filesystem::weakly_canonical(target, ec);
+        if (ec || !IsPathInsideDirectory(target, user_root) || target == user_root) {
+          return JsonErr(403, "Forbidden", "Access outside user directory is prohibited");
+        }
+        std::filesystem::remove_all(target, ec);
+        json::Value out = json::Value::object();
+        out["status"] = "ok";
+        return JsonOk(out);
+      } catch (...) {
+        return JsonErr(400, "Bad Request", "Invalid JSON payload");
+      }
+    }
+  }
+
+  if (req.path == "/api/user-files/content") {
+    const auto user_root = GetUserRootWorkingDir(user->id, user->username);
+    if (req.method == "GET") {
+      std::string subpath;
+      const auto q = req.query.find("path=");
+      if (q != std::string::npos) {
+        subpath = req.query.substr(q + 5);
+        const auto amp = subpath.find('&');
+        if (amp != std::string::npos) subpath = subpath.substr(0, amp);
+      }
+      if (subpath.empty()) return JsonErr(400, "Bad Request", "Missing 'path'");
+      auto target = user_root / std::filesystem::path(subpath);
+      std::error_code ec;
+      target = std::filesystem::weakly_canonical(target, ec);
+      if (ec || !IsPathInsideDirectory(target, user_root) || !std::filesystem::is_regular_file(target, ec)) {
+        return JsonErr(403, "Forbidden", "File inaccessible or outside user directory");
+      }
+      std::ifstream in(target, std::ios::binary);
+      if (!in.is_open()) return JsonErr(500, "Internal Error", "Failed to open file");
+      std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      json::Value out = json::Value::object();
+      out["name"] = target.filename().string();
+      out["content"] = content;
+      out["size"] = static_cast<double>(content.size());
+      return JsonOk(out);
+    }
+    if (req.method == "POST") {
+      try {
+        const auto body = json::parse(req.body);
+        const std::string rel_path = body.member_str("path");
+        const std::string content = body.member_str("content");
+        if (rel_path.empty()) return JsonErr(400, "Bad Request", "Missing 'path'");
+        auto target = user_root / std::filesystem::path(rel_path);
+        std::error_code ec;
+        target = std::filesystem::weakly_canonical(target, ec);
+        if (ec) target = (user_root / std::filesystem::path(rel_path)).lexically_normal();
+        if (!IsPathInsideDirectory(target, user_root)) {
+          return JsonErr(403, "Forbidden", "Destination is outside user directory");
+        }
+        if (target.has_parent_path()) std::filesystem::create_directories(target.parent_path(), ec);
+        std::ofstream out_f(target, std::ios::binary | std::ios::trunc);
+        if (!out_f.is_open()) return JsonErr(500, "Internal Error", "Cannot write file");
+        out_f << content;
+        json::Value out = json::Value::object();
+        out["status"] = "ok";
+        return JsonOk(out);
+      } catch (...) {
+        return JsonErr(400, "Bad Request", "Invalid JSON payload");
+      }
     }
   }
 

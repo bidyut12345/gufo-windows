@@ -13,39 +13,45 @@ See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-
 for user-facing changes and release history.
 
 > [!NOTE]
-> This repository provides native Windows 11 x64 support (`gfx1151`) with AMD TheRock ROCm, fully updated with the latest upstream Gufo features, a complete llama.cpp-style Gufo Chat Web UI with SQLite multi-device persistence, all 9 built-in llama.cpp tools, and Model Context Protocol (MCP) server support. For multi-node environments, see [Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo).
+> This repository provides native Windows 11 x64 support (`gfx1151`) with AMD TheRock ROCm, fully updated with all upstream Gufo features and major enhancements from [dardeaw/MBufo](https://github.com/dardeaw/MBufo) and [endyjasmi/gufo](https://github.com/endyjasmi/gufo), featuring a complete llama.cpp-style Gufo Chat Web UI with SQLite persistence, sandboxed per-user workspaces, KV cache quantization, interactive model inquiries, and 1-click release publishing.
 
-## Gufo Windows Edition (`gufo-windows`)
+## 🚀 Latest Updates in This Fork
 
-This fork delivers full native Windows 11 AMD Strix Halo (`gfx1151`) support, featuring:
+### 🔒 Per-User Sandboxed `UserData/` & File Explorer
+- **Isolated User Directories**: Each user is assigned their own isolated folder: `UserData/{user_id}_{username}/`.
+- **Zero-Leak Sandboxing**: Strict filesystem boundaries enforced in C++ backend (`weakly_canonical` relative path resolution). Users are forbidden from viewing, browsing, reading, writing, or executing tools in other user directories or external computer drives.
+- **Sandboxed File Explorer**: Dedicated file explorer in the sidebar (`📁 Files`) allowing users to navigate subfolders, view file sizes, preview images/documents (`👁️`), delete files, and manage their conversation artifacts.
 
-- **Native Strix Halo Acceleration**: Compiles directly for AMD Radeon 8060S (`gfx1151`) on Windows 11 with AMD TheRock ROCm 10.0.0 and MSVC C++20 without WSL or virtual machines.
-- **Gufo Chat Web UI**:
-  - Full-featured web interface accessible at `http://localhost:8080/`.
-  - **SQLite Server Database** (`%LOCALAPPDATA%\gufo\chat_portal.db`) with multi-device cross-browser chat synchronization.
-  - **User Authentication**: Multi-user registration, secure password hashing, and persistent JWT session tokens.
-  - **Real-Time Streaming**: Live token-by-token SSE streaming, evaluation throughput metrics (`t/s`), and interactive thought/reasoning accordions (`<think>`).
-  - **Multimodal Support**: Drag-and-drop / file upload / paste image attachments for vision-capable models.
-  - **Sampling Controls & Settings**: Temperature, Top-P, and Max Tokens configuration drawer.
-  - **Raw Text Completion**: Dedicated interface for raw prompt continuation.
-- **Built-in System Tools (all 9 from llama.cpp)**:
-  - `get_datetime`: Current ISO-8601 date, time, timezone, and weekday.
-  - `read_file`: Filesystem reader with offset and limit safety controls.
-  - `write_file`: File creation and overwriting.
-  - `edit_file`: Exact string search-and-replace within files.
-  - `apply_diff`: Unified diff patch application.
-  - `file_glob_search`: Recursive workspace glob search.
-  - `grep_search`: Regex and substring content search.
-  - `exec_shell_command`: Command execution on host (PowerShell / Windows CMD).
-  - `fetch_web_page`: HTTP/HTTPS web fetcher with automatic markdown extraction.
-  - Per-user toggle switches, **Enable All**, and **Disable All** controls saved in SQLite.
-- **Model Context Protocol (MCP) & Custom Tools**:
-  - Connect external Model Context Protocol (MCP) servers via `SSE` or `HTTP` stream.
-  - One-click tool discovery & synchronization (`tools/list`).
-  - Custom function tool definitions with JSON Schema parameter validation and optional webhook handlers.
-  - Multi-turn autonomous agentic execution loop with interactive running/completion cards.
-- **One-Click Windows Launcher**:
-  - `start.cmd` and `tools\windows\launcher.ps1` for automatic model detection, draft selection, and context sizing.
+### 🛡️ Tool Permission Control & Interactive Model Inquiries
+- **Ask Before Running vs. Allow All**: Interactive toggle in the attachment menu and settings to require human approval (`[✓ Approve & Run]` / `[✕ Deny]`) before tool execution or allow autonomous agentic flow.
+- **Model Clarification Feature (`ask_user`)**: The model can invoke the built-in `ask_user` tool when it needs clarification or missing parameters. The UI renders an interactive card with selectable option buttons and a text input field, pausing generation until the user responds.
+
+### 🎨 New Chat Interactive Landing View & 7-Item Attachment Menu
+- **Empty Window Action Cards**: When opening a new chat, the empty main viewport presents an interactive hero card grid with direct access to Attach Images, Attach Files, Working Directory, File Explorer, Tools & MCP, Tool Permission, Thinking Level, and Context presets.
+- **Attachment Popup Menu** (Paperclip icon in chat input):
+  1. **Attach Images**: Add multimodal vision attachments.
+  2. **Attach Files**: Attach source code, logs, and text context.
+  3. **Working Directory**: Per-chat working directory inside user's sandbox (`UserData/{user_id}_{username}/{conv_id} - {title}`).
+  4. **Tools & MCP Master Switch & Groups**: Enable/disable all tools or toggle individual tool groups (Filesystem, Code Inspection, Shell, Web, MCP/Custom).
+  5. **System Prompt Presets**: Select from Default, Coder, Concise, Reasoner, Creative, or create custom presets.
+  6. **6 Thinking Levels**: Quick selection of `auto`, `minimum` (512 budget), `low` (2048 budget), `medium` (4096 budget), `high` (8192 budget), and `xhigh` (16384 budget).
+  7. **Context Usage & Compaction**: Live token meter for 262k context with 1-click history compaction (`🧹 Compact`).
+- **Cleaned Navigation**: Removed redundant "Tools & MCP" button from the top header since the Settings drawer already manages tools.
+
+### ⚡ KV Cache Quantization & UD-IQ4_XS Support (VRAM/RAM Optimization)
+- **KV Cache Quantization for Qwen 3.8 Flash-Next**: Referencing optimizations from [dardeaw/MBufo](https://github.com/dardeaw/MBufo) and [endyjasmi/gufo](https://github.com/endyjasmi/gufo), Gufo supports:
+  - `--kv-quant f16`: Standard 16-bit float KV cache.
+  - `--kv-quant q8`: 8-bit quantized KV cache (~50% memory reduction).
+  - `--kv-quant fp8`: 8-bit floating point KV cache for fast tensor cores.
+  - `GUFO_KV_V4=1` (K8V4 / K4V4): 4-bit / 8-bit compressed KV cache, reducing 262k context KV memory footprint from ~64 GiB down to under 16 GiB!
+- **Unsloth `UD-IQ4_XS` Support**: Full support for Unsloth's ultra-compact `UD-IQ4_XS` quantized weights alongside `UD-Q4_K_XL` and `UD-Q8_K_XL`, minimizing VRAM and system memory bandwidth contention.
+- **Quantization-Aware Memory Estimation**: `inventory.ps1` and `launcher.ps1` automatically compute KV cache memory requirements based on selected quantization and total context.
+
+### 📦 1-Click GitHub Release Publish
+- **Double-Clickable `publish_release.cmd`**: One-click publishing that packages the Windows distribution with all DLLs and ROCm dependencies, generates comprehensive release notes, tags the release with `version.txt` (currently `v0.18.0`), and uploads to GitHub via `gh release create`.
+- **PowerShell Script**: `tools\windows\publish_release.ps1` for automated CI/CD and scripted release pipelines.
+
+---
 
 
 ## Models and benchmarks

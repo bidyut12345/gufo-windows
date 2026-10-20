@@ -1,4 +1,5 @@
 #include "src/cli/serve/chat_portal_tools.hpp"
+#include "src/cli/serve/chat_portal_db.hpp"
 
 #include <curl/curl.h>
 
@@ -145,14 +146,30 @@ bool WildcardMatch(std::string_view str, std::string_view pat) {
 }
 
 std::string ResolveTargetPath(const std::string& path_str,
-                              const std::string& base_dir) {
+                              const std::string& base_dir,
+                              const std::string& user_root_dir = "") {
   if (path_str.empty()) return "";
   std::filesystem::path p(path_str);
-  if (base_dir.empty() || p.is_absolute()) {
-    return path_str;
+  std::filesystem::path resolved;
+  if (!base_dir.empty() && !p.is_absolute()) {
+    resolved = std::filesystem::path(base_dir) / p;
+  } else {
+    resolved = p;
   }
-  const auto combined = std::filesystem::path(base_dir) / p;
-  return combined.lexically_normal().string();
+
+  std::error_code ec;
+  auto norm = std::filesystem::weakly_canonical(resolved, ec);
+  if (ec) norm = resolved.lexically_normal();
+
+  if (!user_root_dir.empty()) {
+    auto root = std::filesystem::weakly_canonical(std::filesystem::path(user_root_dir), ec);
+    if (ec) root = std::filesystem::path(user_root_dir).lexically_normal();
+    if (!IsPathInsideDirectory(norm, root)) {
+      return "";  // Prohibited: outside sandboxed directory!
+    }
+  }
+
+  return norm.string();
 }
 
 }  // namespace
@@ -376,6 +393,35 @@ const std::vector<InbuiltToolDefinition>& ToolEngine::GetInbuiltTools() {
       list.push_back(std::move(tool));
     }
 
+    // 10. ask_user (interactive human-in-the-loop inquiry)
+    {
+      InbuiltToolDefinition tool;
+      tool.name = "ask_user";
+      tool.description = "Ask the user a question with optional choice buttons or text write-in when you need more information, clarification, or confirmation.";
+      tool.parameters = json::parse(R"json({
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "The question or prompt to present to the user."
+          },
+          "options": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional list of quick selectable choices for the user (e.g. ['Yes', 'No'])."
+          },
+          "allow_text_input": {
+            "type": "boolean",
+            "description": "Whether the user can provide a freeform text answer (default true)."
+          }
+        },
+        "required": ["question"]
+      })json");
+      tool.enabled_by_default = true;
+      tool.dangerous = false;
+      list.push_back(std::move(tool));
+    }
+
     return list;
   }();
 
@@ -393,8 +439,15 @@ const InbuiltToolDefinition* ToolEngine::FindInbuiltTool(const std::string& name
 
 ToolExecutionResult ToolEngine::Execute(const std::string& name,
                                        const json::Value& arguments,
-                                       const std::string& working_directory) {
+                                       const std::string& working_directory,
+                                       const std::string& user_root_dir) {
   ToolExecutionResult res;
+
+  if (name == "ask_user") {
+    res.success = true;
+    res.output = arguments.member_str("question");
+    return res;
+  }
 
   if (name == "get_datetime") {
     res.success = true;
@@ -408,7 +461,11 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
       res.error = "Missing required argument 'path'";
       return res;
     }
-    const std::string path = ResolveTargetPath(raw_path, working_directory);
+    const std::string path = ResolveTargetPath(raw_path, working_directory, user_root_dir);
+    if (path.empty()) {
+      res.error = "Access denied: file path is outside the user's sandboxed directory.";
+      return res;
+    }
     std::error_code ec;
     if (!std::filesystem::exists(path, ec) || std::filesystem::is_directory(path, ec)) {
       res.error = "File not found or is a directory: " + path;
@@ -451,7 +508,11 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
       return res;
     }
 
-    const std::string path = ResolveTargetPath(raw_path, working_directory);
+    const std::string path = ResolveTargetPath(raw_path, working_directory, user_root_dir);
+    if (path.empty()) {
+      res.error = "Access denied: destination path is outside the user's sandboxed directory.";
+      return res;
+    }
     const auto p = std::filesystem::path(path);
     if (p.has_parent_path()) {
       std::error_code ec;
@@ -479,7 +540,11 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
       return res;
     }
 
-    const std::string path = ResolveTargetPath(raw_path, working_directory);
+    const std::string path = ResolveTargetPath(raw_path, working_directory, user_root_dir);
+    if (path.empty()) {
+      res.error = "Access denied: file path is outside the user's sandboxed directory.";
+      return res;
+    }
     std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) {
       res.error = "Failed to open file for editing: " + path;
@@ -519,7 +584,11 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
       return res;
     }
 
-    const std::string path = ResolveTargetPath(raw_path, working_directory);
+    const std::string path = ResolveTargetPath(raw_path, working_directory, user_root_dir);
+    if (path.empty()) {
+      res.error = "Access denied: file path is outside the user's sandboxed directory.";
+      return res;
+    }
     // Simple line-based unified diff applier
     std::ifstream in(path);
     if (!in.is_open()) {
@@ -572,9 +641,13 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
       return res;
     }
     if (dir.empty() || dir == ".") {
-      dir = working_directory.empty() ? "." : working_directory;
+      dir = working_directory.empty() ? (user_root_dir.empty() ? "." : user_root_dir) : working_directory;
     } else {
-      dir = ResolveTargetPath(dir, working_directory);
+      dir = ResolveTargetPath(dir, working_directory, user_root_dir);
+    }
+    if (dir.empty()) {
+      res.error = "Access denied: search directory is outside the user's sandboxed directory.";
+      return res;
     }
 
     std::error_code ec;
@@ -615,9 +688,13 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
     }
 
     if (raw_path == "." || raw_path.empty()) {
-      raw_path = working_directory.empty() ? "." : working_directory;
+      raw_path = working_directory.empty() ? (user_root_dir.empty() ? "." : user_root_dir) : working_directory;
     } else {
-      raw_path = ResolveTargetPath(raw_path, working_directory);
+      raw_path = ResolveTargetPath(raw_path, working_directory, user_root_dir);
+    }
+    if (raw_path.empty()) {
+      res.error = "Access denied: target path is outside the user's sandboxed directory.";
+      return res;
     }
     const std::string path = raw_path;
 
@@ -680,10 +757,14 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
       return res;
     }
 
-    if (cwd.empty() && !working_directory.empty()) {
-      cwd = working_directory;
-    } else if (!cwd.empty() && !working_directory.empty()) {
-      cwd = ResolveTargetPath(cwd, working_directory);
+    if (cwd.empty()) {
+      cwd = working_directory.empty() ? (user_root_dir.empty() ? "." : user_root_dir) : working_directory;
+    } else {
+      cwd = ResolveTargetPath(cwd, working_directory, user_root_dir);
+    }
+    if (cwd.empty()) {
+      res.error = "Access denied: working directory is outside the user's sandboxed directory.";
+      return res;
     }
 
     std::string full_cmd;
