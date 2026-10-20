@@ -190,7 +190,7 @@ std::unique_ptr<GgufReader> GgufReader::OpenSingleFile(
     return nullptr;
   }
   reader->mapped_regions_.push_back(
-      {reader->data_, reader->size_, reader->fd_});
+      {reader->data_, reader->size_, reader->fd_, path.string()});
   return reader;
 }
 
@@ -294,8 +294,12 @@ std::unique_ptr<GgufReader> GgufReader::OpenSplitFileSet(
   combined->mapped_regions_.reserve(split_count);
 
   for (const auto& shard : shards) {
+    const std::string s_path =
+        shard->mapped_regions_.empty()
+            ? ""
+            : shard->mapped_regions_.front().source_path;
     combined->mapped_regions_.push_back(
-        {shard->data_, shard->size_, shard->fd_});
+        {shard->data_, shard->size_, shard->fd_, s_path});
     for (const auto& tensor : shard->tensors_) {
       if (combined->tensor_index_.contains(tensor.name)) {
         if (error_msg != nullptr) {
@@ -351,7 +355,7 @@ std::unique_ptr<GgufReader> GgufReader::OpenMemory(const void* data,
     return nullptr;
   }
   reader->mapped_regions_.push_back(
-      {reader->data_, reader->size_, reader->fd_});
+      {reader->data_, reader->size_, reader->fd_, {}});
   return reader;
 }
 

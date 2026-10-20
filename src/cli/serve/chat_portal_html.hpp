@@ -418,6 +418,39 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       flex: 1;
       height: 100%;
       overflow: hidden;
+      position: relative;
+    }
+
+    .btn-scroll-bottom {
+      position: absolute;
+      bottom: 110px;
+      left: 50%;
+      transform: translateX(-50%) translateY(8px);
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      background: var(--bg-card);
+      border: 1px solid var(--border-strong);
+      color: var(--text-dim);
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      z-index: 25;
+      opacity: 0;
+      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .btn-scroll-bottom:hover {
+      background: var(--bg-elevated);
+      color: var(--text);
+      border-color: var(--accent);
+      transform: translateX(-50%) translateY(0);
+    }
+    .btn-scroll-bottom.visible {
+      display: flex;
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
     }
 
     .chat-messages {
@@ -2083,6 +2116,139 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       word-break: break-all;
       color: #e4e4e7;
     }
+
+    /* User Profile Dropdown Menu in Top Right */
+    .user-menu-wrapper {
+      position: relative;
+    }
+    .user-popup-menu {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      background: var(--bg-card);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.05);
+      min-width: 250px;
+      padding: 6px;
+      z-index: 100;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      animation: popoverFadeIn 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .user-popup-header {
+      padding: 8px 12px 10px 12px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 4px;
+    }
+    .user-menu-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      padding: 8px 10px;
+      background: transparent;
+      border: none;
+      border-radius: var(--radius-sm);
+      color: var(--text);
+      cursor: pointer;
+      text-decoration: none;
+      transition: background-color 0.12s ease;
+      font-size: 0.82rem;
+    }
+    .user-menu-item:hover {
+      background: var(--bg-hover);
+      color: #fff;
+    }
+    .user-menu-icon {
+      font-size: 1.15rem;
+      width: 22px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .user-menu-text {
+      flex: 1;
+      text-align: left;
+    }
+    .user-menu-title {
+      font-weight: 500;
+      line-height: 1.2;
+    }
+    .user-menu-desc {
+      font-size: 0.7rem;
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
+    .user-menu-divider {
+      height: 1px;
+      background: var(--border);
+      margin: 4px 6px;
+    }
+
+    /* Modal File Browser Styles */
+    .fb-breadcrumbs-bar {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+    }
+    .fb-crumb {
+      color: var(--accent);
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: var(--radius-sm);
+      transition: background 0.12s;
+    }
+    .fb-crumb:hover {
+      background: rgba(59, 130, 246, 0.15);
+      text-decoration: underline;
+    }
+    .fb-crumb.active {
+      color: var(--text-muted);
+      cursor: default;
+      pointer-events: none;
+    }
+    .fb-crumb-sep {
+      color: var(--text-dim);
+      user-select: none;
+    }
+    .fb-file-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 7px 10px;
+      border-radius: var(--radius-sm);
+      border: 1px solid transparent;
+      background: rgba(255, 255, 255, 0.015);
+      transition: all 0.12s ease;
+    }
+    .fb-file-row:hover {
+      background: var(--bg-hover);
+      border-color: var(--border);
+    }
+    .fb-file-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+      min-width: 0;
+      cursor: pointer;
+    }
+    .fb-file-name {
+      font-size: 0.82rem;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .fb-file-name.is-folder {
+      font-weight: 600;
+      color: #93c5fd;
+    }
   </style>
 </head>
 <body>
@@ -2114,10 +2280,45 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
         <span>Settings</span>
       </button>
-      <button id="btn-auth-user" class="btn-top" title="Account & Multi-Device Sync">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
-        <span id="auth-btn-label">Sign In</span>
+      <button id="btn-top-file-browser" class="btn-top" title="Browse Workspace Files">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+        <span>Files</span>
       </button>
+      <div class="user-menu-wrapper">
+        <button id="btn-auth-user" class="btn-top" title="User Account & Workspace Options">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+          <span id="auth-btn-label">Sign In</span>
+          <span style="font-size:0.6rem; color:var(--text-dim); margin-left:2px;">&#9660;</span>
+        </button>
+        <div id="user-popup-menu" class="user-popup-menu" style="display:none;">
+          <div class="user-popup-header">
+            <div id="user-popup-name" style="font-weight:600; font-size:0.86rem; color:var(--text);">Guest</div>
+            <div id="user-popup-root" style="font-size:0.72rem; color:var(--text-dim); font-family:var(--font-mono);">UserData/Guest</div>
+          </div>
+          <button id="btn-menu-file-browser" class="user-menu-item" type="button">
+            <span class="user-menu-icon">📁</span>
+            <div class="user-menu-text">
+              <div class="user-menu-title">Workspace File Browser</div>
+              <div class="user-menu-desc">Explore, upload &amp; manage chat files</div>
+            </div>
+          </button>
+          <button id="btn-menu-workdir-setup" class="user-menu-item" type="button">
+            <span class="user-menu-icon">⚙️</span>
+            <div class="user-menu-text">
+              <div class="user-menu-title">Working Directory Setup</div>
+              <div class="user-menu-desc">Change chat folder under username</div>
+            </div>
+          </button>
+          <div class="user-menu-divider"></div>
+          <button id="btn-menu-auth" class="user-menu-item" type="button">
+            <span id="user-menu-auth-icon" class="user-menu-icon">🔑</span>
+            <div class="user-menu-text">
+              <div id="user-menu-auth-title" class="user-menu-title">Sign In / Switch User</div>
+              <div id="user-menu-auth-desc" class="user-menu-desc">Multi-device sync &amp; isolation</div>
+            </div>
+          </button>
+        </div>
+      </div>
     </div>
   </header>
 
@@ -2187,6 +2388,10 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <div id="messages-container" class="chat-messages">
           <!-- Rendered dynamically -->
         </div>
+
+        <button id="btn-scroll-bottom" class="btn-scroll-bottom" title="Scroll to bottom" type="button">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>
+        </button>
 
         <div class="chat-bottom">
           <div class="input-box">
@@ -2649,21 +2854,45 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <div class="setting-group" style="background:var(--bg-elevated); padding:8px 10px; border-radius:var(--radius);">
           <div style="font-size:0.72rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.04em;">Active Conversation</div>
           <div id="conv-workdir-active-title" style="font-weight:600; font-size:0.88rem; color:var(--text); margin-top:2px;">New Chat</div>
-          <div id="conv-workdir-active-id" style="font-family:var(--font-mono); font-size:0.72rem; color:var(--text-dim); margin-top:1px;"></div>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-top:4px; flex-wrap:wrap; gap:4px;">
+            <div id="conv-workdir-active-id" style="font-family:var(--font-mono); font-size:0.72rem; color:var(--text-dim);"></div>
+            <div id="conv-workdir-display-badge" style="font-family:var(--font-mono); font-size:0.75rem; color:#86efac; background:rgba(34,197,94,0.12); border:1px solid rgba(34,197,94,0.25); border-radius:4px; padding:2px 6px;">UserData/Guest/</div>
+          </div>
         </div>
 
+        <!-- 1. Select from all folders under username -->
         <div class="setting-group">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <label class="setting-label">Working Directory Path</label>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+            <label class="setting-label">Select Existing Folder</label>
+            <span id="conv-workdir-user-prefix" style="font-family:var(--font-mono); font-size:0.75rem; color:var(--text-dim);">UserData/Guest/</span>
+          </div>
+          <select id="conv-workdir-select" class="popup-select" style="width:100%; font-family:var(--font-mono); font-size:0.82rem;">
+            <option value="">-- Choose existing folder under username --</option>
+          </select>
+          <div style="font-size:0.72rem; color:var(--text-dim); margin-top:2px;">
+            Showing all folders created under your sandboxed user directory.
+          </div>
+        </div>
+
+        <!-- 2. Or enter custom folder name -->
+        <div class="setting-group">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+            <label class="setting-label">Folder Name</label>
             <button id="btn-conv-workdir-reset" class="btn-top" type="button" style="font-size:0.72rem; padding:2px 8px;">Reset to Default</button>
           </div>
-          <input type="text" id="conv-workdir-inp" class="setting-input" style="font-family:var(--font-mono); font-size:0.82rem;" placeholder="UserData\{id} - {title}">
-          <div style="font-size:0.72rem; color:var(--text-dim); margin-top:2px; line-height:1.3;">
-            Default location: <code id="conv-workdir-default-hint" style="color:var(--text-muted);">UserData/{conversation_id} - {title}</code> (same folder as gufo.exe)
+          <div style="display:flex; align-items:center; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-sm); overflow:hidden;">
+            <span id="conv-workdir-inp-prefix" style="padding:6px 8px; font-family:var(--font-mono); font-size:0.78rem; color:var(--text-dim); background:var(--bg-elevated); border-right:1px solid var(--border); white-space:nowrap; user-select:none;">UserData/Guest/</span>
+            <input type="text" id="conv-workdir-inp" class="setting-input" style="border:none; border-radius:0; font-family:var(--font-mono); font-size:0.82rem; padding:6px 8px; flex:1;" placeholder="<chat folder>">
+          </div>
+          <div style="font-size:0.72rem; color:var(--text-dim); margin-top:4px; line-height:1.3;">
+            Default chat folder: <code id="conv-workdir-default-hint" style="color:var(--text-muted);">conv_xxx - Title</code>
           </div>
         </div>
 
-        <div style="display:flex; gap:8px; margin-top:8px;">
+        <div style="display:flex; gap:8px; margin-top:10px;">
+          <button id="btn-conv-workdir-open-browser" class="btn-top" type="button" style="padding:6px 12px; gap:6px;">
+            <span>📁</span> Open File Browser
+          </button>
           <button id="btn-conv-workdir-save" class="btn-dialog-submit" style="flex:1;">Save &amp; Apply</button>
           <button id="btn-conv-workdir-cancel" class="btn-top" style="padding:0 14px;">Cancel</button>
         </div>
@@ -2744,6 +2973,106 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
           <span id="file-viewer-meta" style="font-size:0.72rem; color:var(--text-dim);"></span>
           <button id="btn-file-viewer-download" class="btn-dialog-submit" style="padding:4px 14px; font-size:0.8rem;">Download</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fully Featured Workspace File Browser Modal Dialog -->
+  <div id="user-file-browser-dialog" class="dialog-backdrop">
+    <div class="dialog-box" style="max-width:880px; width:94vw; max-height:90vh; display:flex; flex-direction:column; padding:0; overflow:hidden;">
+      <!-- Modal Header -->
+      <div class="dialog-header" style="padding:12px 18px; border-bottom:1px solid var(--border); background:var(--bg-card); display:flex; justify-content:space-between; align-items:center;">
+        <div style="display:flex; align-items:center; gap:10px;">
+          <span style="font-size:1.3rem;">📁</span>
+          <div>
+            <div style="font-weight:700; font-size:1rem; color:var(--text); display:flex; align-items:center; gap:8px;">
+              <span>Workspace File Browser</span>
+              <span id="fb-user-badge" class="tag-pill" style="font-size:0.7rem;">Guest</span>
+            </div>
+            <div id="fb-active-chat-workdir" style="font-size:0.72rem; color:var(--text-dim); font-family:var(--font-mono); margin-top:2px;">
+              Chat Workdir: <span id="fb-chat-workdir-text" style="color:#86efac;">UserData/Guest/conv_...</span>
+            </div>
+          </div>
+        </div>
+        <button id="btn-close-file-browser" class="btn-top" style="padding:4px 10px; font-size:1.1rem; line-height:1;">&times;</button>
+      </div>
+
+      <!-- Toolbar & Breadcrumbs -->
+      <div style="padding:10px 18px; background:var(--bg-elevated); border-bottom:1px solid var(--border); display:flex; flex-direction:column; gap:8px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+          <!-- Breadcrumb navigation -->
+          <div id="fb-breadcrumbs" class="fb-breadcrumbs-bar" style="display:flex; align-items:center; gap:4px; font-family:var(--font-mono); font-size:0.8rem; overflow-x:auto; flex:1;">
+            <span class="fb-crumb active" data-path="">UserData</span>
+          </div>
+
+          <!-- Action buttons -->
+          <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+            <button id="btn-fb-up" class="btn-top" type="button" title="Go to Parent Directory" style="padding:4px 9px; font-size:0.75rem;">
+              <span>⬆️</span> Up
+            </button>
+            <button id="btn-fb-new-folder" class="btn-top" type="button" title="Create New Subfolder" style="padding:4px 9px; font-size:0.75rem;">
+              <span>➕</span> Folder
+            </button>
+            <button id="btn-fb-upload" class="btn-top" type="button" title="Upload Files to Current Directory" style="padding:4px 9px; font-size:0.75rem;">
+              <span>📤</span> Upload
+            </button>
+            <input type="file" id="fb-file-upload-input" multiple style="display:none;">
+            <button id="btn-fb-set-workdir" class="btn-top" type="button" title="Set this folder as Active Chat Working Directory" style="padding:4px 10px; font-size:0.75rem; background:rgba(34,197,94,0.15); border-color:rgba(34,197,94,0.35); color:#86efac; font-weight:600;">
+              <span>📌</span> Set as Chat Workdir
+            </button>
+            <button id="btn-fb-refresh" class="btn-top" type="button" title="Refresh Files" style="padding:4px 8px; font-size:0.75rem;">
+              <span>🔄</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Inline New Folder Form (toggleable) -->
+        <div id="fb-new-folder-box" style="display:none; align-items:center; gap:8px; padding:6px 8px; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-sm);">
+          <span style="font-size:0.8rem; color:var(--text-dim);">New Folder Name:</span>
+          <input type="text" id="fb-new-folder-inp" class="setting-input" style="padding:3px 8px; font-size:0.8rem; flex:1;" placeholder="e.g. project_code">
+          <button id="btn-fb-create-folder-exec" class="btn-dialog-submit" style="padding:3px 10px; font-size:0.75rem;">Create</button>
+          <button id="btn-fb-cancel-folder" class="btn-top" style="padding:3px 8px; font-size:0.75rem;">Cancel</button>
+        </div>
+      </div>
+
+      <!-- Main Browser Area: Files List + Inline Preview -->
+      <div style="display:flex; flex:1; min-height:360px; max-height:55vh; overflow:hidden;">
+        <!-- Left: Files / Folders List -->
+        <div id="fb-files-list-view" style="flex:1; overflow-y:auto; padding:10px 18px; display:flex; flex-direction:column; gap:4px;">
+          <!-- Dynamically populated rows -->
+        </div>
+
+        <!-- Right: Inline File Preview Pane (collapsible) -->
+        <div id="fb-preview-pane" style="display:none; width:380px; border-left:1px solid var(--border); background:var(--bg); flex-direction:column; overflow:hidden;">
+          <div style="padding:8px 12px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; background:var(--bg-elevated);">
+            <div style="display:flex; align-items:center; gap:6px; min-width:0; overflow:hidden;">
+              <span id="fb-preview-icon">📄</span>
+              <span id="fb-preview-name" style="font-weight:600; font-size:0.82rem; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></span>
+            </div>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <button id="btn-fb-preview-download" class="btn-mini" title="Download File" style="font-size:0.8rem; padding:2px 6px;">⬇️</button>
+              <button id="btn-fb-preview-close" class="btn-mini" title="Close Preview" style="font-size:1.1rem; line-height:1; padding:0 4px;">&times;</button>
+            </div>
+          </div>
+          <div id="fb-preview-body" style="flex:1; overflow:auto; padding:10px;">
+            <pre id="fb-preview-text" style="margin:0; font-family:var(--font-mono); font-size:0.75rem; color:var(--text); white-space:pre-wrap; word-break:break-all;"></pre>
+            <img id="fb-preview-img" style="display:none; max-width:100%; height:auto; border-radius:4px; margin:0 auto;" />
+          </div>
+          <div id="fb-preview-footer" style="padding:6px 12px; border-top:1px solid var(--border); font-size:0.7rem; color:var(--text-dim); display:flex; justify-content:space-between; align-items:center;">
+            <span id="fb-preview-size"></span>
+            <button id="btn-fb-preview-copy" class="btn-mini" style="font-size:0.7rem; padding:1px 6px;">📋 Copy</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Modal Footer -->
+      <div style="padding:10px 18px; border-top:1px solid var(--border); background:var(--bg-card); display:flex; justify-content:space-between; align-items:center;">
+        <div id="fb-status-stats" style="font-size:0.75rem; color:var(--text-dim);">
+          0 items
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button id="btn-fb-close-footer" class="btn-top" style="padding:4px 14px;">Close</button>
         </div>
       </div>
     </div>
@@ -2844,6 +3173,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       authBtnLabel: $('auth-btn-label'),
       btnAuthUser: $('btn-auth-user'),
       messagesContainer: $('messages-container'),
+      btnScrollBottom: $('btn-scroll-bottom'),
       imageBar: $('image-bar'),
       thumbImg: $('thumb-img'),
       btnRemoveThumb: $('btn-remove-thumb'),
@@ -2878,15 +3208,59 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       btnSaveNewPrompt: $('btn-save-new-prompt'),
       newPromptNameInp: $('new-prompt-name-inp'),
       newPromptTextInp: $('new-prompt-text-inp'),
+      btnTopFileBrowser: $('btn-top-file-browser'),
+      userPopupMenu: $('user-popup-menu'),
+      userPopupName: $('user-popup-name'),
+      userPopupRoot: $('user-popup-root'),
+      btnMenuFileBrowser: $('btn-menu-file-browser'),
+      btnMenuWorkdirSetup: $('btn-menu-workdir-setup'),
+      btnMenuAuth: $('btn-menu-auth'),
+      userMenuAuthIcon: $('user-menu-auth-icon'),
+      userMenuAuthTitle: $('user-menu-auth-title'),
+      userMenuAuthDesc: $('user-menu-auth-desc'),
+      // File Browser Modal
+      userFileBrowserDialog: $('user-file-browser-dialog'),
+      btnCloseFileBrowser: $('btn-close-file-browser'),
+      btnFbCloseFooter: $('btn-fb-close-footer'),
+      fbUserBadge: $('fb-user-badge'),
+      fbActiveChatWorkdir: $('fb-active-chat-workdir'),
+      fbChatWorkdirText: $('fb-chat-workdir-text'),
+      fbBreadcrumbs: $('fb-breadcrumbs'),
+      btnFbUp: $('btn-fb-up'),
+      btnFbNewFolder: $('btn-fb-new-folder'),
+      btnFbUpload: $('btn-fb-upload'),
+      fbFileUploadInput: $('fb-file-upload-input'),
+      btnFbSetWorkdir: $('btn-fb-set-workdir'),
+      btnFbRefresh: $('btn-fb-refresh'),
+      fbNewFolderBox: $('fb-new-folder-box'),
+      fbNewFolderInp: $('fb-new-folder-inp'),
+      btnFbCreateFolderExec: $('btn-fb-create-folder-exec'),
+      btnFbCancelFolder: $('btn-fb-cancel-folder'),
+      fbFilesListView: $('fb-files-list-view'),
+      fbPreviewPane: $('fb-preview-pane'),
+      fbPreviewIcon: $('fb-preview-icon'),
+      fbPreviewName: $('fb-preview-name'),
+      btnFbPreviewDownload: $('btn-fb-preview-download'),
+      btnFbPreviewClose: $('btn-fb-preview-close'),
+      fbPreviewText: $('fb-preview-text'),
+      fbPreviewImg: $('fb-preview-img'),
+      fbPreviewSize: $('fb-preview-size'),
+      btnFbPreviewCopy: $('btn-fb-preview-copy'),
+      fbStatusStats: $('fb-status-stats'),
       // Conversation Working Directory Modal
       convWorkdirDialog: $('conv-workdir-dialog'),
       btnCloseConvWorkdir: $('btn-close-conv-workdir'),
       btnConvWorkdirCancel: $('btn-conv-workdir-cancel'),
       convWorkdirActiveTitle: $('conv-workdir-active-title'),
       convWorkdirActiveId: $('conv-workdir-active-id'),
+      convWorkdirDisplayBadge: $('conv-workdir-display-badge'),
+      convWorkdirSelect: $('conv-workdir-select'),
+      convWorkdirUserPrefix: $('conv-workdir-user-prefix'),
+      convWorkdirInpPrefix: $('conv-workdir-inp-prefix'),
       convWorkdirInp: $('conv-workdir-inp'),
       convWorkdirDefaultHint: $('conv-workdir-default-hint'),
       btnConvWorkdirReset: $('btn-conv-workdir-reset'),
+      btnConvWorkdirOpenBrowser: $('btn-conv-workdir-open-browser'),
       btnConvWorkdirSave: $('btn-conv-workdir-save'),
       chatInput: $('chat-input'),
       btnSend: $('btn-send'),
@@ -3396,8 +3770,61 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       if (UI.authDialog) UI.authDialog.classList.remove('show');
     }
 
+    function toggleUserDropdown() {
+      if (!UI.userPopupMenu) return;
+      const isOpen = UI.userPopupMenu.style.display === 'flex';
+      if (isOpen) {
+        closeUserDropdown();
+      } else {
+        openUserDropdown();
+      }
+    }
+
+    function openUserDropdown() {
+      if (!UI.userPopupMenu) return;
+      const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+      if (UI.userPopupName) UI.userPopupName.textContent = username;
+      if (UI.userPopupRoot) UI.userPopupRoot.textContent = `UserData/${username}`;
+      if (UI.userMenuAuthTitle) {
+        UI.userMenuAuthTitle.textContent = APP.user ? 'Sign Out' : 'Sign In / Register';
+      }
+      if (UI.userMenuAuthDesc) {
+        UI.userMenuAuthDesc.textContent = APP.user ? `Logged in as ${APP.user.username}` : 'Multi-device sync & isolation';
+      }
+      if (UI.userMenuAuthIcon) {
+        UI.userMenuAuthIcon.textContent = APP.user ? '🚪' : '🔑';
+      }
+      UI.userPopupMenu.style.display = 'flex';
+    }
+
+    function closeUserDropdown() {
+      if (UI.userPopupMenu) UI.userPopupMenu.style.display = 'none';
+    }
+
     if (UI.btnAuthUser) {
-      UI.btnAuthUser.addEventListener('click', () => {
+      UI.btnAuthUser.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleUserDropdown();
+      });
+    }
+
+    if (UI.btnMenuFileBrowser) {
+      UI.btnMenuFileBrowser.addEventListener('click', () => {
+        closeUserDropdown();
+        openUserFileBrowserModal();
+      });
+    }
+
+    if (UI.btnMenuWorkdirSetup) {
+      UI.btnMenuWorkdirSetup.addEventListener('click', () => {
+        closeUserDropdown();
+        openConvWorkdirModal();
+      });
+    }
+
+    if (UI.btnMenuAuth) {
+      UI.btnMenuAuth.addEventListener('click', () => {
+        closeUserDropdown();
         if (APP.user) {
           if (confirm(`Logged in as ${APP.user.username}. Sign out?`)) {
             logout();
@@ -3407,6 +3834,20 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         }
       });
     }
+
+    if (UI.btnTopFileBrowser) {
+      UI.btnTopFileBrowser.addEventListener('click', () => {
+        openUserFileBrowserModal();
+      });
+    }
+
+    document.addEventListener('click', (e) => {
+      if (UI.userPopupMenu && UI.userPopupMenu.style.display === 'flex') {
+        if (!e.target.closest('.user-menu-wrapper')) {
+          closeUserDropdown();
+        }
+      }
+    });
     if (UI.btnCloseAuth) UI.btnCloseAuth.addEventListener('click', closeAuthModal);
     if (UI.linkToggleMode) {
       UI.linkToggleMode.addEventListener('click', (e) => {
@@ -3582,15 +4023,16 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     function updateAttachPopupUI() {
       // 3. Working directory display
       if (UI.attachPopupWorkdirSub) {
+        const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
         let wd = (APP.activeConv && APP.activeConv.working_directory) ? APP.activeConv.working_directory : '';
+        const userPrefix = `UserData/${username}/`;
+        if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
         if (wd) {
-          const parts = wd.split(/[\\/]/).filter(Boolean);
-          const folderName = parts.length > 0 ? parts[parts.length - 1] : wd;
-          UI.attachPopupWorkdirSub.textContent = folderName;
-          UI.attachPopupWorkdirSub.title = wd;
+          UI.attachPopupWorkdirSub.textContent = `UserData/${username}/${wd}`;
+          UI.attachPopupWorkdirSub.title = `UserData/${username}/${wd}`;
         } else {
-          UI.attachPopupWorkdirSub.textContent = 'UserData/...';
-          UI.attachPopupWorkdirSub.title = 'Default folder';
+          UI.attachPopupWorkdirSub.textContent = `UserData/${username}/...`;
+          UI.attachPopupWorkdirSub.title = 'Default chat folder';
         }
       }
 
@@ -4011,21 +4453,60 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     });
 
     // Conversation-Based Working Directory Modal
-    function openConvWorkdirModal() {
+    async function openConvWorkdirModal() {
       if (!UI.convWorkdirDialog) return;
       const conv = APP.activeConv || (APP.conversations.length > 0 ? APP.conversations[0] : null);
+      const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+      const userPrefix = `UserData/${username}/`;
+
       if (UI.convWorkdirActiveTitle) {
         UI.convWorkdirActiveTitle.textContent = (conv && conv.title) ? conv.title : 'New Chat';
       }
       if (UI.convWorkdirActiveId) {
         UI.convWorkdirActiveId.textContent = conv ? `ID: ${conv.id}` : '';
       }
+      if (UI.convWorkdirUserPrefix) UI.convWorkdirUserPrefix.textContent = userPrefix;
+      if (UI.convWorkdirInpPrefix) UI.convWorkdirInpPrefix.textContent = userPrefix;
+
+      let currentRelFolder = '';
+      if (conv && conv.working_directory) {
+        let wd = conv.working_directory;
+        if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
+        currentRelFolder = wd;
+      } else if (conv) {
+        currentRelFolder = `${conv.id} - ${conv.title || 'Chat'}`;
+      }
+
       if (UI.convWorkdirInp) {
-        UI.convWorkdirInp.value = (conv && conv.working_directory) ? conv.working_directory : '';
+        UI.convWorkdirInp.value = currentRelFolder;
+      }
+      if (UI.convWorkdirDisplayBadge) {
+        UI.convWorkdirDisplayBadge.textContent = userPrefix + (currentRelFolder || '');
       }
       if (UI.convWorkdirDefaultHint && conv) {
-        UI.convWorkdirDefaultHint.textContent = `UserData/${conv.id} - ${conv.title || 'Chat'}`;
+        UI.convWorkdirDefaultHint.textContent = `${conv.id} - ${conv.title || 'Chat'}`;
       }
+
+      // Populate dropdown with all folders under username
+      if (UI.convWorkdirSelect) {
+        UI.convWorkdirSelect.innerHTML = '<option value="">-- Choose existing folder under username --</option>';
+        try {
+          const res = await apiFetch('/api/user-files');
+          if (res.ok) {
+            const data = await res.json();
+            const folders = data.folders_list || [];
+            folders.sort();
+            folders.forEach(f => {
+              const opt = document.createElement('option');
+              opt.value = f;
+              opt.textContent = '📁 ' + f;
+              if (f === currentRelFolder) opt.selected = true;
+              UI.convWorkdirSelect.appendChild(opt);
+            });
+          }
+        } catch (_) {}
+      }
+
       UI.convWorkdirDialog.classList.add('show');
     }
 
@@ -4041,6 +4522,35 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       });
     }
 
+    if (UI.convWorkdirSelect) {
+      UI.convWorkdirSelect.addEventListener('change', (e) => {
+        if (e.target.value) {
+          if (UI.convWorkdirInp) UI.convWorkdirInp.value = e.target.value;
+          const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+          if (UI.convWorkdirDisplayBadge) {
+            UI.convWorkdirDisplayBadge.textContent = `UserData/${username}/${e.target.value}`;
+          }
+        }
+      });
+    }
+
+    if (UI.convWorkdirInp) {
+      UI.convWorkdirInp.addEventListener('input', (e) => {
+        const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+        if (UI.convWorkdirDisplayBadge) {
+          UI.convWorkdirDisplayBadge.textContent = `UserData/${username}/${e.target.value.trim()}`;
+        }
+      });
+    }
+
+    if (UI.btnConvWorkdirOpenBrowser) {
+      UI.btnConvWorkdirOpenBrowser.addEventListener('click', () => {
+        const targetPath = UI.convWorkdirInp ? UI.convWorkdirInp.value.trim() : '';
+        closeConvWorkdirModal();
+        openUserFileBrowserModal(targetPath);
+      });
+    }
+
     if (UI.btnConvWorkdirReset) {
       UI.btnConvWorkdirReset.addEventListener('click', async () => {
         if (!APP.activeId) return;
@@ -4051,10 +4561,16 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           });
           if (res.ok) {
             const data = await res.json();
-            if (APP.activeConv) APP.activeConv.working_directory = data.working_directory;
+            const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+            const userPrefix = `UserData/${username}/`;
+            let wd = data.working_directory || '';
+            if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
+
+            if (APP.activeConv) APP.activeConv.working_directory = wd;
             const targetConv = APP.conversations.find(c => c.id === APP.activeId);
-            if (targetConv) targetConv.working_directory = data.working_directory;
-            if (UI.convWorkdirInp) UI.convWorkdirInp.value = data.working_directory || '';
+            if (targetConv) targetConv.working_directory = wd;
+            if (UI.convWorkdirInp) UI.convWorkdirInp.value = wd;
+            if (UI.convWorkdirDisplayBadge) UI.convWorkdirDisplayBadge.textContent = userPrefix + wd;
             updateAttachPopupUI();
           }
         } catch (e) {
@@ -4066,7 +4582,315 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     if (UI.btnConvWorkdirSave) {
       UI.btnConvWorkdirSave.addEventListener('click', async () => {
         if (!APP.activeId) return;
-        const newPath = UI.convWorkdirInp ? UI.convWorkdirInp.value.trim() : '';
+        let newPath = UI.convWorkdirInp ? UI.convWorkdirInp.value.trim() : '';
+        const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+        const userPrefix = `UserData/${username}/`;
+        if (newPath.startsWith(userPrefix)) newPath = newPath.slice(userPrefix.length);
+        try {
+          const res = await apiFetch(`/api/conversations/${APP.activeId}`, {
+            method: 'PATCH',
+            body: { working_directory: newPath }
+          });
+          if (res.ok) {
+            const data = await res.json();
+            let wd = data.working_directory || newPath;
+            if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
+            if (APP.activeConv) APP.activeConv.working_directory = wd;
+            const targetConv = APP.conversations.find(c => c.id === APP.activeId);
+            if (targetConv) targetConv.working_directory = wd;
+            updateAttachPopupUI();
+          }
+        } catch (e) {
+          console.error('Failed to save conversation working directory:', e);
+        }
+        closeConvWorkdirModal();
+      });
+    }
+
+    // Modal Workspace File Browser Implementation
+    let currentModalPath = '';
+
+    function openUserFileBrowserModal(subpath) {
+      if (!UI.userFileBrowserDialog) return;
+      const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+      if (UI.fbUserBadge) UI.fbUserBadge.textContent = username;
+
+      // Determine initial subpath:
+      let pathToGo = '';
+      if (typeof subpath === 'string') {
+        pathToGo = subpath;
+      } else if (APP.activeConv && APP.activeConv.working_directory) {
+        pathToGo = APP.activeConv.working_directory;
+      }
+      const userPrefix = `UserData/${username}/`;
+      if (pathToGo.startsWith(userPrefix)) pathToGo = pathToGo.slice(userPrefix.length);
+
+      updateModalWorkdirBadge();
+      UI.userFileBrowserDialog.classList.add('show');
+      loadModalUserFiles(pathToGo);
+    }
+
+    function closeUserFileBrowserModal() {
+      if (UI.userFileBrowserDialog) UI.userFileBrowserDialog.classList.remove('show');
+      closeModalFilePreview();
+      if (UI.fbNewFolderBox) UI.fbNewFolderBox.style.display = 'none';
+    }
+
+    function updateModalWorkdirBadge() {
+      const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+      const conv = APP.activeConv;
+      let wd = (conv && conv.working_directory) ? conv.working_directory : '';
+      const userPrefix = `UserData/${username}/`;
+      if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
+      const displayWd = wd ? `${userPrefix}${wd}` : `${userPrefix}(root)`;
+      if (UI.fbChatWorkdirText) UI.fbChatWorkdirText.textContent = displayWd;
+    }
+
+    if (UI.btnCloseFileBrowser) UI.btnCloseFileBrowser.addEventListener('click', closeUserFileBrowserModal);
+    if (UI.btnFbCloseFooter) UI.btnFbCloseFooter.addEventListener('click', closeUserFileBrowserModal);
+    if (UI.userFileBrowserDialog) {
+      UI.userFileBrowserDialog.addEventListener('click', (e) => {
+        if (e.target === UI.userFileBrowserDialog) closeUserFileBrowserModal();
+      });
+    }
+
+    async function loadModalUserFiles(subpath = '') {
+      currentModalPath = subpath || '';
+      const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+      renderModalBreadcrumbs(currentModalPath, username);
+      closeModalFilePreview();
+
+      if (!UI.fbFilesListView) return;
+      UI.fbFilesListView.innerHTML = '<div style="color:var(--text-dim); font-size:0.8rem; padding:16px; text-align:center;">Loading files...</div>';
+
+      try {
+        const url = `/api/user-files?path=${encodeURIComponent(currentModalPath)}`;
+        const res = await apiFetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const entries = data.entries || [];
+        renderModalFilesList(entries, currentModalPath);
+      } catch (err) {
+        UI.fbFilesListView.innerHTML = `<div style="color:var(--danger); font-size:0.8rem; padding:16px; text-align:center;">Failed to load files: ${escapeHtml(err.message)}</div>`;
+        if (UI.fbStatusStats) UI.fbStatusStats.textContent = 'Error loading directory';
+      }
+    }
+
+    function renderModalBreadcrumbs(curPath, username) {
+      if (!UI.fbBreadcrumbs) return;
+      UI.fbBreadcrumbs.innerHTML = '';
+
+      // Root crumb: UserData / <username>
+      const rootCrumb = document.createElement('span');
+      rootCrumb.className = 'fb-crumb' + (!curPath ? ' active' : '');
+      rootCrumb.textContent = `UserData/${username}`;
+      rootCrumb.onclick = () => loadModalUserFiles('');
+      UI.fbBreadcrumbs.appendChild(rootCrumb);
+
+      if (!curPath) return;
+
+      const segments = curPath.split(/[\\/]/).filter(Boolean);
+      let cumulative = '';
+      segments.forEach((seg, i) => {
+        const sep = document.createElement('span');
+        sep.className = 'fb-crumb-sep';
+        sep.textContent = '/';
+        UI.fbBreadcrumbs.appendChild(sep);
+
+        cumulative = cumulative ? `${cumulative}/${seg}` : seg;
+        const crumb = document.createElement('span');
+        const isLast = (i === segments.length - 1);
+        crumb.className = 'fb-crumb' + (isLast ? ' active' : '');
+        crumb.textContent = seg;
+        const targetPath = cumulative;
+        if (!isLast) {
+          crumb.onclick = () => loadModalUserFiles(targetPath);
+        }
+        UI.fbBreadcrumbs.appendChild(crumb);
+      });
+    }
+
+    function renderModalFilesList(entries, curPath) {
+      if (!UI.fbFilesListView) return;
+      UI.fbFilesListView.innerHTML = '';
+
+      if (entries.length === 0) {
+        UI.fbFilesListView.innerHTML = `
+          <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:32px; color:var(--text-dim); gap:6px;">
+            <span style="font-size:2rem;">📂</span>
+            <div style="font-size:0.85rem; font-weight:500;">Empty Directory</div>
+            <div style="font-size:0.75rem;">Create a folder or upload files to this workspace.</div>
+          </div>
+        `;
+        if (UI.fbStatusStats) UI.fbStatusStats.textContent = '0 items';
+        return;
+      }
+
+      // Sort: directories first, then alphabetical
+      entries.sort((a, b) => {
+        if (a.is_dir && !b.is_dir) return -1;
+        if (!a.is_dir && b.is_dir) return 1;
+        return a.name.localeCompare(b.name);
+      });
+
+      let dirCount = 0;
+      let fileCount = 0;
+
+      entries.forEach(entry => {
+        if (entry.is_dir) dirCount++; else fileCount++;
+        const row = document.createElement('div');
+        row.className = 'fb-file-row';
+
+        const isImg = !entry.is_dir && entry.name.match(/\\.(png|jpg|jpeg|webp|gif|svg)$/i);
+        const icon = entry.is_dir ? '📁' : (isImg ? '🖼️' : '📄');
+        const sizeStr = entry.is_dir ? '' : formatBytes(entry.size || 0);
+
+        row.innerHTML = `
+          <div class="fb-file-left">
+            <span style="font-size:1.15rem; flex-shrink:0;">${icon}</span>
+            <span class="fb-file-name ${entry.is_dir ? 'is-folder' : ''}">${escapeHtml(entry.name)}</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            ${sizeStr ? `<span style="font-size:0.72rem; color:var(--text-dim); font-family:var(--font-mono);">${sizeStr}</span>` : ''}
+            ${!entry.is_dir ? `<button class="btn-top btn-fb-view" type="button" title="View / Preview" style="padding:2px 7px; font-size:0.72rem;">👁️</button>` : ''}
+            ${!entry.is_dir ? `<button class="btn-top btn-fb-dl" type="button" title="Download" style="padding:2px 7px; font-size:0.72rem;">⬇️</button>` : ''}
+            <button class="btn-top btn-fb-delete" type="button" title="Delete" style="padding:2px 7px; font-size:0.72rem; color:var(--danger); border-color:rgba(239,68,68,0.2);">&times;</button>
+          </div>
+        `;
+
+        const fileLeft = row.querySelector('.fb-file-left');
+        fileLeft.addEventListener('click', () => {
+          if (entry.is_dir) {
+            const nextPath = curPath ? `${curPath}/${entry.name}` : entry.name;
+            loadModalUserFiles(nextPath);
+          } else {
+            const rel = curPath ? `${curPath}/${entry.name}` : entry.name;
+            openModalFilePreview(rel, entry.name, isImg);
+          }
+        });
+
+        const viewBtn = row.querySelector('.btn-fb-view');
+        if (viewBtn) {
+          viewBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const rel = curPath ? `${curPath}/${entry.name}` : entry.name;
+            openModalFilePreview(rel, entry.name, isImg);
+          });
+        }
+
+        const dlBtn = row.querySelector('.btn-fb-dl');
+        if (dlBtn) {
+          dlBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const rel = curPath ? `${curPath}/${entry.name}` : entry.name;
+            downloadModalFile(rel, entry.name);
+          });
+        }
+
+        const delBtn = row.querySelector('.btn-fb-delete');
+        if (delBtn) {
+          delBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const rel = curPath ? `${curPath}/${entry.name}` : entry.name;
+            if (confirm(`Delete "\${entry.name}"? This cannot be undone.`)) {
+              try {
+                const res = await apiFetch(`/api/user-files?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
+                if (res.ok) {
+                  loadModalUserFiles(curPath);
+                } else {
+                  const d = await res.json();
+                  alert('Delete failed: ' + (d.error || 'Server error'));
+                }
+              } catch (err) {
+                alert('Delete failed: ' + err.message);
+              }
+            }
+          });
+        }
+
+        UI.fbFilesListView.appendChild(row);
+      });
+
+      if (UI.fbStatusStats) {
+        UI.fbStatusStats.textContent = `${dirCount} folder(s), ${fileCount} file(s)`;
+      }
+    }
+
+    async function openModalFilePreview(relPath, fileName, isImg) {
+      if (!UI.fbPreviewPane) return;
+      UI.fbPreviewPane.style.display = 'flex';
+      if (UI.fbPreviewName) UI.fbPreviewName.textContent = fileName || relPath;
+      if (UI.fbPreviewIcon) UI.fbPreviewIcon.textContent = isImg ? '🖼️' : '📄';
+      if (UI.fbPreviewText) UI.fbPreviewText.textContent = 'Loading content...';
+      if (UI.fbPreviewImg) UI.fbPreviewImg.style.display = 'none';
+      if (UI.fbPreviewSize) UI.fbPreviewSize.textContent = '';
+
+      if (UI.btnFbPreviewDownload) {
+        UI.btnFbPreviewDownload.onclick = () => downloadModalFile(relPath, fileName);
+      }
+      if (UI.btnFbPreviewCopy) {
+        UI.btnFbPreviewCopy.onclick = () => {
+          if (UI.fbPreviewText && UI.fbPreviewText.textContent) {
+            navigator.clipboard.writeText(UI.fbPreviewText.textContent);
+            UI.btnFbPreviewCopy.textContent = '✓ Copied!';
+            setTimeout(() => { if (UI.btnFbPreviewCopy) UI.btnFbPreviewCopy.textContent = '📋 Copy'; }, 1500);
+          }
+        };
+      }
+
+      try {
+        const res = await apiFetch(`/api/user-files/content?path=${encodeURIComponent(relPath)}`);
+        if (!res.ok) throw new Error(`HTTP \${res.status}`);
+        const data = await res.json();
+        const content = data.content || '';
+        if (isImg) {
+          if (UI.fbPreviewText) UI.fbPreviewText.style.display = 'none';
+          if (UI.fbPreviewImg) {
+            UI.fbPreviewImg.src = `data:image/png;base64,\${content}`;
+            UI.fbPreviewImg.style.display = 'block';
+          }
+        } else {
+          if (UI.fbPreviewImg) UI.fbPreviewImg.style.display = 'none';
+          if (UI.fbPreviewText) {
+            UI.fbPreviewText.style.display = 'block';
+            UI.fbPreviewText.textContent = content;
+          }
+        }
+        if (UI.fbPreviewSize) {
+          UI.fbPreviewSize.textContent = formatBytes(data.size || content.length);
+        }
+      } catch (err) {
+        if (UI.fbPreviewText) {
+          UI.fbPreviewText.style.display = 'block';
+          UI.fbPreviewText.textContent = 'Error loading content: ' + err.message;
+        }
+      }
+    }
+
+    function closeModalFilePreview() {
+      if (UI.fbPreviewPane) UI.fbPreviewPane.style.display = 'none';
+    }
+
+    if (UI.btnFbPreviewClose) UI.btnFbPreviewClose.addEventListener('click', closeModalFilePreview);
+
+    function downloadModalFile(relPath, fileName) {
+      const a = document.createElement('a');
+      a.href = `/api/user-files/content?path=${encodeURIComponent(relPath)}`;
+      a.download = fileName || 'download';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
+    // Set Currently Browsed Folder as Active Chat Working Directory
+    if (UI.btnFbSetWorkdir) {
+      UI.btnFbSetWorkdir.addEventListener('click', async () => {
+        if (!APP.activeId) {
+          alert('No active chat selected.');
+          return;
+        }
+        const newPath = currentModalPath || '';
+        const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
         try {
           const res = await apiFetch(`/api/conversations/${APP.activeId}`, {
             method: 'PATCH',
@@ -4078,12 +4902,91 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             const targetConv = APP.conversations.find(c => c.id === APP.activeId);
             if (targetConv) targetConv.working_directory = data.working_directory || newPath;
             updateAttachPopupUI();
+            updateModalWorkdirBadge();
+            alert(`Chat working directory updated:\nUserData/${username}/${newPath ? newPath : '(root)'}`);
           }
         } catch (e) {
-          console.error('Failed to save conversation working directory:', e);
+          alert('Failed to set chat working directory: ' + e.message);
         }
-        closeConvWorkdirModal();
       });
+    }
+
+    // Modal Folder Creation & File Upload
+    if (UI.btnFbNewFolder) {
+      UI.btnFbNewFolder.addEventListener('click', () => {
+        if (UI.fbNewFolderBox) {
+          const isOpen = UI.fbNewFolderBox.style.display === 'flex';
+          UI.fbNewFolderBox.style.display = isOpen ? 'none' : 'flex';
+          if (!isOpen && UI.fbNewFolderInp) {
+            UI.fbNewFolderInp.value = '';
+            UI.fbNewFolderInp.focus();
+          }
+        }
+      });
+    }
+    if (UI.btnFbCancelFolder) {
+      UI.btnFbCancelFolder.addEventListener('click', () => {
+        if (UI.fbNewFolderBox) UI.fbNewFolderBox.style.display = 'none';
+      });
+    }
+    if (UI.btnFbCreateFolderExec) {
+      UI.btnFbCreateFolderExec.addEventListener('click', async () => {
+        const name = UI.fbNewFolderInp ? UI.fbNewFolderInp.value.trim() : '';
+        if (!name) return;
+        try {
+          const res = await apiFetch('/api/user-folders', {
+            method: 'POST',
+            body: { name: name, parent: currentModalPath }
+          });
+          if (res.ok) {
+            if (UI.fbNewFolderBox) UI.fbNewFolderBox.style.display = 'none';
+            loadModalUserFiles(currentModalPath);
+          } else {
+            const d = await res.json();
+            alert('Failed to create folder: ' + (d.error || 'Server error'));
+          }
+        } catch (err) {
+          alert('Error creating folder: ' + err.message);
+        }
+      });
+    }
+
+    if (UI.btnFbUpload) {
+      UI.btnFbUpload.addEventListener('click', () => {
+        if (UI.fbFileUploadInput) UI.fbFileUploadInput.click();
+      });
+    }
+    if (UI.fbFileUploadInput) {
+      UI.fbFileUploadInput.addEventListener('change', async (e) => {
+        const files = Array.from(e.target.files || []);
+        if (files.length === 0) return;
+        for (const file of files) {
+          try {
+            const content = await readFileAsText(file);
+            const targetRelPath = currentModalPath ? `${currentModalPath}/${file.name}` : file.name;
+            await apiFetch('/api/user-files/content', {
+              method: 'POST',
+              body: { path: targetRelPath, content: content }
+            });
+          } catch (err) {
+            alert(`Failed to upload ${file.name}: ${err.message}`);
+          }
+        }
+        UI.fbFileUploadInput.value = '';
+        loadModalUserFiles(currentModalPath);
+      });
+    }
+
+    if (UI.btnFbUp) {
+      UI.btnFbUp.addEventListener('click', () => {
+        if (!currentModalPath) return;
+        const parts = currentModalPath.split(/[\\/]/).filter(Boolean);
+        parts.pop();
+        loadModalUserFiles(parts.join('/'));
+      });
+    }
+    if (UI.btnFbRefresh) {
+      UI.btnFbRefresh.addEventListener('click', () => loadModalUserFiles(currentModalPath));
     }
 
     // Tools & MCP Management
@@ -4603,14 +5506,19 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       }
 
       messages.forEach(m => appendMessage(m));
-      scrollDown();
+      isUserScrolledUp = false;
+      if (UI.btnScrollBottom) UI.btnScrollBottom.classList.remove('visible');
+      scrollDown(true);
     }
 
     function renderHeroDashboard() {
-      let wdName = 'UserData/...';
+      const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+      const userPrefix = `UserData/${username}/`;
+      let wdName = `UserData/${username}/...`;
       if (APP.activeConv && APP.activeConv.working_directory) {
-        const parts = APP.activeConv.working_directory.split(/[\\/]/).filter(Boolean);
-        wdName = parts.length > 0 ? parts[parts.length - 1] : APP.activeConv.working_directory;
+        let wd = APP.activeConv.working_directory;
+        if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
+        wdName = `UserData/${username}/${wd}`;
       }
       const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.enabled).length;
       const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
@@ -4806,8 +5714,34 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         : '&#9660; Thought Process';
     };
 
-    function scrollDown() {
-      UI.messagesContainer.scrollTop = UI.messagesContainer.scrollHeight;
+    let isUserScrolledUp = false;
+
+    if (UI.messagesContainer) {
+      UI.messagesContainer.addEventListener('scroll', () => {
+        const threshold = 60;
+        const distFromBottom = UI.messagesContainer.scrollHeight - UI.messagesContainer.scrollTop - UI.messagesContainer.clientHeight;
+        isUserScrolledUp = distFromBottom > threshold;
+        if (UI.btnScrollBottom) {
+          UI.btnScrollBottom.classList.toggle('visible', isUserScrolledUp);
+        }
+      });
+    }
+
+    if (UI.btnScrollBottom) {
+      UI.btnScrollBottom.addEventListener('click', () => {
+        isUserScrolledUp = false;
+        if (UI.btnScrollBottom) UI.btnScrollBottom.classList.remove('visible');
+        if (UI.messagesContainer) {
+          UI.messagesContainer.scrollTo({ top: UI.messagesContainer.scrollHeight, behavior: 'smooth' });
+        }
+      });
+    }
+
+    function scrollDown(force = false) {
+      if (!UI.messagesContainer) return;
+      if (force || !isUserScrolledUp) {
+        UI.messagesContainer.scrollTop = UI.messagesContainer.scrollHeight;
+      }
     }
 
     // Image upload & paste handling
@@ -5117,7 +6051,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       }
 
       appendMessage({ role: 'user', content: displayMsgText });
-      scrollDown();
+      isUserScrolledUp = false;
+      if (UI.btnScrollBottom) UI.btnScrollBottom.classList.remove('visible');
+      scrollDown(true);
 
       // Persist user message to DB
       if (APP.activeId) {
@@ -5211,7 +6147,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           group.appendChild(author);
           group.appendChild(body);
           UI.messagesContainer.appendChild(group);
-          scrollDown();
+          isUserScrolledUp = false;
+          if (UI.btnScrollBottom) UI.btnScrollBottom.classList.remove('visible');
+          scrollDown(true);
 
           let assistantText = '';
           let thoughtText = '';
@@ -5220,6 +6158,10 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           let accumulatedToolCalls = [];
           let accumulatedUsage = null;
           let accumulatedTimings = null;
+
+          if (UI.footerSpeedMetrics) {
+            UI.footerSpeedMetrics.textContent = 'generating...';
+          }
 
           APP.abortController = new AbortController();
 
@@ -5326,12 +6268,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                       genTokens++;
                       content.innerHTML = parseMarkdown(assistantText);
                       scrollDown();
-
-                      const elapsed = (performance.now() - startTime) / 1000;
-                      if (elapsed > 0.5) {
-                        const spd = (genTokens / elapsed).toFixed(1);
-                        UI.footerSpeedMetrics.textContent = `eval: ${spd} t/s | ${genTokens} tokens`;
-                      }
                     }
 
                     if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
@@ -5605,6 +6541,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         UI.btnSend.style.display = 'flex';
         UI.btnStop.style.display = 'none';
         UI.slotText.textContent = '1/1 slots (idle)';
+        if (UI.footerSpeedMetrics && UI.footerSpeedMetrics.textContent === 'generating...') {
+          UI.footerSpeedMetrics.textContent = 'eval: 0.0 t/s | prompt: 0.0 t/s';
+        }
         if (APP.activeId) {
           try {
             const res = await apiFetch(`/api/conversations/${APP.activeId}`);

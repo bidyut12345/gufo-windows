@@ -358,8 +358,9 @@ static int moe_vector_projection(int weight_type, const void* W,
                                  const void* X_q8 = nullptr) {
   constexpr const char* tag = "qfn_mmq_moe_vec";
   const auto type = static_cast<ggml_type>(weight_type);
-  if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
-      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q8_0 &&
+  if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_K &&
+      type != GGML_TYPE_Q5_K && type != GGML_TYPE_Q5_1 &&
+      type != GGML_TYPE_Q6_K && type != GGML_TYPE_Q8_0 &&
       type != GGML_TYPE_IQ3_S && type != GGML_TYPE_IQ4_XS &&
       type != GGML_TYPE_IQ4_NL) {
     fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
@@ -391,7 +392,8 @@ static int moe_vector_projection(int weight_type, const void* W,
                                  : MMVQ_MAX_BATCH_SIZE;
   if (gated && (n_tokens > max_gated_rows || n_expert_used > 32 ||
                 (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
-                 type != GGML_TYPE_Q8_0))) {
+                 type != GGML_TYPE_Q8_0 && type != GGML_TYPE_IQ3_S &&
+                 type != GGML_TYPE_IQ4_XS))) {
     fprintf(stderr,
             "%s: gated vector exceeds its format's row or expert limit\n",
             tag);
@@ -604,6 +606,26 @@ extern "C" int qfn_mmq_q4_K_moe_pair_unique(
         W_b, out_b);
 }
 
+extern "C" int qfn_mmq_iq3_s_moe_pair_unique(
+    const void * W_a, const void * W_b, const float * X, const int32_t * ids,
+    float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
+    int n_expert_used, hipStream_t stream) {
+    if (!W_b || !out_b) return -1;
+    return qfn_mmq_moe_impl<GGML_TYPE_IQ3_S>("qfn_mmq_iq3_s_moe_pair_unique",
+        W_a, X, ids, out_a, M, K, n_tokens, n_experts, n_expert_used, stream,
+        W_b, out_b);
+}
+
+extern "C" int qfn_mmq_iq4_xs_moe_pair_unique(
+    const void * W_a, const void * W_b, const float * X, const int32_t * ids,
+    float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
+    int n_expert_used, hipStream_t stream) {
+    if (!W_b || !out_b) return -1;
+    return qfn_mmq_moe_impl<GGML_TYPE_IQ4_XS>("qfn_mmq_iq4_xs_moe_pair_unique",
+        W_a, X, ids, out_a, M, K, n_tokens, n_experts, n_expert_used, stream,
+        W_b, out_b);
+}
+
 extern "C" size_t qfn_mmq_q8_1_bytes(int N, int K) {
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     return (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
@@ -624,18 +646,13 @@ extern "C" int qfn_mmq_quantize_q8_1(
 }
 
 // The 320-row HC down projection has too few waves to hide its long K
-// loads. Fetch `prefetch` iterations together, retaining the MMVQ sum
-// order: every lane still accumulates its blocks in ascending order (see
-// kHcDownPrefetch for the one-token exception). With `silu` the write applies the
-// mixer's SiluScale (silu(x * scale)) with the same expression, saving its
-// separate launch.
-template<int tokens, bool grouped = false, int prefetch = 2, bool silu = false>
+// loads. Fetch two iterations together, retaining the MMVQ sum order.
+template<int tokens, bool grouped = false>
 __launch_bounds__(32) __global__ static void qfn_q8_hc_down_kernel(
         const block_q8_0* __restrict__ weights,
-        const block_q8_1* __restrict__ input, float* __restrict__ output,
-        float silu_scale = 1.0f) {
+        const block_q8_1* __restrict__ input, float* __restrict__ output) {
     constexpr int blocks = 10240 / QK8_0;
-    static_assert(blocks % (8 * prefetch) == 0, "prefetch must tile K");
+    constexpr int prefetch = 2;
     if constexpr (grouped) {
         input += size_t(blockIdx.y) * tokens * blocks;
         output += size_t(blockIdx.y) * tokens * 320;
@@ -670,50 +687,22 @@ __launch_bounds__(32) __global__ static void qfn_q8_hc_down_kernel(
             for (int t = 0; t < tokens; ++t) {
                 int dot = ggml_hip_dp4a(v[j][0], u[j][t][0], 0);
                 dot = ggml_hip_dp4a(v[j][1], u[j][t][1], dot);
-                if constexpr (tokens == 1) {
-                    const float scale =
-                        __fmul_rn(__half2float(dw[j]), __half2float(dx[j][t]));
-                    const float product = __fmul_rn(scale, static_cast<float>(dot));
-                    sum[t] = __fadd_rn(sum[t], product);
-                } else {
-                    // Preserve the batched MMVQ weight-dot rounding and
-                    // input-scale FMA; reassociating the scales changes logits.
-                    const float product =
-                        __fmul_rn(__half2float(dw[j]), static_cast<float>(dot));
-                    sum[t] = __fmaf_rn(__half2float(dx[j][t]), product, sum[t]);
-                }
+                // One rounding sequence for every row count: a batched row
+                // must be bit-identical to the same row decoded alone, or
+                // every speculative verify row and every concurrent decode
+                // row drifts from the autoregressive frontier.
+                const float scale =
+                    __fmul_rn(__half2float(dw[j]), __half2float(dx[j][t]));
+                const float product = __fmul_rn(scale, static_cast<float>(dot));
+                sum[t] = __fadd_rn(sum[t], product);
             }
         }
     }
 #pragma unroll
     for (int t = 0; t < tokens; ++t) {
         sum[t] = warp_reduce_sum<32>(sum[t]);
-        if (lane == 0) {
-            float value = sum[t];
-            if constexpr (silu) {
-                // Same expression as SiluScaleKernel: SiluF(x * scale).
-                const float x = value * silu_scale;
-                value = x * (1.0f / (1.0f + __expf(-x)));
-            }
-            output[t * 320 + blockIdx.x] = value;
-        }
+        if (lane == 0) output[t * 320 + blockIdx.x] = sum[t];
     }
-}
-
-// Deeper prefetch for small token counts; register use grows with both.
-// One token stays at 2: its plain adds are reassociable under -ffast-math,
-// and a deeper unroll regroups them (measured: 77% of outputs changed).
-// The FMA chain of two or more tokens is bit-identical at any depth.
-template<int tokens>
-constexpr int kHcDownPrefetch =
-    tokens == 1 ? 2 : (tokens <= 2 ? 8 : (tokens <= 4 ? 5 : 4));
-
-// The deeper prefetch is a Windows-validated switch (Tuning::fused_hc_down,
-// set by the executor); off, every token count keeps the original depth 2.
-static bool g_hc_down_deep_prefetch = false;
-
-extern "C" void qfn_mmq_set_hc_down_deep_prefetch(int enabled) {
-    g_hc_down_deep_prefetch = enabled != 0;
 }
 
 template<int tokens = 1>
@@ -736,35 +725,16 @@ static int prepare_decode_kernels() {
     return status == 0 ? prepare_q8_decode() : status;
 }
 
-template<int tokens = 1, bool silu = false>
+template<int tokens = 1>
 static void launch_q8_hc_down(const void* weights, const void* input,
-                              float* output, int rows, hipStream_t stream,
-                              float silu_scale = 1.0f) {
+                              float* output, int rows, hipStream_t stream) {
     if (rows == tokens) {
-        const auto* w = static_cast<const block_q8_0*>(weights);
-        const auto* x = static_cast<const block_q8_1*>(input);
-        if (g_hc_down_deep_prefetch) {
-            qfn_q8_hc_down_kernel<tokens, false, kHcDownPrefetch<tokens>, silu>
-                <<<320, 32, 0, stream>>>(w, x, output, silu_scale);
-        } else {
-            qfn_q8_hc_down_kernel<tokens, false, 2, silu>
-                <<<320, 32, 0, stream>>>(w, x, output, silu_scale);
-        }
+        qfn_q8_hc_down_kernel<tokens><<<320, 32, 0, stream>>>(
+            static_cast<const block_q8_0*>(weights),
+            static_cast<const block_q8_1*>(input), output);
     } else if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
-        launch_q8_hc_down<tokens + 1, silu>(weights, input, output, rows,
-                                            stream, silu_scale);
+        launch_q8_hc_down<tokens + 1>(weights, input, output, rows, stream);
     }
-}
-
-extern "C" int qfn_mmq_q8_0_hc_down_silu(const void* W, const void* X_q8,
-                                         float* out_f32, int N, float scale,
-                                         hipStream_t stream) {
-    if (!W || !X_q8 || !out_f32 || N <= 0 || N > MMVQ_MAX_BATCH_SIZE) {
-        fprintf(stderr, "qfn_mmq_q8_0_hc_down_silu: bad arguments N=%d\n", N);
-        return -1;
-    }
-    launch_q8_hc_down<1, true>(W, X_q8, out_f32, N, stream, scale);
-    return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 
 extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,

@@ -17,8 +17,8 @@
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
-#include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/prompt_lookup.hpp"
 
 namespace gufo::core {
@@ -41,13 +41,8 @@ class SnapshotState;
 struct PrefillCheckpoint;
 }  // namespace rocm
 
-/// Tokens the MTP draft head may propose.
 enum class DraftVocabulary {
   kFull,
-  /// Special tokens plus every token whose text is ASCII (English, code,
-  /// numbers, markup and the unaccented pieces of Latin-script languages)
-  /// or ASCII with common typographic marks: about half of the vocabulary,
-  /// so each draft step reads half of the output head.
   kLatinText,
 };
 
@@ -62,14 +57,11 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
-  /// Opt-in MTP draft policies. Verification is unchanged, so outputs keep
-  /// the target distribution (greedy text is byte-identical); they change
-  /// how many tokens a cycle proposes and how cheaply.
-  /// Sampled single-session drafting stops on a chain-survival estimate
-  /// from the draft head's own confidence instead of the length controller.
+  /// Attention KV cache storage: F16 halves by default, Q8_0 blocks for
+  /// both planes, or Q8_0 keys with Q4_K super-block values. Lossy beyond
+  /// F16; snapshots of different modes are not interchangeable.
+  KvCacheMode kv_cache_mode = KvCacheMode::kF16;
   bool mtp_survival = false;
-  /// Single-session prompt lookup: after an MTP draft, a match of 12+ tokens
-  /// in the conversation proposes the tokens that followed it (PromptLookup).
   bool prompt_lookup = false;
   DraftVocabulary draft_vocabulary = DraftVocabulary::kFull;
 };
@@ -107,6 +99,9 @@ public:
   [[nodiscard]] bool HasMtp() const noexcept;
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
+  }
+  [[nodiscard]] KvCacheMode kv_cache_mode() const noexcept {
+    return options_.kv_cache_mode;
   }
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const Config& config() const noexcept;
@@ -173,17 +168,19 @@ public:
                                  double* capture_ms = nullptr);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
-  /// Appends `tokens` through the decode arithmetic: one token as a decode
-  /// step, more as a fully accepted speculative verification (at most
-  /// MaxVerifyWidth()). With `prefill`, through the prompt arithmetic
-  /// instead (a session without MTP). `rows` receives every token's
-  /// next-token logits (tokens.size() * vocab). For numerical A/B of the
-  /// kernels.
+  /// Widest verify pass TeacherForce accepts; 1 without MTP.
+  [[nodiscard]] std::uint32_t MaxVerifyWidth() const noexcept;
+  /// Feeds `tokens` through the target arithmetic without consulting the
+  /// draft head and writes every row's logits (n * vocab floats): one token
+  /// as a decode step, 2..MaxVerifyWidth() as a verify pass whose every row
+  /// is kept, or — with `prefill` on an MTP-free session — prompt
+  /// arithmetic at any width. Teacher-forced dumps compare targets,
+  /// schedules and builds bit for bit; the session continues from the last
+  /// row.
   [[nodiscard]] bool TeacherForce(std::span<const std::int32_t> tokens,
                                   std::vector<float>* rows,
                                   std::string* error_msg = nullptr,
                                   bool prefill = false);
-  [[nodiscard]] std::uint32_t MaxVerifyWidth() const noexcept;
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
@@ -225,8 +222,7 @@ public:
       std::span<const AdvanceRequest> requests,
       std::string* error_msg = nullptr);
   [[nodiscard]] std::span<const float> Logits() const noexcept {
-    return valid_ && EnsureFrontier() ? std::span<const float>(logits_)
-                                      : std::span<const float>{};
+    return valid_ ? std::span<const float>(logits_) : std::span<const float>{};
   }
   [[nodiscard]] std::uint32_t Position() const noexcept;
   [[nodiscard]] std::uint32_t ContextSize() const noexcept;
@@ -258,7 +254,13 @@ public:
   }
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 18;
+  /// 17: KV cache sections may be planar Q8_0 (kv_dtype header field).
+  /// 18: K/V planes carry separate dtypes (kv_v_dtype header field); Q4_K
+  /// value planes.
+  /// 19: per-layer sparse selection tails (partial-group chunk invariance).
+  /// 20: MTP drafts scored over the request vocabulary (upstream 17).
+  /// 21: MTP drafts copy repeated context (upstream 18).
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 21;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(
@@ -268,6 +270,14 @@ public:
   /// until a rewind, reset, destruction, fork or byte reader needs them.
   enum class SnapshotMode { kBorrowed, kMaterialized };
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
+      std::string* error_msg = nullptr,
+      SnapshotMode mode = SnapshotMode::kBorrowed) const;
+  /// Continuation-cache capture: the payload's context ends on the sparse
+  /// group boundary this model's prefill arithmetic is exact at, so a
+  /// restored session re-prefills at most one group of tokens to reach the
+  /// original frontier. Falls back to SaveSnapshot when the live context is
+  /// already aligned or no aligned point was kept for it.
+  [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveAlignedSnapshot(
       std::string* error_msg = nullptr,
       SnapshotMode mode = SnapshotMode::kBorrowed) const;
   [[nodiscard]] bool OwnsSnapshot(
@@ -296,7 +306,9 @@ private:
             std::unique_ptr<SessionSnapshot>* checkpoint = nullptr,
             double* capture_ms = nullptr,
             std::span<const std::int32_t> after = {},
-            const PrefillCapture& capture = {});
+            const PrefillCapture& capture = {},
+            std::uint32_t rewind_boundary = 0,
+            std::unique_ptr<SessionSnapshot>* rewind_out = nullptr);
   bool SyncImpl(std::span<const std::int32_t> prompt, std::string* error_msg,
                 std::uint32_t boundary,
                 std::unique_ptr<SessionSnapshot>* checkpoint,
@@ -342,15 +354,7 @@ private:
   std::shared_ptr<Model> model_;
   std::unique_ptr<rocm::Session> session_;
   std::vector<std::int32_t> tokens_;
-  mutable std::vector<float> logits_;
-  /// A sampled cycle's rollback left the frontier row in flight (see
-  /// FinishDecode): logits_ is stale until EnsureFrontier fetches it.
-  mutable bool frontier_pending_{false};
-  bool EnsureFrontier(std::string* error_msg = nullptr) const;
-  /// GPU-selected top candidates of logits_, valid only from a sampled MTP
-  /// cycle's FinishDecode until the next PrepareDecode consumes them.
-  MtpCandidateLogits anchor_candidates_{};
-  bool anchor_candidates_valid_{false};
+  std::vector<float> logits_;
   std::int32_t draft_token_{0};
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
@@ -363,6 +367,14 @@ private:
       std::size_t token_count) const;
   bool valid_{true};
   ContinuationHooks* continuation_hooks_{nullptr};
+  /// Group-aligned rewind point of the last prefill: taken when the pass
+  /// ended inside a sparse group, consumed by the next continuing Sync.
+  /// The packed sparse attention of a pass that ends mid-group unions fewer
+  /// query masks than a pass that runs through, so those trailing rows can
+  /// never match a fresh prefill; restoring here and re-prefilling the tail
+  /// keeps every continuation on the exact single-pass arithmetic.
+  std::unique_ptr<SessionSnapshot> rewind_;
+  std::uint32_t rewind_full_{0};  ///< frontier the rewind point was taken at
   /// This request's draft vocabulary; the device table follows it.
   MtpDraftVocab draft_vocab_;
   bool draft_vocab_stale_{false};
@@ -392,6 +404,8 @@ public:
   /// Materializes borrowed rows; may throw on a failed device transfer.
   [[nodiscard]] std::span<const std::uint8_t> bytes() const;
   [[nodiscard]] bool CopyTo(std::span<std::uint8_t> destination) const noexcept;
+  /// Tokens the restored session would own, from the payload header.
+  [[nodiscard]] std::uint32_t ValidContext() const;
 
 private:
   explicit SessionSnapshot(std::uint64_t size);

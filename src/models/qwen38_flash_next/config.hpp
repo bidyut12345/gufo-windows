@@ -137,6 +137,15 @@ struct Config {
       std::string* error_msg = nullptr);
 };
 
+/// Locates the shared MTP predictor sidecar for a `qwen4exp` target artifact
+/// without an explicit --mtp-model. Mirrors the vision sidecar search: the
+/// target's directory, its `MTP/` subdirectory, then one level up (the
+/// Unsloth snapshot layout keeps the draft in a sibling `MTP/` directory).
+/// Only `-shared-` sidecars qualify; the standalone drafts are rejected by
+/// MtpWeights::Bind. Quant preference is Q8_0, Q4_K_M, BF16. Returns an empty
+/// string when no sidecar exists.
+std::string DiscoverMtpSidecar(const std::string& model_path);
+
 }  // namespace gufo::models::qwen38_flash_next
 
 #endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_CONFIG_HPP_

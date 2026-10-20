@@ -19,6 +19,7 @@ std::filesystem::path GetUserRootWorkingDir(const std::string& user_id, const st
 std::filesystem::path GetConversationDefaultWorkingDir(const std::string& user_id, const std::string& username,
                                                       const std::string& conv_id, const std::string& title);
 std::filesystem::path GetConversationDefaultWorkingDir(const std::string& conv_id, const std::string& title);
+std::string GetConversationDefaultFolderName(const std::string& conv_id, const std::string& title);
 bool IsPathInsideDirectory(const std::filesystem::path& target, const std::filesystem::path& base);
 
 struct ChatMessageRecord {

@@ -834,6 +834,7 @@ bool ContinuationAdapter::Validate(
   session.lookup_.Restore(metadata.lookup);
   session.draft_token_ = 0;
   session.stats_ = {};
+  session.rewind_.reset();
   session.valid_ = true;
   state.restoring = false;
   state.coverage.clear();

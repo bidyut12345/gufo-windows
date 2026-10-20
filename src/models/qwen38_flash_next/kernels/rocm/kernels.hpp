@@ -1,3 +1,4 @@
+// SYNCPROBE-2026-09-29A
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_
 
@@ -9,6 +10,7 @@
 
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/vision/rope.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kv_layout.hpp"
 
 /// Model-private HIP launchers for everything outside the quantized GEMM
 /// tier. Activations are row-major float32 [tokens][dim] unless noted; every
@@ -70,8 +72,11 @@ enum class WeightType : std::uint32_t {
   kF16 = 1,
   kQ5_1 = 7,
   kQ8_0 = 8,
+  kIQ4_NL = 20,
   kQ4_K = 12,
   kQ5_K = 13,
+  kQ6_K = 14,
+  kIQ3_S = 21,
   kBF16 = 30,
 };
 
@@ -232,16 +237,18 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
                    std::uint32_t n_tokens, hipStream_t stream);
 
 /// Stacked Q8_0 QKV projection [13312,2560], head normalization and RoPE.
-/// Writes Q/gates in F32 and K/V caches in F16, preserving separate rounding.
+/// Writes Q/gates in F32 and K/V caches in F16 (or quantized with
+/// `kv_dtypes`), preserving separate rounding.
 /// Fixed geometry: 24 query heads, two KV heads, 256 dimensions, 64 rotary.
 /// Requires at least 1024 tokens; cache capacity must include position +
 /// tokens.
 bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
-                      float* gate, __half* keys, __half* values,
+                      float* gate, void* keys, void* values,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
-                      const qwen::vision::DeviceRope* rope = nullptr);
+                      const qwen::vision::DeviceRope* rope = nullptr,
+                      KvDtypes kv_dtypes = {});
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -262,11 +269,16 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                   std::size_t m, std::size_t k, hipStream_t stream,
                   std::size_t input_stride = 0);
 /// BF16 weight rows [m][k] times BF16 activation rows [batch][k] with one
-/// F32 K16 chain per output. Token t's chain starts ((t / 32) % 4) * 128
+/// F32 K16 chain per output. Token t's chain starts (((t / 32) % 4) * 128
 /// elements into K and wraps: hipBLASLt's MT32x32x64 order (BlasLt::Gemm).
-/// out is [batch][m].
+/// `token_offset` names the device word holding the batch's first absolute
+/// position; the 512-token slabs then align to absolute positions, so the
+/// rotation class of every token is its absolute (t / 32) % 4 and any chunk
+/// of a prompt places a token on the same K chain a single-pass prefill
+/// would. Null keeps the launch-relative rotation. out is [batch][m].
 bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
-                   std::size_t m, std::size_t k, hipStream_t stream);
+                   std::size_t m, std::size_t k, hipStream_t stream,
+                   const std::uint32_t* token_offset = nullptr);
 
 /// SSM Q8_0 projection fused with its four-tap convolution. Supports
 /// [m=16384,k=2560,channels=10240] and at least 1024 tokens. qkvz retains
@@ -433,17 +445,18 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
                  hipStream_t stream);
 
 /// Unpacks a stacked Q/gate/K/V projection, normalizes and rotates Q/K,
-/// and writes the F16 caches. Returns false for heads wider than 256.
+/// and writes the caches (F16 values, or Q8_0 blocks with `kv_dtype`).
+/// Returns false for heads wider than 256.
 /// With zero query heads, packed contains only K/V and q/gate may be null.
 bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const float* q_gamma, const float* k_gamma, float* q,
-                      float* gate, __half* k_cache, __half* v_cache,
+                      float* gate, void* k_cache, void* v_cache,
                       std::uint32_t n_tokens, std::uint32_t heads,
                       std::uint32_t kv_heads, std::uint32_t d,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false);
+                      bool prefill = false, KvDtypes kv_dtypes = {});
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
@@ -454,11 +467,12 @@ void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
           const std::uint32_t* start_pos, float theta, hipStream_t stream,
           const qwen::vision::DeviceRope* rope = nullptr);
 
-/// Stores f32 rows into the f16 cache at positions start_pos + t:
-/// cache[(start_pos + t)][row_dim].
-void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
+/// Stores f32 rows into the cache at positions start_pos + t:
+/// cache[(start_pos + t)][row_dim], rounded to F16 or quantized to Q8_0/Q4_K
+/// blocks per `kv_dtype`.
+void StoreKv(const float* src, void* cache, std::uint32_t n_tokens,
              std::uint32_t row_dim, const std::uint32_t* start_pos,
-             hipStream_t stream);
+             hipStream_t stream, KvCacheDtype kv_dtype = KvCacheDtype::kF16);
 /// Stores raw indexer rows in a power-of-two ring of `capacity` rows.
 void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
                std::uint32_t row_dim, const std::uint32_t* start_pos,
@@ -501,14 +515,14 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
 /// mask at ratio 4, each row's selected blocks are first compacted once into
 /// `lists`; `list_capacity` is the selection budget (blocks per row). The
 /// output is bitwise identical to the mask walk. Null lists use the mask walk.
-void Attention(const float* q, const __half* k_cache, const __half* v_cache,
+void Attention(const float* q, const void* k_cache, const void* v_cache,
                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
                hipStream_t stream, std::uint32_t* lists = nullptr,
                std::uint32_t* counts = nullptr,
-               std::uint32_t list_capacity = 0);
+               std::uint32_t list_capacity = 0, KvDtypes kv_dtypes = {});
 
 /// Fused causal attention on the WMMA cores for wide batches: scores, online
 /// softmax, PV and the sigmoid output gate in one launch. `mask` follows
@@ -516,14 +530,17 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 /// false, launching nothing, when the geometry is not the model's 24 x 256
 /// heads over two KV heads. `last_only` computes only the final dense query
 /// tile, retaining its key sweep and leaving earlier output rows untouched.
-bool WmmaCausalAttention(const float* q, const float* gate,
-                         const __half* k_cache, const __half* v_cache,
-                         const std::uint32_t* mask, std::uint32_t mask_words,
-                         float* out, std::uint32_t n_tokens,
-                         std::uint32_t start_pos, std::uint32_t heads,
-                         std::uint32_t kv_heads, std::uint32_t d,
-                         std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false);
+/// `lead` selection rows precede the batch at `lead_mask`: they align the
+/// packed query groups to absolute positions so a chunk starting mid-group
+/// unions the same four selections a full pass unions. Zero keeps the
+/// launch-relative grouping.
+bool WmmaCausalAttention(
+    const float* q, const float* gate, const void* k_cache, const void* v_cache,
+    const std::uint32_t* mask, std::uint32_t mask_words, float* out,
+    std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t heads,
+    std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
+    hipStream_t stream, bool last_only = false, KvDtypes kv_dtypes = {},
+    const std::uint32_t* lead_mask = nullptr, std::uint32_t lead = 0);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
@@ -560,6 +577,15 @@ void MoeEpilogueVec4F16(const __half* expert_out, const float* weights,
 void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
                float* dst, std::uint32_t n_tokens, std::uint32_t width,
                hipStream_t stream);
+
+/// Advances the draft control block after one chained draft stage: the draft
+/// position moves by `count` tokens and, once past the indexer budget, the
+/// pooled block count tracks it. `hidden_row` falls back to the carried
+/// residual.
+void MtpAdvanceControl(std::uint32_t* mtp_position, std::uint32_t* mtp_blocks,
+                       std::int32_t* hidden_row, std::uint32_t count,
+                       std::uint32_t top_k, std::uint32_t compress_ratio,
+                       hipStream_t stream);
 
 /// Add the projected embedding once to each projected hidden branch.
 void MtpAddEmbedding(const float* embedding, float* residual,
@@ -626,6 +652,28 @@ std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab);
 void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t* scratch_ids, float* scores,
                       std::uint32_t vocab, hipStream_t stream);
+
+/// Vocabulary rows a chained greedy draft step ranks its proposal over.
+inline constexpr std::uint32_t kMtpDraftShortlist = 512;
+
+/// Shortlist-buffer ID capacity of one selection pass: the first reduction
+/// keeps this many of the vocabulary's top candidates.
+std::uint32_t MtpDraftShortlistWorkspaceSize(std::uint32_t vocab);
+
+/// Exact top-`kMtpDraftShortlist` of one full-vocab logit row, descending
+/// score with lowest-token-ID ties. Both ID buffers have room for
+/// MtpDraftShortlistWorkspaceSize(vocab). Graph-safe.
+void MtpDraftShortlist(const float* logits, std::uint32_t* ids,
+                       std::uint32_t* scratch_ids, float* scores,
+                       std::uint32_t vocab, hipStream_t stream);
+
+/// Copies the shortlisted rows of the Q4_0 draft head into one compact
+/// row-major matrix of `rows` rows (`row_bytes` encoded bytes each) so the
+/// chained steps' head GEMV reads only the shortlist. `row_bytes` must be a
+/// multiple of 16. Graph-safe.
+void GatherDraftHeadRows(const void* weights, const std::uint32_t* ids,
+                         void* gathered, std::uint32_t row_bytes,
+                         std::uint32_t rows, hipStream_t stream);
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 

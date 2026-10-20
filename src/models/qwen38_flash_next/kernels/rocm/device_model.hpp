@@ -78,6 +78,8 @@ public:
   const Config& config() const noexcept { return config_; }
   const DeviceTensor& token_embd() const noexcept { return token_embd_; }
   const DeviceTensor& output() const noexcept { return output_; }
+  /// Q4_0 copy of the LM head for draft proposals (empty when absent).
+  const DeviceTensor& output_draft() const noexcept { return output_draft_; }
   /// The leading output() rows the MTP draft head scores in place (see
   /// draft_vocab.hpp); empty when the draft projects the full vocabulary.
   const DeviceTensor& draft_output() const noexcept { return draft_output_; }
@@ -118,6 +120,7 @@ private:
   Config config_;
   DeviceTensor token_embd_;
   DeviceTensor output_;
+  DeviceTensor output_draft_{};
   std::size_t output_bytes_{0};
   DeviceTensor draft_output_;
   std::vector<std::int32_t> draft_specials_;

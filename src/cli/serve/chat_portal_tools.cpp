@@ -150,9 +150,31 @@ std::string ResolveTargetPath(const std::string& path_str,
                               const std::string& user_root_dir = "") {
   if (path_str.empty()) return "";
   std::filesystem::path p(path_str);
+
+  std::filesystem::path effective_base;
+  if (!user_root_dir.empty()) {
+    std::filesystem::path root(user_root_dir);
+    if (!base_dir.empty()) {
+      std::filesystem::path bd(base_dir);
+      if (bd.is_absolute()) {
+        effective_base = bd;
+      } else {
+        effective_base = root / bd;
+      }
+    } else {
+      effective_base = root;
+    }
+  } else if (!base_dir.empty()) {
+    effective_base = std::filesystem::path(base_dir);
+  }
+
   std::filesystem::path resolved;
-  if (!base_dir.empty() && !p.is_absolute()) {
-    resolved = std::filesystem::path(base_dir) / p;
+  if (!p.is_absolute()) {
+    if (!effective_base.empty()) {
+      resolved = effective_base / p;
+    } else {
+      resolved = p;
+    }
   } else {
     resolved = p;
   }

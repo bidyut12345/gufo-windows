@@ -118,15 +118,13 @@ std::unique_ptr<BlasLt::Plan> BlasLt::MakePlan(hipDataType type, int m, int n,
         p->algorithm = candidates[i].algo;
         // The indexer projections' MT32x32x64 kernel runs at ~5 TFLOPS;
         // DenseBf16Gemm reproduces its K order (including the StaggerU
-        // rotation) at about 4x the speed. Only the shapes, token counts (up
-        // to one 4096-token prefill chunk) and library kernel checked bitwise
-        // by dense_gemm_bench take it.
-        p->own_bf16 =
-            type == HIP_R_16BF && k == 2560 &&
-            (m == 512 || m == 256 || m == 128 || m == 64) && n <= 4096 &&
-            hipblaslt_ext::getIndexFromAlgo(p->algorithm) == 4438 &&
-            hipblaslt_ext::getKernelNameFromAlgo(handle_, p->algorithm)
-                    .find("_MT32x32x64_MI16x16x1_") != std::string::npos;
+        // rotation) at about 4x the speed (checked bitwise by
+        // dense_gemm_bench at offset zero). Every BF16 k=2560 projection
+        // takes it at every token count: which kernel serves a shape must
+        // not depend on the prefill chunk size, or a restored-turn suffix
+        // and a fresh full prefill would compute different indexer scores
+        // and disagree on top-k block selection near ties.
+        p->own_bf16 = type == HIP_R_16BF && k == 2560;
         return p;
       }
     }
@@ -152,7 +150,7 @@ bool BlasLt::Gemm(const void* weights, const void* input, float* out,
   if (p == nullptr)
     return false;
   if (p->own_bf16)
-    return DenseBf16Gemm(weights, input, out, n, m, k, stream_);
+    return DenseBf16Gemm(weights, input, out, n, m, k, stream_, token_offset_);
   return Run(*p, weights, input, out, error);
 }
 

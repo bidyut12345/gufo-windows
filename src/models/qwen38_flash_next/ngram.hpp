@@ -46,10 +46,12 @@ public:
   NgramTable& operator=(const NgramTable&) = delete;
 
   /// Borrows the bound GGUF descriptor during Open; retains its own handle.
+  /// `source_path` backs the Windows unbuffered reopen, where the POSIX
+  /// descriptor is not available.
   [[nodiscard]] static std::unique_ptr<NgramTable> Open(
-      int file_descriptor, std::uint64_t file_offset, std::uint64_t rows,
-      std::uint32_t row_dim, core::GgmlType type,
-      std::string* error_msg = nullptr);
+      int file_descriptor, const std::string& source_path,
+      std::uint64_t file_offset, std::uint64_t rows, std::uint32_t row_dim,
+      core::GgmlType type, std::string* error_msg = nullptr);
 
   /// Gathers `rows.size()` rows into `out` (rows.size() * row_dim floats).
   /// Duplicate ids are read once. Returns false on any failed read.
@@ -85,8 +87,10 @@ private:
   // occurrence in the current input, so no row-cache state is retained here.
   std::vector<std::size_t> first_rows_;
   void DecodeRow(const std::uint8_t* src, float* dst) const;
+  void StoreRow(std::uint32_t row, const std::uint8_t* src, float* dst);
   bool ReadCached(std::uint32_t row, float* dst);
-  bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf);
+  bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf,
+               void* io_event);
   void Worker();
 
   struct CacheEntry {
@@ -99,6 +103,9 @@ private:
   std::size_t cache_count_{0};
 
   int fd_{-1};
+#if defined(_WIN32)
+  void* file_handle_{nullptr};
+#endif
   bool direct_{false};
   std::uint64_t base_offset_{0};
   std::uint64_t rows_{0};

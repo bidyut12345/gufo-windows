@@ -20,6 +20,33 @@ std::string ToLower(std::string_view s) {
   return out;
 }
 
+std::string UrlDecodeSimple(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  for (std::size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '%' && i + 2 < s.size()) {
+      auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+      };
+      int h1 = hex(s[i + 1]);
+      int h2 = hex(s[i + 2]);
+      if (h1 >= 0 && h2 >= 0) {
+        out.push_back(static_cast<char>((h1 << 4) | h2));
+        i += 2;
+        continue;
+      }
+    } else if (s[i] == '+') {
+      out.push_back(' ');
+      continue;
+    }
+    out.push_back(s[i]);
+  }
+  return out;
+}
+
 HttpResponse JsonResponse(int status, const std::string& reason,
                          const std::string& body) {
   HttpResponse resp;
@@ -531,15 +558,26 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
         if (conv && !conv->working_directory.empty()) {
           working_dir = conv->working_directory;
         } else {
-          working_dir = GetConversationDefaultWorkingDir(user->id, user->username, conv_id, conv ? conv->title : "Chat").string();
+          working_dir = GetConversationDefaultFolderName(conv_id, conv ? conv->title : "Chat");
         }
       }
       if (working_dir.empty()) {
         const auto st = db.GetSettings(user->id);
         working_dir = st.working_directory;
       }
-      if (working_dir.empty() || !IsPathInsideDirectory(working_dir, user_root)) {
-        working_dir = user_root.string();
+
+      std::filesystem::path full_wd;
+      if (std::filesystem::path(working_dir).is_absolute()) {
+        full_wd = std::filesystem::path(working_dir);
+      } else if (!working_dir.empty()) {
+        full_wd = user_root / working_dir;
+      } else {
+        full_wd = user_root;
+      }
+      std::error_code ec;
+      std::filesystem::create_directories(full_wd, ec);
+      if (!IsPathInsideDirectory(full_wd, user_root)) {
+        working_dir = "";
       }
 
       // Check if inbuilt tool
@@ -759,12 +797,19 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
 
     if (req.method == "GET") {
       std::string subpath;
-      const auto q = req.query.find("subpath=");
+      auto q = req.query.find("subpath=");
       if (q != std::string::npos) {
         subpath = req.query.substr(q + 8);
-        const auto amp = subpath.find('&');
-        if (amp != std::string::npos) subpath = subpath.substr(0, amp);
+      } else {
+        q = req.query.find("path=");
+        if (q != std::string::npos) {
+          subpath = req.query.substr(q + 5);
+        }
       }
+      const auto amp = subpath.find('&');
+      if (amp != std::string::npos) subpath = subpath.substr(0, amp);
+      subpath = UrlDecodeSimple(subpath);
+
       auto target = user_root;
       if (!subpath.empty()) {
         target = user_root / std::filesystem::path(subpath);
@@ -787,32 +832,93 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
           arr.push_back(std::move(item));
         }
       }
+
+      // Collect all folder relative paths under user_root for working directory selection
+      json::Value folders_list = json::Value::array();
+      if (std::filesystem::exists(user_root, ec)) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(user_root, std::filesystem::directory_options::skip_permission_denied, ec)) {
+          if (entry.is_directory(ec)) {
+            auto rel = std::filesystem::relative(entry.path(), user_root, ec);
+            if (!rel.empty()) {
+              folders_list.push_back(rel.generic_string());
+            }
+          }
+        }
+      }
+
       json::Value out = json::Value::object();
       auto cur_rel = std::filesystem::relative(target, user_root, ec);
-      out["current_path"] = cur_rel.empty() ? "" : cur_rel.generic_string();
-      out["user_root_name"] = user_root.filename().string();
+      const std::string cur_str = (cur_rel.empty() || cur_rel == ".") ? "" : cur_rel.generic_string();
+      const std::string username_display = user->username.empty() ? "Guest" : user->username;
+      out["current_path"] = cur_str;
+      out["user_root_name"] = username_display;
+      out["logical_path"] = "UserData/" + username_display + (cur_str.empty() ? "" : ("/" + cur_str));
       out["entries"] = std::move(arr);
+      out["folders_list"] = std::move(folders_list);
       return JsonOk(out);
     }
 
     if (req.method == "DELETE") {
-      try {
-        const auto body = json::parse(req.body);
-        const std::string rel_path = body.member_str("path");
-        if (rel_path.empty()) return JsonErr(400, "Bad Request", "Missing 'path'");
-        auto target = user_root / std::filesystem::path(rel_path);
-        std::error_code ec;
-        target = std::filesystem::weakly_canonical(target, ec);
-        if (ec || !IsPathInsideDirectory(target, user_root) || target == user_root) {
-          return JsonErr(403, "Forbidden", "Access outside user directory is prohibited");
-        }
-        std::filesystem::remove_all(target, ec);
-        json::Value out = json::Value::object();
-        out["status"] = "ok";
-        return JsonOk(out);
-      } catch (...) {
-        return JsonErr(400, "Bad Request", "Invalid JSON payload");
+      std::string rel_path;
+      auto q = req.query.find("path=");
+      if (q != std::string::npos) {
+        rel_path = req.query.substr(q + 5);
+        auto amp = rel_path.find('&');
+        if (amp != std::string::npos) rel_path = rel_path.substr(0, amp);
+        rel_path = UrlDecodeSimple(rel_path);
       }
+      if (rel_path.empty() && !req.body.empty()) {
+        try {
+          const auto body = json::parse(req.body);
+          rel_path = body.member_str("path");
+        } catch (...) {}
+      }
+      if (rel_path.empty()) return JsonErr(400, "Bad Request", "Missing 'path'");
+      auto target = user_root / std::filesystem::path(rel_path);
+      std::error_code ec;
+      target = std::filesystem::weakly_canonical(target, ec);
+      if (ec || !IsPathInsideDirectory(target, user_root) || target == user_root) {
+        return JsonErr(403, "Forbidden", "Access outside user directory is prohibited");
+      }
+      std::filesystem::remove_all(target, ec);
+      json::Value out = json::Value::object();
+      out["status"] = "ok";
+      return JsonOk(out);
+    }
+  }
+
+  // -------------------------------------------------------------
+  // User Folders API (Create directories under UserData/<user>/)
+  // -------------------------------------------------------------
+  if (req.path == "/api/user-folders" && req.method == "POST") {
+    const auto user_root = GetUserRootWorkingDir(user->id, user->username);
+    try {
+      const auto body = json::parse(req.body);
+      const std::string name = body.member_str("name");
+      const std::string parent = body.member_str("parent");
+      if (name.empty()) return JsonErr(400, "Bad Request", "Missing 'name'");
+
+      auto target = user_root;
+      if (!parent.empty()) target = target / std::filesystem::path(parent);
+      target = target / std::filesystem::path(name);
+
+      std::error_code ec;
+      target = std::filesystem::weakly_canonical(target, ec);
+      if (ec) target = target.lexically_normal();
+      if (!IsPathInsideDirectory(target, user_root)) {
+        return JsonErr(403, "Forbidden", "Destination is outside user directory");
+      }
+      std::filesystem::create_directories(target, ec);
+      if (ec) return JsonErr(500, "Internal Error", "Failed to create directory");
+
+      json::Value out = json::Value::object();
+      auto rel = std::filesystem::relative(target, user_root, ec);
+      out["status"] = "ok";
+      out["path"] = rel.generic_string();
+      out["name"] = target.filename().string();
+      return JsonOk(out);
+    } catch (...) {
+      return JsonErr(400, "Bad Request", "Invalid JSON payload");
     }
   }
 
@@ -820,11 +926,12 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
     const auto user_root = GetUserRootWorkingDir(user->id, user->username);
     if (req.method == "GET") {
       std::string subpath;
-      const auto q = req.query.find("path=");
+      auto q = req.query.find("path=");
       if (q != std::string::npos) {
         subpath = req.query.substr(q + 5);
         const auto amp = subpath.find('&');
         if (amp != std::string::npos) subpath = subpath.substr(0, amp);
+        subpath = UrlDecodeSimple(subpath);
       }
       if (subpath.empty()) return JsonErr(400, "Bad Request", "Missing 'path'");
       auto target = user_root / std::filesystem::path(subpath);

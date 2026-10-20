@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <limits>
 #include <string_view>
 #include <utility>
@@ -275,6 +276,40 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
     }
   }
   return c;
+}
+
+std::string DiscoverMtpSidecar(const std::string& model_path) {
+  static constexpr std::string_view kSharedQuants[] = {"Q8_0", "Q4_K_M",
+                                                       "BF16"};
+  const std::filesystem::path start =
+      std::filesystem::path(model_path).parent_path();
+  for (const std::string_view quant : kSharedQuants) {
+    const std::string suffix = std::string("-") + std::string(quant) + ".gguf";
+    auto directory = start;
+    for (unsigned level = 0; level < 2; ++level) {
+      for (const auto& base : {directory, directory / "MTP"}) {
+        std::filesystem::path best;
+        std::error_code ec;
+        for (const auto& entry :
+             std::filesystem::directory_iterator(base, ec)) {
+          if (!entry.is_regular_file()) {
+            continue;
+          }
+          const std::string name = entry.path().filename().string();
+          if (name.starts_with("mtp-") &&
+              name.find("-shared-") != std::string::npos &&
+              name.ends_with(suffix) && (best.empty() || entry.path() < best)) {
+            best = entry.path();
+          }
+        }
+        if (!ec && !best.empty()) {
+          return best.string();
+        }
+      }
+      directory = directory.parent_path();
+    }
+  }
+  return {};
 }
 
 }  // namespace gufo::models::qwen38_flash_next

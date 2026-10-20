@@ -29,16 +29,16 @@ struct Format {
       return {32, 24};
     case GgmlType::kIQ4_NL:
       return {32, 18};
-    case GgmlType::kIQ4_XS:
-      return {256, 136};
-    case GgmlType::kIQ3_S:
-      return {256, 110};
     case GgmlType::kQ4_K:
       return {256, 144};
     case GgmlType::kQ5_K:
       return {256, 176};
     case GgmlType::kQ6_K:
       return {256, 210};
+    case GgmlType::kIQ3_S:
+      return {256, 110};
+    case GgmlType::kIQ4_XS:
+      return {256, 136};
     default:
       return {0, 0};
   }
@@ -144,8 +144,8 @@ struct Binder {
     const std::uint64_t hc_dim = c.HcDim();
     const auto dense = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
                         GgmlType::kF32};
-    const auto experts = {GgmlType::kQ4_K,   GgmlType::kQ5_K,  GgmlType::kQ6_K,
-                          GgmlType::kQ5_1,   GgmlType::kQ8_0,  GgmlType::kIQ3_S,
+    const auto experts = {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
+                          GgmlType::kQ5_1, GgmlType::kQ8_0, GgmlType::kIQ3_S,
                           GgmlType::kIQ4_XS, GgmlType::kIQ4_NL};
 
     l.hc_attn = Mixer(p + "hc_attn", c, true);

@@ -76,9 +76,7 @@ std::filesystem::path GetExecutableDirectory() {
 std::filesystem::path GetUserRootWorkingDir(const std::string& user_id, const std::string& username) {
   std::string user_folder = SanitizeFolderName(username);
   if (user_folder.empty()) {
-    user_folder = user_id.empty() ? "default" : SanitizeFolderName(user_id);
-  } else if (!user_id.empty()) {
-    user_folder = SanitizeFolderName(user_id) + "_" + user_folder;
+    user_folder = user_id.empty() ? "Guest" : SanitizeFolderName(user_id);
   }
   auto root = GetExecutableDirectory() / "UserData" / user_folder;
   std::error_code ec;
@@ -87,10 +85,14 @@ std::filesystem::path GetUserRootWorkingDir(const std::string& user_id, const st
   return ec ? root.lexically_normal() : norm;
 }
 
+std::string GetConversationDefaultFolderName(const std::string& conv_id, const std::string& title) {
+  return conv_id + " - " + SanitizeFolderName(title);
+}
+
 std::filesystem::path GetConversationDefaultWorkingDir(const std::string& user_id, const std::string& username,
                                                       const std::string& conv_id, const std::string& title) {
   auto user_root = GetUserRootWorkingDir(user_id, username);
-  std::string folder_name = conv_id + " - " + SanitizeFolderName(title);
+  std::string folder_name = GetConversationDefaultFolderName(conv_id, title);
   auto p = user_root / folder_name;
   std::error_code ec;
   std::filesystem::create_directories(p, ec);
@@ -100,6 +102,22 @@ std::filesystem::path GetConversationDefaultWorkingDir(const std::string& user_i
 
 std::filesystem::path GetConversationDefaultWorkingDir(const std::string& conv_id, const std::string& title) {
   return GetConversationDefaultWorkingDir("", "", conv_id, title);
+}
+
+std::string NormalizeWorkingDirRelative(const std::string& raw_wd) {
+  if (raw_wd.empty()) return "";
+  std::filesystem::path p(raw_wd);
+  if (p.is_absolute()) {
+    return p.filename().string();
+  }
+  std::string s = raw_wd;
+  for (char& c : s) if (c == '\\') c = '/';
+  if (s.rfind("UserData/", 0) == 0) {
+    auto slash = s.find('/', 9);
+    if (slash != std::string::npos) s = s.substr(slash + 1);
+    else s = "";
+  }
+  return s;
 }
 
 bool IsPathInsideDirectory(const std::filesystem::path& target, const std::filesystem::path& base) {
@@ -562,7 +580,9 @@ std::vector<ConversationRecord> ChatDatabase::ListConversations(
     conv.updated_at = sel.column_text(7);
     const int count = sel.column_int(8);
     if (conv.working_directory.empty()) {
-      conv.working_directory = GetConversationDefaultWorkingDir(conv.id, conv.title).string();
+      conv.working_directory = GetConversationDefaultFolderName(conv.id, conv.title);
+    } else {
+      conv.working_directory = NormalizeWorkingDirRelative(conv.working_directory);
     }
     conv.messages.resize(static_cast<std::size_t>(count > 0 ? count : 0));
     results.push_back(std::move(conv));
@@ -598,7 +618,9 @@ std::optional<ConversationRecord> ChatDatabase::GetConversation(
     conv.created_at = sel.column_text(6);
     conv.updated_at = sel.column_text(7);
     if (conv.working_directory.empty()) {
-      conv.working_directory = GetConversationDefaultWorkingDir(conv.id, conv.title).string();
+      conv.working_directory = GetConversationDefaultFolderName(conv.id, conv.title);
+    } else {
+      conv.working_directory = NormalizeWorkingDirRelative(conv.working_directory);
     }
   }
 
@@ -638,13 +660,26 @@ ConversationRecord ChatDatabase::CreateConversation(
   conv.system_prompt = system_prompt;
   conv.created_at = CurrentIsoTime();
   conv.updated_at = conv.created_at;
-  if (!working_directory.empty()) {
-    conv.working_directory = working_directory;
+  if (!working_directory.empty() && working_directory != "default") {
+    conv.working_directory = NormalizeWorkingDirRelative(working_directory);
   } else {
-    conv.working_directory = GetConversationDefaultWorkingDir(conv.id, conv.title).string();
+    conv.working_directory = GetConversationDefaultFolderName(conv.id, conv.title);
   }
+
+  std::string username;
+  if (db_ && !user_id.empty()) {
+    Stmt sel(db_, "SELECT username FROM users WHERE id = ?;");
+    if (sel.valid()) {
+      sel.bind_text(1, user_id);
+      if (sqlite3_step(sel) == SQLITE_ROW) {
+        username = sel.column_text(0);
+      }
+    }
+  }
+  auto user_root = GetUserRootWorkingDir(user_id, username);
+  auto dir_on_disk = user_root / conv.working_directory;
   std::error_code ec;
-  std::filesystem::create_directories(conv.working_directory, ec);
+  std::filesystem::create_directories(dir_on_disk, ec);
 
   if (db_) {
     Stmt ins(db_,
@@ -688,11 +723,21 @@ bool ChatDatabase::UpdateConversationTitle(const std::string& user_id,
 
   const std::string now = CurrentIsoTime();
   std::string new_working_dir = curr_working_dir;
-  std::string old_default = GetConversationDefaultWorkingDir(conv_id, old_title).string();
-  if (curr_working_dir.empty() || curr_working_dir == old_default) {
-    new_working_dir = GetConversationDefaultWorkingDir(conv_id, new_title).string();
+  std::string old_default = GetConversationDefaultFolderName(conv_id, old_title);
+  std::string norm_curr = NormalizeWorkingDirRelative(curr_working_dir);
+  if (norm_curr.empty() || norm_curr == old_default) {
+    new_working_dir = GetConversationDefaultFolderName(conv_id, new_title);
+    std::string username;
+    Stmt sel_u(db_, "SELECT username FROM users WHERE id = ?;");
+    if (sel_u.valid()) {
+      sel_u.bind_text(1, user_id);
+      if (sqlite3_step(sel_u) == SQLITE_ROW) username = sel_u.column_text(0);
+    }
+    auto user_root = GetUserRootWorkingDir(user_id, username);
     std::error_code ec;
-    std::filesystem::create_directories(new_working_dir, ec);
+    std::filesystem::create_directories(user_root / new_working_dir, ec);
+  } else {
+    new_working_dir = norm_curr;
   }
 
   Stmt upd(db_,
@@ -724,11 +769,21 @@ bool ChatDatabase::UpdateConversationWorkingDir(const std::string& user_id,
         title = sel.column_text(0);
       }
     }
-    target_dir = GetConversationDefaultWorkingDir(conv_id, title).string();
+    target_dir = GetConversationDefaultFolderName(conv_id, title);
+  } else {
+    target_dir = NormalizeWorkingDirRelative(target_dir);
+    if (target_dir.empty()) target_dir = GetConversationDefaultFolderName(conv_id, "Chat");
   }
 
+  std::string username;
+  Stmt sel_u(db_, "SELECT username FROM users WHERE id = ?;");
+  if (sel_u.valid()) {
+    sel_u.bind_text(1, user_id);
+    if (sqlite3_step(sel_u) == SQLITE_ROW) username = sel_u.column_text(0);
+  }
+  auto user_root = GetUserRootWorkingDir(user_id, username);
   std::error_code ec;
-  std::filesystem::create_directories(target_dir, ec);
+  std::filesystem::create_directories(user_root / target_dir, ec);
 
   const std::string now = CurrentIsoTime();
   Stmt upd(db_,
