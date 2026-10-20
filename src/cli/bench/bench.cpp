@@ -258,6 +258,46 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
         opt.min_draft_tokens = count;
         return true;
       });
+
+  parser.AddCustomOption(
+      "", "--kv-cache", "MODE",
+      "KV cache storage for Flash-Next: f16 (default), q8 / q8_0 (both "
+      "planes, ~47% fewer bytes), q8_0-q4_k / K8V4 (Q8_0 keys, Q4_K values, "
+      "~59% fewer bytes); lossy except f16",
+      "Cache",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
+                                                         &opt.kv_cache_mode)) {
+          if (error != nullptr) {
+            *error = "Invalid mode for --kv-cache: '" + std::string(value) +
+                     "' (want " +
+                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
+                     ")";
+          }
+          return false;
+        }
+        return true;
+      });
+  parser.AddCustomOption(
+      "", "--kv-quant", "MODE",
+      "Alias for --kv-cache: f16, q8, q8_0, fp8, q8_0-q4_k, K8V4",
+      "Cache",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
+                                                         &opt.kv_cache_mode)) {
+          if (error != nullptr) {
+            *error = "Invalid mode for --kv-quant: '" + std::string(value) +
+                     "' (want " +
+                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
+                     ")";
+          }
+          return false;
+        }
+        return true;
+      });
+
   RegisterSamplingOptions(parser, &opt.sampling, "Sampling", false);
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
@@ -1080,6 +1120,7 @@ int RunQwen38FlashNextBenchmark(
           .max_context = static_cast<std::uint32_t>(required_context),
           .mtp_model_path = mtp ? options.mtp_model_path : "",
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
+          .kv_cache_mode = options.kv_cache_mode,
       },
       &error);
   if (model == nullptr) {

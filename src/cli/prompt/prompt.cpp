@@ -32,6 +32,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 #endif
 
 namespace gufo::cli {
@@ -197,6 +198,45 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
           return false;
         }
         opt.min_draft_tokens = count;
+        return true;
+      });
+
+  parser.AddCustomOption(
+      "", "--kv-cache", "MODE",
+      "KV cache storage for Flash-Next: f16 (default), q8 / q8_0 (both "
+      "planes, ~47% fewer bytes), q8_0-q4_k / K8V4 (Q8_0 keys, Q4_K values, "
+      "~59% fewer bytes); lossy except f16",
+      "Cache",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
+                                                         &opt.kv_cache_mode)) {
+          if (error != nullptr) {
+            *error = "Invalid mode for --kv-cache: '" + std::string(value) +
+                     "' (want " +
+                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
+                     ")";
+          }
+          return false;
+        }
+        return true;
+      });
+  parser.AddCustomOption(
+      "", "--kv-quant", "MODE",
+      "Alias for --kv-cache: f16, q8, q8_0, fp8, q8_0-q4_k, K8V4",
+      "Cache",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
+                                                         &opt.kv_cache_mode)) {
+          if (error != nullptr) {
+            *error = "Invalid mode for --kv-quant: '" + std::string(value) +
+                     "' (want " +
+                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
+                     ")";
+          }
+          return false;
+        }
         return true;
       });
 
@@ -670,7 +710,8 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
        .mtp_model_path =
            opt.speculative_backend == "mtp" ? opt.mtp_model_path : "",
        .max_draft_tokens = opt.draft_tokens,
-       .vision_model_path = opt.vision_model_path},
+       .vision_model_path = opt.vision_model_path,
+       .kv_cache_mode = opt.kv_cache_mode},
       &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)

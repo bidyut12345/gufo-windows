@@ -13,6 +13,7 @@
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
+#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 
 namespace gufo::hip {
 class QwenGpuModel;
@@ -86,7 +87,9 @@ public:
             const TextSpeculativeConfig& speculative_config = {},
             const TextDiskCacheConfig& disk_cache_config = {},
             const std::string& vision_model_path = {},
-            TextRunnerRamCacheOptions ram_cache_config = {});
+            TextRunnerRamCacheOptions ram_cache_config = {},
+            models::qwen38_flash_next::KvCacheMode kv_cache_mode =
+                models::qwen38_flash_next::KvCacheMode::kF16);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.

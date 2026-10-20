@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "src/core/sampling.hpp"
+#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 
 namespace gufo::cli {
 
@@ -33,6 +34,8 @@ struct BenchOptions {
   std::uint32_t min_draft_tokens{1};
   sampling::SamplingConfig sampling{.seed = 0};
   bool verbose{false};
+  models::qwen38_flash_next::KvCacheMode kv_cache_mode{
+      models::qwen38_flash_next::KvCacheMode::kF16};
 };
 
 void PrintBenchHelp(std::string_view program_name);
