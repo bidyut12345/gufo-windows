@@ -1320,45 +1320,152 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         font-size: 0.7rem;
       }
     }
-    /* Tools & MCP Styles */
-    .tools-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
+    /* Drawer Tabs */
+    .drawer-tabs {
+      display: flex;
+      border-bottom: 1px solid var(--border);
       background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 20px;
-      font-size: 0.75rem;
-      cursor: pointer;
+      padding: 0 16px;
+      gap: 8px;
+    }
+    .drawer-tab-btn {
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
       color: var(--text-muted);
+      font-size: 0.82rem;
+      font-weight: 600;
+      padding: 10px 12px;
+      cursor: pointer;
       transition: all 0.15s ease;
     }
-    .tools-pill:hover {
-      background: var(--bg-hover);
+    .drawer-tab-btn:hover {
       color: var(--text);
-      border-color: var(--border-strong);
     }
-    .tools-pill.active {
-      border-color: #3b82f6;
-      color: #93c5fd;
-      background: rgba(59, 130, 246, 0.12);
+    .drawer-tab-btn.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
     }
-    .tools-pill.disabled {
-      opacity: 0.6;
-      border-color: var(--border);
-      color: var(--text-dim);
-      background: var(--bg-card);
+
+    /* Attachment Menu & Tools Popover */
+    .attach-menu-container {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      flex-shrink: 0;
     }
-    .tools-pill-dot {
-      width: 6px;
-      height: 6px;
+    .attach-tools-badge {
+      position: absolute;
+      top: 3px;
+      right: 3px;
+      width: 7px;
+      height: 7px;
       border-radius: 50%;
-      background: #3b82f6;
+      background: #22c55e;
+      border: 1.5px solid var(--bg-card);
+      transition: all 0.2s;
+      pointer-events: none;
     }
-    .tools-pill.disabled .tools-pill-dot {
+    .attach-tools-badge.disabled {
       background: var(--text-dim);
+      opacity: 0.5;
     }
+    .attach-popup-menu {
+      position: absolute;
+      bottom: calc(100% + 10px);
+      left: 0;
+      width: 290px;
+      max-width: calc(100vw - 32px);
+      background: rgba(22, 22, 27, 0.96);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-lg);
+      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.04);
+      padding: 8px;
+      z-index: 100;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      animation: attachPopIn 0.16s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    @keyframes attachPopIn {
+      from { opacity: 0; transform: translateY(6px) scale(0.97); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .attach-popup-header {
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      padding: 6px 10px 4px 10px;
+    }
+    .attach-popup-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.12s ease;
+      color: var(--text);
+    }
+    .attach-popup-item:hover {
+      background: var(--bg-hover);
+    }
+    .attach-item-icon {
+      font-size: 1.15rem;
+      width: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .attach-item-info {
+      flex: 1;
+      min-width: 0;
+    }
+    .attach-item-title {
+      font-size: 0.84rem;
+      font-weight: 500;
+      color: var(--text);
+      line-height: 1.2;
+    }
+    .attach-item-sub {
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      margin-top: 2px;
+      line-height: 1.2;
+    }
+    .attach-path-truncate {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 190px;
+      font-family: var(--font-mono);
+    }
+    .attach-item-arrow {
+      font-size: 0.8rem;
+      color: var(--text-dim);
+      margin-left: auto;
+    }
+    .attach-popup-divider {
+      height: 1px;
+      background: var(--border);
+      margin: 4px 6px;
+    }
+    .attach-popup-tools-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px;
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    /* Tools & MCP Styles */
     .switch-toggle-mini {
       position: relative;
       display: inline-block;
@@ -1608,11 +1715,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <span id="slot-text">1/1 slots (idle)</span>
       </div>
       <div id="model-pill" class="model-pill" title="Loaded Model">loading model...</div>
-      <button id="btn-nav-workdir" class="btn-top" title="Configured Working Directory">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-        <span id="nav-workdir-label" style="max-width:130px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">.</span>
-      </button>
-      <button id="btn-open-tools" class="btn-top" title="Tools & MCP Servers">
+      <button id="btn-open-tools" class="btn-top" title="Tools & MCP Settings">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>
         <span id="nav-tools-label">Tools & MCP</span>
       </button>
@@ -1684,18 +1787,63 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               <button id="btn-remove-thumb" class="btn-remove-thumb">&times;</button>
             </div>
             <div class="input-row">
-              <input type="file" id="file-uploader" accept="image/*" style="display:none">
-              <button id="btn-upload-file" class="btn-icon-input" title="Attach file / image">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
-              </button>
-              <div id="quick-tools-container" class="tools-pill active" title="Autonomous tools status" style="flex-shrink:0;">
-                <label class="switch-toggle-mini" title="Toggle tools ON / OFF" style="cursor:pointer; display:flex; align-items:center; margin:0;" onclick="event.stopPropagation();">
-                  <input type="checkbox" id="chk-master-tools" checked>
-                  <span class="slider-mini"></span>
-                </label>
-                <span id="quick-tools-label" style="cursor:pointer;" title="Click to open tools settings"><span class="tools-label-prefix">Tools: </span>8</span>
-                <span id="btn-quick-tools-gear" style="cursor:pointer; opacity:0.75; font-size:0.8rem;" title="Configure tools & MCP">⚙️</span>
+              <input type="file" id="file-uploader" accept="image/*,.txt,.md,.json,.py,.cpp,.h,.js,.ts,.html,.css,.log,.csv" style="display:none">
+              
+              <!-- Attachment Button & Popover Menu -->
+              <div class="attach-menu-container">
+                <button id="btn-upload-file" class="btn-icon-input" title="Attachments, Working Directory & Tools" type="button">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+                  <span id="attach-tools-badge" class="attach-tools-badge" title="Agent Tools Status"></span>
+                </button>
+
+                <!-- Attachment & Tools Popover Menu -->
+                <div id="attach-popup-menu" class="attach-popup-menu" style="display:none;">
+                  <div class="attach-popup-header">Chat Tools &amp; Files</div>
+                  
+                  <div id="attach-item-upload" class="attach-popup-item">
+                    <span class="attach-item-icon">📎</span>
+                    <div class="attach-item-info">
+                      <div class="attach-item-title">Attach File / Image</div>
+                      <div class="attach-item-sub">Images, text or code files</div>
+                    </div>
+                  </div>
+
+                  <div id="attach-item-workdir" class="attach-popup-item">
+                    <span class="attach-item-icon">📁</span>
+                    <div class="attach-item-info">
+                      <div class="attach-item-title">Working Directory</div>
+                      <div id="attach-popup-workdir-sub" class="attach-item-sub attach-path-truncate">UserData/...</div>
+                    </div>
+                    <span class="attach-item-arrow">⚙️</span>
+                  </div>
+
+                  <div class="attach-popup-divider"></div>
+
+                  <div class="attach-popup-tools-row">
+                    <div style="display:flex; align-items:center; gap:8px;">
+                      <span style="font-size:1.05rem;">⚡</span>
+                      <div>
+                        <div style="font-size:0.83rem; font-weight:600; color:var(--text);">Agent Tools</div>
+                        <div id="attach-tools-status-text" style="font-size:0.7rem; color:var(--text-dim);">8 tools enabled</div>
+                      </div>
+                    </div>
+                    <label class="switch-toggle-mini" title="Toggle tools ON / OFF" style="cursor:pointer; margin:0;" onclick="event.stopPropagation();">
+                      <input type="checkbox" id="chk-master-tools" checked>
+                      <span class="slider-mini"></span>
+                    </label>
+                  </div>
+
+                  <div id="attach-item-mcp-settings" class="attach-popup-item" style="margin-top:2px;">
+                    <span class="attach-item-icon">🔧</span>
+                    <div class="attach-item-info">
+                      <div class="attach-item-title">Tools &amp; MCP Settings</div>
+                      <div class="attach-item-sub">Configure tools &amp; external servers</div>
+                    </div>
+                    <span class="attach-item-arrow">➔</span>
+                  </div>
+                </div>
               </div>
+
               <textarea id="chat-input" rows="1" placeholder="Say something... (Shift+Enter for newline)"></textarea>
               <button id="btn-stop" class="btn-stop-stream" title="Stop generating">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"></rect></svg>
@@ -1849,14 +1997,22 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     </main>
   </div>
 
-  <!-- Settings Drawer (llama.cpp style) -->
+  <!-- Settings Drawer (right side dialog) -->
   <div id="drawer-backdrop" class="drawer-backdrop"></div>
   <aside id="drawer-panel" class="drawer-panel">
     <div class="drawer-header">
-      <span class="drawer-title">Sampling & Server Settings</span>
+      <span class="drawer-title">Server &amp; Portal Settings</span>
       <button id="btn-close-drawer" class="btn-top" style="padding:2px 8px;">&times;</button>
     </div>
-    <div class="drawer-body">
+
+    <!-- Drawer Navigation Tabs -->
+    <div class="drawer-tabs">
+      <button id="drawer-tab-inference" class="drawer-tab-btn active" type="button">Sampling &amp; Model</button>
+      <button id="drawer-tab-tools" class="drawer-tab-btn" type="button">⚡ Tools &amp; MCP</button>
+    </div>
+
+    <!-- Tab 1: Inference & Sampling -->
+    <div id="drawer-pane-inference" class="drawer-body">
       <div class="setting-group">
         <label class="setting-label">System Prompt</label>
         <textarea id="set-system-prompt" class="setting-textarea" rows="3"></textarea>
@@ -1892,26 +2048,140 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <input type="number" id="inp-max-tokens" class="setting-input" value="4096" min="64" max="32768" step="128">
       </div>
 
-      <div class="setting-group">
-        <div class="setting-label">
-          <span>Working Directory</span>
-          <button id="btn-drawer-reset-cwd" class="btn-top" type="button" style="font-size:0.7rem; padding:1px 6px;">Reset to Server CWD</button>
-        </div>
-        <input type="text" id="set-working-dir" class="setting-input" placeholder="e.g. C:\Projects or . for server cwd">
-        <span class="setting-desc">Base directory for filesystem tools (read, write, edit, apply_diff, shell exec).</span>
-      </div>
-
       <div class="setting-group" style="margin-top:10px;">
-        <div style="font-weight:600; font-size:0.85rem; color:var(--text); margin-bottom:4px;">Server & Storage</div>
+        <div style="font-weight:600; font-size:0.85rem; color:var(--text); margin-bottom:4px;">Server &amp; Storage</div>
         <div style="font-size:0.75rem; color:var(--text-dim); line-height:1.4;">
-          Database location: <code style="color:var(--text-muted);">%LOCALAPPDATA%\gufo\chat_portal.db</code><br>
+          Database: <code style="color:var(--text-muted);">%LOCALAPPDATA%\gufo\chat_portal.db</code><br>
           Acceleration: <span style="color:#86efac;">AMD Strix Halo gfx1151</span>
         </div>
       </div>
 
       <button id="btn-save-drawer" class="btn-dialog-submit" style="margin-top:10px;">Save Settings</button>
     </div>
+
+    <!-- Tab 2: Tools & MCP Settings (Moved to main setting right side dialog!) -->
+    <div id="drawer-pane-tools" class="drawer-body" style="display:none;">
+      <!-- Master Autonomous Tool Execution Switch -->
+      <div style="background:var(--bg-elevated); border:1px solid var(--border-strong); border-radius:var(--radius); padding:10px 14px; display:flex; justify-content:space-between; align-items:center;">
+        <div>
+          <div style="font-weight:600; font-size:0.86rem; color:var(--text); display:flex; align-items:center; gap:6px;">
+            <span>⚡ Autonomous Tool Execution</span>
+          </div>
+          <div style="font-size:0.75rem; color:var(--text-dim); margin-top:2px;">Turn off to disable all tool calling and run pure conversation mode.</div>
+        </div>
+        <label class="switch-toggle" title="Enable or disable autonomous tools">
+          <input type="checkbox" id="modal-chk-master-tools" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <!-- Tools Subtabs -->
+      <div class="tools-tabs" style="background:transparent; padding:0; border-bottom:1px solid var(--border); margin-top:4px;">
+        <button id="tab-inbuilt-tools" class="tools-tab-btn active" type="button">Inbuilt Tools</button>
+        <button id="tab-mcp-servers" class="tools-tab-btn" type="button">MCP Servers</button>
+        <button id="tab-custom-tools" class="tools-tab-btn" type="button">Custom Tools</button>
+      </div>
+
+      <!-- Inbuilt Tools Pane -->
+      <div id="pane-inbuilt-tools" class="tools-content-pane" style="padding:4px 0;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+          <span style="font-size:0.78rem; color:var(--text-muted);">Standard built-in system tools executed on host server.</span>
+          <div style="display:flex; gap:6px;">
+            <button id="btn-enable-all-tools" class="btn-top" type="button" style="font-size:0.72rem; padding:2px 6px;">Enable All</button>
+            <button id="btn-disable-all-tools" class="btn-top" type="button" style="font-size:0.72rem; padding:2px 6px;">Disable All</button>
+          </div>
+        </div>
+        <div id="inbuilt-tools-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+      </div>
+
+      <!-- MCP Servers Pane -->
+      <div id="pane-mcp-servers" class="tools-content-pane" style="display:none; padding:4px 0;">
+        <div style="font-size:0.78rem; color:var(--text-muted); line-height:1.4;">
+          Connect external Model Context Protocol (MCP) servers via Server-Sent Events (SSE) or HTTP stream. Tools provided by these servers are automatically exposed to Gufo Chat.
+        </div>
+        
+        <div style="background:var(--bg-elevated); padding:10px; border-radius:var(--radius); display:flex; flex-direction:column; gap:8px;">
+          <div style="font-weight:600; font-size:0.82rem;">Add MCP Server</div>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+            <input type="text" id="mcp-srv-name" class="setting-input" placeholder="Server Name (e.g. Memory)">
+            <input type="text" id="mcp-srv-url" class="setting-input" placeholder="URL (e.g. http://localhost:8001/sse)">
+          </div>
+          <div style="display:grid; grid-template-columns:100px 1fr; gap:6px;">
+            <select id="mcp-srv-transport" class="setting-input">
+              <option value="sse">SSE</option>
+              <option value="http">HTTP</option>
+            </select>
+            <input type="text" id="mcp-srv-headers" class="setting-input" placeholder='Headers JSON {"Auth":"..."}'>
+          </div>
+          <button id="btn-add-mcp-server" class="btn-dialog-submit" type="button" style="padding:6px; font-size:0.8rem;">Add &amp; Discover Tools</button>
+        </div>
+
+        <div style="font-weight:600; font-size:0.82rem; margin-top:4px;">Configured MCP Servers</div>
+        <div id="mcp-servers-list" style="display:flex; flex-direction:column; gap:6px;"></div>
+      </div>
+
+      <!-- Custom Tools Pane -->
+      <div id="pane-custom-tools" class="tools-content-pane" style="display:none; padding:4px 0;">
+        <div style="font-size:0.78rem; color:var(--text-muted); line-height:1.4;">
+          Define custom function tools with JSON Schema parameters. When called by the model, Gufo can invoke an HTTP handler URL or return arguments.
+        </div>
+
+        <div style="background:var(--bg-elevated); padding:10px; border-radius:var(--radius); display:flex; flex-direction:column; gap:8px;">
+          <div style="font-weight:600; font-size:0.82rem;">Add Custom Function Tool</div>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+            <input type="text" id="custom-tool-name" class="setting-input" placeholder="Name (e.g. query_db)">
+            <input type="text" id="custom-tool-handler" class="setting-input" placeholder="Handler URL (optional)">
+          </div>
+          <input type="text" id="custom-tool-desc" class="setting-input" placeholder="Description of tool...">
+          <textarea id="custom-tool-schema" class="setting-input" style="height:60px; font-family:var(--font-mono); font-size:0.72rem;" placeholder='{"type":"object","properties":{...}}'></textarea>
+          <button id="btn-add-custom-tool" class="btn-dialog-submit" type="button" style="padding:6px; font-size:0.8rem;">Add Custom Tool</button>
+        </div>
+
+        <div style="font-weight:600; font-size:0.82rem; margin-top:4px;">Your Custom Tools</div>
+        <div id="custom-tools-list" style="display:flex; flex-direction:column; gap:6px;"></div>
+      </div>
+    </div>
   </aside>
+
+  <!-- Conversation Working Directory Modal (Dedicated Dialog) -->
+  <div id="conv-workdir-dialog" class="dialog-backdrop">
+    <div class="dialog-box" style="max-width:540px;">
+      <div class="dialog-header">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="font-size:1.15rem;">📁</span>
+          <span style="font-weight:700; font-size:1rem;">Conversation Working Directory</span>
+        </div>
+        <button id="btn-close-conv-workdir" class="btn-top" style="padding:2px 8px;">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <div style="font-size:0.8rem; color:var(--text-muted); line-height:1.4;">
+          Each conversation has its own dedicated workspace on the server. Filesystem tools (read, write, edit, grep, shell) are scoped strictly to this folder.
+        </div>
+
+        <div class="setting-group" style="background:var(--bg-elevated); padding:8px 10px; border-radius:var(--radius);">
+          <div style="font-size:0.72rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.04em;">Active Conversation</div>
+          <div id="conv-workdir-active-title" style="font-weight:600; font-size:0.88rem; color:var(--text); margin-top:2px;">New Chat</div>
+          <div id="conv-workdir-active-id" style="font-family:var(--font-mono); font-size:0.72rem; color:var(--text-dim); margin-top:1px;"></div>
+        </div>
+
+        <div class="setting-group">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <label class="setting-label">Working Directory Path</label>
+            <button id="btn-conv-workdir-reset" class="btn-top" type="button" style="font-size:0.72rem; padding:2px 8px;">Reset to Default</button>
+          </div>
+          <input type="text" id="conv-workdir-inp" class="setting-input" style="font-family:var(--font-mono); font-size:0.82rem;" placeholder="UserData\{id} - {title}">
+          <div style="font-size:0.72rem; color:var(--text-dim); margin-top:2px; line-height:1.3;">
+            Default location: <code id="conv-workdir-default-hint" style="color:var(--text-muted);">UserData/{conversation_id} - {title}</code> (same folder as gufo.exe)
+          </div>
+        </div>
+
+        <div style="display:flex; gap:8px; margin-top:8px;">
+          <button id="btn-conv-workdir-save" class="btn-dialog-submit" style="flex:1;">Save &amp; Apply</button>
+          <button id="btn-conv-workdir-cancel" class="btn-top" style="padding:0 14px;">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- Auth Modal (Sign In / Register) -->
   <div id="auth-dialog" class="dialog-backdrop">
@@ -1937,116 +2207,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <div style="text-align:center; font-size:0.8rem; color:var(--text-dim);">
           <a href="#" id="link-toggle-mode" style="color:var(--text-muted); text-decoration:underline;">Don't have an account? Create one</a>
         </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Tools & MCP Modal -->
-  <div id="tools-dialog" class="dialog-backdrop">
-    <div class="tools-dialog-box">
-      <div class="dialog-header">
-        <div style="display:flex; align-items:center; gap:8px;">
-          <span style="font-size:1.1rem;">🔧</span>
-          <span style="font-weight:700; font-size:1rem;">Tools & Model Context Protocol (MCP)</span>
-        </div>
-        <button id="btn-close-tools" class="btn-top" style="padding:2px 8px;">&times;</button>
-      </div>
-
-      <div class="tools-tabs">
-        <button id="tab-inbuilt-tools" class="tools-tab-btn active">Inbuilt Tools (llama.cpp)</button>
-        <button id="tab-mcp-servers" class="tools-tab-btn">MCP Servers</button>
-        <button id="tab-custom-tools" class="tools-tab-btn">Custom Tools</button>
-      </div>
-
-      <!-- Inbuilt Tools Pane -->
-      <div id="pane-inbuilt-tools" class="tools-content-pane">
-        <!-- Master Autonomous Tool Execution Switch & Working Directory Card -->
-        <div style="background:var(--bg-elevated); border:1px solid var(--border-strong); border-radius:var(--radius); padding:10px 14px; margin-bottom:8px; display:flex; flex-direction:column; gap:10px;">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <div>
-              <div style="font-weight:600; font-size:0.86rem; color:var(--text); display:flex; align-items:center; gap:6px;">
-                <span>⚡ Autonomous Tool Execution</span>
-              </div>
-              <div style="font-size:0.75rem; color:var(--text-dim); margin-top:2px;">Turn off to disable all tool calling and run pure conversation mode.</div>
-            </div>
-            <label class="switch-toggle" title="Enable or disable autonomous tools">
-              <input type="checkbox" id="modal-chk-master-tools" checked>
-              <span class="slider"></span>
-            </label>
-          </div>
-          <div style="border-top:1px solid var(--border); padding-top:8px; display:flex; flex-direction:column; gap:6px;">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-              <span style="font-size:0.78rem; font-weight:600; color:var(--text-muted); display:flex; align-items:center; gap:5px;">
-                <span>📁</span> Working Directory
-              </span>
-              <span id="tools-server-cwd-hint" style="font-size:0.72rem; color:var(--text-dim); font-family:var(--font-mono);"></span>
-            </div>
-            <div style="display:flex; gap:6px;">
-              <input type="text" id="tools-working-dir-inp" class="setting-input" style="flex:1; font-size:0.8rem; padding:5px 8px;" placeholder="Server working directory (.)">
-              <button id="btn-tools-save-workdir" class="btn-top" type="button" style="font-size:0.75rem; padding:4px 10px; font-weight:500;">Set</button>
-              <button id="btn-tools-reset-workdir" class="btn-top" type="button" style="font-size:0.75rem; padding:4px 8px;">Reset</button>
-            </div>
-          </div>
-        </div>
-
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-          <span style="font-size:0.8rem; color:var(--text-muted);">Standard built-in system tools executed securely on the host server.</span>
-          <div style="display:flex; gap:6px;">
-            <button id="btn-enable-all-tools" class="btn-top" style="font-size:0.75rem; padding:3px 8px;">Enable All</button>
-            <button id="btn-disable-all-tools" class="btn-top" style="font-size:0.75rem; padding:3px 8px;">Disable All</button>
-          </div>
-        </div>
-        <div id="inbuilt-tools-list" style="display:flex; flex-direction:column; gap:8px;"></div>
-      </div>
-
-      <!-- MCP Servers Pane -->
-      <div id="pane-mcp-servers" class="tools-content-pane" style="display:none;">
-        <div style="font-size:0.8rem; color:var(--text-muted); line-height:1.4;">
-          Connect external Model Context Protocol (MCP) servers via Server-Sent Events (SSE) or HTTP stream. Tools provided by these servers are automatically exposed to Gufo Chat.
-        </div>
-        
-        <div style="background:var(--bg-elevated); padding:12px; border-radius:var(--radius); display:flex; flex-direction:column; gap:10px;">
-          <div style="font-weight:600; font-size:0.84rem;">Add MCP Server</div>
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-            <input type="text" id="mcp-srv-name" class="setting-input" placeholder="Server Name (e.g. Memory, GitHub)">
-            <input type="text" id="mcp-srv-url" class="setting-input" placeholder="URL (e.g. http://localhost:8001/sse)">
-          </div>
-          <div style="display:grid; grid-template-columns:120px 1fr; gap:8px;">
-            <select id="mcp-srv-transport" class="setting-input">
-              <option value="sse">SSE</option>
-              <option value="http">HTTP</option>
-            </select>
-            <input type="text" id="mcp-srv-headers" class="setting-input" placeholder='Custom Headers JSON (e.g. {"Authorization":"Bearer ..."})'>
-          </div>
-          <button id="btn-add-mcp-server" class="btn-dialog-submit" style="padding:7px; font-size:0.82rem;">Add & Discover Tools</button>
-        </div>
-
-        <div style="font-weight:600; font-size:0.84rem; margin-top:6px;">Configured MCP Servers</div>
-        <div id="mcp-servers-list" style="display:flex; flex-direction:column; gap:8px;"></div>
-      </div>
-
-      <!-- Custom Tools Pane -->
-      <div id="pane-custom-tools" class="tools-content-pane" style="display:none;">
-        <div style="font-size:0.8rem; color:var(--text-muted); line-height:1.4;">
-          Define custom function tools with JSON Schema parameters. When called by the model, Gufo can invoke an HTTP handler URL or return the arguments.
-        </div>
-
-        <div style="background:var(--bg-elevated); padding:12px; border-radius:var(--radius); display:flex; flex-direction:column; gap:10px;">
-          <div style="font-weight:600; font-size:0.84rem;">Add Custom Function Tool</div>
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-            <input type="text" id="custom-tool-name" class="setting-input" placeholder="Function Name (e.g. query_db)">
-            <input type="text" id="custom-tool-handler" class="setting-input" placeholder="Handler URL (optional endpoint)">
-          </div>
-          <input type="text" id="custom-tool-desc" class="setting-input" placeholder="Description of what this tool does...">
-          <div>
-            <div style="font-size:0.75rem; color:var(--text-dim); margin-bottom:3px;">Parameters (JSON Schema):</div>
-            <textarea id="custom-tool-schema" class="setting-input" style="height:70px; font-family:var(--font-mono); font-size:0.75rem;" placeholder='{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}'></textarea>
-          </div>
-          <button id="btn-add-custom-tool" class="btn-dialog-submit" style="padding:7px; font-size:0.82rem;">Add Custom Tool</button>
-        </div>
-
-        <div style="font-weight:600; font-size:0.84rem; margin-top:6px;">Your Custom Tools</div>
-        <div id="custom-tools-list" style="display:flex; flex-direction:column; gap:8px;"></div>
       </div>
     </div>
   </div>
@@ -2129,7 +2289,26 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       thumbImg: $('thumb-img'),
       btnRemoveThumb: $('btn-remove-thumb'),
       fileUploader: $('file-uploader'),
+      // Attachment & Popover Menu
       btnUploadFile: $('btn-upload-file'),
+      attachToolsBadge: $('attach-tools-badge'),
+      attachPopupMenu: $('attach-popup-menu'),
+      attachItemUpload: $('attach-item-upload'),
+      attachItemWorkdir: $('attach-item-workdir'),
+      attachPopupWorkdirSub: $('attach-popup-workdir-sub'),
+      chkMasterTools: $('chk-master-tools'),
+      attachToolsStatusText: $('attach-tools-status-text'),
+      attachItemMcpSettings: $('attach-item-mcp-settings'),
+      // Conversation Working Directory Modal
+      convWorkdirDialog: $('conv-workdir-dialog'),
+      btnCloseConvWorkdir: $('btn-close-conv-workdir'),
+      btnConvWorkdirCancel: $('btn-conv-workdir-cancel'),
+      convWorkdirActiveTitle: $('conv-workdir-active-title'),
+      convWorkdirActiveId: $('conv-workdir-active-id'),
+      convWorkdirInp: $('conv-workdir-inp'),
+      convWorkdirDefaultHint: $('conv-workdir-default-hint'),
+      btnConvWorkdirReset: $('btn-conv-workdir-reset'),
+      btnConvWorkdirSave: $('btn-conv-workdir-save'),
       chatInput: $('chat-input'),
       btnSend: $('btn-send'),
       btnStop: $('btn-stop'),
@@ -2139,19 +2318,21 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       btnCompGenerate: $('btn-comp-generate'),
       btnCompClear: $('btn-comp-clear'),
       compStatus: $('comp-status'),
-      // Drawer
+      // Drawer & Tabs
       btnOpenDrawer: $('btn-open-drawer'),
       btnCloseDrawer: $('btn-close-drawer'),
       drawerBackdrop: $('drawer-backdrop'),
       drawerPanel: $('drawer-panel'),
+      drawerTabInference: $('drawer-tab-inference'),
+      drawerTabTools: $('drawer-tab-tools'),
+      drawerPaneInference: $('drawer-pane-inference'),
+      drawerPaneTools: $('drawer-pane-tools'),
       setSystemPrompt: $('set-system-prompt'),
       rangeTemp: $('range-temp'),
       valTemp: $('val-temp'),
       rangeTopP: $('range-top-p') || $('range-topp'),
       valTopP: $('val-top-p') || $('val-topp'),
       inpMaxTokens: $('inp-max-tokens'),
-      setWorkingDir: $('set-working-dir'),
-      btnDrawerResetCwd: $('btn-drawer-reset-cwd'),
       btnSaveDrawer: $('btn-save-drawer'),
       // Auth Dialog
       authDialog: $('auth-dialog'),
@@ -2162,20 +2343,10 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       authPassInp: $('auth-pass-inp'),
       btnAuthExec: $('btn-auth-exec'),
       linkToggleMode: $('link-toggle-mode'),
-      // Tools & MCP
+      // Tools & MCP in Drawer
       btnOpenTools: $('btn-open-tools'),
       navToolsLabel: $('nav-tools-label'),
-      quickToolsContainer: $('quick-tools-container'),
-      chkMasterTools: $('chk-master-tools'),
-      quickToolsLabel: $('quick-tools-label'),
-      btnQuickToolsGear: $('btn-quick-tools-gear'),
-      toolsDialog: $('tools-dialog'),
-      btnCloseTools: $('btn-close-tools'),
       modalChkMasterTools: $('modal-chk-master-tools'),
-      toolsWorkingDirInp: $('tools-working-dir-inp'),
-      toolsServerCwdHint: $('tools-server-cwd-hint'),
-      btnToolsSaveWorkdir: $('btn-tools-save-workdir'),
-      btnToolsResetWorkdir: $('btn-tools-reset-workdir'),
       tabInbuiltTools: $('tab-inbuilt-tools'),
       tabMcpServers: $('tab-mcp-servers'),
       tabCustomTools: $('tab-custom-tools'),
@@ -2546,33 +2717,45 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       loadConversations();
     }
 
-    // Settings Drawer
-    if (UI.btnOpenDrawer) {
-      UI.btnOpenDrawer.addEventListener('click', () => {
+    // Settings Drawer (right-side dialog)
+    function openDrawer(tab = 'inference') {
+      switchDrawerTab(tab);
+      if (tab === 'inference') {
         if (UI.setSystemPrompt) UI.setSystemPrompt.value = APP.settings.system_prompt;
         if (UI.rangeTemp) UI.rangeTemp.value = APP.settings.temperature;
         if (UI.valTemp) UI.valTemp.textContent = Number(APP.settings.temperature).toFixed(2);
         if (UI.rangeTopP) UI.rangeTopP.value = APP.settings.top_p;
         if (UI.valTopP) UI.valTopP.textContent = Number(APP.settings.top_p).toFixed(2);
         if (UI.inpMaxTokens) UI.inpMaxTokens.value = APP.settings.max_tokens;
-        if (UI.setWorkingDir) UI.setWorkingDir.value = APP.settings.working_directory || '';
-
-        if (UI.drawerBackdrop) UI.drawerBackdrop.classList.add('show');
-        if (UI.drawerPanel) UI.drawerPanel.classList.add('show');
-      });
+      } else {
+        loadTools();
+      }
+      if (UI.drawerBackdrop) UI.drawerBackdrop.classList.add('show');
+      if (UI.drawerPanel) UI.drawerPanel.classList.add('show');
     }
 
     function closeDrawer() {
       if (UI.drawerBackdrop) UI.drawerBackdrop.classList.remove('show');
       if (UI.drawerPanel) UI.drawerPanel.classList.remove('show');
     }
+
+    function switchDrawerTab(tab) {
+      if (UI.drawerTabInference) UI.drawerTabInference.classList.toggle('active', tab === 'inference');
+      if (UI.drawerTabTools) UI.drawerTabTools.classList.toggle('active', tab === 'tools');
+      if (UI.drawerPaneInference) UI.drawerPaneInference.style.display = (tab === 'inference' ? 'flex' : 'none');
+      if (UI.drawerPaneTools) UI.drawerPaneTools.style.display = (tab === 'tools' ? 'flex' : 'none');
+    }
+
+    if (UI.drawerTabInference) UI.drawerTabInference.addEventListener('click', () => switchDrawerTab('inference'));
+    if (UI.drawerTabTools) UI.drawerTabTools.addEventListener('click', () => {
+      switchDrawerTab('tools');
+      loadTools();
+    });
+
+    if (UI.btnOpenDrawer) UI.btnOpenDrawer.addEventListener('click', () => openDrawer('inference'));
+    if (UI.btnOpenTools) UI.btnOpenTools.addEventListener('click', () => openDrawer('tools'));
     if (UI.btnCloseDrawer) UI.btnCloseDrawer.addEventListener('click', closeDrawer);
     if (UI.drawerBackdrop) UI.drawerBackdrop.addEventListener('click', closeDrawer);
-    if (UI.btnDrawerResetCwd) {
-      UI.btnDrawerResetCwd.addEventListener('click', () => {
-        if (UI.setWorkingDir) UI.setWorkingDir.value = '';
-      });
-    }
 
     if (UI.rangeTemp) {
       UI.rangeTemp.addEventListener('input', e => {
@@ -2591,66 +2774,168 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         if (UI.rangeTemp) APP.settings.temperature = parseFloat(UI.rangeTemp.value);
         if (UI.rangeTopP) APP.settings.top_p = parseFloat(UI.rangeTopP.value);
         if (UI.inpMaxTokens) APP.settings.max_tokens = parseInt(UI.inpMaxTokens.value, 10);
-        if (UI.setWorkingDir) APP.settings.working_directory = UI.setWorkingDir.value.trim();
 
         try {
           await apiFetch('/api/settings', { method: 'POST', body: APP.settings });
-          updateWorkingDirUI();
         } catch (e) {}
         closeDrawer();
       });
     }
 
-    // Working Directory Helpers
-    function updateWorkingDirUI() {
-      const wd = (APP.settings.working_directory || '').trim();
-      const displayWd = wd || APP.serverCurrentDirectory || '.';
+    // Attachment Popover Menu Logic
+    function toggleAttachPopup() {
+      if (!UI.attachPopupMenu) return;
+      const isOpen = UI.attachPopupMenu.style.display === 'flex';
+      if (isOpen) {
+        closeAttachPopup();
+      } else {
+        openAttachPopup();
+      }
+    }
 
-      if (UI.navWorkdirLabel) {
-        let shortPath = displayWd;
-        if (shortPath.length > 22) {
-          const parts = shortPath.split(/[\\/]/).filter(Boolean);
-          shortPath = parts.length > 0 ? parts[parts.length - 1] : shortPath.slice(-20);
+    function openAttachPopup() {
+      if (!UI.attachPopupMenu) return;
+      updateAttachPopupUI();
+      UI.attachPopupMenu.style.display = 'flex';
+    }
+
+    function closeAttachPopup() {
+      if (UI.attachPopupMenu) UI.attachPopupMenu.style.display = 'none';
+    }
+
+    function updateAttachPopupUI() {
+      if (UI.attachPopupWorkdirSub) {
+        let wd = (APP.activeConv && APP.activeConv.working_directory) ? APP.activeConv.working_directory : '';
+        if (wd) {
+          const parts = wd.split(/[\\/]/).filter(Boolean);
+          const folderName = parts.length > 0 ? parts[parts.length - 1] : wd;
+          UI.attachPopupWorkdirSub.textContent = folderName;
+          UI.attachPopupWorkdirSub.title = wd;
+        } else {
+          UI.attachPopupWorkdirSub.textContent = 'UserData/...';
+          UI.attachPopupWorkdirSub.title = 'Default folder';
         }
-        UI.navWorkdirLabel.textContent = shortPath;
-        UI.navWorkdirLabel.title = `Working Directory: ${displayWd}`;
       }
-      if (UI.setWorkingDir) {
-        UI.setWorkingDir.value = wd;
+      if (UI.chkMasterTools) {
+        UI.chkMasterTools.checked = APP.toolsEnabled;
       }
-      if (UI.toolsWorkingDirInp) {
-        UI.toolsWorkingDirInp.value = wd;
-      }
-      if (UI.toolsServerCwdHint) {
-        UI.toolsServerCwdHint.textContent = `Server CWD: ${APP.serverCurrentDirectory || '.'}`;
+      if (UI.attachToolsStatusText) {
+        const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.enabled).length;
+        const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
+        const total = activeInbuilt + activeCustom;
+        UI.attachToolsStatusText.textContent = APP.toolsEnabled ? `${total} tools active` : 'Tools disabled';
       }
     }
 
-    async function saveWorkingDirectory(newWd) {
-      APP.settings.working_directory = (newWd || '').trim();
-      updateWorkingDirUI();
-      try {
-        await apiFetch('/api/settings', {
-          method: 'POST',
-          body: { working_directory: APP.settings.working_directory }
-        });
-      } catch (e) {
-        console.error('Failed to save working directory:', e);
-      }
-    }
-
-    if (UI.btnNavWorkdir) {
-      UI.btnNavWorkdir.addEventListener('click', () => openToolsModal('inbuilt'));
-    }
-    if (UI.btnToolsSaveWorkdir) {
-      UI.btnToolsSaveWorkdir.addEventListener('click', () => {
-        saveWorkingDirectory(UI.toolsWorkingDirInp ? UI.toolsWorkingDirInp.value : '');
+    if (UI.btnUploadFile) {
+      UI.btnUploadFile.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleAttachPopup();
       });
     }
-    if (UI.btnToolsResetWorkdir) {
-      UI.btnToolsResetWorkdir.addEventListener('click', () => {
-        if (UI.toolsWorkingDirInp) UI.toolsWorkingDirInp.value = '';
-        saveWorkingDirectory('');
+
+    if (UI.attachItemUpload) {
+      UI.attachItemUpload.addEventListener('click', () => {
+        closeAttachPopup();
+        if (UI.fileUploader) UI.fileUploader.click();
+      });
+    }
+
+    if (UI.attachItemWorkdir) {
+      UI.attachItemWorkdir.addEventListener('click', () => {
+        closeAttachPopup();
+        openConvWorkdirModal();
+      });
+    }
+
+    if (UI.attachItemMcpSettings) {
+      UI.attachItemMcpSettings.addEventListener('click', () => {
+        closeAttachPopup();
+        openDrawer('tools');
+      });
+    }
+
+    document.addEventListener('click', (e) => {
+      if (UI.attachPopupMenu && UI.attachPopupMenu.style.display === 'flex') {
+        if (!e.target.closest('.attach-menu-container')) {
+          closeAttachPopup();
+        }
+      }
+    });
+
+    // Conversation-Based Working Directory Modal
+    function openConvWorkdirModal() {
+      if (!UI.convWorkdirDialog) return;
+      const conv = APP.activeConv || (APP.conversations.length > 0 ? APP.conversations[0] : null);
+      if (UI.convWorkdirActiveTitle) {
+        UI.convWorkdirActiveTitle.textContent = (conv && conv.title) ? conv.title : 'New Chat';
+      }
+      if (UI.convWorkdirActiveId) {
+        UI.convWorkdirActiveId.textContent = conv ? `ID: ${conv.id}` : '';
+      }
+      if (UI.convWorkdirInp) {
+        UI.convWorkdirInp.value = (conv && conv.working_directory) ? conv.working_directory : '';
+      }
+      if (UI.convWorkdirDefaultHint && conv) {
+        UI.convWorkdirDefaultHint.textContent = `UserData/${conv.id} - ${conv.title || 'Chat'}`;
+      }
+      UI.convWorkdirDialog.classList.add('show');
+    }
+
+    function closeConvWorkdirModal() {
+      if (UI.convWorkdirDialog) UI.convWorkdirDialog.classList.remove('show');
+    }
+
+    if (UI.btnCloseConvWorkdir) UI.btnCloseConvWorkdir.addEventListener('click', closeConvWorkdirModal);
+    if (UI.btnConvWorkdirCancel) UI.btnConvWorkdirCancel.addEventListener('click', closeConvWorkdirModal);
+    if (UI.convWorkdirDialog) {
+      UI.convWorkdirDialog.addEventListener('click', (e) => {
+        if (e.target === UI.convWorkdirDialog) closeConvWorkdirModal();
+      });
+    }
+
+    if (UI.btnConvWorkdirReset) {
+      UI.btnConvWorkdirReset.addEventListener('click', async () => {
+        if (!APP.activeId) return;
+        try {
+          const res = await apiFetch(`/api/conversations/${APP.activeId}`, {
+            method: 'PATCH',
+            body: { working_directory: 'default' }
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (APP.activeConv) APP.activeConv.working_directory = data.working_directory;
+            const targetConv = APP.conversations.find(c => c.id === APP.activeId);
+            if (targetConv) targetConv.working_directory = data.working_directory;
+            if (UI.convWorkdirInp) UI.convWorkdirInp.value = data.working_directory || '';
+            updateAttachPopupUI();
+          }
+        } catch (e) {
+          console.error('Failed to reset conversation working directory:', e);
+        }
+      });
+    }
+
+    if (UI.btnConvWorkdirSave) {
+      UI.btnConvWorkdirSave.addEventListener('click', async () => {
+        if (!APP.activeId) return;
+        const newPath = UI.convWorkdirInp ? UI.convWorkdirInp.value.trim() : '';
+        try {
+          const res = await apiFetch(`/api/conversations/${APP.activeId}`, {
+            method: 'PATCH',
+            body: { working_directory: newPath }
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (APP.activeConv) APP.activeConv.working_directory = data.working_directory || newPath;
+            const targetConv = APP.conversations.find(c => c.id === APP.activeId);
+            if (targetConv) targetConv.working_directory = data.working_directory || newPath;
+            updateAttachPopupUI();
+          }
+        } catch (e) {
+          console.error('Failed to save conversation working directory:', e);
+        }
+        closeConvWorkdirModal();
       });
     }
 
@@ -2674,21 +2959,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         setMasterTools(e.target.checked);
       });
     }
-    if (UI.quickToolsContainer) {
-      UI.quickToolsContainer.addEventListener('click', (e) => {
-        if (e.target.closest('.switch-toggle-mini')) return;
-        openToolsModal('inbuilt');
-      });
-    }
 
-    function openToolsModal(tab = 'inbuilt') {
-      switchToolsTab(tab);
-      if (UI.toolsDialog) UI.toolsDialog.classList.add('show');
-      loadTools();
-    }
-    function closeToolsModal() {
-      if (UI.toolsDialog) UI.toolsDialog.classList.remove('show');
-    }
     function switchToolsTab(tab) {
       APP.tools.activeTab = tab;
       const tabs = [
@@ -2702,13 +2973,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       });
     }
 
-    if (UI.btnOpenTools) UI.btnOpenTools.addEventListener('click', () => openToolsModal('inbuilt'));
-    if (UI.btnCloseTools) UI.btnCloseTools.addEventListener('click', closeToolsModal);
-    if (UI.toolsDialog) {
-      UI.toolsDialog.addEventListener('click', (e) => {
-        if (e.target === UI.toolsDialog) closeToolsModal();
-      });
-    }
     if (UI.tabInbuiltTools) UI.tabInbuiltTools.addEventListener('click', () => switchToolsTab('inbuilt'));
     if (UI.tabMcpServers) UI.tabMcpServers.addEventListener('click', () => switchToolsTab('mcp'));
     if (UI.tabCustomTools) UI.tabCustomTools.addEventListener('click', () => switchToolsTab('custom'));
@@ -2724,9 +2988,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           if (data.server_current_directory) {
             APP.serverCurrentDirectory = data.server_current_directory;
           }
-          if (data.working_directory !== undefined && data.working_directory !== null) {
-            APP.settings.working_directory = data.working_directory;
-          }
           if (typeof data.master_enabled === 'boolean') {
             if (localStorage.getItem('gufo_tools_enabled') === null) {
               APP.toolsEnabled = data.master_enabled;
@@ -2736,7 +2997,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           renderMcpServers();
           renderCustomTools();
           updateToolsPill();
-          updateWorkingDirUI();
+          updateAttachPopupUI();
         }
       } catch (err) {
         console.error('Failed to load tools:', err);
@@ -2748,24 +3009,14 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
       const total = activeInbuilt + activeCustom;
 
-      const isEnabled = APP.toolsEnabled && total > 0;
-      if (UI.quickToolsLabel) {
-        if (!APP.toolsEnabled) {
-          UI.quickToolsLabel.innerHTML = '<span class="tools-label-prefix">Tools: </span>OFF';
-        } else {
-          UI.quickToolsLabel.innerHTML = `<span class="tools-label-prefix">Tools: </span>${total}`;
-        }
+      if (UI.attachToolsBadge) {
+        UI.attachToolsBadge.classList.toggle('disabled', !APP.toolsEnabled);
+      }
+      if (UI.attachToolsStatusText) {
+        UI.attachToolsStatusText.textContent = APP.toolsEnabled ? `${total} tools active` : 'Tools disabled';
       }
       if (UI.navToolsLabel) {
-        if (!APP.toolsEnabled) {
-          UI.navToolsLabel.textContent = 'Tools: OFF';
-        } else {
-          UI.navToolsLabel.textContent = `Tools & MCP (${total})`;
-        }
-      }
-      if (UI.quickToolsContainer) {
-        UI.quickToolsContainer.classList.toggle('active', isEnabled);
-        UI.quickToolsContainer.classList.toggle('disabled', !APP.toolsEnabled);
+        UI.navToolsLabel.textContent = APP.toolsEnabled ? `Tools & MCP (${total})` : 'Tools: OFF';
       }
       if (UI.chkMasterTools) {
         UI.chkMasterTools.checked = APP.toolsEnabled;
@@ -3153,6 +3404,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         if (res.ok) {
           APP.activeConv = await res.json();
           renderMessages(APP.activeConv.messages || []);
+          updateAttachPopupUI();
         }
       } catch (err) {}
     }
@@ -3164,8 +3416,17 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           body: { title }
         });
         if (res.ok) {
+          const data = await res.json();
           const item = APP.conversations.find(c => c.id === id);
-          if (item) item.title = title;
+          if (item) {
+            item.title = title;
+            if (data.working_directory) item.working_directory = data.working_directory;
+          }
+          if (APP.activeConv && APP.activeConv.id === id) {
+            APP.activeConv.title = title;
+            if (data.working_directory) APP.activeConv.working_directory = data.working_directory;
+            updateAttachPopupUI();
+          }
           renderChatList();
         }
       } catch (err) {}
@@ -3773,7 +4034,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                 body: {
                   tool_name: tc.name,
                   arguments: parsedArgs,
-                  working_directory: APP.settings.working_directory || '',
+                  working_directory: (APP.activeConv && APP.activeConv.working_directory) ? APP.activeConv.working_directory : '',
                   conversation_id: APP.activeId
                 }
               });

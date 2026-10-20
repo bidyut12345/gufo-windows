@@ -198,6 +198,7 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       obj["id"] = c.id;
       obj["title"] = c.title;
       obj["model"] = c.model;
+      obj["working_directory"] = c.working_directory;
       obj["updated_at"] = c.updated_at;
       obj["message_count"] = static_cast<int>(c.messages.size());
       arr.push_back(std::move(obj));
@@ -211,13 +212,15 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       const std::string title = body.member_str("title");
       const std::string model = body.member_str("model");
       const std::string system_prompt = body.member_str("system_prompt");
-      const auto conv = db.CreateConversation(user->id, title, model, system_prompt);
+      const std::string working_dir = body.member_str("working_directory");
+      const auto conv = db.CreateConversation(user->id, title, model, system_prompt, working_dir);
 
       json::Value obj = json::Value::object();
       obj["id"] = conv.id;
       obj["title"] = conv.title;
       obj["model"] = conv.model;
       obj["system_prompt"] = conv.system_prompt;
+      obj["working_directory"] = conv.working_directory;
       obj["created_at"] = conv.created_at;
       obj["updated_at"] = conv.updated_at;
       obj["messages"] = json::Value::array();
@@ -263,6 +266,7 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       obj["title"] = conv->title;
       obj["model"] = conv->model;
       obj["system_prompt"] = conv->system_prompt;
+      obj["working_directory"] = conv->working_directory;
       obj["created_at"] = conv->created_at;
       obj["updated_at"] = conv->updated_at;
 
@@ -284,13 +288,24 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
     if (sub_route.empty() && req.method == "PATCH") {
       try {
         const auto body = json::parse(req.body);
-        const std::string title = body.member_str("title");
-        if (db.UpdateConversationTitle(user->id, conv_id, title)) {
+        bool updated = false;
+        if (const auto* w = body.find("working_directory"); w && w->is_string()) {
+          updated = db.UpdateConversationWorkingDir(user->id, conv_id, w->str()) || updated;
+        }
+        if (const auto* t = body.find("title"); t && t->is_string() && !t->str().empty()) {
+          updated = db.UpdateConversationTitle(user->id, conv_id, t->str()) || updated;
+        }
+        if (updated) {
+          const auto updated_conv = db.GetConversation(user->id, conv_id);
           json::Value out = json::Value::object();
           out["status"] = "ok";
+          if (updated_conv) {
+            out["working_directory"] = updated_conv->working_directory;
+            out["title"] = updated_conv->title;
+          }
           return JsonOk(out);
         }
-        return JsonErr(404, "Not Found", "Conversation not found");
+        return JsonErr(404, "Not Found", "Conversation not found or nothing updated");
       } catch (...) {
         return JsonErr(400, "Bad Request", "Invalid JSON payload");
       }
@@ -476,9 +491,19 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       const auto* args_ptr = body.find("arguments");
       json::Value args = (args_ptr && args_ptr->is_object()) ? *args_ptr : json::Value::object();
       std::string working_dir = body.member_str("working_directory");
+      const std::string conv_id = body.member_str("conversation_id");
+      if (working_dir.empty() && !conv_id.empty()) {
+        const auto conv = db.GetConversation(user->id, conv_id);
+        if (conv) {
+          working_dir = conv->working_directory;
+        }
+      }
       if (working_dir.empty()) {
         const auto st = db.GetSettings(user->id);
         working_dir = st.working_directory;
+      }
+      if (working_dir.empty() && !conv_id.empty()) {
+        working_dir = GetConversationDefaultWorkingDir(conv_id, "default").string();
       }
 
       // Check if inbuilt tool

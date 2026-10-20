@@ -2,6 +2,19 @@
 
 #include <sqlite3.h>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__linux__)
+#include <limits.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -13,6 +26,61 @@
 #include "src/core/crypto/sha256.hpp"
 
 namespace gufo::server {
+
+std::string SanitizeFolderName(const std::string& raw) {
+  std::string clean;
+  clean.reserve(raw.size());
+  for (char c : raw) {
+    if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+        c == '"' || c == '<' || c == '>' || c == '|' || c == '\n' ||
+        c == '\r' || c == '\t') {
+      clean += '_';
+    } else {
+      clean += c;
+    }
+  }
+  while (!clean.empty() && (clean.front() == ' ' || clean.front() == '.')) {
+    clean.erase(clean.begin());
+  }
+  while (!clean.empty() && (clean.back() == ' ' || clean.back() == '.')) {
+    clean.pop_back();
+  }
+  if (clean.empty()) {
+    clean = "Conversation";
+  }
+  if (clean.size() > 60) {
+    clean.resize(60);
+  }
+  return clean;
+}
+
+std::filesystem::path GetExecutableDirectory() {
+#if defined(_WIN32)
+  wchar_t buffer[MAX_PATH];
+  DWORD len = GetModuleFileNameW(NULL, buffer, MAX_PATH);
+  if (len > 0 && len < MAX_PATH) {
+    return std::filesystem::path(buffer).parent_path();
+  }
+#elif defined(__linux__)
+  char buffer[PATH_MAX];
+  ssize_t len = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+  if (len != -1) {
+    buffer[len] = '\0';
+    return std::filesystem::path(buffer).parent_path();
+  }
+#endif
+  std::error_code ec;
+  return std::filesystem::current_path(ec);
+}
+
+std::filesystem::path GetConversationDefaultWorkingDir(const std::string& conv_id, const std::string& title) {
+  std::string folder_name = conv_id + " - " + SanitizeFolderName(title);
+  auto p = GetExecutableDirectory() / "UserData" / folder_name;
+  std::error_code ec;
+  std::filesystem::create_directories(p, ec);
+  return p;
+}
+
 namespace {
 
 std::string CurrentIsoTime() {
@@ -195,6 +263,7 @@ void ChatDatabase::InitSchema() {
       title TEXT NOT NULL,
       model TEXT NOT NULL,
       system_prompt TEXT,
+      working_directory TEXT DEFAULT '',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -271,6 +340,10 @@ void ChatDatabase::InitSchema() {
   sqlite3_exec(
       db_,
       "ALTER TABLE user_settings ADD COLUMN working_directory TEXT DEFAULT '';",
+      nullptr, nullptr, nullptr);
+  sqlite3_exec(
+      db_,
+      "ALTER TABLE conversations ADD COLUMN working_directory TEXT DEFAULT '';",
       nullptr, nullptr, nullptr);
 }
 
@@ -436,7 +509,7 @@ std::vector<ConversationRecord> ChatDatabase::ListConversations(
   if (!db_) return results;
 
   Stmt sel(db_,
-           "SELECT c.id, c.user_id, c.title, c.model, c.system_prompt, c.created_at, c.updated_at, "
+           "SELECT c.id, c.user_id, c.title, c.model, c.system_prompt, c.working_directory, c.created_at, c.updated_at, "
            "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) "
            "FROM conversations c WHERE c.user_id = ? "
            "ORDER BY c.updated_at DESC;");
@@ -450,9 +523,13 @@ std::vector<ConversationRecord> ChatDatabase::ListConversations(
     conv.title = sel.column_text(2);
     conv.model = sel.column_text(3);
     conv.system_prompt = sel.column_text(4);
-    conv.created_at = sel.column_text(5);
-    conv.updated_at = sel.column_text(6);
-    const int count = sel.column_int(7);
+    conv.working_directory = sel.column_text(5);
+    conv.created_at = sel.column_text(6);
+    conv.updated_at = sel.column_text(7);
+    const int count = sel.column_int(8);
+    if (conv.working_directory.empty()) {
+      conv.working_directory = GetConversationDefaultWorkingDir(conv.id, conv.title).string();
+    }
     conv.messages.resize(static_cast<std::size_t>(count > 0 ? count : 0));
     results.push_back(std::move(conv));
   }
@@ -468,7 +545,7 @@ std::optional<ConversationRecord> ChatDatabase::GetConversation(
   ConversationRecord conv;
   {
     Stmt sel(db_,
-             "SELECT id, user_id, title, model, system_prompt, created_at, updated_at "
+             "SELECT id, user_id, title, model, system_prompt, working_directory, created_at, updated_at "
              "FROM conversations WHERE id = ? AND user_id = ?;");
     if (!sel.valid()) return std::nullopt;
 
@@ -483,8 +560,12 @@ std::optional<ConversationRecord> ChatDatabase::GetConversation(
     conv.title = sel.column_text(2);
     conv.model = sel.column_text(3);
     conv.system_prompt = sel.column_text(4);
-    conv.created_at = sel.column_text(5);
-    conv.updated_at = sel.column_text(6);
+    conv.working_directory = sel.column_text(5);
+    conv.created_at = sel.column_text(6);
+    conv.updated_at = sel.column_text(7);
+    if (conv.working_directory.empty()) {
+      conv.working_directory = GetConversationDefaultWorkingDir(conv.id, conv.title).string();
+    }
   }
 
   {
@@ -511,7 +592,8 @@ std::optional<ConversationRecord> ChatDatabase::GetConversation(
 
 ConversationRecord ChatDatabase::CreateConversation(
     const std::string& user_id, const std::string& title,
-    const std::string& model, const std::string& system_prompt) {
+    const std::string& model, const std::string& system_prompt,
+    const std::string& working_directory) {
   std::lock_guard lock(mutex_);
 
   ConversationRecord conv;
@@ -522,19 +604,27 @@ ConversationRecord ChatDatabase::CreateConversation(
   conv.system_prompt = system_prompt;
   conv.created_at = CurrentIsoTime();
   conv.updated_at = conv.created_at;
+  if (!working_directory.empty()) {
+    conv.working_directory = working_directory;
+  } else {
+    conv.working_directory = GetConversationDefaultWorkingDir(conv.id, conv.title).string();
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(conv.working_directory, ec);
 
   if (db_) {
     Stmt ins(db_,
-             "INSERT INTO conversations (id, user_id, title, model, system_prompt, created_at, updated_at) "
-             "VALUES (?, ?, ?, ?, ?, ?, ?);");
+             "INSERT INTO conversations (id, user_id, title, model, system_prompt, working_directory, created_at, updated_at) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?, ?);");
     if (ins.valid()) {
       ins.bind_text(1, conv.id);
       ins.bind_text(2, conv.user_id);
       ins.bind_text(3, conv.title);
       ins.bind_text(4, conv.model);
       ins.bind_text(5, conv.system_prompt);
-      ins.bind_text(6, conv.created_at);
-      ins.bind_text(7, conv.updated_at);
+      ins.bind_text(6, conv.working_directory);
+      ins.bind_text(7, conv.created_at);
+      ins.bind_text(8, conv.updated_at);
       sqlite3_step(ins);
     }
   }
@@ -548,12 +638,70 @@ bool ChatDatabase::UpdateConversationTitle(const std::string& user_id,
   std::lock_guard lock(mutex_);
   if (!db_) return false;
 
+  std::string old_title;
+  std::string curr_working_dir;
+  {
+    Stmt sel(db_, "SELECT title, working_directory FROM conversations WHERE id = ? AND user_id = ?;");
+    if (sel.valid()) {
+      sel.bind_text(1, conv_id);
+      sel.bind_text(2, user_id);
+      if (sqlite3_step(sel) == SQLITE_ROW) {
+        old_title = sel.column_text(0);
+        curr_working_dir = sel.column_text(1);
+      }
+    }
+  }
+
   const std::string now = CurrentIsoTime();
+  std::string new_working_dir = curr_working_dir;
+  std::string old_default = GetConversationDefaultWorkingDir(conv_id, old_title).string();
+  if (curr_working_dir.empty() || curr_working_dir == old_default) {
+    new_working_dir = GetConversationDefaultWorkingDir(conv_id, new_title).string();
+    std::error_code ec;
+    std::filesystem::create_directories(new_working_dir, ec);
+  }
+
   Stmt upd(db_,
-           "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?;");
+           "UPDATE conversations SET title = ?, working_directory = ?, updated_at = ? WHERE id = ? AND user_id = ?;");
   if (!upd.valid()) return false;
 
   upd.bind_text(1, new_title);
+  upd.bind_text(2, new_working_dir);
+  upd.bind_text(3, now);
+  upd.bind_text(4, conv_id);
+  upd.bind_text(5, user_id);
+  return sqlite3_step(upd) == SQLITE_DONE && sqlite3_changes(db_) > 0;
+}
+
+bool ChatDatabase::UpdateConversationWorkingDir(const std::string& user_id,
+                                                const std::string& conv_id,
+                                                const std::string& working_directory) {
+  std::lock_guard lock(mutex_);
+  if (!db_) return false;
+
+  std::string target_dir = working_directory;
+  if (target_dir.empty() || target_dir == "default") {
+    std::string title;
+    Stmt sel(db_, "SELECT title FROM conversations WHERE id = ? AND user_id = ?;");
+    if (sel.valid()) {
+      sel.bind_text(1, conv_id);
+      sel.bind_text(2, user_id);
+      if (sqlite3_step(sel) == SQLITE_ROW) {
+        title = sel.column_text(0);
+      }
+    }
+    target_dir = GetConversationDefaultWorkingDir(conv_id, title).string();
+  }
+
+  std::error_code ec;
+  std::filesystem::create_directories(target_dir, ec);
+
+  const std::string now = CurrentIsoTime();
+  Stmt upd(db_,
+           "UPDATE conversations SET working_directory = ?, updated_at = ? WHERE id = ? AND user_id = ?;");
+  if (!upd.valid()) return false;
+
+  upd.bind_text(1, target_dir);
   upd.bind_text(2, now);
   upd.bind_text(3, conv_id);
   upd.bind_text(4, user_id);

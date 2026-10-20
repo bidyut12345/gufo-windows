@@ -28,6 +28,7 @@ struct ConversationRecord {
   std::string title;
   std::string model;
   std::string system_prompt;
+  std::string working_directory;
   std::string created_at;
   std::string updated_at;
   std::vector<ChatMessageRecord> messages;
@@ -81,6 +82,10 @@ struct CustomToolRecord {
   std::string created_at;
 };
 
+std::filesystem::path GetExecutableDirectory();
+std::string SanitizeFolderName(const std::string& raw);
+std::filesystem::path GetConversationDefaultWorkingDir(const std::string& conv_id, const std::string& title);
+
 class ChatDatabase {
  public:
   static ChatDatabase& Instance();
@@ -111,10 +116,14 @@ class ChatDatabase {
   ConversationRecord CreateConversation(const std::string& user_id,
                                         const std::string& title,
                                         const std::string& model,
-                                        const std::string& system_prompt);
+                                        const std::string& system_prompt,
+                                        const std::string& working_directory = "");
   bool UpdateConversationTitle(const std::string& user_id,
                                const std::string& conv_id,
                                const std::string& new_title);
+  bool UpdateConversationWorkingDir(const std::string& user_id,
+                                    const std::string& conv_id,
+                                    const std::string& working_directory);
   bool DeleteConversation(const std::string& user_id,
                           const std::string& conv_id);
   bool AddMessage(const std::string& user_id, const std::string& conv_id,
