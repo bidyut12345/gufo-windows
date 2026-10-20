@@ -708,6 +708,24 @@ bool ChatDatabase::UpdateConversationWorkingDir(const std::string& user_id,
   return sqlite3_step(upd) == SQLITE_DONE && sqlite3_changes(db_) > 0;
 }
 
+bool ChatDatabase::UpdateConversationSystemPrompt(const std::string& user_id,
+                                                  const std::string& conv_id,
+                                                  const std::string& system_prompt) {
+  std::lock_guard lock(mutex_);
+  if (!db_) return false;
+
+  const std::string now = CurrentIsoTime();
+  Stmt upd(db_,
+           "UPDATE conversations SET system_prompt = ?, updated_at = ? WHERE id = ? AND user_id = ?;");
+  if (!upd.valid()) return false;
+
+  upd.bind_text(1, system_prompt);
+  upd.bind_text(2, now);
+  upd.bind_text(3, conv_id);
+  upd.bind_text(4, user_id);
+  return sqlite3_step(upd) == SQLITE_DONE && sqlite3_changes(db_) > 0;
+}
+
 bool ChatDatabase::DeleteConversation(const std::string& user_id,
                                      const std::string& conv_id) {
   std::lock_guard lock(mutex_);
@@ -784,6 +802,64 @@ bool ChatDatabase::AddMessage(const std::string& user_id,
   Stmt upd(db_, "UPDATE conversations SET updated_at = ? WHERE id = ?;");
   if (upd.valid()) {
     upd.bind_text(1, created);
+    upd.bind_text(2, conv_id);
+    sqlite3_step(upd);
+  }
+
+  return true;
+}
+
+bool ChatDatabase::ReplaceMessages(const std::string& user_id,
+                                   const std::string& conv_id,
+                                   const std::vector<ChatMessageRecord>& messages) {
+  std::lock_guard lock(mutex_);
+  if (!db_) return false;
+
+  // Verify conversation ownership
+  {
+    Stmt check(db_, "SELECT id FROM conversations WHERE id = ? AND user_id = ?;");
+    if (!check.valid()) return false;
+    check.bind_text(1, conv_id);
+    check.bind_text(2, user_id);
+    if (sqlite3_step(check) != SQLITE_ROW) {
+      return false;
+    }
+  }
+
+  // Delete all existing messages for this conversation
+  {
+    Stmt del(db_, "DELETE FROM messages WHERE conversation_id = ?;");
+    if (del.valid()) {
+      del.bind_text(1, conv_id);
+      sqlite3_step(del);
+    }
+  }
+
+  const std::string now = CurrentIsoTime();
+  int idx = 1;
+  for (const auto& msg : messages) {
+    const std::string msg_id = msg.id.empty() ? ("msg_" + RandomHex(8)) : msg.id;
+    const std::string created = msg.created_at.empty() ? now : msg.created_at;
+    Stmt ins(db_,
+             "INSERT INTO messages (id, conversation_id, user_id, role, content, reasoning_content, created_at, order_idx) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?, ?);");
+    if (ins.valid()) {
+      ins.bind_text(1, msg_id);
+      ins.bind_text(2, conv_id);
+      ins.bind_text(3, user_id);
+      ins.bind_text(4, msg.role);
+      ins.bind_text(5, msg.content);
+      ins.bind_text(6, msg.reasoning_content);
+      ins.bind_text(7, created);
+      sqlite3_bind_int(ins, 8, idx++);
+      sqlite3_step(ins);
+    }
+  }
+
+  // Update conversation updated_at
+  Stmt upd(db_, "UPDATE conversations SET updated_at = ? WHERE id = ?;");
+  if (upd.valid()) {
+    upd.bind_text(1, now);
     upd.bind_text(2, conv_id);
     sqlite3_step(upd);
   }

@@ -124,10 +124,15 @@ class ChatDatabase {
   bool UpdateConversationWorkingDir(const std::string& user_id,
                                     const std::string& conv_id,
                                     const std::string& working_directory);
+  bool UpdateConversationSystemPrompt(const std::string& user_id,
+                                      const std::string& conv_id,
+                                      const std::string& system_prompt);
   bool DeleteConversation(const std::string& user_id,
                           const std::string& conv_id);
   bool AddMessage(const std::string& user_id, const std::string& conv_id,
                   const ChatMessageRecord& msg);
+  bool ReplaceMessages(const std::string& user_id, const std::string& conv_id,
+                       const std::vector<ChatMessageRecord>& messages);
 
   UserSettingsRecord GetSettings(const std::string& user_id);
   void SaveSettings(const UserSettingsRecord& settings);

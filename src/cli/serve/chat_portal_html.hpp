@@ -1374,19 +1374,21 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       position: absolute;
       bottom: calc(100% + 10px);
       left: 0;
-      width: 290px;
+      width: 320px;
       max-width: calc(100vw - 32px);
-      background: rgba(22, 22, 27, 0.96);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
+      max-height: 82vh;
+      overflow-y: auto;
+      background: rgba(20, 20, 25, 0.97);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
       border: 1px solid var(--border-strong);
       border-radius: var(--radius-lg);
-      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.04);
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.05);
       padding: 8px;
       z-index: 100;
       display: flex;
       flex-direction: column;
-      gap: 2px;
+      gap: 3px;
       animation: attachPopIn 0.16s cubic-bezier(0.16, 1, 0.3, 1);
     }
     @keyframes attachPopIn {
@@ -1455,6 +1457,200 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       height: 1px;
       background: var(--border);
       margin: 4px 6px;
+    }
+    .attach-popup-card {
+      padding: 6px 10px;
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.04);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .attach-card-label {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .btn-mini-arrow {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      font-size: 0.68rem;
+      padding: 2px 6px;
+      cursor: pointer;
+      border-radius: var(--radius-sm);
+      transition: all 0.15s ease;
+      line-height: 1;
+    }
+    .btn-mini-arrow:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+    .attach-subgroup-container {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 6px;
+      background: rgba(0, 0, 0, 0.35);
+      border-radius: var(--radius);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      margin: 2px 2px 4px 2px;
+    }
+    .attach-group-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 5px 8px;
+      border-radius: var(--radius-sm);
+      transition: background 0.12s;
+    }
+    .attach-group-row:hover {
+      background: rgba(255, 255, 255, 0.04);
+    }
+    .attach-group-info {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .attach-group-title {
+      font-size: 0.8rem;
+      font-weight: 500;
+      color: var(--text);
+    }
+    .attach-group-count {
+      font-size: 0.68rem;
+      color: var(--text-dim);
+    }
+    .popup-select {
+      width: 100%;
+      background: var(--bg-card);
+      color: var(--text);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      padding: 6px 8px;
+      font-size: 0.8rem;
+      font-family: var(--font-sans);
+      outline: none;
+      cursor: pointer;
+    }
+    .popup-select:focus {
+      border-color: var(--accent);
+    }
+    .btn-mini-action {
+      background: var(--bg-hover);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-size: 0.7rem;
+      font-weight: 500;
+      padding: 2px 7px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-mini-action:hover {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .segmented-control {
+      display: flex;
+      background: var(--bg-elevated);
+      border-radius: var(--radius-sm);
+      padding: 2px;
+      gap: 2px;
+      border: 1px solid var(--border);
+    }
+    .seg-btn {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: var(--text-dim);
+      font-size: 0.74rem;
+      font-weight: 500;
+      padding: 5px 0;
+      border-radius: 3px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      text-align: center;
+    }
+    .seg-btn:hover {
+      color: var(--text);
+    }
+    .seg-btn.active {
+      background: var(--accent);
+      color: #fff;
+      font-weight: 600;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    }
+    .context-meter-bg {
+      width: 100%;
+      height: 5px;
+      background: var(--bg-elevated);
+      border-radius: 9999px;
+      overflow: hidden;
+      margin: 4px 0 2px 0;
+    }
+    .context-meter-bar {
+      height: 100%;
+      background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+      border-radius: 9999px;
+      transition: width 0.3s ease;
+    }
+    .btn-compact-context {
+      background: rgba(139, 92, 246, 0.18);
+      border: 1px solid rgba(139, 92, 246, 0.35);
+      color: #c4b5fd;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 3px 9px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .btn-compact-context:hover {
+      background: rgba(139, 92, 246, 0.35);
+      border-color: #8b5cf6;
+      color: #fff;
+    }
+    .attached-files-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 6px 12px 2px 12px;
+    }
+    .attached-file-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      padding: 3px 8px;
+      border-radius: var(--radius-sm);
+      font-size: 0.75rem;
+      color: var(--text);
+      animation: attachPopIn 0.15s ease;
+    }
+    .attached-file-pill .file-size {
+      color: var(--text-dim);
+      font-size: 0.7rem;
+    }
+    .attached-file-pill .btn-remove-file {
+      background: transparent;
+      border: none;
+      color: var(--text-dim);
+      font-size: 0.95rem;
+      cursor: pointer;
+      line-height: 1;
+      padding: 0 2px;
+    }
+    .attached-file-pill .btn-remove-file:hover {
+      color: var(--danger);
     }
     .attach-popup-tools-row {
       display: flex;
@@ -1786,28 +1982,41 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               <img id="thumb-img" class="image-thumb" src="" alt="preview">
               <button id="btn-remove-thumb" class="btn-remove-thumb">&times;</button>
             </div>
+            <div id="attached-files-bar" class="attached-files-bar" style="display:none;"></div>
             <div class="input-row">
-              <input type="file" id="file-uploader" accept="image/*,.txt,.md,.json,.py,.cpp,.h,.js,.ts,.html,.css,.log,.csv" style="display:none">
+              <input type="file" id="file-uploader-image" accept="image/*" style="display:none">
+              <input type="file" id="file-uploader-doc" accept=".txt,.md,.json,.py,.cpp,.h,.hpp,.c,.js,.ts,.html,.css,.log,.csv,.pdf,.yaml,.toml,.rs,.go,.sh,.bat,.cmd,.xml,.ini,.cfg" multiple style="display:none">
               
               <!-- Attachment Button & Popover Menu -->
               <div class="attach-menu-container">
-                <button id="btn-upload-file" class="btn-icon-input" title="Attachments, Working Directory & Tools" type="button">
+                <button id="btn-upload-file" class="btn-icon-input" title="Context, Attachments & Tools" type="button">
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
                   <span id="attach-tools-badge" class="attach-tools-badge" title="Agent Tools Status"></span>
                 </button>
 
-                <!-- Attachment & Tools Popover Menu -->
+                <!-- Attachment & Context Popover Menu (All 7 Menu Items) -->
                 <div id="attach-popup-menu" class="attach-popup-menu" style="display:none;">
-                  <div class="attach-popup-header">Chat Tools &amp; Files</div>
+                  <div class="attach-popup-header">Attachments &amp; Context</div>
                   
-                  <div id="attach-item-upload" class="attach-popup-item">
-                    <span class="attach-item-icon">📎</span>
+                  <!-- 1. Attach images (to be added in context) -->
+                  <div id="attach-item-image" class="attach-popup-item">
+                    <span class="attach-item-icon">🖼️</span>
                     <div class="attach-item-info">
-                      <div class="attach-item-title">Attach File / Image</div>
-                      <div class="attach-item-sub">Images, text or code files</div>
+                      <div class="attach-item-title">Attach Images</div>
+                      <div class="attach-item-sub">Add visual context for multimodal vision</div>
                     </div>
                   </div>
 
+                  <!-- 2. Attach Files -->
+                  <div id="attach-item-files" class="attach-popup-item">
+                    <span class="attach-item-icon">📄</span>
+                    <div class="attach-item-info">
+                      <div class="attach-item-title">Attach Files</div>
+                      <div class="attach-item-sub">Code, markdown, json, logs, or text files</div>
+                    </div>
+                  </div>
+
+                  <!-- 3. Working directory (Show selected directory name from server) -->
                   <div id="attach-item-workdir" class="attach-popup-item">
                     <span class="attach-item-icon">📁</span>
                     <div class="attach-item-info">
@@ -1819,27 +2028,77 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
                   <div class="attach-popup-divider"></div>
 
+                  <!-- 4. Enable / disable all mcp tools -->
                   <div class="attach-popup-tools-row">
                     <div style="display:flex; align-items:center; gap:8px;">
                       <span style="font-size:1.05rem;">⚡</span>
                       <div>
-                        <div style="font-size:0.83rem; font-weight:600; color:var(--text);">Agent Tools</div>
+                        <div style="font-size:0.83rem; font-weight:600; color:var(--text);">Agent &amp; MCP Tools</div>
                         <div id="attach-tools-status-text" style="font-size:0.7rem; color:var(--text-dim);">8 tools enabled</div>
                       </div>
                     </div>
-                    <label class="switch-toggle-mini" title="Toggle tools ON / OFF" style="cursor:pointer; margin:0;" onclick="event.stopPropagation();">
-                      <input type="checkbox" id="chk-master-tools" checked>
-                      <span class="slider-mini"></span>
-                    </label>
+                    <div style="display:flex; align-items:center; gap:6px;">
+                      <button id="btn-toggle-tools-submenu" class="btn-mini-arrow" title="Toggle tool groups submenu" type="button">Groups ▼</button>
+                      <label class="switch-toggle-mini" title="Toggle all tools ON / OFF" style="cursor:pointer; margin:0;" onclick="event.stopPropagation();">
+                        <input type="checkbox" id="chk-master-tools" checked>
+                        <span class="slider-mini"></span>
+                      </label>
+                    </div>
                   </div>
 
-                  <div id="attach-item-mcp-settings" class="attach-popup-item" style="margin-top:2px;">
-                    <span class="attach-item-icon">🔧</span>
-                    <div class="attach-item-info">
-                      <div class="attach-item-title">Tools &amp; MCP Settings</div>
-                      <div class="attach-item-sub">Configure tools &amp; external servers</div>
+                  <!-- 4.a - Submenu (list all mcp tool groups, can enable and disable) -->
+                  <div id="attach-tools-groups-sub" class="attach-subgroup-container" style="display:none;">
+                    <div style="font-size:0.68rem; font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.04em; padding:2px 4px;">Tool Groups</div>
+                    <div id="attach-tool-groups-list" style="display:flex; flex-direction:column; gap:2px;"></div>
+                    <div style="display:flex; justify-content:flex-end; padding-top:2px;">
+                      <button id="attach-btn-manage-tools" class="btn-mini-action" type="button" style="font-size:0.68rem;">Advanced MCP Settings ➔</button>
                     </div>
-                    <span class="attach-item-arrow">➔</span>
+                  </div>
+
+                  <div class="attach-popup-divider"></div>
+
+                  <!-- 5. System prompt drop down and a button to add new -->
+                  <div class="attach-popup-card">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                      <div class="attach-card-label">System Prompt</div>
+                      <button id="btn-popup-new-prompt" class="btn-mini-action" type="button">+ New</button>
+                    </div>
+                    <select id="popup-system-prompt-select" class="popup-select">
+                      <option value="default">Gufo Assistant (Default)</option>
+                      <option value="coder">Expert Software Engineer</option>
+                      <option value="concise">Concise &amp; Direct</option>
+                      <option value="reasoner">Deep Reasoning &amp; Logic</option>
+                      <option value="creative">Creative &amp; Brainstorm</option>
+                    </select>
+                  </div>
+
+                  <div class="attach-popup-divider"></div>
+
+                  <!-- 6. Thinking level -->
+                  <div class="attach-popup-card">
+                    <div class="attach-card-label">Thinking Level</div>
+                    <div class="segmented-control" id="thinking-level-control">
+                      <button type="button" class="seg-btn" data-level="off">Off</button>
+                      <button type="button" class="seg-btn active" data-level="standard">Standard</button>
+                      <button type="button" class="seg-btn" data-level="deep">Deep</button>
+                    </div>
+                  </div>
+
+                  <div class="attach-popup-divider"></div>
+
+                  <!-- 7. Current context size and compact button -->
+                  <div class="attach-popup-card">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                      <div class="attach-card-label">Current Context</div>
+                      <span id="popup-context-tokens" style="font-size:0.72rem; color:var(--text-muted); font-family:var(--font-mono);">0 / 262k</span>
+                    </div>
+                    <div class="context-meter-bg">
+                      <div id="popup-context-bar" class="context-meter-bar" style="width:0%;"></div>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-top:2px;">
+                      <span id="popup-context-pct" style="font-size:0.68rem; color:var(--text-dim);">0.0% used</span>
+                      <button id="btn-compact-context" class="btn-compact-context" type="button" title="Compact earlier conversation turns into concise summary">🧹 Compact</button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -2183,6 +2442,36 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- New System Prompt Dialog -->
+  <div id="new-prompt-dialog" class="dialog-backdrop">
+    <div class="dialog-box" style="max-width:500px;">
+      <div class="dialog-header">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="font-size:1.15rem;">✨</span>
+          <span style="font-weight:700; font-size:1rem;">Add Custom System Prompt</span>
+        </div>
+        <button id="btn-close-new-prompt" class="btn-top" style="padding:2px 8px;">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <div style="font-size:0.8rem; color:var(--text-muted); line-height:1.4;">
+          Create a personalized system prompt persona. Custom prompts are saved locally and immediately selectable from the attachment popup menu.
+        </div>
+        <div class="setting-group">
+          <label class="setting-label">Prompt Name</label>
+          <input type="text" id="new-prompt-name-inp" class="setting-input" placeholder="e.g. C++ Kernel Expert">
+        </div>
+        <div class="setting-group">
+          <label class="setting-label">Instructions / Persona</label>
+          <textarea id="new-prompt-text-inp" class="setting-textarea" rows="4" placeholder="You are an expert in..."></textarea>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:8px;">
+          <button id="btn-save-new-prompt" class="btn-dialog-submit" style="flex:1;">Save &amp; Select</button>
+          <button id="btn-cancel-new-prompt" class="btn-top" style="padding:0 14px;">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Auth Modal (Sign In / Register) -->
   <div id="auth-dialog" class="dialog-backdrop">
     <div class="dialog-box">
@@ -2220,6 +2509,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       activeId: null,
       activeConv: null,
       attachedImage: null,
+      attachedFiles: [],
+      thinkingLevel: localStorage.getItem('gufo_thinking_level') || 'standard',
+      customPrompts: JSON.parse(localStorage.getItem('gufo_custom_prompts') || '[]'),
       isGenerating: false,
       abortController: null,
       mode: 'chat', // 'chat' or 'comp'
@@ -2288,17 +2580,37 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       imageBar: $('image-bar'),
       thumbImg: $('thumb-img'),
       btnRemoveThumb: $('btn-remove-thumb'),
-      fileUploader: $('file-uploader'),
-      // Attachment & Popover Menu
+      attachedFilesBar: $('attached-files-bar'),
+      fileUploaderImage: $('file-uploader-image'),
+      fileUploaderDoc: $('file-uploader-doc'),
+      // Attachment & Popover Menu (7 Menu Items)
       btnUploadFile: $('btn-upload-file'),
       attachToolsBadge: $('attach-tools-badge'),
       attachPopupMenu: $('attach-popup-menu'),
-      attachItemUpload: $('attach-item-upload'),
+      attachItemImage: $('attach-item-image'),
+      attachItemFiles: $('attach-item-files'),
       attachItemWorkdir: $('attach-item-workdir'),
       attachPopupWorkdirSub: $('attach-popup-workdir-sub'),
       chkMasterTools: $('chk-master-tools'),
       attachToolsStatusText: $('attach-tools-status-text'),
-      attachItemMcpSettings: $('attach-item-mcp-settings'),
+      btnToggleToolsSubmenu: $('btn-toggle-tools-submenu'),
+      attachToolsGroupsSub: $('attach-tools-groups-sub'),
+      attachToolGroupsList: $('attach-tool-groups-list'),
+      attachBtnManageTools: $('attach-btn-manage-tools'),
+      popupSystemPromptSelect: $('popup-system-prompt-select'),
+      btnPopupNewPrompt: $('btn-popup-new-prompt'),
+      thinkingLevelControl: $('thinking-level-control'),
+      popupContextTokens: $('popup-context-tokens'),
+      popupContextBar: $('popup-context-bar'),
+      popupContextPct: $('popup-context-pct'),
+      btnCompactContext: $('btn-compact-context'),
+      // New System Prompt Dialog
+      newPromptDialog: $('new-prompt-dialog'),
+      btnCloseNewPrompt: $('btn-close-new-prompt'),
+      btnCancelNewPrompt: $('btn-cancel-new-prompt'),
+      btnSaveNewPrompt: $('btn-save-new-prompt'),
+      newPromptNameInp: $('new-prompt-name-inp'),
+      newPromptTextInp: $('new-prompt-text-inp'),
       // Conversation Working Directory Modal
       convWorkdirDialog: $('conv-workdir-dialog'),
       btnCloseConvWorkdir: $('btn-close-conv-workdir'),
@@ -2793,6 +3105,23 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       }
     }
 
+    // 7 Attachment & Context Menu Items Implementation
+    const TOOL_GROUPS = [
+      { id: 'fs', name: 'Filesystem Tools', icon: '📁', tools: ['read_file', 'write_file', 'edit_file', 'apply_diff'] },
+      { id: 'search', name: 'Code & Inspection', icon: '🔍', tools: ['file_glob_search', 'grep_search', 'get_datetime'] },
+      { id: 'shell', name: 'Shell Execution', icon: '💻', tools: ['exec_shell_command'] },
+      { id: 'web', name: 'Web Access', icon: '🌐', tools: ['fetch_web_page'] },
+      { id: 'mcp_custom', name: 'MCP & Custom Tools', icon: '🔌', isCustom: true }
+    ];
+
+    const DEFAULT_SYSTEM_PROMPTS = {
+      default: 'You are a helpful, respectful and honest assistant.',
+      coder: 'You are an expert software engineer and systems architect. Write clean, idiomatic, high-performance code with minimal fluff and direct explanations.',
+      concise: 'You are a concise, direct AI assistant. Keep responses brief, clear, and straight to the point without filler or preamble.',
+      reasoner: 'You are a meticulous reasoning assistant. Think through problems step by step, exploring assumptions, edge cases, and verifying conclusions.',
+      creative: 'You are an imaginative creative assistant and brainstormer, providing novel ideas, rich analogies, and diverse perspectives.'
+    };
+
     function openAttachPopup() {
       if (!UI.attachPopupMenu) return;
       updateAttachPopupUI();
@@ -2801,9 +3130,12 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
     function closeAttachPopup() {
       if (UI.attachPopupMenu) UI.attachPopupMenu.style.display = 'none';
+      if (UI.attachToolsGroupsSub) UI.attachToolsGroupsSub.style.display = 'none';
+      if (UI.btnToggleToolsSubmenu) UI.btnToggleToolsSubmenu.textContent = 'Groups ▼';
     }
 
     function updateAttachPopupUI() {
+      // 3. Working directory display
       if (UI.attachPopupWorkdirSub) {
         let wd = (APP.activeConv && APP.activeConv.working_directory) ? APP.activeConv.working_directory : '';
         if (wd) {
@@ -2816,31 +3148,357 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           UI.attachPopupWorkdirSub.title = 'Default folder';
         }
       }
+
+      // 4. Master tools switch & status
       if (UI.chkMasterTools) {
         UI.chkMasterTools.checked = APP.toolsEnabled;
       }
+      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.enabled).length;
+      const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
+      const total = activeInbuilt + activeCustom;
       if (UI.attachToolsStatusText) {
-        const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.enabled).length;
-        const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
-        const total = activeInbuilt + activeCustom;
         UI.attachToolsStatusText.textContent = APP.toolsEnabled ? `${total} tools active` : 'Tools disabled';
+      }
+
+      // 4.a Render tool groups
+      renderToolGroupsSubmenu();
+
+      // 5. System prompt dropdown
+      renderSystemPromptDropdown();
+
+      // 6. Thinking level buttons
+      renderThinkingLevelButtons();
+
+      // 7. Context size calculation
+      calculateContextSize();
+    }
+
+    function renderToolGroupsSubmenu() {
+      if (!UI.attachToolGroupsList) return;
+      UI.attachToolGroupsList.innerHTML = '';
+
+      TOOL_GROUPS.forEach(group => {
+        let totalInGroup = 0;
+        let activeInGroup = 0;
+
+        if (group.isCustom) {
+          totalInGroup = (APP.tools.customTools || []).length + (APP.tools.mcpServers || []).length;
+          activeInGroup = (APP.tools.customTools || []).filter(c => c.enabled).length + (APP.tools.mcpServers || []).filter(s => s.enabled).length;
+        } else {
+          const groupTools = (APP.tools.inbuilt || []).filter(t => group.tools.includes(t.name));
+          totalInGroup = groupTools.length;
+          activeInGroup = groupTools.filter(t => t.enabled).length;
+        }
+
+        const isGroupEnabled = totalInGroup > 0 ? activeInGroup > 0 : true;
+
+        const row = document.createElement('div');
+        row.className = 'attach-group-row';
+        row.innerHTML = `
+          <div class="attach-group-info">
+            <span>${group.icon}</span>
+            <div>
+              <div class="attach-group-title">${escapeHtml(group.name)}</div>
+              <div class="attach-group-count">${activeInGroup}/${totalInGroup} active</div>
+            </div>
+          </div>
+          <label class="switch-toggle-mini" title="Toggle ${escapeHtml(group.name)}" onclick="event.stopPropagation();">
+            <input type="checkbox" ${isGroupEnabled ? 'checked' : ''} ${!APP.toolsEnabled ? 'disabled' : ''}>
+            <span class="slider-mini"></span>
+          </label>
+        `;
+
+        const chk = row.querySelector('input[type="checkbox"]');
+        chk.addEventListener('change', (e) => {
+          const enable = e.target.checked;
+          if (group.isCustom) {
+            (APP.tools.customTools || []).forEach(c => c.enabled = enable);
+            (APP.tools.mcpServers || []).forEach(s => s.enabled = enable);
+          } else {
+            (APP.tools.inbuilt || []).forEach(t => {
+              if (group.tools.includes(t.name)) {
+                t.enabled = enable;
+              }
+            });
+            saveInbuiltTools();
+          }
+          updateToolsPill();
+          renderToolGroupsSubmenu();
+        });
+
+        UI.attachToolGroupsList.appendChild(row);
+      });
+    }
+
+    function renderSystemPromptDropdown() {
+      if (!UI.popupSystemPromptSelect) return;
+      const currentPrompt = APP.settings.system_prompt || '';
+      UI.popupSystemPromptSelect.innerHTML = '';
+
+      // Standard presets
+      const standardKeys = [
+        { key: 'default', label: 'Gufo Assistant (Default)' },
+        { key: 'coder', label: 'Expert Software Engineer' },
+        { key: 'concise', label: 'Concise & Direct' },
+        { key: 'reasoner', label: 'Deep Reasoning & Logic' },
+        { key: 'creative', label: 'Creative & Brainstorm' }
+      ];
+
+      let matched = false;
+      standardKeys.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.key;
+        opt.textContent = p.label;
+        if (DEFAULT_SYSTEM_PROMPTS[p.key] === currentPrompt) {
+          opt.selected = true;
+          matched = true;
+        }
+        UI.popupSystemPromptSelect.appendChild(opt);
+      });
+
+      // User custom prompts
+      if (APP.customPrompts && APP.customPrompts.length > 0) {
+        const optgroup = document.createElement('optgroup');
+        optgroup.label = 'Custom Presets';
+        APP.customPrompts.forEach((cp, idx) => {
+          const opt = document.createElement('option');
+          opt.value = `custom_${idx}`;
+          opt.textContent = `⭐ ${cp.name}`;
+          if (cp.prompt === currentPrompt) {
+            opt.selected = true;
+            matched = true;
+          }
+          optgroup.appendChild(opt);
+        });
+        UI.popupSystemPromptSelect.appendChild(optgroup);
+      }
+
+      // If current prompt doesn't match presets, add custom option
+      if (!matched && currentPrompt) {
+        const customOpt = document.createElement('option');
+        customOpt.value = 'active_custom';
+        customOpt.textContent = 'Active Custom Prompt';
+        customOpt.selected = true;
+        UI.popupSystemPromptSelect.appendChild(customOpt);
       }
     }
 
-    if (UI.btnUploadFile) {
-      UI.btnUploadFile.addEventListener('click', (e) => {
-        e.stopPropagation();
-        toggleAttachPopup();
+    if (UI.popupSystemPromptSelect) {
+      UI.popupSystemPromptSelect.addEventListener('change', async (e) => {
+        const val = e.target.value;
+        let newPromptText = '';
+        if (DEFAULT_SYSTEM_PROMPTS[val]) {
+          newPromptText = DEFAULT_SYSTEM_PROMPTS[val];
+        } else if (val.startsWith('custom_')) {
+          const idx = parseInt(val.split('_')[1], 10);
+          if (APP.customPrompts[idx]) {
+            newPromptText = APP.customPrompts[idx].prompt;
+          }
+        }
+        if (newPromptText) {
+          APP.settings.system_prompt = newPromptText;
+          if (UI.setSystemPrompt) UI.setSystemPrompt.value = newPromptText;
+          if (APP.activeId) {
+            try {
+              await apiFetch(`/api/conversations/${APP.activeId}`, {
+                method: 'PATCH',
+                body: { system_prompt: newPromptText }
+              });
+              if (APP.activeConv) APP.activeConv.system_prompt = newPromptText;
+            } catch (_) {}
+          }
+          try {
+            await apiFetch('/api/settings', { method: 'POST', body: APP.settings });
+          } catch (_) {}
+          calculateContextSize();
+        }
       });
     }
 
-    if (UI.attachItemUpload) {
-      UI.attachItemUpload.addEventListener('click', () => {
+    // New Custom System Prompt Dialog handlers
+    if (UI.btnPopupNewPrompt) {
+      UI.btnPopupNewPrompt.addEventListener('click', () => {
         closeAttachPopup();
-        if (UI.fileUploader) UI.fileUploader.click();
+        if (UI.newPromptNameInp) UI.newPromptNameInp.value = '';
+        if (UI.newPromptTextInp) UI.newPromptTextInp.value = '';
+        if (UI.newPromptDialog) UI.newPromptDialog.classList.add('show');
       });
     }
 
+    function closeNewPromptModal() {
+      if (UI.newPromptDialog) UI.newPromptDialog.classList.remove('show');
+    }
+
+    if (UI.btnCloseNewPrompt) UI.btnCloseNewPrompt.addEventListener('click', closeNewPromptModal);
+    if (UI.btnCancelNewPrompt) UI.btnCancelNewPrompt.addEventListener('click', closeNewPromptModal);
+    if (UI.newPromptDialog) {
+      UI.newPromptDialog.addEventListener('click', e => {
+        if (e.target === UI.newPromptDialog) closeNewPromptModal();
+      });
+    }
+
+    if (UI.btnSaveNewPrompt) {
+      UI.btnSaveNewPrompt.addEventListener('click', async () => {
+        const name = (UI.newPromptNameInp ? UI.newPromptNameInp.value : '').trim();
+        const text = (UI.newPromptTextInp ? UI.newPromptTextInp.value : '').trim();
+        if (!name || !text) {
+          alert('Please provide both a preset name and prompt instructions.');
+          return;
+        }
+
+        APP.customPrompts.push({ name, prompt: text });
+        localStorage.setItem('gufo_custom_prompts', JSON.stringify(APP.customPrompts));
+        APP.settings.system_prompt = text;
+        if (UI.setSystemPrompt) UI.setSystemPrompt.value = text;
+        if (APP.activeId) {
+          try {
+            await apiFetch(`/api/conversations/${APP.activeId}`, {
+              method: 'PATCH',
+              body: { system_prompt: text }
+            });
+            if (APP.activeConv) APP.activeConv.system_prompt = text;
+          } catch (_) {}
+        }
+        try {
+          await apiFetch('/api/settings', { method: 'POST', body: APP.settings });
+        } catch (_) {}
+
+        closeNewPromptModal();
+        renderSystemPromptDropdown();
+        calculateContextSize();
+      });
+    }
+
+    // 6. Thinking Level Control
+    function renderThinkingLevelButtons() {
+      if (!UI.thinkingLevelControl) return;
+      const btns = UI.thinkingLevelControl.querySelectorAll('.seg-btn');
+      btns.forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.level === APP.thinkingLevel);
+      });
+    }
+
+    if (UI.thinkingLevelControl) {
+      UI.thinkingLevelControl.addEventListener('click', (e) => {
+        const btn = e.target.closest('.seg-btn');
+        if (!btn) return;
+        APP.thinkingLevel = btn.dataset.level || 'standard';
+        localStorage.setItem('gufo_thinking_level', APP.thinkingLevel);
+        renderThinkingLevelButtons();
+      });
+    }
+
+    // 7. Context Size Calculation & Compaction
+    function calculateContextSize() {
+      let chars = (APP.settings.system_prompt || '').length;
+      if (APP.activeConv && APP.activeConv.messages) {
+        for (const m of APP.activeConv.messages) {
+          chars += (m.content || '').length + (m.reasoning_content || '').length + 24;
+        }
+      }
+      if (APP.attachedFiles) {
+        for (const f of APP.attachedFiles) {
+          chars += (f.content || '').length + 60;
+        }
+      }
+      const estimatedTokens = Math.max(0, Math.round(chars / 3.8));
+      const maxContext = 262144; // 262k
+      const pct = Math.min(100, (estimatedTokens / maxContext) * 100);
+
+      if (UI.popupContextTokens) {
+        UI.popupContextTokens.textContent = `${estimatedTokens.toLocaleString()} / 262k`;
+      }
+      if (UI.popupContextBar) {
+        UI.popupContextBar.style.width = `${Math.max(1, pct)}%`;
+      }
+      if (UI.popupContextPct) {
+        UI.popupContextPct.textContent = `${pct.toFixed(1)}% used`;
+      }
+      return { estimatedTokens, maxContext, pct };
+    }
+
+    async function compactActiveConversation() {
+      if (!APP.activeId || !APP.activeConv || !APP.activeConv.messages || APP.activeConv.messages.length <= 3) {
+        alert('Conversation context is already minimal; compaction not required.');
+        return;
+      }
+      const msgs = APP.activeConv.messages;
+      if (!confirm(`Compact this conversation? Older turns will be condensed into a concise summary to free up model context.`)) {
+        return;
+      }
+
+      if (UI.btnCompactContext) {
+        UI.btnCompactContext.disabled = true;
+        UI.btnCompactContext.textContent = 'Compacting...';
+      }
+
+      try {
+        const keepLast = 4;
+        const olderMsgs = msgs.slice(0, msgs.length - keepLast);
+        const recentMsgs = msgs.slice(msgs.length - keepLast);
+
+        let summaryText = 'Summary of earlier conversation:\n';
+        for (const m of olderMsgs) {
+          const snippet = (m.content || '').replace(/\s+/g, ' ').slice(0, 140);
+          summaryText += `- ${m.role}: ${snippet}${m.content.length > 140 ? '...' : ''}\n`;
+        }
+
+        const compactedMessages = [
+          {
+            role: 'system',
+            content: `[Previous Context Summary]\n${summaryText}`
+          },
+          ...recentMsgs
+        ];
+
+        const res = await apiFetch(`/api/conversations/${APP.activeId}/messages`, {
+          method: 'PUT',
+          body: { messages: compactedMessages }
+        });
+
+        if (res.ok) {
+          const refreshRes = await apiFetch(`/api/conversations/${APP.activeId}`);
+          if (refreshRes.ok) {
+            APP.activeConv = await refreshRes.json();
+            renderMessages(APP.activeConv.messages);
+          }
+          calculateContextSize();
+          closeAttachPopup();
+          alert('Context compacted successfully!');
+        } else {
+          throw new Error('Failed to save compacted messages');
+        }
+      } catch (err) {
+        alert('Compaction failed: ' + err.message);
+      } finally {
+        if (UI.btnCompactContext) {
+          UI.btnCompactContext.disabled = false;
+          UI.btnCompactContext.textContent = '🧹 Compact';
+        }
+      }
+    }
+
+    if (UI.btnCompactContext) {
+      UI.btnCompactContext.addEventListener('click', compactActiveConversation);
+    }
+
+    // 1. Attach Images Item
+    if (UI.attachItemImage) {
+      UI.attachItemImage.addEventListener('click', () => {
+        closeAttachPopup();
+        if (UI.fileUploaderImage) UI.fileUploaderImage.click();
+      });
+    }
+
+    // 2. Attach Files Item
+    if (UI.attachItemFiles) {
+      UI.attachItemFiles.addEventListener('click', () => {
+        closeAttachPopup();
+        if (UI.fileUploaderDoc) UI.fileUploaderDoc.click();
+      });
+    }
+
+    // 3. Working Directory Item
     if (UI.attachItemWorkdir) {
       UI.attachItemWorkdir.addEventListener('click', () => {
         closeAttachPopup();
@@ -2848,16 +3506,35 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       });
     }
 
-    if (UI.attachItemMcpSettings) {
-      UI.attachItemMcpSettings.addEventListener('click', () => {
+    // 4. Toggle Tool Groups Submenu Button
+    if (UI.btnToggleToolsSubmenu) {
+      UI.btnToggleToolsSubmenu.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (!UI.attachToolsGroupsSub) return;
+        const isHidden = UI.attachToolsGroupsSub.style.display === 'none';
+        UI.attachToolsGroupsSub.style.display = isHidden ? 'flex' : 'none';
+        UI.btnToggleToolsSubmenu.textContent = isHidden ? 'Groups ▲' : 'Groups ▼';
+      });
+    }
+
+    if (UI.attachBtnManageTools) {
+      UI.attachBtnManageTools.addEventListener('click', () => {
         closeAttachPopup();
         openDrawer('tools');
       });
     }
 
+    // Attachment Button Toggle
+    if (UI.btnUploadFile) {
+      UI.btnUploadFile.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleAttachPopup();
+      });
+    }
+
     document.addEventListener('click', (e) => {
       if (UI.attachPopupMenu && UI.attachPopupMenu.style.display === 'flex') {
-        if (!e.target.closest('.attach-menu-container')) {
+        if (!e.target.closest('.attach-menu-container') && !e.target.closest('#new-prompt-dialog')) {
           closeAttachPopup();
         }
       }
@@ -3558,14 +4235,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       UI.messagesContainer.scrollTop = UI.messagesContainer.scrollHeight;
     }
 
-    // Image upload & paste
-    if (UI.btnUploadFile) {
-      UI.btnUploadFile.addEventListener('click', () => {
-        if (UI.fileUploader) UI.fileUploader.click();
-      });
-    }
-    if (UI.fileUploader) {
-      UI.fileUploader.addEventListener('change', e => {
+    // Image upload & paste handling
+    if (UI.fileUploaderImage) {
+      UI.fileUploaderImage.addEventListener('change', e => {
         const file = e.target.files[0];
         if (file) handleImageFile(file);
       });
@@ -3584,7 +4256,67 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       UI.btnRemoveThumb.addEventListener('click', () => {
         APP.attachedImage = null;
         if (UI.imageBar) UI.imageBar.style.display = 'none';
-        if (UI.fileUploader) UI.fileUploader.value = '';
+        if (UI.fileUploaderImage) UI.fileUploaderImage.value = '';
+      });
+    }
+
+    // Document & Code Files Upload Handling
+    if (UI.fileUploaderDoc) {
+      UI.fileUploaderDoc.addEventListener('change', async e => {
+        const files = Array.from(e.target.files || []);
+        for (const file of files) {
+          try {
+            const content = await readFileAsText(file);
+            APP.attachedFiles.push({
+              name: file.name,
+              size: file.size,
+              content: content
+            });
+          } catch (err) {
+            console.error('Failed to read file:', file.name, err);
+          }
+        }
+        UI.fileUploaderDoc.value = '';
+        renderAttachedFilesBar();
+        calculateContextSize();
+      });
+    }
+
+    function readFileAsText(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsText(file);
+      });
+    }
+
+    function renderAttachedFilesBar() {
+      if (!UI.attachedFilesBar) return;
+      if (!APP.attachedFiles || APP.attachedFiles.length === 0) {
+        UI.attachedFilesBar.style.display = 'none';
+        UI.attachedFilesBar.innerHTML = '';
+        return;
+      }
+      UI.attachedFilesBar.style.display = 'flex';
+      UI.attachedFilesBar.innerHTML = '';
+      APP.attachedFiles.forEach((f, idx) => {
+        const pill = document.createElement('div');
+        pill.className = 'attached-file-pill';
+        const formattedSize = f.size > 1024 ? `${(f.size / 1024).toFixed(1)} KB` : `${f.size} B`;
+        pill.innerHTML = `
+          <span>📄</span>
+          <span style="font-weight:500; max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(f.name)}</span>
+          <span class="file-size">(${formattedSize})</span>
+          <button type="button" class="btn-remove-file" title="Remove attachment">&times;</button>
+        `;
+        pill.querySelector('.btn-remove-file').addEventListener('click', (e) => {
+          e.stopPropagation();
+          APP.attachedFiles.splice(idx, 1);
+          renderAttachedFilesBar();
+          calculateContextSize();
+        });
+        UI.attachedFilesBar.appendChild(pill);
       });
     }
 
@@ -3647,8 +4379,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
     // Send Message with Live SSE Streaming & Autonomous Tool Execution
     async function sendMessage() {
-      const text = UI.chatInput.value.trim();
-      if ((!text && !APP.attachedImage) || APP.isGenerating) return;
+      const rawText = UI.chatInput.value.trim();
+      const hasFiles = APP.attachedFiles && APP.attachedFiles.length > 0;
+      if ((!rawText && !APP.attachedImage && !hasFiles) || APP.isGenerating) return;
 
       if (!APP.activeId) await newChat();
 
@@ -3656,7 +4389,21 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       const hero = UI.messagesContainer.querySelector('.llama-hero');
       if (hero) hero.remove();
 
-      appendMessage({ role: 'user', content: text });
+      let text = rawText;
+      let displayMsgText = rawText;
+      if (hasFiles) {
+        let fileBlock = 'Attached Context Files:\n';
+        for (const f of APP.attachedFiles) {
+          fileBlock += `--- BEGIN FILE: ${f.name} (${f.size} bytes) ---\n${f.content}\n--- END FILE: ${f.name} ---\n\n`;
+        }
+        text = fileBlock + (rawText || 'Please inspect the attached file(s).');
+        const fileNamesList = APP.attachedFiles.map(f => `📄 ${escapeHtml(f.name)}`).join(', ');
+        displayMsgText = (rawText ? `${rawText}\n\n` : '') + `*Attached files:* ${fileNamesList}`;
+        APP.attachedFiles = [];
+        renderAttachedFilesBar();
+      }
+
+      appendMessage({ role: 'user', content: displayMsgText });
       scrollDown();
 
       // Persist user message to DB
@@ -3671,7 +4418,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
       // Rename chat on first message
       if (APP.activeConv && (!APP.activeConv.messages || APP.activeConv.messages.length === 0)) {
-        renameChat(APP.activeId, text.slice(0, 28) + (text.length > 28 ? '...' : ''));
+        const titleSource = rawText || (hasFiles ? 'Attached Files Analysis' : 'New Chat');
+        renameChat(APP.activeId, titleSource.slice(0, 28) + (titleSource.length > 28 ? '...' : ''));
       }
 
       // Reset Input
@@ -3774,6 +4522,17 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               top_p: Number(APP.settings.top_p) || 0.95,
               max_tokens: parseInt(APP.settings.max_tokens, 10) || 4096
             };
+            if (APP.thinkingLevel === 'off') {
+              payload.think = false;
+              payload.chat_template_kwargs = { thinking: false };
+            } else if (APP.thinkingLevel === 'deep') {
+              payload.think = true;
+              payload.chat_template_kwargs = { thinking: true, thinking_budget: 16384 };
+              payload.max_tokens = Math.max(payload.max_tokens, 8192);
+            } else {
+              payload.think = true;
+              payload.chat_template_kwargs = { thinking: true };
+            }
             if (activeTools.length > 0) {
               payload.tools = activeTools;
               payload.tool_choice = 'auto';
@@ -4086,6 +4845,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             if (res.ok) APP.activeConv = await res.json();
           } catch (_) {}
         }
+        calculateContextSize();
       }
     }
 
@@ -4221,6 +4981,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       }
       updateWorkingDirUI();
       await loadConversations();
+      updateAttachPopupUI();
     }
 
     init();

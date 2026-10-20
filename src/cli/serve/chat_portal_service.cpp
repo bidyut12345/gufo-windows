@@ -255,6 +255,34 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       }
     }
 
+    // PUT /api/conversations/<id>/messages (Replace all messages, used by context compaction)
+    if (sub_route == "/messages" && req.method == "PUT") {
+      try {
+        const auto body = json::parse(req.body);
+        std::vector<ChatMessageRecord> msgs;
+        const auto* arr = body.is_array() ? &body : body.find("messages");
+        if (arr && arr->is_array()) {
+          for (const auto& item : arr->items()) {
+            ChatMessageRecord msg;
+            msg.id = item.member_str("id");
+            msg.role = item.member_str("role");
+            msg.content = item.member_str("content");
+            msg.reasoning_content = item.member_str("reasoning_content");
+            msgs.push_back(std::move(msg));
+          }
+        }
+        if (db.ReplaceMessages(user->id, conv_id, msgs)) {
+          json::Value out = json::Value::object();
+          out["status"] = "ok";
+          out["count"] = static_cast<double>(msgs.size());
+          return JsonOk(out);
+        }
+        return JsonErr(404, "Not Found", "Conversation not found");
+      } catch (...) {
+        return JsonErr(400, "Bad Request", "Invalid JSON payload");
+      }
+    }
+
     // GET /api/conversations/<id>
     if (sub_route.empty() && req.method == "GET") {
       const auto conv = db.GetConversation(user->id, conv_id);
@@ -295,6 +323,9 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
         if (const auto* t = body.find("title"); t && t->is_string() && !t->str().empty()) {
           updated = db.UpdateConversationTitle(user->id, conv_id, t->str()) || updated;
         }
+        if (const auto* sp = body.find("system_prompt"); sp && sp->is_string()) {
+          updated = db.UpdateConversationSystemPrompt(user->id, conv_id, sp->str()) || updated;
+        }
         if (updated) {
           const auto updated_conv = db.GetConversation(user->id, conv_id);
           json::Value out = json::Value::object();
@@ -302,6 +333,7 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
           if (updated_conv) {
             out["working_directory"] = updated_conv->working_directory;
             out["title"] = updated_conv->title;
+            out["system_prompt"] = updated_conv->system_prompt;
           }
           return JsonOk(out);
         }
