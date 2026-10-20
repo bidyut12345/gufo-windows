@@ -4627,10 +4627,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       `;
     }
 
-      messages.forEach(m => appendMessage(m));
-      scrollDown();
-    }
-
     function appendMessage(m) {
       if (m.role === 'tool') {
         const card = document.createElement('div');
