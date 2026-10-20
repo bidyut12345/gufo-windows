@@ -734,6 +734,35 @@ def check_batches(client, model, checks, width, vision=False, speculative="off")
     assert rejected[1:] == expected[1:], (rejected, expected)
     checks[f"batch_c{width}_rejected_peer_isolation"] = rejected
 
+    # Short greedy answers end at EOS inside a speculative block. A batched
+    # row must stop there exactly as its serial run does (#612).
+    words = ("BRAVO KILO", "CHARLIE ROMEO", "GOLF FOXTROT", "KILO NOVEMBER",
+             "SIERRA JULIET", "ALPHA DELTA", "JULIET GOLF", "TANGO QUEBEC")
+    short = [dict(model=model, temperature=0, seed=42, max_completion_tokens=32,
+                  messages=[{"role": "user", "content":
+                             f"Reply with exactly the words: {pair}"}],
+                  extra_body={"cache_prompt": False,
+                              "chat_template_kwargs": {"enable_thinking": False}})
+             for pair in words]
+    serial = [chat_result(client, body) for body in short]
+    batched, references = [], []
+    for offset in (0, 1):
+        indices = [(index + offset) % len(short) for index in range(len(short))]
+        for group in range(0, len(indices) - width + 1, width):
+            members = indices[group:group + width]
+            barrier = threading.Barrier(width)
+            def together(index):
+                barrier.wait(timeout=30)
+                return chat_result(client, short[index], True)
+            with ThreadPoolExecutor(width) as pool:
+                batched += list(pool.map(together, members))
+            references += [serial[index] for index in members]
+    assert max(row["usage"]["gufo"]["physical_execution_width"] for row in batched) > 1, batched
+    for row, reference in zip(batched, references, strict=True):
+        assert (row["text"], row["finish"]) == (reference["text"], reference["finish"]), (
+            row, reference)
+    checks[f"batch_c{width}_greedy_short_replies_match_serial"] = batched
+
 
 def check_conversations(client, model, checks, vision=False, server_log=None):
     """Exercise thinking controls and cache reuse after a client disconnect."""
@@ -1749,6 +1778,36 @@ def check_tool_edges(client, model, checks, sampling_preset=None):
             if sampling_preset == "deepseek4" and "tool" in order:
                 assert "text" not in order[order.index("tool"):], result
 
+    # The newline a model writes between parallel calls is layout, not a reply.
+    # The turn has no text, as with one call, with or without thinking (#673).
+    pair = [{"name": name, "description": f"Return {name[4:]}.",
+             "parameters": {"type": "object", "properties": {}}}
+            for name in ("get_alpha", "get_beta")]
+    prompt = "Call both tools in one parallel block: get_alpha and get_beta."
+    for effort in ("none", "low"):
+        for endpoint in ("chat", "responses"):
+            for stream in (False, True):
+                if endpoint == "chat":
+                    result = chat_result(client, dict(
+                        **common, messages=[{"role": "user", "content": prompt}],
+                        tools=[{"type": "function", "function": tool} for tool in pair],
+                        tool_choice="auto", parallel_tool_calls=True,
+                        reasoning_effort=effort, max_completion_tokens=1024), stream)
+                else:
+                    result = response_result(client, dict(
+                        **common, input=prompt,
+                        tools=[{"type": "function", **tool} for tool in pair],
+                        tool_choice="auto", parallel_tool_calls=True,
+                        reasoning={"effort": effort}, max_output_tokens=1024,
+                        store=False), stream)
+                name = f"parallel_separator_{endpoint}_{effort}_stream{stream}"
+                checks[name] = result
+                print(f"CHECK {name}", file=sys.stderr, flush=True)
+                assert result["finish"] == "tool_calls", result
+                assert sorted(call["function"]["name"] for call in result["tools"]) == [
+                    "get_alpha", "get_beta"], result
+                assert not result["text"] or result["text"].strip(), result
+
 
 def check_state_edges(client, model, checks, speculative, vision=False, server_log=None):
     """Mode proof and request-local grammar state across limits, errors and reuse."""
@@ -2412,7 +2471,8 @@ def check_prompt_progress(client, model, checks, width, vision, allow_missing, s
 
     if vision:
         image_request = {**cached, "messages": [{"role": "user", "content": [
-            image_content("red"), {"type": "text", "text": "Name the color of this image."}]}]}
+            image_content("red"),
+            {"type": "text", "text": "Name the color of this image. Reply in one lowercase word."}]}]}
         a = chat("progress_image_off", image_request, False)
         b = chat("progress_image_on_cached", image_request)
         assert signature(a) == signature(b) and "red" in b["text"].lower()
