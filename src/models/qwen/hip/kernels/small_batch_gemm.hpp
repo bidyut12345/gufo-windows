@@ -660,8 +660,8 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
   }
 
   if constexpr (DistributedOutput) {
-    static_assert(Batch == 8 || Batch == 14 || Batch == 16);
-    constexpr Index kColumns = Batch == 8 ? 8 : 16;
+    static_assert(Batch == 5 || Batch == 8 || Batch == 14 || Batch == 16);
+    constexpr Index kColumns = Batch <= 8 ? 8 : 16;
     constexpr Index kLanesPerToken = LogicalLanes / kColumns;
     float final[RowsPerWave];
 #pragma unroll

@@ -64,6 +64,46 @@ proposals on that same current history. The older 51.20 tok/s therefore
 is not a matched control for current main's 24.02 tok/s.
 Functional timing limitations are recorded in [QUALITY.md](QUALITY.md#october-21-prefill-and-sampling-review).
 
+## October 21 sampled coding and prose follow-up
+
+The five-token IQ4_XS verification change is measured against the previous
+branch commit `77c82ecb`, with the same Q4 target/draft, release toolchain,
+HTTP requests, seed 31 and default sampling. Thinking is off for these two
+requests; each follows a one-token warm request and completes before its
+1,536-token output limit. These are fresh code/prose generation, not literal
+copying workloads.
+
+| Request | Output tokens | Previous branch tg (tok/s) | Candidate tg (tok/s) |
+| --- | ---: | ---: | ---: |
+| Implement interval merging and its tests | 720 | 54.07 | 54.12 |
+| Explain throughput and latency | 347 | 24.67 | 24.84 |
+
+Outputs, draft counts and cache work are identical. Coding remains effectively
+flat; prose improves about 0.7%. A focused coding replay measures
+54.09 → 54.16 tok/s. Its earlier maximum-token-pause flag remains inconclusive;
+see [quality](QUALITY.md#october-21-coding-and-prose-follow-up).
+The request-bounded diagnostic profiles account for roughly 97% of wall time
+in kernels. Faster cold-weight five-token FFN projections therefore translate
+to a small complete-model gain, not their isolated 7–14% improvement.
+
+Against original main `0c03748a`, the complete branch measures code generation
+at 54.91 → 54.11 tok/s (817 → 720 output tokens) and prose at
+21.99 → 24.81 tok/s (348 → 347 tokens). Those sampled completions differ;
+they are workload observations, not the identical-output kernel comparison
+above. A finished thinking/code request matches main exactly at 3,377 tokens,
+47.46 → 47.53 tok/s. The interval and retry implementations pass independent
+behavior checks.
+
+The final standard pp2048/tg128 mixed controls retain main's complete output,
+prompt/cache and draft counts. No full sweep was repeated:
+
+| Cached depth | Main pp (tok/s) | Candidate pp (tok/s) | Main tg (tok/s) | Candidate tg (tok/s) |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 585.54 | 579.34 | 26.98 | 27.01 |
+| 32,768 | 413.72 | 420.90 | 21.75 | 21.83 |
+
+The October 19 sweep and all llama.cpp rows remain unchanged.
+
 ## Single user, autoregressive
 
 Approximately pp2048 / tg128; depth is the cached prefix in tokens.

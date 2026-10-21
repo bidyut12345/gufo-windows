@@ -15,6 +15,53 @@ parity remain unqualified.
 | Target verification, widths 2–8 and ragged cohorts | Full logits/features match scalar | Full logits/features match scalar |
 | Serving and state | Cancellation, continuation, RAM/disk restore and seeded replay pass | Same; also eight 32K continuation forks |
 
+## October 21 coding and prose follow-up
+
+The retained change affects only five-token IQ4_XS FFN projections. It keeps
+both original lane partials and their reduction order; three unused output
+columns are zero and never read or write extra token rows. Actual 17408/34816
+by 5120 gate/up and 5120 by 17408 down projections match scalar decode
+byte-for-byte, including output guards. The independent CPU-qualified IQ4_XS
+scalar error is 2.38e-7 against the existing 1e-6 limit. Cold read-only mapped
+weights exceeding 128 MiB and three input scales also match exactly.
+
+Native C2–C8 checks pass exact layers, logits, selector probabilities, private
+RNG/controller state, mixed widths/positions and persistent replay. The final
+HTTP default-sampling history through `sampling_concurrent_thinkingFalse`
+passes all 467 timing checks against `77c82ecb`, without output, work or
+coverage changes. Scalar AR, wide prefill, sampling policy and lookup state
+have no new implementation changes.
+
+The sampled coding/prose requests match the previous branch's complete text,
+reasoning, tool/finish fields and draft/cache counts. Independently checked
+generated interval code passes its own tests, 300 half-integer coverage cases,
+input-preservation and invalid-input checks. Generated retry code passes
+exact call/delay counts, capped delays, successful return, original last-error
+identity, nonretryable errors and invalid configuration. Both main and the
+candidate needed a larger output budget for the complete thinking example:
+the retained 4096-token-budget run finishes at 3377 identical tokens.
+The earlier 1536/3072-token truncations are retained, not counted as completed
+task passes. [The functional checker](../../../tests/functional/generation_quality.py)
+requires completed responses.
+
+The prose example is a speed and output-consistency control. Both original
+main and the previous branch make numerical mistakes in their queueing
+examples; this is not a factual-quality pass. The kernel change preserves
+the previous branch's text and does not alter the target distribution.
+
+One coding maximum-token-pause comparison is **inconclusive**:
+138.43 → 155.87 ms, despite unchanged total decode time. An earlier two-kernel
+candidate also reached 157.92 ms. A later retained-candidate run measured
+137.69 ms; the focused identical-history replay measured candidate 137.72 ms
+versus previous-branch 137.93 ms, with every request/phase check passing.
+The outlier's cause is not established. The earlier cache/snapshot timing
+limitations below remain unresolved; no stall-free claim is made.
+
+Standard mixed d0/32K pp2048/tg128 controls preserve original main's complete
+output and prompt/cache/draft counts. Q8 serving and full benchmark sweeps
+were not repeated. Reports, commands, inputs and rejected experiments remain
+under `/tmp/gufo-qwen27b-dflash2-20261021` on the development host.
+
 ## October 21 prefill and sampling review
 
 Main `0c03748a` and `perf/qwen27b-dflash2-speed` use the same release toolchain,

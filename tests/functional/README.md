@@ -77,6 +77,22 @@ greedy and sampled copies. These cases require accepted lookup tokens before
 client cancellation, confirm the server observed cancellation, and replay the
 same output from the cached image prompt without prefill.
 
+`generation_quality.py` validates reviewed coding responses from the sampled
+Qwen27B generation controls. It checks generated interval tests plus independent
+coverage/input-preservation cases, and retry call counts, delay caps and error behavior.
+It requires completed output, so a truncated thinking response cannot pass:
+
+```sh
+nix develop -c python3 tests/functional/generation_quality.py \
+  /tmp/generation/results.json \
+  --thinking-results /tmp/completed-thinking/results.json
+```
+
+The reports contain `code` and `code-think` entries from `chat_result`, including
+text and finish reason. This executes the reviewed generated Python on the
+development host. The requests and measurement scope are recorded in the
+[Qwen27B quality notes](../../docs/models/qwen3.8-27b/QUALITY.md#october-21-coding-and-prose-follow-up).
+
 `prompt_lookup_workflows.py` checks extraction, generated URI tests and edits
 after a long source archive against an already running Flash-Next MTP server:
 
