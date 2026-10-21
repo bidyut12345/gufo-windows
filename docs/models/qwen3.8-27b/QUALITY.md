@@ -15,6 +15,54 @@ parity remain unqualified.
 | Target verification, widths 2–8 and ragged cohorts | Full logits/features match scalar | Full logits/features match scalar |
 | Serving and state | Cancellation, continuation, RAM/disk restore and seeded replay pass | Same; also eight 32K continuation forks |
 
+## October 21 prefill and sampling review
+
+Main `0c03748a` and `perf/qwen27b-dflash2-speed` use the same release toolchain,
+Q4 target and Q4 DFlash2 draft. All six measured C1 AR/DFlash2 d0/32K
+completions, prompt/cache counts and draft counts match exactly. The candidate
+does not change weights, cache precision, attention arithmetic or sampling
+probabilities.
+
+The native target prefill checks pass on Q4/Q8. Q4's cropped final output
+tile matches forced full-layer capture for full-vocabulary logits and
+continued cache state, including 2,048 rows at d0 and 1,025 rows at d8K.
+The attention operator retains its independent FP64 checks; skipped query
+rows remain untouched and the retained output/LSE bytes match full execution
+across workspace head groups. Sampling passes 216 policies, including
+speculative rejection/residual correction. New candidate-order tests compare
+against both the original full GPU sort and independent CPU stable ordering
+for vocabulary sizes 1,023/1,024/1,025/32,769/248,320, top counts
+1/20/32/33/64, ties, signed zero and nonfinite inputs.
+
+Q4 DFlash2 HTTP `sampling-defaults`, `long-context`, `state-edges` and `cache`
+pass correctness, including concurrent independent samplers, thinking,
+cancellation, RAM/disk restart and continuation. No output or coverage change
+is reported. These checks do not repeat the earlier image, Q8 serving or
+full-depth qualification.
+
+Timing remains **inconclusive**: the original comparison passes 2,168 checks
+and flags ten around concurrent admission, snapshot copying, token gaps and
+two disk restores. One focused unchanged-main/candidate repeat of
+`sampling-defaults` passes correctness and 1,405 timings, with seven
+inconclusive timings. Main itself reproduces 189–206 ms admission pauses;
+admission order and physical execution width vary between runs. The
+candidate's initially flagged 172 ms token gap returns to 160–163 ms, while
+the unchanged-main control reaches 220 ms. The two original disk-restore
+flags were not repeated and remain unqualified. No timing margin was widened
+and these observations are not a blanket latency pass.
+
+Raw profiles, binaries and all observations are retained outside Git under
+`/tmp/gufo-qwen27b-dflash2-20261021` on the test host, with reports copied to
+the editing host's `qwen27b-dflash2-20261021` directory. The principal records
+are `bench-main-q4`, `bench-v3-q4`, `functional-main-q4`,
+`functional-v3-q4` and both `functional-*-q4-defaults-control` directories.
+The final retained binary is `gufo-v3`; `v2` includes the rejected feature
+staging experiment. Q4 prefill was rerun after removing staging; the retained
+sampling and attention kernels are the versions covered by the V2 native
+operator checks. Formatting passes for the shared C++ set and changed HIP
+sources. The focused [performance table](BENCHMARKS.md#october-21-focused-prefill-and-sampling-comparison)
+retains the dated main/candidate results.
+
 ## October 19 wave64 verification review
 
 The wave64 verification attention (#660) reproduces the scalar decode bits.

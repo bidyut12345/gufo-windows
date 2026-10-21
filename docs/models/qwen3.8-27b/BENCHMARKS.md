@@ -17,6 +17,35 @@ throughput tables retain their dates and do not qualify the new cache wiring.
 Positive gain favors Gufo.
 [Quality and measurement details](QUALITY.md) · [Model identities](artifacts/model-identities.json)
 
+## October 21 focused prefill and sampling comparison
+
+Main `0c03748a` versus `perf/qwen27b-dflash2-speed`, with the same production
+CMake release preset, Nix toolchain (GCC 15.3 / ROCm 7.2.3), weights and
+HTTP benchmark. Q4 target / Q4 DFlash2 draft, C1, pp2048/tg128, greedy,
+thinking off; one warmed sample per cell. Context capacity is 133760.
+This is a two-depth comparison; the October 19 sweep and llama.cpp data below
+retain their original date.
+
+| Mode / workload | Cached depth | Main pp (tok/s) | Candidate pp (tok/s) | Main tg (tok/s) | Candidate tg (tok/s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AR | 0 | 634.59 | 635.34 | 12.37 | 12.37 |
+| AR | 32,768 | 452.62 | 460.92 | 11.13 | 11.13 |
+| DFlash2 mixed | 0 | 585.54 | 590.41 | 26.98 | 26.92 |
+| DFlash2 mixed | 32,768 | 413.72 | 421.60 | 21.75 | 21.72 |
+| DFlash2 repetitive | 0 | 584.43 | 590.87 | 64.96 | 65.04 |
+| DFlash2 repetitive | 32,768 | 442.15 | 447.63 | 24.02 | 24.00 |
+
+Every completion hash, prompt/cache count and draft count matches main.
+Prefill improves by 0.1–1.9%; generation remains within 0.3%. The bounded
+sampling selector separately takes 84–86 µs versus 125–128 µs for the full
+vocabulary sort; these greedy rows do not measure that sampled-path gain.
+
+The older repetitive 32K row below is a different history and completion:
+32,733 cached / 2,023 prefilled tokens and 109/114 accepted drafts, versus
+32,767 / 2,055 and 84/182 on both current builds. Its 51.20 tok/s therefore
+is not a matched control for the current 24.02 tok/s.
+Functional timing limitations are recorded in [QUALITY.md](QUALITY.md#october-21-prefill-and-sampling-review).
+
 ## Single user, autoregressive
 
 Approximately pp2048 / tg128; depth is the cached prefix in tokens.

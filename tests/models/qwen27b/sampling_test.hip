@@ -4,8 +4,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -525,8 +527,8 @@ void TestSamplingBoundaryValues() {
     gufo::hip::GpuSamplingParameters parameters;
     parameters.temperature = 1.0F;
     parameters.top_k = top_k;
-    const auto result = SampleSpeculatively(
-        equal_logits, parameters, 0, 0.25F, ids, probabilities, gpu_draw, 0.5F);
+    const auto result = SampleSpeculatively(equal_logits, parameters, 0, 0.25F,
+                                            ids, probabilities, gpu_draw, 0.5F);
     Expect(result.accepted && result.token == 0,
            "p(y) = q(y) accepts even the largest draw on both GPU routes");
   }
@@ -734,6 +736,73 @@ void TestBatchedArgmaxTiles() {
   }
 }
 
+void TestExactCandidatePrefix() {
+  for (const std::size_t size : {1023U, 1024U, 1025U, 32769U, 248320U}) {
+    std::vector<float> logits(size);
+    std::vector<std::uint32_t> expected(size);
+    float* device = nullptr;
+    CheckHip(hipMalloc(&device, size * sizeof(float)), "candidate input");
+    gufo::hip::GpuSamplingWorkspace workspace;
+    gufo::hip::AllocateGpuSamplingWorkspace(&workspace, size, 0);
+    for (unsigned fixture = 0; fixture < 4; ++fixture) {
+      for (std::size_t i = 0; i < size; ++i) {
+        if (fixture == 0)
+          logits[i] =
+              static_cast<float>(static_cast<int>(i * 131U % 997) - 498) /
+              97.0F;
+        else if (fixture == 1)
+          logits[i] = i % 2 ? -0.0F : 0.0F;
+        else if (fixture == 2)
+          logits[i] = i % 3 ? -INFINITY : NAN;
+        else
+          logits[i] = i % 1024 == 1023 ? 10.0F : -1.0F;
+      }
+      if (fixture != 1) {
+        logits[size / 2] = INFINITY;
+        logits[size - 1] = -INFINITY;
+      }
+      std::iota(expected.begin(), expected.end(), 0U);
+      const auto finite = [&](auto id) {
+        return std::isfinite(logits[id]) ? logits[id] : -INFINITY;
+      };
+      std::stable_sort(expected.begin(), expected.end(),
+                       [&](auto a, auto b) { return finite(a) > finite(b); });
+      CheckHip(hipMemcpy(device, logits.data(), size * sizeof(float),
+                         hipMemcpyHostToDevice),
+               "candidate upload");
+      gufo::hip::LaunchGPUSortLogits(device, &workspace);
+      std::vector<float> reference(64), actual(64);
+      std::vector<std::uint32_t> reference_ids(64), ids(64);
+      CheckHip(hipMemcpy(reference.data(), workspace.sorted_logits,
+                         64 * sizeof(float), hipMemcpyDeviceToHost),
+               "full sort logits");
+      CheckHip(hipMemcpy(reference_ids.data(), workspace.sorted_token_ids,
+                         64 * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
+               "full sort ids");
+      Expect(std::equal(reference_ids.begin(), reference_ids.end(),
+                        expected.begin()),
+             "full sort independent ordering");
+      for (const std::size_t keep : {1U, 20U, 32U, 33U, 64U}) {
+        gufo::hip::LaunchGPUSortLogits(device, &workspace, nullptr, keep);
+        CheckHip(hipMemcpy(actual.data(), workspace.sorted_logits,
+                           keep * sizeof(float), hipMemcpyDeviceToHost),
+                 "bounded logits");
+        CheckHip(hipMemcpy(ids.data(), workspace.sorted_token_ids,
+                           keep * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
+                 "bounded ids");
+        Expect(std::memcmp(actual.data(), reference.data(),
+                           keep * sizeof(float)) == 0 &&
+                   std::equal(ids.begin(), ids.begin() + keep,
+                              reference_ids.begin()),
+               "bounded candidates must retain exact scores and tie order");
+      }
+    }
+    gufo::hip::FreeGpuSamplingWorkspace(&workspace);
+    CheckHip(hipFree(device), "free candidate input");
+  }
+  std::cout << "Bounded candidate prefixes match full sort and CPU ordering.\n";
+}
+
 }  // namespace
 
 int main() {
@@ -757,6 +826,7 @@ int main() {
   TestExactNucleusBoundaryAndGreedyTies();
   TestFullVocabularyQuantiles();
   TestBatchedArgmaxTiles();
+  TestExactCandidatePrefix();
   std::cout << "All Qwen GPU sampling tests passed.\n";
   return 0;
 }

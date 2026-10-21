@@ -132,6 +132,9 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
 /// Optional workspace spans hold temporary KV layouts and must not alias live
 /// inputs, outputs or each other. Heads reuse the workspace in bounded groups
 /// when the full layout does not fit. Persistent KV storage is unchanged.
+/// first_query skips output tiles only; all KV rows are still written. It
+/// must be a multiple of 32 below batch_size. Skipped output/LSE rows are
+/// untouched, and retained rows use the full call's original arithmetic.
 /// Returns false when the shape is unsupported, so the caller can fall back.
 [[nodiscard]] bool LaunchQwenWmmaAttention(
     const float* q, const float* k, const float* v, const float* gate,
@@ -142,7 +145,7 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     hipStream_t stream = nullptr, float* lse_out = nullptr,
     std::uint32_t key_begin = 0, bool skip_kv_write = false,
     std::span<float> packed_k_workspace = {},
-    std::span<float> packed_v_workspace = {});
+    std::span<float> packed_v_workspace = {}, std::size_t first_query = 0);
 
 /// Large-batch causal attention using float32 QK/PV GEMMs and one reusable
 /// [batch, context] score buffer.
