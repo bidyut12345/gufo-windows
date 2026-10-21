@@ -1,113 +1,81 @@
 param(
-    [string]$Tag = "v0.1.1",
+    [string]$Tag = "v0.20.0",
     [string]$Repo = "bidyut12345/gufo-windows",
-    [string[]]$Files = @(
-        "dist\gufo-windows-v0.1.1-windows.zip",
-        "dist\gufo-windows-v0.1.1-bin.zip"
-    ),
+    [string[]]$Files = @(),
     [string]$TargetCommitish = "",
     [switch]$Force = $false
 )
+
+$ErrorActionPreference = "Stop"
 
 # Retrieve token from git credential manager
 $inputStr = "protocol=https`nhost=github.com`n`n"
 $res = $inputStr | git credential fill
 $tokenLine = $res | Where-Object { $_ -like "password=*" }
 if (-not $tokenLine) { throw "No GitHub token found in git credential manager" }
-$token = $tokenLine.Substring(9)
+$token = $tokenLine.Substring(9).Trim()
+$env:GH_TOKEN = $token
+$env:GH_PROMPT_DISABLED = "1"
 
-$apiBase = "https://api.github.com"
 $headers = @{
-    "Authorization" = "Bearer $token"
-    "User-Agent" = "Gufo-Release-Uploader"
-    "Accept" = "application/vnd.github+json"
+    "Authorization" = "token $token"
+    "Accept"        = "application/vnd.github.v3+json"
 }
 
-Write-Host "Fetching release for tag '$Tag' from $Repo..."
+$notesPath = if (Test-Path "dist\RELEASE_NOTES.md") { (Resolve-Path "dist\RELEASE_NOTES.md").Path } else { "" }
+$bodyText = if ($notesPath) { [System.IO.File]::ReadAllText($notesPath, [System.Text.Encoding]::UTF8) } else { "Release $Tag" }
+
+Write-Host "Checking for release '$Tag' in $Repo..." -ForegroundColor Cyan
 $release = $null
 try {
-    $release = Invoke-RestMethod -Uri "$apiBase/repos/$Repo/releases/tags/$Tag" -Headers $headers -Method Get
-    Write-Host "Found existing release: ID=$($release.id), Name='$($release.name)'"
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/tags/$Tag" -Headers $headers -Method Get
 } catch {
-    Write-Host "Release for tag '$Tag' does not exist yet. Creating..."
-    $releaseNotes = if (Test-Path "dist\RELEASE_NOTES.md") { [System.IO.File]::ReadAllText((Resolve-Path "dist\RELEASE_NOTES.md").Path) } else { "Release $Tag" }
-    $target = if ($TargetCommitish) { $TargetCommitish } else { (& git rev-parse HEAD).Trim() }
-    $createBody = @{
-        tag_name = $Tag
-        target_commitish = $target
-        name = "Gufo for Windows $Tag"
-        body = $releaseNotes
-        draft = $false
-        prerelease = $false
-    } | ConvertTo-Json
-
-    $release = Invoke-RestMethod -Uri "$apiBase/repos/$Repo/releases" -Headers $headers -Method Post -Body $createBody -ContentType "application/json"
-    Write-Host "Created release ID=$($release.id)"
+    # 404 is expected if release does not exist yet
 }
 
-$releaseId = $release.id
+if (-not $release) {
+    Write-Host "Creating release '$Tag' on GitHub..." -ForegroundColor Yellow
+    $createPayload = @{
+        tag_name   = $Tag
+        name       = "Gufo for Windows $Tag"
+        body       = $bodyText
+        draft      = $false
+        prerelease = $false
+    }
+    if ($TargetCommitish) {
+        $createPayload["target_commitish"] = $TargetCommitish
+    }
+    $jsonPayload = $createPayload | ConvertTo-Json -Depth 5
+    $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($jsonPayload)
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases" -Headers $headers -Method Post -Body $jsonBytes -ContentType "application/json; charset=utf-8"
+    Write-Host "Created release ID: $($release.id)" -ForegroundColor Green
+} else {
+    Write-Host "Found existing release ID: $($release.id)" -ForegroundColor Green
+}
 
-# Refresh release info to get current assets
-$release = Invoke-RestMethod -Uri "$apiBase/repos/$Repo/releases/$releaseId" -Headers $headers -Method Get
-$existingAssets = $release.assets
-
-foreach ($filePath in $Files) {
-    if (-not (Test-Path $filePath)) {
-        Write-Warning "File not found: $filePath, skipping."
+# Upload files
+foreach ($f in $Files) {
+    if (-not (Test-Path $f)) {
+        Write-Warning "File not found: $f"
         continue
     }
+    $resolvedPath = (Resolve-Path $f).Path
+    $fileName = [System.IO.Path]::GetFileName($resolvedPath)
+    $fileSizeMB = [math]::Round(((Get-Item $resolvedPath).Length / 1MB), 2)
 
-    $fileName = [System.IO.Path]::GetFileName($filePath)
-    $resolvedPath = (Resolve-Path $filePath).Path
-    $fileSizeMB = [math]::Round((Get-Item $resolvedPath).Length / 1MB, 2)
-
-    # Check for existing asset
-    if ($existingAssets) {
-        $found = $existingAssets | Where-Object { $_.name -eq $fileName }
-        if ($found) {
-            if (-not $Force) {
-                Write-Host "Asset '$fileName' already exists on release ($([math]::Round($found.size / 1MB, 2)) MB). Skipping (use -Force to re-upload)." -ForegroundColor Yellow
-                continue
-            }
-            Write-Host "Deleting existing asset '$fileName' (ID: $($found.id))..."
-            try {
-                Invoke-RestMethod -Uri "$apiBase/repos/$Repo/releases/assets/$($found.id)" -Headers $headers -Method Delete
-                Write-Host "Deleted existing asset."
-                Start-Sleep -Seconds 3
-            } catch {
-                Write-Warning "Failed to delete asset $($found.id): $_"
-            }
-        }
+    # Check if asset already exists in release
+    $existing = $release.assets | Where-Object { $_.name -eq $fileName }
+    if ($existing) {
+        Write-Host "Removing existing asset '$fileName' (ID: $($existing.id))..." -ForegroundColor Yellow
+        Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/assets/$($existing.id)" -Headers $headers -Method Delete
     }
 
-    Write-Host "Uploading $fileName ($fileSizeMB MB) with curl..."
-    $uploadUrl = "https://uploads.github.com/repos/$Repo/releases/$releaseId/assets?name=$fileName"
-
-    $authHeader = "Authorization: Bearer $token"
-    $acceptHeader = "Accept: application/vnd.github+json"
-    $typeHeader = "Content-Type: application/zip"
-
-    Start-Sleep -Seconds 2
-    & curl.exe -# -X POST `
-        --retry 3 `
-        --retry-delay 5 `
-        -H $authHeader `
-        -H $acceptHeader `
-        -H $typeHeader `
-        --data-binary "@$resolvedPath" `
-        $uploadUrl
-
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "`nUploaded $fileName successfully!" -ForegroundColor Green
-    } else {
-        Write-Error "Failed to upload $fileName, curl exit code: $LASTEXITCODE"
+    Write-Host "Uploading $fileName ($fileSizeMB MB) to release $Tag via gh release upload..." -ForegroundColor Cyan
+    & gh release upload $Tag $resolvedPath --repo $Repo --clobber
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to upload $fileName (gh exit code $LASTEXITCODE)"
     }
+    Write-Host "`nSuccessfully uploaded $fileName!" -ForegroundColor Green
 }
 
-Write-Host "`nAll release checks completed!" -ForegroundColor Green
-$relFinal = Invoke-RestMethod -Uri "$apiBase/repos/$Repo/releases/$releaseId" -Headers $headers -Method Get
-Write-Host "Release URL: $($relFinal.html_url)"
-Write-Host "Assets:"
-foreach ($a in $relFinal.assets) {
-    Write-Host " - $($a.name): $([math]::Round($a.size / 1MB, 2)) MB -> $($a.browser_download_url)"
-}
+Write-Host "`nRelease URL: $($release.html_url)" -ForegroundColor Green

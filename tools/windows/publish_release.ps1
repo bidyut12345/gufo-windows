@@ -104,9 +104,16 @@ Write-Host "Wrote release notes to $releaseNotesPath" -ForegroundColor Green
 Write-Host "`n[4/4] Publishing release $Tag to GitHub ($Repo)..." -ForegroundColor Yellow
 $uploadScript = Join-Path $root "tools\windows\upload_release.ps1"
 $commitSha = (& git rev-parse HEAD).Trim()
-powershell -ExecutionPolicy Bypass -File $uploadScript -Tag $Tag -Repo $Repo -Files @($zipPath) -TargetCommitish $commitSha -Force:$Force
+$uploadParams = @{
+    Tag = $Tag
+    Repo = $Repo
+    Files = @($zipPath)
+    TargetCommitish = $commitSha
+}
+if ($Force) { $uploadParams["Force"] = $true }
+& $uploadScript @uploadParams
 
-if ($LASTEXITCODE -eq 0) {
+if ($LASTEXITCODE -eq 0 -or $? -eq $true) {
     Write-Host "`n==========================================================" -ForegroundColor Green
     Write-Host " Successfully published release $Tag to GitHub!" -ForegroundColor Green
     Write-Host " URL: https://github.com/$Repo/releases/tag/$Tag" -ForegroundColor Cyan
