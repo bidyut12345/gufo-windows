@@ -269,21 +269,11 @@ void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
                    no_webui);
   }
   if (tools_enabled != nullptr) {
-    parser.AddCustomOption(
-        "", "--tools", "yes|no", "Enable or disable tool execution (yes or no)",
-        "Server",
-        [tools_enabled](std::string_view flag, std::string_view value,
-                        std::string* error) {
-          if (value == "yes" || value == "on" || value == "true" || value == "1") {
-            *tools_enabled = true;
-            return true;
-          }
-          if (value == "no" || value == "off" || value == "false" || value == "0") {
-            *tools_enabled = false;
-            return true;
-          }
-          *error = std::string(flag) + " must be yes or no";
-          return false;
+    parser.AddCustomFlag(
+        "", "--no-tools", "Disable Chat Portal tool execution", "Server",
+        [tools_enabled](std::string_view, std::string*) {
+          *tools_enabled = false;
+          return true;
         });
   }
   parser.AddCustomOption(
@@ -643,6 +633,7 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t cache_ram_bytes = 0;
     models::qwen38_flash_next::KvCacheMode kv_cache_mode =
         models::qwen38_flash_next::KvCacheMode::kF16;
+    bool managed_experts = false;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -667,6 +658,10 @@ void PrintServeHelp(std::string_view program_name,
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    parser.AddFlag(
+        "", "--managed-experts",
+        "Place MoE routed experts in managed memory to reduce dedicated VRAM footprint",
+        "Model", &managed_experts);
 
     // Sampling Defaults
     parser.AddOption(
@@ -784,15 +779,6 @@ void PrintServeHelp(std::string_view program_name,
           return models::qwen38_flash_next::ParseKvCacheMode(value,
                                                              &kv_cache_mode);
         });
-    parser.AddCustomOption(
-        "", "--kv-quant", "MODE",
-        "Alias for --kv-cache: f16, q8, q8_0, fp8, q8_0-q4_k, K8V4",
-        "Cache",
-        [&kv_cache_mode](std::string_view, std::string_view value,
-                         std::string* error) -> bool {
-          return models::qwen38_flash_next::ParseKvCacheMode(value,
-                                                             &kv_cache_mode);
-        });
     parser.AddOption("", "--cache-disk", "DIR",
                      "Opt-in restart-safe continuation cache directory "
                      "(Flash-Next: owned by one process)",
@@ -847,7 +833,7 @@ void PrintServeHelp(std::string_view program_name,
          "8388608)\n"
       << "      --api-key <KEY>    Require Bearer authorization for requests\n"
       << "      --no-webui         Disable Chat Portal web UI\n"
-      << "      --tools <yes|no>   Enable or disable tool execution (yes or no)\n"
+      << "      --no-tools         Disable Chat Portal tool execution\n"
       << "\nLogging:\n"
       << "      --log-level <LEVEL>\n"
       << "                         " << kLogLevelHelp << "\n"
@@ -1248,6 +1234,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t cache_ram_bytes = 0;
     models::qwen38_flash_next::KvCacheMode kv_cache_mode =
         models::qwen38_flash_next::KvCacheMode::kF16;
+    bool managed_experts = false;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -1271,6 +1258,10 @@ int RunServe(std::span<const char* const> args) {
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    llm_parser.AddFlag(
+        "", "--managed-experts",
+        "Place MoE routed experts in managed memory to reduce dedicated VRAM footprint",
+        "Model", &managed_experts);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1387,25 +1378,6 @@ int RunServe(std::span<const char* const> args) {
             if (error != nullptr) {
               *error =
                   "Invalid mode for --kv-cache: '" + std::string(value) +
-                  "' (want " +
-                  std::string(models::qwen38_flash_next::kKvCacheModeList) +
-                  ")";
-            }
-            return false;
-          }
-          return true;
-        });
-    llm_parser.AddCustomOption(
-        "", "--kv-quant", "MODE",
-        "Alias for --kv-cache: f16, q8, q8_0, fp8, q8_0-q4_k, K8V4",
-        "Cache",
-        [&kv_cache_mode](std::string_view, std::string_view value,
-                         std::string* error) -> bool {
-          if (!models::qwen38_flash_next::ParseKvCacheMode(value,
-                                                           &kv_cache_mode)) {
-            if (error != nullptr) {
-              *error =
-                  "Invalid mode for --kv-quant: '" + std::string(value) +
                   "' (want " +
                   std::string(models::qwen38_flash_next::kKvCacheModeList) +
                   ")";
@@ -1605,7 +1577,8 @@ int RunServe(std::span<const char* const> args) {
         },
         vision_model_path,
         server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes},
-        kv_cache_mode);
+        kv_cache_mode,
+        managed_experts);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

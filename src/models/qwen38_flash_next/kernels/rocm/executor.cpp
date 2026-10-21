@@ -796,6 +796,7 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   auto& view = *checkpoint->state;
   view.owner_ = this;
   view.max_context_ = source.max_context_;
+  view.kv_capacity_ = source.kv_capacity_;
   view.index_capacity_ = source.index_capacity_;
   view.position_ = source.position_ + prefix;
   view.mtp_enabled_ = source.mtp_enabled_;
@@ -1348,6 +1349,7 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     return nullptr;
   }
   s->max_context_ = max_context;
+  s->kv_capacity_ = std::min<std::uint32_t>(max_context, 8192U);
   // Before sparse attention starts, pooling can lag by indexer_top_k
   // rows. Afterwards only an incomplete block precedes the current batch.
   // Completed block keys remain in block_k; their raw rows are dead.
@@ -1372,16 +1374,16 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
     } else {
       auto& at = s->attention_[il];
-      at.k_cache = Alloc<unsigned char>(a, max_context * k_cache_row_bytes,
+      at.k_cache = Alloc<unsigned char>(a, s->kv_capacity_ * k_cache_row_bytes,
                                         error_msg, &s->allocated_bytes_);
-      at.v_cache = Alloc<unsigned char>(a, max_context * v_cache_row_bytes,
+      at.v_cache = Alloc<unsigned char>(a, s->kv_capacity_ * v_cache_row_bytes,
                                         error_msg, &s->allocated_bytes_);
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
       at.block_k = Alloc<__half>(
           a,
-          static_cast<std::size_t>(max_context / c.compress_ratio + 1) *
+          static_cast<std::size_t>(s->kv_capacity_ / c.compress_ratio + 1) *
               c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
       // Selection rows the next chunk's partial first sparse group unions.
@@ -1401,15 +1403,15 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     s->mtp_.target_hidden = Alloc<float>(
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
         error_msg, &s->allocated_bytes_);
-    s->mtp_.k_cache = Alloc<unsigned char>(a, max_context * k_cache_row_bytes,
+    s->mtp_.k_cache = Alloc<unsigned char>(a, s->kv_capacity_ * k_cache_row_bytes,
                                            error_msg, &s->allocated_bytes_);
-    s->mtp_.v_cache = Alloc<unsigned char>(a, max_context * v_cache_row_bytes,
+    s->mtp_.v_cache = Alloc<unsigned char>(a, s->kv_capacity_ * v_cache_row_bytes,
                                            error_msg, &s->allocated_bytes_);
     s->mtp_.index_k =
         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
                      error_msg, &s->allocated_bytes_);
     s->mtp_.block_k = Alloc<__half>(
-        a, std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim,
+        a, std::size_t{s->kv_capacity_ / c.compress_ratio + 1} * c.indexer_head_dim,
         error_msg, &s->allocated_bytes_);
     s->mtp_.h = Alloc<float>(a, c.HcDim(), error_msg, &s->allocated_bytes_);
     if (!model_->draft_output().empty()) {
@@ -1550,6 +1552,241 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
     }
     session.rollback_depth_ = row + 1;
   }
+  return true;
+}
+
+bool Executor::EnsureKvCapacity(Session& s, std::uint32_t needed,
+                                std::string* error_msg) const {
+  if (needed <= s.kv_capacity_) {
+    return true;
+  }
+  if (needed > s.max_context_) {
+    AssignError(error_msg, "context request exceeds max context limit");
+    return false;
+  }
+
+  // Geometric growth: double the capacity until it satisfies `needed`,
+  // capped at `s.max_context_`.
+  std::uint32_t new_cap = s.kv_capacity_ == 0 ? 8192U : s.kv_capacity_;
+  while (new_cap < needed) {
+    if (new_cap >= s.max_context_ / 2) {
+      new_cap = s.max_context_;
+      break;
+    }
+    new_cap *= 2;
+  }
+  new_cap = std::min(new_cap, s.max_context_);
+
+  const auto& c = config();
+  const std::size_t kv_row = c.AttentionKvDim();
+  const std::size_t k_cache_row_bytes =
+      KvRowBytes(kv_row, options_.kv_dtypes.key);
+  const std::size_t v_cache_row_bytes =
+      KvRowBytes(kv_row, options_.kv_dtypes.value);
+
+  // Synchronize stream so in-flight work completes before reallocation
+  if (!Check(hipStreamSynchronize(stream_), "EnsureKvCapacity sync",
+             error_msg)) {
+    return false;
+  }
+
+  // Preserve any snapshot state referencing current buffers
+  try {
+    s.PreserveSnapshots(0, 0);
+  } catch (...) {
+    AssignError(error_msg,
+                "Failed to preserve snapshots during KV cache expansion");
+    return false;
+  }
+
+  const std::uint32_t copy_tokens = s.position_;
+  const std::uint32_t new_blocks =
+      c.compress_ratio ? (new_cap / c.compress_ratio + 1) : 0;
+  const std::size_t copy_block_bytes =
+      static_cast<std::size_t>(s.blocks_ + 1) * c.indexer_head_dim *
+      sizeof(__half);
+
+  // Resize trunk attention layers
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    if (c.IsLinearLayer(il))
+      continue;
+    auto& at = s.attention_[il];
+
+    // 1. K cache
+    unsigned char* new_k = nullptr;
+    const std::size_t new_k_bytes =
+        static_cast<std::size_t>(new_cap) * k_cache_row_bytes;
+    if (hip::AllocateDevice(&new_k, new_k_bytes) != hipSuccess) {
+      AssignError(error_msg, "Failed to allocate expanded K cache");
+      return false;
+    }
+    if (copy_tokens > 0 && at.k_cache != nullptr) {
+      (void)hipMemcpyAsync(
+          new_k, at.k_cache,
+          static_cast<std::size_t>(copy_tokens) * k_cache_row_bytes,
+          hipMemcpyDeviceToDevice, stream_);
+    }
+    const std::size_t copy_k_bytes =
+        static_cast<std::size_t>(copy_tokens) * k_cache_row_bytes;
+    if (new_k_bytes > copy_k_bytes) {
+      (void)hipMemsetAsync(new_k + copy_k_bytes, 0,
+                           new_k_bytes - copy_k_bytes, stream_);
+    }
+    std::replace(s.allocations_.begin(), s.allocations_.end(),
+                 static_cast<void*>(at.k_cache), static_cast<void*>(new_k));
+    (void)hipFree(at.k_cache);
+    at.k_cache = new_k;
+
+    // 2. V cache
+    unsigned char* new_v = nullptr;
+    const std::size_t new_v_bytes =
+        static_cast<std::size_t>(new_cap) * v_cache_row_bytes;
+    if (hip::AllocateDevice(&new_v, new_v_bytes) != hipSuccess) {
+      AssignError(error_msg, "Failed to allocate expanded V cache");
+      return false;
+    }
+    if (copy_tokens > 0 && at.v_cache != nullptr) {
+      (void)hipMemcpyAsync(
+          new_v, at.v_cache,
+          static_cast<std::size_t>(copy_tokens) * v_cache_row_bytes,
+          hipMemcpyDeviceToDevice, stream_);
+    }
+    const std::size_t copy_v_bytes =
+        static_cast<std::size_t>(copy_tokens) * v_cache_row_bytes;
+    if (new_v_bytes > copy_v_bytes) {
+      (void)hipMemsetAsync(new_v + copy_v_bytes, 0,
+                           new_v_bytes - copy_v_bytes, stream_);
+    }
+    std::replace(s.allocations_.begin(), s.allocations_.end(),
+                 static_cast<void*>(at.v_cache), static_cast<void*>(new_v));
+    (void)hipFree(at.v_cache);
+    at.v_cache = new_v;
+
+    // 3. block_k
+    if (new_blocks > 0) {
+      __half* new_block_k = nullptr;
+      const std::size_t new_block_k_bytes =
+          static_cast<std::size_t>(new_blocks) * c.indexer_head_dim *
+          sizeof(__half);
+      if (hip::AllocateDevice(&new_block_k, new_block_k_bytes) != hipSuccess) {
+        AssignError(error_msg, "Failed to allocate expanded block_k");
+        return false;
+      }
+      if (copy_block_bytes > 0 && at.block_k != nullptr) {
+        (void)hipMemcpyAsync(new_block_k, at.block_k, copy_block_bytes,
+                             hipMemcpyDeviceToDevice, stream_);
+      }
+      if (new_block_k_bytes > copy_block_bytes) {
+        (void)hipMemsetAsync(
+            reinterpret_cast<char*>(new_block_k) + copy_block_bytes, 0,
+            new_block_k_bytes - copy_block_bytes, stream_);
+      }
+      std::replace(s.allocations_.begin(), s.allocations_.end(),
+                   static_cast<void*>(at.block_k),
+                   static_cast<void*>(new_block_k));
+      (void)hipFree(at.block_k);
+      at.block_k = new_block_k;
+    }
+  }
+
+  // Resize MTP if enabled
+  if (s.mtp_enabled_) {
+    const std::uint32_t mtp_copy_tokens = s.mtp_.position;
+    const std::size_t mtp_copy_block_bytes =
+        static_cast<std::size_t>(s.mtp_.blocks + 1) * c.indexer_head_dim *
+        sizeof(__half);
+
+    // MTP K cache
+    unsigned char* new_k = nullptr;
+    const std::size_t new_k_bytes =
+        static_cast<std::size_t>(new_cap) * k_cache_row_bytes;
+    if (hip::AllocateDevice(&new_k, new_k_bytes) != hipSuccess) {
+      AssignError(error_msg, "Failed to allocate expanded MTP K cache");
+      return false;
+    }
+    if (mtp_copy_tokens > 0 && s.mtp_.k_cache != nullptr) {
+      (void)hipMemcpyAsync(
+          new_k, s.mtp_.k_cache,
+          static_cast<std::size_t>(mtp_copy_tokens) * k_cache_row_bytes,
+          hipMemcpyDeviceToDevice, stream_);
+    }
+    const std::size_t copy_k_bytes =
+        static_cast<std::size_t>(mtp_copy_tokens) * k_cache_row_bytes;
+    if (new_k_bytes > copy_k_bytes) {
+      (void)hipMemsetAsync(new_k + copy_k_bytes, 0,
+                           new_k_bytes - copy_k_bytes, stream_);
+    }
+    std::replace(s.allocations_.begin(), s.allocations_.end(),
+                 static_cast<void*>(s.mtp_.k_cache), static_cast<void*>(new_k));
+    (void)hipFree(s.mtp_.k_cache);
+    s.mtp_.k_cache = new_k;
+
+    // MTP V cache
+    unsigned char* new_v = nullptr;
+    const std::size_t new_v_bytes =
+        static_cast<std::size_t>(new_cap) * v_cache_row_bytes;
+    if (hip::AllocateDevice(&new_v, new_v_bytes) != hipSuccess) {
+      AssignError(error_msg, "Failed to allocate expanded MTP V cache");
+      return false;
+    }
+    if (mtp_copy_tokens > 0 && s.mtp_.v_cache != nullptr) {
+      (void)hipMemcpyAsync(
+          new_v, s.mtp_.v_cache,
+          static_cast<std::size_t>(mtp_copy_tokens) * v_cache_row_bytes,
+          hipMemcpyDeviceToDevice, stream_);
+    }
+    const std::size_t copy_v_bytes =
+        static_cast<std::size_t>(mtp_copy_tokens) * v_cache_row_bytes;
+    if (new_v_bytes > copy_v_bytes) {
+      (void)hipMemsetAsync(new_v + copy_v_bytes, 0,
+                           new_v_bytes - copy_v_bytes, stream_);
+    }
+    std::replace(s.allocations_.begin(), s.allocations_.end(),
+                 static_cast<void*>(s.mtp_.v_cache), static_cast<void*>(new_v));
+    (void)hipFree(s.mtp_.v_cache);
+    s.mtp_.v_cache = new_v;
+
+    // MTP block_k
+    if (new_blocks > 0) {
+      __half* new_block_k = nullptr;
+      const std::size_t new_block_k_bytes =
+          static_cast<std::size_t>(new_blocks) * c.indexer_head_dim *
+          sizeof(__half);
+      if (hip::AllocateDevice(&new_block_k, new_block_k_bytes) != hipSuccess) {
+        AssignError(error_msg, "Failed to allocate expanded MTP block_k");
+        return false;
+      }
+      if (mtp_copy_block_bytes > 0 && s.mtp_.block_k != nullptr) {
+        (void)hipMemcpyAsync(new_block_k, s.mtp_.block_k, mtp_copy_block_bytes,
+                             hipMemcpyDeviceToDevice, stream_);
+      }
+      if (new_block_k_bytes > mtp_copy_block_bytes) {
+        (void)hipMemsetAsync(
+            reinterpret_cast<char*>(new_block_k) + mtp_copy_block_bytes, 0,
+            new_block_k_bytes - mtp_copy_block_bytes, stream_);
+      }
+      std::replace(s.allocations_.begin(), s.allocations_.end(),
+                   static_cast<void*>(s.mtp_.block_k),
+                   static_cast<void*>(new_block_k));
+      (void)hipFree(s.mtp_.block_k);
+      s.mtp_.block_k = new_block_k;
+    }
+  }
+
+  // Synchronize to ensure copies and zeroes complete
+  if (!Check(hipStreamSynchronize(stream_), "EnsureKvCapacity copy sync",
+             error_msg)) {
+    return false;
+  }
+
+  // Destroy captured graphs because pointers have changed
+  for (const auto& [key, graph] : s.graphs_) {
+    (void)hipGraphExecDestroy(graph);
+  }
+  s.graphs_.clear();
+  s.warmed_.clear();
+
+  s.kv_capacity_ = new_cap;
   return true;
 }
 
@@ -3299,6 +3536,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     AssignError(error_msg, "session context is full");
     return false;
   }
+  if (!EnsureKvCapacity(session, session.position_ + n, error_msg))
+    return false;
   for (auto t : tokens) {
     if (t < 0 || static_cast<std::uint32_t>(t) >= c.vocab_size) {
       AssignError(error_msg, "token out of range");
@@ -4207,6 +4446,9 @@ bool Executor::RestoreSnapshot(Session& session,
   }
   if (layout.images.empty())
     session.ConfigureVision(nullptr, nullptr, stream_);
+  if (!EnsureKvCapacity(session, h.position, error_msg)) {
+    return false;
+  }
   // The session's queued work targets buffers the copies overwrite.
   if (!Check(hipStreamSynchronize(stream_), "restore drain", error_msg)) {
     return false;
@@ -4620,6 +4862,9 @@ bool Executor::MtpForward(Session& session,
   const std::uint32_t pos = session.mtp_.position;
   if (pos + n > session.max_context_) {
     AssignError(error_msg, "MTP context is full");
+    return false;
+  }
+  if (!EnsureKvCapacity(session, pos + n, error_msg)) {
     return false;
   }
   if (session.continuation_hooks_)

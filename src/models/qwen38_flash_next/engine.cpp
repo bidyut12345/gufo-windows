@@ -140,7 +140,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   m->device_ = rocm::DeviceModel::Upload(*m->weights_, *m->reader_,
                                          m->mtp_weights_.get(),
-                                         m->mtp_reader_.get(), error_msg);
+                                         m->mtp_reader_.get(), error_msg,
+                                         options.managed_experts);
   if (!m->device_) {
     return nullptr;
   }

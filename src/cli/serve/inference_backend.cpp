@@ -3300,7 +3300,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
                             TextRunnerRamCacheOptions ram_cache_config,
-                            models::qwen38_flash_next::KvCacheMode kv_cache_mode) {
+                            models::qwen38_flash_next::KvCacheMode kv_cache_mode,
+                            bool managed_experts) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3429,6 +3430,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 speculative_config.mtp_latin_draft_vocabulary
                     ? models::qwen38_flash_next::DraftVocabulary::kLatinText
                     : models::qwen38_flash_next::DraftVocabulary::kFull,
+            .managed_experts = managed_experts,
         },
         &load_error);
     if (model == nullptr) {

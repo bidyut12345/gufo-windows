@@ -124,6 +124,7 @@ struct Uploader {
   bool ok{true};
   std::uint32_t shard_base{0};
   std::uint64_t requested{0};
+  bool managed_experts{false};
 
   [[nodiscard]] bool Measuring() const noexcept { return weights == nullptr; }
 
@@ -134,7 +135,14 @@ struct Uploader {
     ok = false;
   }
 
-  [[nodiscard]] hipError_t Allocate(void** pointer, std::size_t size) {
+  [[nodiscard]] hipError_t Allocate(void** pointer, std::size_t size,
+                                    bool is_expert = false) {
+    if (managed_experts && is_expert) {
+      if (Measuring()) {
+        return hipSuccess;
+      }
+      return hip::AllocateManaged(pointer, size);
+    }
     requested += size;
     if (Measuring()) {
       return hipSuccess;
@@ -327,7 +335,8 @@ struct Uploader {
     }
     const std::size_t size = t.SizeBytes();
     void* ptr = nullptr;
-    if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
+    const bool is_expert = (t.experts > 1);
+    if (Allocate(&ptr, size + kTailMargin, is_expert) != hipSuccess) {
       Fail("device allocation failed for " + std::string(t.name) + " (" +
            std::to_string(size) + " bytes)");
       return d;
@@ -616,7 +625,11 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
 std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
-    std::string* error_msg) {
+    std::string* error_msg, bool managed_experts) {
+  const char* env_me = std::getenv("GUFO_MANAGED_EXPERTS");
+  if (env_me != nullptr && std::string_view(env_me) != "0") {
+    managed_experts = true;
+  }
   // The routed expert kernels cover Q4_K, Q5_K, Q5_1, Q8_0, IQ3_S and
   // IQ4_XS. The LM head may be Q6_K: it is host-dequantized to Q8_0 instead,
   // which keeps it on the fast dense-GEMM tiers.
@@ -669,7 +682,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::size_t max_q8_cols = 32;
     Uploader measure{*stager, nullptr,       conversions, allocations,
                      bytes,   max_half_cols, max_q8_cols, shards,
-                     error_msg};
+                     error_msg, /*ok=*/true, /*shard_base=*/0, /*requested=*/0,
+                     managed_experts};
     (void)measure.Model(w, mtp, shard_count);
     if (!measure.ok) {
       return nullptr;
@@ -680,7 +694,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   std::vector<Conversion> conversions;
   Uploader up{*stager,   &weights,          conversions,     m->allocations_,
               m->bytes_, m->max_half_cols_, m->max_q8_cols_, shards,
-              error_msg};
+              error_msg, /*ok=*/true, /*shard_base=*/0, /*requested=*/0,
+              managed_experts};
   Uploaded uploaded = up.Model(w, mtp, shard_count);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;

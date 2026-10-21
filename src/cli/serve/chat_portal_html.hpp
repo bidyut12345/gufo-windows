@@ -6066,6 +6066,37 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       } catch (err) {}
     }
 
+    function saveMessageBadge(convId, m, idx, badgeHtml) {
+      if (!convId || !badgeHtml) return;
+      try {
+        const storageKey = 'gufo_msg_badges_' + convId;
+        const badges = JSON.parse(localStorage.getItem(storageKey) || '{}');
+        if (idx != null) badges['idx_' + idx] = badgeHtml;
+        if (m && m.id) badges['id_' + m.id] = badgeHtml;
+        if (m && m.content) {
+          badges['c_' + m.content.slice(0, 60).replace(/\s+/g, ' ')] = badgeHtml;
+        }
+        localStorage.setItem(storageKey, JSON.stringify(badges));
+      } catch (_) {}
+    }
+
+    function getMessageBadge(convId, m, idx) {
+      if (!convId) return null;
+      try {
+        const storageKey = 'gufo_msg_badges_' + convId;
+        const badges = JSON.parse(localStorage.getItem(storageKey) || '{}');
+        if (m && m.id && badges['id_' + m.id]) return badges['id_' + m.id];
+        if (m && m.content) {
+          const cKey = 'c_' + m.content.slice(0, 60).replace(/\s+/g, ' ');
+          if (badges[cKey]) return badges[cKey];
+        }
+        if (idx != null && badges['idx_' + idx]) return badges['idx_' + idx];
+        return null;
+      } catch (_) {
+        return null;
+      }
+    }
+
     // Render Messages
     function renderMessages(messages) {
       UI.messagesContainer.innerHTML = '';
@@ -6469,6 +6500,16 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         }, 1500);
       };
       actions.appendChild(btnCopy);
+
+      if (!isUser) {
+        const savedBadgeHtml = m.usage_badge || getMessageBadge(APP.activeId, m, msgIdx);
+        if (savedBadgeHtml) {
+          const usageBadge = document.createElement('div');
+          usageBadge.className = 'msg-usage-badge';
+          usageBadge.innerHTML = savedBadgeHtml;
+          actions.appendChild(usageBadge);
+        }
+      }
 
       group.appendChild(author);
       group.appendChild(body);
@@ -7366,6 +7407,14 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           }
           usageBadge.innerHTML = badgeHtml;
           actions.appendChild(usageBadge);
+          if (convId) {
+            const lastIdx = (APP.activeConv && APP.activeConv.messages) ? (APP.activeConv.messages.length - 1) : null;
+            const curMsg = { id: null, content: assistantText };
+            saveMessageBadge(convId, curMsg, lastIdx, badgeHtml);
+            if (APP.activeConv && APP.activeConv.messages && lastIdx >= 0) {
+              APP.activeConv.messages[lastIdx].usage_badge = badgeHtml;
+            }
+          }
 
           let footerText = `eval: ${evalTps || '0.0'} t/s`;
           if (promptTps && Number(promptTps) > 0) footerText += ` | prompt: ${promptTps} t/s`;
@@ -7705,6 +7754,15 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             }
             usageBadge.innerHTML = badgeHtml;
             actions.appendChild(usageBadge);
+
+            if (APP.activeId) {
+              const lastIdx = (APP.activeConv && APP.activeConv.messages) ? (APP.activeConv.messages.length - 1) : null;
+              const curMsg = { id: null, content: assistantText };
+              saveMessageBadge(APP.activeId, curMsg, lastIdx, badgeHtml);
+              if (APP.activeConv && APP.activeConv.messages && lastIdx >= 0) {
+                APP.activeConv.messages[lastIdx].usage_badge = badgeHtml;
+              }
+            }
 
             // Update footer speed metrics
             let footerText = `eval: ${evalTps || '0.0'} t/s`;

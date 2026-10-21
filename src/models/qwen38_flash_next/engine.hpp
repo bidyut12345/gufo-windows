@@ -64,6 +64,7 @@ struct ModelOptions {
   bool mtp_survival = false;
   bool prompt_lookup = false;
   DraftVocabulary draft_vocabulary = DraftVocabulary::kFull;
+  bool managed_experts = false;
 };
 
 class Session;

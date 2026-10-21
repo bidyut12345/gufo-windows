@@ -89,7 +89,8 @@ public:
             const std::string& vision_model_path = {},
             TextRunnerRamCacheOptions ram_cache_config = {},
             models::qwen38_flash_next::KvCacheMode kv_cache_mode =
-                models::qwen38_flash_next::KvCacheMode::kF16);
+                models::qwen38_flash_next::KvCacheMode::kF16,
+            bool managed_experts = false);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
