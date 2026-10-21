@@ -140,6 +140,10 @@ public:
     return mutation_epoch_;
   }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  /// PLE rows this session has gathered, including prefetches, since creation.
+  [[nodiscard]] NgramTotals NgramRowTotals() const noexcept {
+    return ngram_counters_.Load();
+  }
   [[nodiscard]] bool OwnsSnapshot(
       const SnapshotState& snapshot) const noexcept {
     return snapshots_ == snapshot.registry_;
@@ -147,6 +151,7 @@ public:
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt,
                        std::shared_ptr<qwen::vision::Encoder> encoder,
                        hipStream_t stream);
+  void PrepareVision(hipStream_t stream);
   void RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
                            hipStream_t stream);
   [[nodiscard]] const qwen::vision::RopeLayout& VisionLayout() const noexcept {
@@ -223,6 +228,8 @@ private:
   RollbackRows ple_snapshots_;   ///< [max_spec-1][PleConvHistory()][hc_dim]
   NgramHistory ngram_;
   std::vector<NgramHistory> ngram_snapshots_;
+  // Prefetches count against the const session that will consume them.
+  mutable NgramCounters ngram_counters_;
   std::uint32_t spec_base_{0};    ///< position before the speculative batch
   std::uint32_t spec_tokens_{0};  ///< tokens of the pending speculative batch
   MtpState mtp_;
@@ -355,7 +362,7 @@ public:
     std::int32_t* token{nullptr};
     MtpCandidateLogits* candidates{nullptr};
     MtpTrace* trace{nullptr};  ///< final-row diagnostic; disables graph capture
-    /// Prefill needs only persistent KV. A subsequent full forward with
+    /// Prefill and headless steps need only persistent KV. A full forward with
     /// known trunk hidden rows is required before heads/recursive proposals.
     bool kv_only{false};
     /// Draft through the small head (the output() prefix plus the
@@ -370,6 +377,7 @@ public:
     Session* session;
     std::span<const std::int32_t> tokens;
     std::int32_t hidden_row;
+    bool kv_only{false};
   };
   /// Copies output() rows `ids` into the session's draft table from slot
   /// `first` on. Enqueued on stream(); never during graph capture.
@@ -420,6 +428,14 @@ public:
   /// Greedy verification keeps full logit rows on the GPU, including penalties.
   [[nodiscard]] bool GreedyMtpPredictions(
       std::span<ArgmaxCandidate> predictions,
+      const sampling::SamplerState& sampler,
+      std::span<const std::int32_t> drafts, std::string* error_msg) const;
+  [[nodiscard]] static bool CanCompactMtpVerification(
+      const sampling::SamplerState& sampler);
+  /// Candidate spans remain valid until this executor next verifies a
+  /// request. One transfer serves all rows; no full CPU rows are reconstructed.
+  [[nodiscard]] bool SampledMtpCandidates(
+      std::span<std::span<const sampling::LogitCandidate>> rows,
       const sampling::SamplerState& sampler,
       std::span<const std::int32_t> drafts, std::string* error_msg) const;
 
@@ -795,6 +811,12 @@ private:
   /// Shared transient storage, grown only for penalty-aware verification.
   mutable sampling::TokenPenalty* verification_penalties_{nullptr};
   mutable std::size_t verification_penalty_capacity_{0};
+  static constexpr std::size_t kCompactPenaltyLimit = 4096;
+  std::uint32_t* verification_ids_{nullptr};
+  std::uint32_t* verification_scratch_ids_{nullptr};
+  sampling::LogitCandidate* verification_candidates_{nullptr};
+  sampling::LogitCandidate* verification_candidates_host_{nullptr};
+  mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};
@@ -822,16 +844,20 @@ private:
   mutable hip::HostAllocations host_allocations_;
   float* host_emb_{nullptr};
   mutable std::vector<std::uint32_t> host_rows_;
+  mutable std::vector<NgramGatherOwner> ngram_owners_;
   mutable bool ple_pending_{false};
   /// The rows a prefill chunk reads are a pure function of its tokens and
   /// the n-gram history before them, so prefetched rows are claimed only by
-  /// a batch with exactly those tokens and that history, whichever session
-  /// it belongs to. A claim copies them into host_emb_, whose stable address
-  /// is retained by captured graphs.
+  /// a batch with that history whose tokens extend, or are extended by, the
+  /// prefetched ones, whichever session it belongs to. A claim copies them
+  /// into host_emb_, whose stable address is retained by captured graphs.
   struct PlePrefetch {
     bool pending{false};  ///< read in flight
     bool ready{false};    ///< rows complete in `rows`
-    bool claimed{false};  ///< WaitPle collects them for the current batch
+    /// Leading batch tokens whose rows WaitPle collects from `rows`.
+    std::size_t claimed{0};
+    /// The batch extends past `tokens`; the table reads its remaining rows.
+    bool tail{false};
     NgramHistory before;
     NgramHistory after;
     std::vector<std::int32_t> tokens;

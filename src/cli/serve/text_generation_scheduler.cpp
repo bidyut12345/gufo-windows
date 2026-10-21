@@ -953,6 +953,12 @@ struct TextGenerationScheduler::Impl {
     // A stop may land on a preview, an unadvanced AR token, or inside an
     // accepted speculative block. Retain only correctly labelled executed
     // state, using the same cache reconciliation as an interrupted request.
+    // Read before the commit returns the leased state.
+    const auto ngram = request->runner_request.ngram_rows();
+    request->result.ngram_rows = ngram.rows;
+    request->result.ngram_dedup_rows = ngram.dedup_rows;
+    request->result.ngram_cache_hits = ngram.cache_hits;
+    request->result.ngram_disk_reads = ngram.disk_reads;
     const auto cache_commit =
         finish_reason == TextGenerationBackend::FinishReason::kStopSequence
             ? request->runner_request.Cancel()
@@ -1037,17 +1043,24 @@ struct TextGenerationScheduler::Impl {
         common = shared;
       }
     }
-    if (leader == nullptr ||
-        common < TextRunnerPool::Request::kSharedPrefixMinTokens)
+    if (leader == nullptr)
       return false;
     // A longer retained prefix, such as this conversation's previous turn,
     // already beats waiting for a peer.
     const auto cached =
         runner_pool->CachedPrefixTokens(prompt, request->prompt_context.get());
-    if (common < cached + TextRunnerPool::Request::kSharedPrefixMinTokens)
+    // A leader may have leased a deeper native frontier than a sibling can
+    // restore. Share its next planned checkpoint even for a short suffix:
+    // replaying generated tokens through prefill can change recurrent state.
+    // Ordinary cold-prefix sharing retains its minimum-work threshold.
+    const auto minimum_gain =
+        leader->runner_request.cached_prompt_tokens() > cached
+            ? std::size_t{1}
+            : TextRunnerPool::Request::kSharedPrefixMinTokens;
+    if (common < cached + minimum_gain)
       return false;
     const auto position = leader->runner_request.ShareCheckpoint(common);
-    if (position < cached + TextRunnerPool::Request::kSharedPrefixMinTokens)
+    if (position < cached + minimum_gain)
       return false;
     request->prefix_leader = std::move(leader);
     request->prefix_position = position;

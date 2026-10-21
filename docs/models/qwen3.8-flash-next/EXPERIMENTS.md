@@ -1,5 +1,34 @@
 # Qwen3.8 Flash-Next experiments
 
+## Exact sampled decode (October 21, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| Skip a redundant neural proposal after an established sampled copy | Retained only with an accepted source, a full 24-token match and at least three available copies. New sources and short resume matches still use the neural proposal. Target rejection/correction, private history and restored RNG remain authoritative. |
+| Compact sampled target verification | Retained for unconstrained top-k/min-keep up to 64 and bounded penalty history. Transfer the exact top 64 unpenalized logits plus every penalized logit, then apply the existing FP64 target sampler. Grammar activation, forced reasoning closure and unsupported settings use full rows. Independent CPU sorting and full-row distributions agree bit for bit, including correction RNG. Complete transfer/selection/sampling costs for 1/3/7 rows: 94.60/273.17/594.92 → 75.84/156.63/323.45 µs. Reconstructing full CPU rows first was exact but slower and was removed. |
+| KV-only predictor catch-up when no proposal is needed | Retained: scalar and uniform cache-only cohorts stop after K/V and indexer updates; mixed cohorts preserve the original row arithmetic. No discarded attention/output/FFN residual is produced in the uniform path. Independent predictor checks and full-logit/RNG/cache replay pass. |
+| Prepare image-capable slots' stable RoPE descriptor before text graphs | Retained after a cancellation/resume control exposed a repeatable 5.8 ms first-token regression. Admission profiling locates 5.61 ms in image-context setup; the first image descriptor invalidated previously captured text graphs. Preparing the empty descriptor at session creation keeps its pointer stable. The same resumed request falls from 9.45–9.46 to 3.71 ms TTFT (main 3.62–3.78), with identical output and faster decode. Other Qwen models retain their existing lazy initialization. |
+| Recalibrate deterministic sampled draft lengths | Rejected after auditing depths 0/4096/32768, C1/2/4/6/8 and widths 1–8 with the actual small sampled head. New-code generation improved 75.27 → 81.57 tok/s, but thinking fell 51.90 → 49.18 and the focused repeat reproduced 51.67 → 49.04. Original policy and cost tables remain. |
+| Pack Q8 output waves and vary Q4 expert rows per wave | Rejected. Q8 variants were flat/slower after matching production allocation and rotating weights beyond MALL. Q4 one-row waves changed result bits for a sub-1% gain; exact four/eight-row variants were slower than the existing two-row path. No production GEMV changes retained. |
+| Wider lookup blocks, lookup without a sidecar and Flash-Next DFlash2 | Not retained. Wider blocks need independently qualified decode arithmetic and recurrent rollback beyond eight rows; the AR-only path currently has no speculative reserve. The available DFlash2 fork still needs an audit of its exported proposal probabilities and restore/batch fallback before a lossless port. These are separate implementation projects, not enabled features. |
+
+Matched serving gains are modest: about 1–2.5% for copying and flat ordinary
+coding/thinking. See [the focused comparison](BENCHMARKS.md#sampled-decode-follow-up-october-21)
+and [quality limits](QUALITY.md#exact-sampled-decode-october-21-2026).
+
+## Mid-size prefill passes (October 21, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| Wide prefill routes for every prefill pass above eight rows | Retained: the fused SSM projection/convolution, fused attention projection, half-only HC mix, last-layer query skip and paired 128-row gate/up with 64-row down tiles started at 1,024 rows, so pp1023 ran at 1,432 tok/s against 1,624 for pp1024. Native AR pp, before → after: pp9 93.5 → 98.3, pp33 229.8 → 243.7, pp128 541.7 → 594.1, pp256 802.5 → 899.3, pp470 1,054.4 → 1,225.5, pp768 1,216.7 → 1,446.9, pp1023 1,432.2 → 1,578.7; pp1024+ unchanged. The paired experts supply most of the gain (pp470 1,082 → 1,225). Every row's prefill logits are byte-identical to main at 30–845 tokens and for 2,518 tokens split at 2,048; AR/MTP tg64 after 33/470/900-token prefixes keeps output hashes and draft counts. Decode and verification batches keep their routes. HTTP, pi system prompt on a new prefix (2,048 + 477-token passes), alternating arms: TTFT 1,745–1,756 → 1,684–1,696 ms; a 2,968-token single pass is unchanged. |
+
+## Component-cache admission (October 20, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| One rank per eligible slot, checkpoint-presence queries and one cold reset | Retained: the 128-checkpoint CPU fixture measures 107.05 µs for a full lookup and 31.49 µs for presence. All six HTTP profiles pass correctness, with exact responses and cache/prefill work. Native AR/MTP replay and d0/C1–C8 controls retain quality. Per-request timings remain partly inconclusive; see [qualification](QUALITY.md). |
+| Share completed full-prompt retry captures across peers | Rejected under the existing phase gate. The identical cohort avoids three 133,129,584-byte copies, and sampled MTP replies replay exactly, but larger physical decode batches repeatedly add 7–9 ms to some decode phases. Total request time improves; eight phase measurements fail. The default fix preserves capture behavior. |
+
 ## Host compaction and cache transfers (October 18, 2026)
 
 KFD SMI events and HIP traces distinguish queue suspension from slower model
@@ -26,6 +55,7 @@ limitations. Raw requests, profiles and rejected controls remain outside Git.
 
 | Experiment | Decision / evidence |
 | --- | --- |
+| Vector loads for F16/BF16 small projections, October 20 (#681) | Retained: the whole-pass `SmallGemm` path (#518) took only F32 rows, while Flash-Next narrows router and GDN alpha/beta to F16 and keeps the indexer in BF16, so every decode and verification call used the scalar, bounds-checked loop. F16/BF16 rows of whole passes now take one 8-byte load per step, widened exactly, with the same FMA order. Production fixtures (F16 513/96x2560, BF16 128/512x2560) are bit-identical to the grouped scalar kernel. Isolated calls with weights rotated past MALL: router w2 29.4 to 17.7 us, alpha/beta w2 17.0 to 8.1 us. Served decode median 1.7% less time (compare.py, within margin). |
 | CPU image preprocessing reuse, October 18 (#627) | Retained: backend-owned 128 MiB combined encoded/RGB cache, fast lookup hash followed by exact byte equality, immutable request ownership and unchanged continuation hashing. Flash-Next queue medians: 45.01/82.40/161.49 → 9.65/13.25/20.63 ms for 1/2/4 screenshots. Miss median differences: −0.26 ms small PNG, +0.42 ms 6.2 MB PNG; individual stalls and broad timing flags remain inconclusive. Rejected: SHA-256 lookup added about 6.7 ms for large PNG misses; unconditional reuse changed forced-cold behavior, so `cache_prompt:false` bypasses reuse. [Evidence](https://github.com/gufo-org/gufo/pull/645). |
 | Prepare indexer plans before readiness, October 17 (#632) | Retained: the first heuristic query loads a hipBLASLt code object for 104–115 ms, overlapping a 115 ms GPU idle gap. Preparing actual indexer geometry during model startup runs no trial GEMMs and preserves exact-shape selection. Cold 13-token PP falls from 257–260 to 145–146 ms; all 12 d0 control outputs/work match, with no timing flags. Independent F64 and prepared/lazy F16/BF16 checks, native snapshot replay and Pi tools/edit/code pass. |
 | Long-term pins for committed cache backing, October 17 (#632) | Retained as migration protection when process policy permits: registered base pages can still move under ordinary compaction. io_uring buffer registration supplies long-term pins without I/O; ranges split at Linux's 1 GiB per-buffer limit. Lifetime, failure, large-buffer and restricted-policy fallback tests pass. A 4 GiB held-memory control preserves all 24 outputs and timings, but neither arm repeats main's earlier 2.83-second gap. Podman syscall policy can disable the pins despite unlimited memlock. Cache timing outliers remain inconclusive as detailed in [quality](QUALITY.md); this is not a blanket stall or timing pass. |

@@ -249,6 +249,7 @@ QwenDFlashGpuDraftBackend::CreateFromGguf(
 
 bool QwenDFlashGpuDraftBackend::PrimeTargetContext(
     const speculative::DraftTargetContext& context) {
+  CheckContinuation();
   Reset();
   if (context.prompt_tokens.empty()) {
     return false;
@@ -315,6 +316,7 @@ std::vector<speculative::DraftProposal> QwenDFlashGpuDraftBackend::ProposeBatch(
   for (std::size_t index = 0; index < requests.size(); ++index) {
     const auto& request = requests[index];
     const auto& backend = *backends[index];
+    backend.CheckContinuation();
     if (!backend.primed_ || request.tokens.empty() || request.position == 0 ||
         backend.proposal_active_ || !std::isfinite(request.temperature) ||
         request.temperature < 0.0F ||
@@ -456,6 +458,7 @@ void QwenDFlashGpuDraftBackend::InjectPendingFeatures(
 
 bool QwenDFlashGpuDraftBackend::AppendTargetContext(
     const speculative::DraftTargetContext& context, std::uint32_t position) {
+  CheckContinuation();
   if (!primed_ || proposal_active_ ||
       context.hidden_size != executor_->GetTargetFeaturesSize() ||
       context.prompt_hidden_states.size() !=
@@ -472,6 +475,7 @@ speculative::DraftProposal QwenDFlashGpuDraftBackend::ProposeImpl(
     std::span<const tokenization::TokenId> prompt_tokens,
     std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
     std::uint64_t* rng_state) {
+  CheckContinuation();
   if (!primed_ || prompt_tokens.empty() || current_pos == 0) {
     throw std::logic_error("DFlash GPU draft backend is not primed");
   }
@@ -598,6 +602,7 @@ speculative::DraftProposal QwenDFlashGpuDraftBackend::ProposeImpl(
 void QwenDFlashGpuDraftBackend::AcceptFeedback(
     std::span<const tokenization::TokenId> accepted,
     tokenization::TokenId correction_token) {
+  CheckContinuation();
   (void)correction_token;
   if (!proposal_active_ || accepted.size() > proposed_tokens_.size()) {
     throw std::logic_error("DFlash GPU proposal feedback is invalid");
@@ -628,6 +633,7 @@ void QwenDFlashGpuDraftBackend::AcceptFeedback(
 
 void QwenDFlashGpuDraftBackend::UpdateTargetHidden(
     std::span<const float> hidden) {
+  CheckContinuation();
   const std::size_t enc_in_dim = executor_->GetTargetFeaturesSize();
   if (hidden.size() != enc_in_dim) {
     throw std::invalid_argument(
@@ -639,6 +645,7 @@ void QwenDFlashGpuDraftBackend::UpdateTargetHidden(
 
 void QwenDFlashGpuDraftBackend::DiscardPendingTargetContext(
     std::uint32_t position) {
+  CheckContinuation();
   if (proposal_active_ || executor_->GetInjectedContextLength() != position)
     throw std::logic_error("DFlash cancellation frontier is not retained");
   pending_target_features_.clear();
@@ -668,6 +675,7 @@ QwenDFlashGpuDraftBackend::Snapshot() const {
 
 void QwenDFlashGpuDraftBackend::RestoreSnapshot(
     const speculative::IDraftBackendSnapshot& snapshot) {
+  CheckContinuation();
   const auto* dflash_snapshot =
       dynamic_cast<const QwenDFlashDraftSnapshot*>(&snapshot);
   if (dflash_snapshot == nullptr || dflash_snapshot->gpu_snapshot == nullptr) {
@@ -696,6 +704,7 @@ void QwenDFlashGpuDraftBackend::RestoreSnapshot(
 
 void QwenDFlashGpuDraftBackend::RestorePersistentSnapshot(
     std::span<const std::uint8_t> payload) {
+  CheckContinuation();
   if (payload.size() < kDFlashDraftPersistentHeaderBytes ||
       !std::equal(kDFlashDraftPersistentMagic.begin(),
                   kDFlashDraftPersistentMagic.end(), payload.begin()) ||
@@ -776,6 +785,13 @@ void QwenDFlashGpuDraftBackend::RestorePersistentSnapshot(
 }
 
 void QwenDFlashGpuDraftBackend::Reset() noexcept {
+  try {
+    CheckContinuation();
+  } catch (...) {
+    if (continuation_hooks_)
+      continuation_hooks_->WriteFailed();
+    return;
+  }
   executor_->Reset();
   controller_.Reset();
   pending_target_features_.clear();

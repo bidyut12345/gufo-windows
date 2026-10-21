@@ -9,11 +9,13 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
 
 #include "src/core/model_config.hpp"
+#include "src/models/qwen/continuation_hooks.hpp"
 #include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/state.hpp"
@@ -32,6 +34,11 @@
 #include "src/models/qwen/vision/device_input.hpp"
 
 namespace gufo::hip {
+
+class QwenPrefillCancelled final : public std::runtime_error {
+public:
+  QwenPrefillCancelled() : std::runtime_error("Qwen prefill cancelled") {}
+};
 
 class HipblasLtGemm;
 class QwenGpuExecutor;
@@ -341,6 +348,8 @@ public:
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const core::ModelConfig& config, std::uint32_t max_context,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+  [[nodiscard]] static std::size_t RecurrentStateBytes(
+      const core::ModelConfig& config, QwenExecutionPolicy policy);
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       std::uint32_t valid_context) const;
@@ -364,6 +373,8 @@ public:
 
 private:
   void FreeAll() noexcept;
+  friend class models::qwen::ContinuationAdapter;
+  friend class QwenGpuExecutor;
   void AllocateRecurrentSnapshot();
   void SyncLivePointers() noexcept;
   [[nodiscard]] bool AllocateSsmReplayLog();
@@ -571,6 +582,8 @@ public:
   void FinishVerification();
 
 private:
+  friend class models::qwen::ContinuationAdapter;
+  models::qwen::ContinuationHooks* continuation_hooks_{nullptr};
   void CheckPrefillCancellation() const;
   void PrefillLayerCheckpoint(std::uint32_t layer);
   std::function<bool()> cancellation_check_;
@@ -578,6 +591,8 @@ private:
   void CheckReset() const {
     if (reset_failure_)
       std::rethrow_exception(reset_failure_);
+    if (continuation_hooks_)
+      continuation_hooks_->BeforeExecution();
   }
   std::exception_ptr reset_failure_;
   void ReplaySsmState(std::uint32_t position, std::uint32_t count = 1);

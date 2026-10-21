@@ -255,12 +255,14 @@ struct ComponentTextCache::Impl {
       entry->slot = std::make_unique<cache::LeasedSlot>(
           ledger, *resources->adapter, *entry->preservation,
           cache::SlotId{i + 1},
-          cache::IdleSpillConfig{1ULL << 20, resources->stream, [this] {
+          cache::IdleSpillConfig{1ULL << 20, resources->stream,
+                                 [this] {
                                    const std::lock_guard lock(mutex);
                                    return std::ranges::none_of(
                                        entries,
                                        [](const auto& e) { return e->busy; });
-                                 }});
+                                 },
+                                 resources->reassignment_batch_size});
       entries.push_back(std::move(entry));
     }
     std::size_t automatic_bytes{}, max_bytes{};
@@ -905,24 +907,80 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       const auto uncovered = [&](const Impl::Entry& e) {
         if (!e.live || e.live_tokens.size() <= kUncoveredTokens)
           return false;
-        const auto covering = impl_->index.Lookup(
+        return !impl_->index.HasCheckpoint(
             {impl_->identity, e.live_tokens,
-             cache::InputIdentity(e.live_tokens.size(), e.live_input)});
-        std::size_t deepest = 0;
-        for (const auto& candidate : covering.candidates)
-          if (!candidate.live)
-            deepest =
-                std::max(deepest, static_cast<std::size_t>(candidate.boundary));
-        return e.live_tokens.size() - deepest > kUncoveredTokens;
+             cache::InputIdentity(e.live_tokens.size(), e.live_input)},
+            e.live_tokens.size() - kUncoveredTokens);
       };
+      using Rank = std::tuple<bool, bool, bool, bool, std::uint64_t>;
       const auto rank = [&](const Impl::Entry& e) {
-        return std::tuple{uncovered(e), !e.slot->PreservationComplete(),
-                          bool(e.live),
-                          e.live_tokens.size() >= kUncoveredTokens, e.used};
+        return Rank{uncovered(e), !e.slot->PreservationComplete(), bool(e.live),
+                    e.live_tokens.size() >= kUncoveredTokens, e.used};
       };
-      for (auto& candidate : impl_->entries)
-        if (!candidate->busy && (!entry || rank(*candidate) < rank(*entry)))
+      std::optional<Rank> selected_rank;
+      for (auto& candidate : impl_->entries) {
+        if (candidate->busy)
+          continue;
+        if (!entry) {
           entry = candidate.get();
+          continue;
+        }
+        if (!selected_rank)
+          selected_rank = rank(*entry);
+        const auto candidate_rank = rank(*candidate);
+        if (candidate_rank < *selected_rank) {
+          entry = candidate.get();
+          selected_rank = candidate_rank;
+        }
+      }
+      // Keep ordinary cold selection unchanged. Only a cancelled executor
+      // with outstanding work needs an alternative; do not query every
+      // stream or look up exact checkpoint coverage on normal admissions.
+      if (entry && !entry->slot->ExecutionComplete()) {
+        if (!selected_rank)
+          selected_rank = rank(*entry);
+        Impl::Entry* ready = nullptr;
+        std::optional<Rank> ready_rank;
+        for (auto& candidate : impl_->entries) {
+          if (candidate.get() == entry || candidate->busy ||
+              !candidate->slot->ExecutionComplete())
+            continue;
+          const auto candidate_rank = rank(*candidate);
+          // A ready slot must not sacrifice uncovered work or introduce
+          // foreground preservation. Keep a deep generated tail unless an
+          // exact checkpoint or another idle live copy still covers it.
+          const auto live_copy = [&] {
+            return candidate->history &&
+                   std::ranges::any_of(impl_->entries, [&](const auto& other) {
+                     return other != candidate && !other->busy && other->live &&
+                            other->history &&
+                            other->history->Lineage() ==
+                                candidate->history->Lineage() &&
+                            other->live_input == candidate->live_input &&
+                            other->live_tokens == candidate->live_tokens;
+                   });
+          };
+          if (std::tie(std::get<0>(candidate_rank),
+                       std::get<1>(candidate_rank)) >
+                  std::tie(std::get<0>(*selected_rank),
+                           std::get<1>(*selected_rank)) ||
+              (candidate->live &&
+               candidate->live_tokens.size() >= kUncoveredTokens &&
+               !impl_->index.HasCheckpoint(
+                   {impl_->identity, candidate->live_tokens,
+                    cache::InputIdentity(candidate->live_tokens.size(),
+                                         candidate->live_input)},
+                   candidate->live_tokens.size()) &&
+               !live_copy()))
+            continue;
+          if (!ready || candidate_rank < *ready_rank) {
+            ready = candidate.get();
+            ready_rank = candidate_rank;
+          }
+        }
+        if (ready)
+          entry = ready;
+      }
     }
     if (!entry)
       throw cache::SlotBusy();
@@ -948,6 +1006,21 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     request.state->SetStopAtEos(stop_at_eos);
     impl_->runner->SetPromptContext(*request.state, context);
     const auto started = Clock::now();
+    // Cold Acquire has already reset the slot. Only an attempted restore (or
+    // an unusable live frontier) can require another reset before cold use.
+    bool clean = !live;
+    // A frontier captured between prefill passes cannot select the next token
+    // of a prompt that ends there; serve that prompt from a shallower boundary.
+    const auto decodable = [&](std::size_t boundary) {
+      return boundary < prompt.size() ||
+             impl_->runner->HasDecodeFrontier(*request.state);
+    };
+    if (live && !decodable(found.selected->boundary)) {
+      live.reset();
+      const std::lock_guard lock(impl_->mutex);
+      entry->branch = std::make_shared<const std::uint8_t>(0);
+      entry->durable.reset();
+    }
     bool restored = bool(live);
     if (live)
       request.cached = found.selected->boundary;
@@ -962,6 +1035,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           std::vector<cache::ComponentPosition> positions;
           for (const auto& c : checkpoint.Components())
             positions.push_back(c.position);
+          clean = false;
           impl_->resources->adapter->BeginRestore(request.slot.Execution(),
                                                   positions);
           // Every pin outlives all submitted loads, including failure drain.
@@ -1069,6 +1143,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           }
           restored = true;
         } else if (candidate.durable && impl_->streaming) {
+          clean = false;
           cache::TransferTiming timing;
           const auto id = candidate.durable->Manifest().checkpoint;
           restored = impl_->streaming->Restore(
@@ -1103,6 +1178,16 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
             impl_->catalog->Touch(id);
           }
         }
+        if (restored && !decodable(candidate.boundary)) {
+          if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
+            throw std::runtime_error("component restore reset failed");
+          entry->history.reset();
+          request.source = {};
+          request.restored = 0;
+          request.disk_hit = false;
+          restored = false;
+          continue;
+        }
         if (restored) {
           request.cached = candidate.boundary;
           const std::lock_guard lock(impl_->mutex);
@@ -1111,11 +1196,13 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       } catch (...) {
         if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
           throw;
+        clean = true;
         request.restored = 0;
       }
     }
     if (!restored) {
-      if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
+      if (!clean &&
+          !impl_->resources->adapter->Invalidate(request.slot.Execution()))
         throw std::runtime_error("component cold initialization failed");
       entry->history = std::make_unique<cache::ExecutionHistory>(
           cache::ExecutionHistory::Cold(impl_->ledger,
@@ -1245,12 +1332,10 @@ ContinuationLookup ComponentTextCache::Lease::lookup() const noexcept {
 bool ComponentTextCache::Lease::HasSnapshotFor(
     std::span<const ContinuationToken> tokens) const {
   const std::lock_guard lock(impl_->cache->mutex);
-  auto found = impl_->cache->index.Lookup(
+  return impl_->cache->index.HasCheckpoint(
       {impl_->cache->identity, tokens,
-       cache::InputIdentity(tokens.size(), At(impl_->input, tokens.size()))});
-  return std::any_of(
-      found.candidates.begin(), found.candidates.end(),
-      [&](const auto& c) { return !c.live && c.boundary == tokens.size(); });
+       cache::InputIdentity(tokens.size(), At(impl_->input, tokens.size()))},
+      tokens.size());
 }
 bool ComponentTextCache::Lease::TryReserveSnapshot(
     std::size_t bytes, std::size_t boundary, bool preserve,

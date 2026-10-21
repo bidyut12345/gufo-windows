@@ -107,6 +107,12 @@ bool MatrixRows(std::uint32_t rows) {
 bool ExpertMatrixRows(std::uint32_t rows) {
   return prefill_phase || rows > 4 * kVecBatch;
 }
+/// Prefill passes wider than a vector batch take the fused projections and
+/// the paired routed expert tiles: they win from 9 rows up to the full chunk.
+/// Decode and verification batches keep their single-token arithmetic.
+bool WidePrefill(std::uint32_t rows) {
+  return prefill_phase && rows > kVecBatch;
+}
 
 /// Whether mmq's Q8_1 rows of width k carry no padding, so a producer's
 /// contiguous element order is the layout.
@@ -725,6 +731,12 @@ void Session::RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
   }
 }
 
+void Session::PrepareVision(hipStream_t stream) {
+  vision_input_.PrepareRope(stream);
+  for (auto& attention : attention_)
+    attention.rope = vision_input_.rope();
+}
+
 void Session::ConfigureVision(
     std::shared_ptr<const qwen::vision::Prompt> prompt,
     std::shared_ptr<qwen::vision::Encoder> encoder, hipStream_t stream) {
@@ -1324,6 +1336,27 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     std::construct_at(e->mtp_candidates_host_);
     e->mtp_candidates_host_->size =
         std::min<std::size_t>(c.vocab_size, kMtpCandidates);
+    const auto rows = std::min<std::size_t>(7, e->options_.max_speculative - 1);
+    if (rows != 0) {
+      e->verification_ids_ = Alloc<std::uint32_t>(
+          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
+      e->verification_scratch_ids_ = Alloc<std::uint32_t>(
+          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
+      const auto candidates = rows * (kMtpCandidates + kCompactPenaltyLimit);
+      e->verification_candidates_ =
+          Alloc<sampling::LogitCandidate>(a, candidates, error_msg);
+      if (!Check(e->host_allocations_.Allocate(
+                     &e->verification_candidates_host_,
+                     candidates * sizeof(sampling::LogitCandidate)),
+                 "pinned verification candidates", error_msg) ||
+          !Check(hip::AllocateDevice(&e->verification_penalties_,
+                                     rows * kCompactPenaltyLimit *
+                                         sizeof(sampling::TokenPenalty)),
+                 "verification penalties", error_msg))
+        return nullptr;
+      e->verification_penalty_capacity_ = rows * kCompactPenaltyLimit;
+      e->verification_penalty_host_.reserve(e->verification_penalty_capacity_);
+    }
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -2142,8 +2175,8 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
       }
     }
   };
-  if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
-    // Wide batches: 64-token tiles for the down projection, then 128-token
+  if (WidePrefill(n_tokens)) {
+    // Prefill batches: 64-token tiles for the down projection, then 128-token
     // tiles for the paired gate/up projections.
     append(64);
     routed_64_tiles_ = n_tiles;
@@ -2528,18 +2561,50 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
   if (ple_pending_ && !WaitPle(error_msg)) {
     return false;
   }
-  if ((prefetch_.pending || prefetch_.ready) && !speculative &&
-      session.ngram_ == prefetch_.before &&
-      std::ranges::equal(tokens, prefetch_.tokens)) {
-    // These are this batch's rows: WaitPle collects them.
-    session.ngram_ = prefetch_.after;
-    prefetch_.claimed = true;
-    ple_pending_ = true;
-    return true;
-  }
-  FinishPrefetch();
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
+  if ((prefetch_.pending || prefetch_.ready) && !speculative &&
+      session.ngram_ == prefetch_.before) {
+    // A cache checkpoint or another step budget can end this chunk before
+    // or after the hinted one. Rows are per token, so a common prefix still
+    // serves every token both cover.
+    const auto shared = static_cast<std::size_t>(
+        std::ranges::mismatch(tokens, prefetch_.tokens).in1 - tokens.begin());
+    if (shared == tokens.size() || shared == prefetch_.tokens.size()) {
+      prefetch_.claimed = shared;
+      ple_pending_ = true;
+      if (shared == prefetch_.tokens.size()) {
+        session.ngram_ = prefetch_.after;
+      } else {
+        HashNgramRows(
+            c, session.ngram_, tokens,
+            std::span<std::uint32_t>(host_rows_.data(), n * c.ple_heads));
+      }
+      if (shared == tokens.size())
+        return true;
+      // Only one table read runs at a time: finish the prefetch, which had a
+      // whole chunk to complete, then read the rows past it.
+      FinishPrefetch();
+      const auto rest = tokens.subspan(shared);
+      const auto rows = rest.size() * c.ple_heads;
+      HashNgramRows(c, session.ngram_, rest,
+                    std::span<std::uint32_t>(host_rows_.data(), rows));
+      const NgramGatherOwner owner{rows, &session.ngram_counters_};
+      prefetch_.tail = ngram_->StartRead(
+          std::span<const std::uint32_t>(host_rows_.data(), rows),
+          std::span<float>(host_emb_ + shared * c.PleEmbeddingDim(),
+                           rest.size() * c.PleEmbeddingDim()),
+          std::span(&owner, 1));
+      if (!prefetch_.tail) {
+        prefetch_.claimed = 0;
+        prefetch_.ready = false;
+        ple_pending_ = false;
+        AssignError(error_msg, "n-gram table read could not start");
+      }
+      return prefetch_.tail;
+    }
+  }
+  FinishPrefetch();
   // Only proper prefixes need snapshots; the full batch keeps its live state.
   if (speculative) {
     for (std::uint32_t i = 0; i < n; ++i) {
@@ -2554,10 +2619,12 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
     HashNgramRows(c, session.ngram_, tokens,
                   std::span<std::uint32_t>(host_rows_.data(), n * c.ple_heads));
   }
+  const NgramGatherOwner owner{n * c.ple_heads, &session.ngram_counters_};
   ple_pending_ = ngram_->StartRead(
       std::span<const std::uint32_t>(host_rows_.data(), n * c.ple_heads),
       std::span<float>(host_emb_,
-                       static_cast<std::size_t>(n) * c.PleEmbeddingDim()));
+                       static_cast<std::size_t>(n) * c.PleEmbeddingDim()),
+      std::span(&owner, 1));
   if (!ple_pending_) {
     AssignError(error_msg, "n-gram table read could not start");
   }
@@ -2566,16 +2633,18 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
 
 bool Executor::WaitPle(std::string* error_msg) const {
   bool ok = ple_pending_;
-  if (ok && prefetch_.claimed) {
+  if (ok && prefetch_.claimed != 0) {
     FinishPrefetch();
     ok = prefetch_.ready;
     if (ok) {
       std::copy_n(prefetch_.rows.data(),
-                  prefetch_.tokens.size() * config().PleEmbeddingDim(),
-                  host_emb_);
+                  prefetch_.claimed * config().PleEmbeddingDim(), host_emb_);
     }
+    if (prefetch_.tail)
+      ok = ngram_->WaitRead() && ok;
     prefetch_.ready = false;
-    prefetch_.claimed = false;
+    prefetch_.claimed = 0;
+    prefetch_.tail = false;
   } else if (ok) {
     ok = ngram_->WaitRead();
   }
@@ -2606,8 +2675,10 @@ void Executor::PrefetchPle(const Session& session,
   if (prefetch_.rows.size() < count) {
     prefetch_.rows.resize(count);
   }
+  const NgramGatherOwner owner{rows.size(), &session.ngram_counters_};
   prefetch_.pending =
-      ngram_->StartRead(rows, std::span<float>(prefetch_.rows.data(), count));
+      ngram_->StartRead(rows, std::span<float>(prefetch_.rows.data(), count),
+                        std::span(&owner, 1));
 }
 
 void Executor::FinishPrefetch() const {
@@ -2708,7 +2779,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
-    if (!projections_ready && !speculative && n_tokens >= 1024 &&
+    if (!projections_ready && !speculative && WidePrefill(n_tokens) &&
         n_tokens <= options_.max_batch && DenseF16Route(l.ssm_in, n_tokens)) {
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
       convolved = DenseF16SsmGemm(
@@ -2889,10 +2960,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     // wide route was verified bit-identical to the separate path for F16
     // caches, so F16 bytes do not change.
     const bool fused_projection =
-        !projections_ready && prefill_phase && n_tokens <= options_.max_batch &&
-        DenseF16Route(l.attn_qkv, n_tokens) && l.attn_qkv.rows == 13312 &&
-        l.attn_qkv.cols == 2560 && c.num_heads == 24 && c.num_kv_heads == 2 &&
-        c.head_dim == 256 && c.rotary_dim == 64;
+        !projections_ready && WidePrefill(n_tokens) &&
+        n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
+        l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
+        c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
+        c.rotary_dim == 64;
     if (fused_projection) {
       PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
       prepared = AttentionF16Gemm(
@@ -3243,8 +3315,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       half_bf16_ = false;
     }
     const auto* x_half = static_cast<const __half*>(s_.x_half);
-    // Large batches pair the gate/up projections and apply SwiGLU without
-    // materializing the gate. Smaller buckets favor separate projections.
+    // Prefill pairs the gate/up projections and applies SwiGLU without
+    // materializing the gate; decode-time batches keep separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
     const WeightType gate_type =
         l.ffn_gate_exps.type == GgmlType::kQ5_K    ? WeightType::kQ5_K
@@ -3264,7 +3336,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
         wide_tiles ? routed_64_tiles_ : routed_n_tiles_;
     const std::uint32_t separate_rows = wide_tiles ? 64 : routed_tile_rows_;
     const bool gated_ok =
-        pair_ok && n_tokens >= 1024 && routed_tile_rows_ == 48
+        routed_64_tiles_ != 0
             ? RoutedGatedF16Gemm(
                   l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
                   s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
@@ -3288,8 +3360,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
         l.ffn_down_exps.type == GgmlType::kQ8_0     ? WeightType::kQ8_0
         : l.ffn_down_exps.type == GgmlType::kIQ4_NL ? WeightType::kIQ4_NL
                                                     : WeightType::kQ5_1;
-    // Wide batches take the 64-token down tiles: they decode each expert's
-    // weights over more rows, also where 48-token tiles would be fewer.
+    // Prefill takes the 64-token down tiles: they decode each expert's
+    // weights over more rows, also where narrower tiles would be fewer.
     const bool wide_down = routed_64_tiles_ != 0;
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
@@ -3720,19 +3792,19 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
     // Both stacked SSM projections consume the same F16 input. Avoid writing
     // unused F32/Q8 copies when the wide mixer can supply that input directly.
-    const bool half_only =
-        prefill_phase && n >= 1024 && n <= options_.max_batch && l.linear &&
-        DenseF16Route(l.ssm_in, n) && l.ssm_alpha_beta.type == GgmlType::kF16 &&
-        l.ssm_alpha_beta.cols == l.ssm_in.cols;
+    const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
+                           l.linear && DenseF16Route(l.ssm_in, n) &&
+                           l.ssm_alpha_beta.type == GgmlType::kF16 &&
+                           l.ssm_alpha_beta.cols == l.ssm_in.cols;
     if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
                half_only)) {
       return false;
     }
     // The last target layer's query outputs have no later cache consumer.
     // Preserve all K/V/indexer rows and the final query's original tile.
-    const bool last_attention = prefill_phase && !session.mtp_enabled_ &&
-                                il + 1 == c.num_layers && n >= 1024 &&
-                                n_logits == 1 && checkpoint == nullptr;
+    const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
+                                il + 1 == c.num_layers && n_logits == 1 &&
+                                checkpoint == nullptr;
     if (l.linear) {
       const auto capture =
           checkpoint ? GdnCheckpoint{checkpoint->state->linear_[il].state,
@@ -4778,44 +4850,63 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
   return copied && completed;
 }
 
-bool Executor::GreedyArgmaxNodes(std::uint32_t n_logits,
-                                 std::string* error_msg) const {
-  // Appended to the kVerifyGreedy body: ranks every verified row including
-  // the frontier and parks the candidates in pinned memory for
-  // ReadGreedyPredictions(). Runs inside capture like any other node. The
-  // frontier row's argmax is the next cycle's greedy anchor.
-  if (n_logits < 1 || s_.mtp_ids == nullptr) {
-    return true;
-  }
-  const auto rows = n_logits;
-  if (rows > kArgmaxParts) {
-    AssignError(error_msg, "greedy MTP verification exceeds the argmax parts");
-    return false;
-  }
-  const auto vocab = config().vocab_size;
-  gufo::hip::LaunchBatchedGPUArgmax(
-      VerificationLogits(), s_.mtp_ids, rows, vocab,
-      {reinterpret_cast<float*>(s_.mtp_scratch_ids),
-       MtpCandidateWorkspaceSize(vocab)},
-      stream_);
-  GatherArgmaxCandidates(VerificationLogits(), s_.mtp_ids, s_.mtp_argmax, rows,
-                         vocab, stream_);
-  return Check(hipMemcpyAsync(mtp_predictions_host_, s_.mtp_argmax,
-                              rows * sizeof(ArgmaxCandidate),
-                              hipMemcpyDeviceToHost, stream_),
-               "greedy MTP predictions download", error_msg);
+bool Executor::CanCompactMtpVerification(
+    const sampling::SamplerState& sampler) {
+  const auto& config = sampler.config();
+  return config.uses_random_sampling() && config.top_k > 0 &&
+         std::size_t(config.top_k) <= kMtpCandidates &&
+         config.min_keep <= kMtpCandidates &&
+         sampler.penalties().size() + 8 <= kCompactPenaltyLimit &&
+         !sampler.NeedsConstraintMask();
 }
 
-bool Executor::ReadGreedyPredictions(std::span<ArgmaxCandidate> predictions,
-                                     std::string* error_msg) const {
-  if (predictions.empty() ||
-      predictions.size_bytes() >
-          options_.max_speculative * sizeof(ArgmaxCandidate)) {
-    AssignError(error_msg, "invalid greedy MTP prediction read");
+bool Executor::SampledMtpCandidates(
+    std::span<std::span<const sampling::LogitCandidate>> output,
+    const sampling::SamplerState& sampler, std::span<const std::int32_t> drafts,
+    std::string* error_msg) const {
+  const auto rows = output.size();
+  if (rows == 0 || rows > 7 || rows >= options_.max_speculative ||
+      rows != drafts.size() || verification_ids_ == nullptr ||
+      !CanCompactMtpVerification(sampler)) {
+    AssignError(error_msg, "invalid compact MTP verification request");
     return false;
   }
-  std::memcpy(predictions.data(), mtp_predictions_host_,
-              predictions.size_bytes());
+  auto& penalties = verification_penalty_host_;
+  penalties.clear();
+  GreedyPenaltyRows batch{};
+  auto tentative = sampler.WithoutConstraint();
+  for (std::size_t row = 0; row < rows; ++row) {
+    const auto counts = tentative.penalties();
+    penalties.insert(penalties.end(), counts.begin(), counts.end());
+    batch.offsets[row + 1] = penalties.size();
+    if (row + 1 < rows)
+      tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
+  }
+  batch.penalties = verification_penalties_;
+  if (!penalties.empty() &&
+      !Check(hipMemcpyAsync(verification_penalties_, penalties.data(),
+                            penalties.size() * sizeof(penalties[0]),
+                            hipMemcpyHostToDevice, stream_),
+             "compact verification penalties", error_msg))
+    return false;
+  VerificationCandidates(VerificationLogits(), batch, verification_ids_,
+                         verification_scratch_ids_, verification_candidates_,
+                         rows, config().vocab_size, stream_);
+  const auto count = rows * kMtpCandidates + penalties.size();
+  const bool copied = Check(
+      hipMemcpyAsync(verification_candidates_host_, verification_candidates_,
+                     count * sizeof(sampling::LogitCandidate),
+                     hipMemcpyDeviceToHost, stream_),
+      "compact verification candidates", error_msg);
+  const bool completed =
+      Check(hipStreamSynchronize(stream_), "compact verification", error_msg);
+  if (!copied || !completed)
+    return false;
+  for (std::size_t row = 0; row < rows; ++row)
+    output[row] = {
+        verification_candidates_host_ + row * kMtpCandidates +
+            batch.offsets[row],
+        kMtpCandidates + batch.offsets[row + 1] - batch.offsets[row]};
   return true;
 }
 

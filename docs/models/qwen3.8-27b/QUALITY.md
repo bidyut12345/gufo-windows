@@ -80,14 +80,53 @@ tolerances, not bit-identical upstream sampler parity.
 
 ## Vision
 
-Q4/Q8 AR and DFlash2 pass multi-image, sampled/greedy C4, cancellation,
-generated-history continuation and disk-restart checks. Q8 also requires exact
+Earlier Q4/Q8 AR and DFlash2 checks cover multi-image, sampled/greedy C4,
+cancellation, generated-history continuation and disk restart. The current
+component migration retains a strict Q4 cold-prefill versus decoded-history
+failure; see [the current status](#component-serving-migration). Q8 also requires exact
 cold/live/restored continuation logits. Encoder controls use official
 Transformers operators over the **same converted BF16 GGUF**; they cannot detect
 conversion errors. Flash-Next has a separate [vision limit](../qwen3.8-flash-next/QUALITY.md#vision).
 Q4/Q8 image snapshots restored after cancellation inside the image encoder or
 text prefill match all target logits exactly; token-limit endings and stripped
 tool reasoning retain the compatible conversation prefix.
+
+## Autoregressive component checkpoints
+
+October 10, 2026: the model-local component adapter passes Q4/Q8 checks in
+both FP16 and FP32 attention KV layouts. Every restored component byte and
+full continuation logit row matches uninterrupted execution. The checks cover
+earlier-boundary edits, pending generation tokens, leased-row preservation,
+committed recurrent replay, failed/discarded transfers and completion lifetime.
+Image regressions restore before the first image and between two images while
+retaining the matching request's future images and complete RoPE layout;
+those focused image checks use production FP16 KV.
+
+Production FP16 probes at 32K and 100K also match every restored byte and
+sixteen continuation logit rows/token decisions after transfer to another slot.
+These are Gufo execution-consistency checks. They do not extend upstream or
+weight-conversion parity, qualify alternate BF16 recurrence, or qualify the
+common checkpoint allocator. The [adapter inventory and commands](CONTINUATION-ADAPTER.md)
+and [card 15 results](../../cache-redesign/cards/15-qwen27b-ar-adapter.md)
+record the scope and retained evidence.
+
+## Long-context FP32 attention qualification (2026-10-13)
+
+A new capacity probe exposed an invalid FP32 prefill launch at 16K: its
+context-sized score array plus reduction scratch used 66,560 bytes of LDS,
+above gfx1151's 64 KiB limit. The bounded online fallback passes the existing
+attention controls and new three-row causal checks around the LDS boundary,
+32K and 100K in both KV representations. The worst absolute FP64-oracle error
+is 5.04e-7 (limit 1e-5); long rows match scalar online attention exactly, and
+BF16 output bits match independent rounding. The pinned `64639c28` Q4 FP32
+32K full-model probe also passes every restored component byte and sixteen
+continued full-logit/token checks. After the telemetry-only repair, the pinned
+`e008ffc7` binary passes Q4/Q8 FP16 and Q4 FP32 at both 32K and 100K,
+and Q8 FP32 at 32K. Every restored component byte and sixteen continued
+full-logit/token checks match. The user stopped the Q8 FP32 100K probe and
+skipped further long-capacity probes for both KV precisions. That case has no
+qualification result. Matched-main timing flags remain open. All original aborts and diagnostics remain retained in
+`/home/mixer/gufo-qualification/qwen27b-component-2026-10-13`.
 
 ## Reproduce
 
@@ -128,3 +167,53 @@ Loading uses cold files (`POSIX_FADV_DONTNEED`, zero resident pages checked
 with `mincore`), C1/DFlash2/capacity 262144; memory uses C1/AR peak HIP
 allocation. Commands, hashes and counts remain in [artifacts](artifacts/bench.json)
 and the [benchmark workflow](../../../.agents/skills/benchmark-model/SKILL.md).
+
+## Component serving migration
+
+October 20 refresh: main `1b0a5a84` is merged (`8ed4da99`), with fixes
+`4d802349`, `e8713aba` and `94fee48e`. The last stops a prompt that ends
+exactly at a partial-prefill frontier from decoding a placeholder token; it
+recomputes from a shallower boundary, and Q4 AR/DFlash2 suites do the same work. Q4/Q8 native adapter, DFlash2 state, serving-cache,
+target numerical and attention operator checks pass. Restored component bytes
+and full logits match across FP16/FP32 KV, edits, rollback, images, sampled
+frontiers, cancellation, disk compatibility, concurrent forks and cleanup.
+
+All selected HTTP profiles pass every stage (23 stages, 290 requests): Q4 AR
+and DFlash2 twice, Q8 DFlash2, and Flash-Next AR twice and MTP once on both
+main and the candidate, because the PR moves the shared snapshot copy helper
+and touches the shared verifier, backend and scheduler. Q4 DFlash2 observes
+3,423 proposed and 2,016 accepted draft tokens. Main fails only `cache-edits`,
+which its legacy 27B cache does not support.
+
+Speculative rollback (`RestoreState`) previously guarded every attention row
+although it only swaps recurrent buffers. Each rejected draft therefore copied
+borrowed rows in the foreground, and disk-only checkpoints were retired before
+publication. After the fix, every over-RAM DFlash2 checkpoint publishes and
+concurrent cold DFlash2 decode returns to main's 53 ms per token from 60–64 ms.
+
+High-context and first-request probes (main/PR/PR/main) pass with equal work.
+Standard pp2048/tg128 stays within 1.6% of main. Deep-peer AR and DFlash2
+pass 142K crash recovery, twelve short peers reusing the system boundary and a
+second restart. Pi AR and DFlash2 pass tools, edit and bugfix workflows; a first
+AR run failed only because the model wrote a trailing newline.
+Over-RAM passes through `E1`. `E2` released its publication wait at the
+36.6 s cost bound, 6 s before the deeper checkpoint, which was queued behind
+two older jobs, was published. That timing-dependent case remains unqualified.
+
+Memory: the component cache commits about 2.27 GB of backing before readiness
+in every mode (`GrowAhead`), as Flash does on main. Each DFlash2 checkpoint
+also carries a fixed 84.7 MB of draft ring and feature state. Main's legacy
+snapshots live in device (GTT) memory and the component cache keeps them in
+host RAM, so compare system totals: the peak MemAvailable drop over a full run
+is 50.3 GiB versus main's 52.4 GiB (Q4 AR) and 55.0 versus 57.4 GiB (Q4
+DFlash2).
+
+Accepted timing costs, repeated in both observations: a 3–6 ms admission floor
+in `queue_ms` (component acquire costs about 2.8 ms; Flash shows the same floor
+on main) and higher `cache_snapshot_ms` where main captured nothing or less
+in `cache-concurrency`. Optimization is tracked in
+[#678](https://github.com/gufo-org/gufo/issues/678). Disk requests queue less than on main. See the
+[dated review record](artifacts/component-cache-review.json) for commands,
+binaries and every observation. The earlier cold-prefill versus
+decoded-history vision difference remains unqualified; the wide prefill route
+restored by `dabc85cf` is retained.

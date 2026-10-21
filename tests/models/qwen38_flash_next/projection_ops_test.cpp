@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -197,7 +198,7 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
   }
   // A rejected geometry must not touch any pointer.
   if (q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                         1023, m, k, channels, 4, nullptr) ||
+                         0, m, k, channels, 4, nullptr) ||
       q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                          batch, m, k, channels, 3, nullptr)) {
     throw std::runtime_error("SSM projection accepted an unsupported shape");
@@ -254,6 +255,12 @@ void CheckAttentionProjection(const void* weights, const __half* input,
   hipGraph_t graph = nullptr;
   hipGraphExec_t replay = nullptr;
   CheckHip(hipStreamCreate(&stream), "attention stream");
+  gufo::models::qwen::vision::DeviceInput vision;
+  vision.PrepareRope(stream);
+  const auto* descriptor = vision.rope();
+  vision.PrepareRope(stream);
+  if (descriptor == nullptr || vision.rope() != descriptor)
+    throw std::runtime_error("prepared image descriptor is not stable");
   CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
            "attention capture");
   if (!q::AttentionF16Gemm(weights, input, device_gamma, device_gamma + 256,
@@ -261,12 +268,15 @@ void CheckAttentionProjection(const void* weights, const __half* input,
                            static_cast<float*>(actual[1]) + 8,
                            static_cast<__half*>(actual[2]) + 8,
                            static_cast<__half*>(actual[3]) + 8, batch, position,
-                           1e7F, 1e-6F, stream))
+                           1e7F, 1e-6F, stream, vision.rope()))
     throw std::runtime_error("attention fusion rejected the model shape");
   CheckHip(hipStreamEndCapture(stream, &graph), "attention capture end");
   CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
            "attention graph");
   for (unsigned repetition = 0; repetition < 2; ++repetition) {
+    vision.RestoreLayout({}, stream);
+    if (vision.rope() != descriptor)
+      throw std::runtime_error("text restore replaced the image descriptor");
     for (unsigned i = 0; i < 4; ++i)
       CheckHip(hipMemsetAsync(actual[i], 0xA5,
                               i < 2 ? query_bytes : cache_bytes, stream),
@@ -289,9 +299,9 @@ void CheckAttentionProjection(const void* weights, const __half* input,
                           static_cast<float*>(actual[0]) + 8,
                           static_cast<float*>(actual[1]) + 8,
                           static_cast<__half*>(actual[2]) + 8,
-                          static_cast<__half*>(actual[3]) + 8, 1023, position,
+                          static_cast<__half*>(actual[3]) + 8, 0, position,
                           1e7F, 1e-6F, nullptr))
-    throw std::runtime_error("attention fusion accepted a short batch");
+    throw std::runtime_error("attention fusion accepted an empty batch");
   CheckHip(hipGraphExecDestroy(replay), "attention graph free");
   CheckHip(hipGraphDestroy(graph), "attention graph definition free");
   CheckHip(hipStreamDestroy(stream), "attention stream free");
@@ -645,7 +655,7 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
             << worst_f16_vs_mmq << ", worst |W8A8 - F64| " << worst_vs_ref
             << ", worst |F16 - F64| " << worst_f16 << " (reference scale "
             << ref_scale << ")\n";
-  if (m == 16384 && k == 2560 && batch >= 1024) {
+  if (m == 16384 && k == 2560 && batch > 8) {
     CheckSsmProjection(d_w, d_x_half, d_f16, f16,
                        static_cast<std::uint32_t>(batch));
   }
@@ -653,7 +663,7 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
     CheckHcDownProjection(d_w, d_tiled, d_w8,
                           static_cast<std::uint32_t>(batch));
   }
-  if (m == 13312 && k == 2560 && batch >= 1024) {
+  if (m == 13312 && k == 2560 && batch > 8) {
     CheckAttentionProjection(d_w, d_x_half, d_f16,
                              static_cast<std::uint32_t>(batch));
   }
@@ -936,6 +946,10 @@ int main() {
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
     CheckSmallProjection(q::WeightType::kF32, 96, 2560);
     CheckSmallProjection(q::WeightType::kBF16, 129, 2560);
+    CheckSmallProjection(q::WeightType::kF16, 513, 2560);
+    CheckSmallProjection(q::WeightType::kF16, 96, 2560);
+    CheckSmallProjection(q::WeightType::kBF16, 128, 2560);
+    CheckSmallProjection(q::WeightType::kBF16, 512, 2560);
     CheckSmallProjection(q::WeightType::kF16, 7, 131);
     CheckDecodeGrouping(64, 2560);
     CheckDecodeGrouping(320, 10240);
@@ -960,6 +974,13 @@ int main() {
     // Wide SSM projection: two K blocks per stage, with a partial token tile.
     ok = Run(2049, 16384, 2560, 0x16384256U, 2) < 1e-2 && ok;
     ok = Run(2049, 13312, 2560, 0x13312256U, 2) < 1e-2 && ok;
+    // Every prefill pass wider than a vector batch fuses these projections:
+    // one partial 32-token tile, a ragged 128-token tile and a mid-size pass.
+    for (const std::size_t batch : {9U, 33U, 470U}) {
+      const auto seed = static_cast<std::uint32_t>(batch);
+      ok = Run(batch, 16384, 2560, 0x16384000U + seed, 2) < 1e-2 && ok;
+      ok = Run(batch, 13312, 2560, 0x13312000U + seed, 2) < 1e-2 && ok;
+    }
     // HC up: the grouped grid, including the last partial token tile.
     ok = Run(2049, 10240, 320, 0x8A8A320U, 2) < 1e-2 && ok;
     // HC down fusion: its first supported batch and a partial final tile.

@@ -873,6 +873,7 @@ struct TextRunnerPool::Request::Impl {
           state,
           std::span<const TextRunnerToken>(prompt).first(prefill_offset));
     }
+    ngram_baseline = runner->NgramRows(state);
     const auto capabilities = runner->Descriptor().capabilities;
     // Component adapters supply their own pass boundaries below. Building the
     // generic plan first only repeats prefix lookups before discarding it.
@@ -1232,6 +1233,8 @@ struct TextRunnerPool::Request::Impl {
   std::vector<TextRunnerToken> generated;
   std::size_t prefill_offset{0};
   bool decode_ready{false};
+  /// The leased state's cumulative n-gram rows before this request ran.
+  TextRunnerNgramRows ngram_baseline;
   // A throwing model call may have partially mutated device state. Never
   // publish that state as a live continuation, even if its position is stale.
   bool state_reusable{true};
@@ -1328,6 +1331,16 @@ double TextRunnerPool::Request::cache_restore_ms() const noexcept {
   return impl_ != nullptr ? impl_->lease.restore_ms() : 0.0;
 }
 
+TextRunnerNgramRows TextRunnerPool::Request::ngram_rows() const {
+  if (impl_ == nullptr)
+    return {};
+  const auto now = impl_->runner->NgramRows(
+      dynamic_cast<const TextRunnerState&>(impl_->lease.state()));
+  const auto& base = impl_->ngram_baseline;
+  return {now.rows - base.rows, now.dedup_rows - base.dedup_rows,
+          now.cache_hits - base.cache_hits, now.disk_reads - base.disk_reads};
+}
+
 bool TextRunnerPool::Request::cache_disk_hit() const noexcept {
   return impl_ != nullptr && impl_->lease.restored_from_disk();
 }
@@ -1378,6 +1391,21 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
   const auto offset = impl_->prefill_offset;
   if (target <= offset)
     return 0;
+  // A peer can arrive while the stable-boundary copy is pending, or just
+  // after it was published. Reuse that nearby frontier instead of inserting
+  // another pass a few tokens later (for example, splitting framing 6 + 1).
+  if (offset && impl_->lease.component() &&
+      target - offset <= kSharedCheckpointSlack) {
+    const bool capturing =
+        impl_->snapshot_future.valid() &&
+        (impl_->boundary_capture || impl_->snapshot_tokens.size() == offset);
+    const bool published =
+        impl_->fallback_position == offset &&
+        impl_->lease.HasSnapshotFor(
+            std::span<const TextRunnerToken>(impl_->prompt).first(offset));
+    if (capturing || published)
+      return offset;
+  }
   // Prefill already publishes the fallback, this turn's stable boundary and
   // intermediate checkpoints before advancing past them.
   std::size_t planned = 0;
@@ -1499,12 +1527,11 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
           ? std::function<std::unique_ptr<TextRunnerSnapshot>()>(
                 [&] { return impl_->lease.Capture(); })
           : std::function<std::unique_ptr<TextRunnerSnapshot>()>{};
-  // A cancellation observed inside a step abandons it half-fed, which loses
-  // the whole conversation. Let a step run to completion instead, and honour
-  // the cancellation at the next step boundary where Cancel keeps the prefix.
-  const bool finish_step =
-      impl_->runner->Descriptor().capabilities.partial_prefill_retention &&
-      impl_->cancelled;
+  // A runner must either roll back an interrupted step or finish it before
+  // cancellation can retain the completed conversation frontier.
+  const auto capabilities = impl_->runner->Descriptor().capabilities;
+  const bool finish_step = capabilities.partial_prefill_retention &&
+                           !capabilities.prefill_rollback && impl_->cancelled;
   struct Rearm {
     TextRunnerState* state;
     const CancellationCheck* check;
@@ -1518,12 +1545,37 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   // Fallback captures and admission must finish before pinning starts. The
   // chunk's GPU work can overlap preparation; cached decode never calls it.
   impl_->lease.PreparePrefill(std::min(remaining, max_input_tokens));
+  // The following step starts at this frontier and stops at the next one, so
+  // a runner may read its inputs during this step.
+  auto lookahead_end = impl_->prompt.size();
+  for (const auto point : impl_->checkpoints)
+    if (point > frontier)
+      lookahead_end = std::min(lookahead_end, point);
+  for (const auto point : impl_->boundaries)
+    if (point > frontier)
+      lookahead_end = std::min(lookahead_end, point);
+  if (snapshot_position > frontier)
+    lookahead_end = std::min(lookahead_end, snapshot_position);
+  struct ClearLookahead {
+    TextRunnerState& state;
+    ~ClearLookahead() { state.SetPrefillLookahead({}); }
+  } clear_lookahead{state};
+  state.SetPrefillLookahead(std::span<const TextRunnerToken>(impl_->prompt)
+                                .subspan(frontier, lookahead_end - frontier));
   auto step =
       in_pass ? impl_->runner->PrefillThrough(
                     state, model_prompt, impl_->prefill_offset,
                     max_input_tokens, snapshot_position, &captured, capture)
               : impl_->runner->Prefill(state, model_prompt,
                                        impl_->prefill_offset, max_input_tokens);
+  if (step.interrupted) {
+    if (!capabilities.prefill_rollback || step.consumed_tokens ||
+        step.decode_ready || !impl_->cancelled || !impl_->cancelled() ||
+        impl_->runner->CheckpointPosition(state) != impl_->prefill_offset)
+      throw std::runtime_error("invalid interrupted prefill frontier");
+    impl_->state_reusable = true;
+    throw std::runtime_error("generation cancelled");
+  }
   const std::size_t maximum_consumed = std::min(remaining, max_input_tokens);
   if (step.consumed_tokens == 0 || step.consumed_tokens > maximum_consumed) {
     throw std::runtime_error(

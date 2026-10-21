@@ -363,6 +363,57 @@ void CheckPrefillChunks(const std::shared_ptr<qfn::Model>& model) {
   }
 }
 
+// A prefetched chunk serves the next chunk's leading tokens when a cache
+// frontier or step budget ends that chunk before or after the hint.
+void CheckPrefetchHints(const std::shared_ptr<qfn::Model>& model) {
+  const auto& c = model->config();
+  if (c.ple_layer < 0)
+    return;
+  std::string error;
+  const auto pattern = model->Tokenize(
+      "Virtual memory maps pages to physical storage. "
+      "A train travels sixty kilometers per hour. ");
+  std::vector<std::int32_t> tokens(2048), other(2048);
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    tokens[i] = pattern[i % pattern.size()];
+    other[i] = pattern[(i + 1025) % pattern.size()];
+  }
+  Require(other[0] != tokens[1024], "diverging hint shares its first token");
+  const auto mode = model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                                    : gufo::core::SessionMode::kAutoregressive;
+  auto bulk = model->CreateSession(mode, 6145, &error);
+  Require(bulk && bulk->Sync(tokens, &error), error);
+  const std::span all(tokens);
+  struct Case {
+    const char* name;
+    std::span<const std::int32_t> hint;
+    std::size_t middle;  ///< a frontier before the full prompt, or 0
+    std::size_t wasted;  ///< hinted tokens no chunk claims
+  };
+  for (const auto& [name, hint, middle, wasted] : {
+           Case{"exact", all.subspan(1024), 0, 0},
+           Case{"shorter", all.subspan(1024, 512), 0, 0},
+           Case{"longer", all.subspan(1024), 1536, 512},
+           Case{"diverging", std::span<const std::int32_t>(other).first(1024),
+                0, 1024},
+       }) {
+    auto split = model->CreateSession(mode, 6145, &error);
+    Require(split != nullptr, error);
+    Require(split->Sync(all.first(1024), &error, hint), error);
+    if (middle != 0)
+      Require(split->Sync(all.first(middle), &error), error);
+    Require(split->Sync(tokens, &error), error);
+    const auto rows = split->NgramRowTotals();
+    Require(
+        rows.rows == (tokens.size() + wasted) * c.ple_heads &&
+            rows.rows == rows.dedup_rows + rows.cache_hits + rows.disk_reads,
+        std::string("prefetch hint read unexpected rows: ") + name);
+    RequireExact(bulk->Logits(), split->Logits(),
+                 std::string("prefetch hint changed logits: ") + name);
+    std::cout << "prefetch hint: " << name << " exact\n" << std::flush;
+  }
+}
+
 void CheckMtpCacheReplay(const std::shared_ptr<qfn::Model>& model) {
   namespace qt = gufo::tokenization;
   std::string error;
@@ -705,8 +756,10 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
       for (std::size_t i = 0; i < width; ++i) {
         const std::size_t budget = 1 + (i * 3 + cycle * 5 + 7) % 8;
         before.push_back(serial[i]->Statistics());
+        // Unplanned greedy rows price drafts at the cohort width.
         Require(serial[i]->DecodeStep(budget, serial_samplers[i], &expected[i],
-                                      &error, false),
+                                      &error, false,
+                                      static_cast<std::uint32_t>(width)),
                 error);
         requests.push_back(
             {batched[i].get(), budget, &batch_samplers[i], &actual[i], false});
@@ -825,6 +878,13 @@ void CheckLookupBatch(const std::shared_ptr<qfn::Model>& model) {
     config.repeat_penalty = 1;
     config.frequency_penalty = 0;
     config.presence_penalty = 0;
+    if (i % 4 == 1) {
+      // Mix default sampled verification with unbounded sampling and greedy
+      // peers, retaining exact per-session logits and replay across C2..C8.
+      config.top_k = 20;
+      config.top_p = 0.8F;
+      config.presence_penalty = 1.5F;
+    }
     samplers.emplace_back(
         config, std::vector<sampling::TokenId>(prompt.begin(), prompt.end()));
     twins.push_back(samplers.back());
@@ -835,8 +895,9 @@ void CheckLookupBatch(const std::shared_ptr<qfn::Model>& model) {
       std::vector<qfn::Session::DecodeRequest> requests;
       for (std::size_t i = 0; i < width; ++i) {
         const std::size_t budget = cycle == 2 && i % 3 == 0 ? 3 : 8;
+        // Unplanned greedy rows price drafts at the cohort width.
         Require(serial[i]->DecodeStep(budget, samplers[i], &expected[i], &error,
-                                      false),
+                                      false, static_cast<std::uint32_t>(width)),
                 error);
         requests.push_back(
             {batched[i].get(), budget, &twins[i], &actual[i], false});
@@ -1152,8 +1213,9 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
     std::vector<qfn::Session::DecodeResult> expected(3), actual(3);
     std::vector<qfn::Session::DecodeRequest> requests;
     for (std::size_t i = 0; i < 3; ++i) {
+      // Unplanned greedy rows price drafts at the cohort width.
       Require(serial[i]->DecodeStep(8, serial_samplers[i], &expected[i], &error,
-                                    false),
+                                    false, 3),
               error);
       requests.push_back(
           {batched[i].get(), 8, &batch_samplers[i], &actual[i], false});
@@ -1894,6 +1956,7 @@ int main(int argc, char** argv) {
     if (!batch_only) {
       CheckExecutionModes(model, 2048, true);
       CheckPrefillChunks(model);
+      CheckPrefetchHints(model);
     }
     if (prefill_only)
       return 0;

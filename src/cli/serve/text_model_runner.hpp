@@ -126,6 +126,9 @@ struct TextRunnerCapabilities {
   /// A completed prefill step leaves a consistent state, so a cancelled
   /// request can keep it as a live prefix for a superseding request.
   bool partial_prefill_retention{false};
+  /// Interrupted prefill rolls back to its entry frontier without consuming
+  /// input, so cancellation need not wait for the whole pass.
+  bool prefill_rollback{false};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.
@@ -178,6 +181,16 @@ struct TextPrefillStep {
   std::size_t consumed_tokens{0};
   bool decode_ready{false};
   double checkpoint_ms{0};
+  bool interrupted{false};
+};
+
+/// Hashed n-gram embedding rows a request gathered. Each row was copied from
+/// a duplicate in the same gather, served by the row cache or read from disk.
+struct TextRunnerNgramRows {
+  std::uint64_t rows{0};
+  std::uint64_t dedup_rows{0};
+  std::uint64_t cache_hits{0};
+  std::uint64_t disk_reads{0};
 };
 
 struct TextDecodeSelection {
@@ -210,6 +223,17 @@ public:
   void SetStopAtEos(bool value) noexcept { stop_at_eos_ = value; }
   [[nodiscard]] bool stop_at_eos() const noexcept { return stop_at_eos_; }
 
+  /// Prompt tokens past the next Prefill's frontier, up to the frontier
+  /// planned after it. A runner may read their inputs ahead during that call
+  /// but never consumes them. Empty outside a prefill step.
+  void SetPrefillLookahead(std::span<const TextRunnerToken> tokens) noexcept {
+    prefill_lookahead_ = tokens;
+  }
+  [[nodiscard]] std::span<const TextRunnerToken> prefill_lookahead()
+      const noexcept {
+    return prefill_lookahead_;
+  }
+
   /// Installs a request-scoped cancellation check for model calls that can
   /// yield internally. Implementations that only yield between work units may
   /// keep the default no-op behavior.
@@ -223,6 +247,7 @@ public:
 
 private:
   bool stop_at_eos_{true};
+  std::span<const TextRunnerToken> prefill_lookahead_;
 };
 
 /// Immutable model-owned continuation payload.
@@ -367,6 +392,11 @@ public:
   [[nodiscard]] virtual std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter&, cache::Slot&) const;
   virtual void ReconcileComponentState(TextRunnerState&, std::size_t) const;
+  /// Whether restored component state can select its next token. A boundary
+  /// captured between prefill passes cannot, so it serves only longer prompts.
+  [[nodiscard]] virtual bool HasDecodeFrontier(const TextRunnerState&) const {
+    return true;
+  }
 
   /// Optional first-token preview without advancing model state. The caller
   /// supplies a copy of the sampler; normal decoding must reproduce the token.
@@ -381,6 +411,13 @@ public:
       TextRunnerState& state, std::span<const TextRunnerToken> prefix) const {
     (void)state;
     (void)prefix;
+  }
+  /// Cumulative n-gram rows gathered through this state; models without an
+  /// n-gram table report none.
+  [[nodiscard]] virtual TextRunnerNgramRows NgramRows(
+      const TextRunnerState& state) const {
+    (void)state;
+    return {};
   }
   /// Tells a request state that its next execution will use a multi-request
   /// batch. Runners with request-local speculative state may discard work that
@@ -524,6 +561,8 @@ public:
     [[nodiscard]] std::size_t cache_restore_bytes() const noexcept;
     [[nodiscard]] double cache_restore_ms() const noexcept;
     [[nodiscard]] bool cache_disk_hit() const noexcept;
+    /// N-gram rows gathered since this request leased its state.
+    [[nodiscard]] TextRunnerNgramRows ngram_rows() const;
     [[nodiscard]] std::optional<ComponentCacheMetrics> component_cache_metrics()
         const;
     [[nodiscard]] std::size_t prompt_tokens() const noexcept;
