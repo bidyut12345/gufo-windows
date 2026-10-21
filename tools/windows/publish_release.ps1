@@ -63,18 +63,19 @@ High-performance native local LLM inference engine optimized for AMD Ryzen AI MA
 
 ## What's New in this Release
 
-### 🚀 Web Portal & Attachment Dashboard
-- **New Chat Attachment Landing View**: On a new chat, the empty main viewport directly presents a sleek, interactive dashboard of all context attachment and session tools.
-- **7-Item Context & Attachment Popover Menu**:
-  1. 🖼️ **Attach Images**: Multimodal vision inputs directly included in conversation context.
-  2. 📄 **Attach Files**: Attach source code, markdown, logs, and docs.
-  3. 📁 **Per-Conversation Working Directory**: Dedicated workspace per chat (\`UserData/{convId} - {title}\`).
-  4. ⚡ **Agent & MCP Tools**: Master toggle with interactive tool group filters (\`fs\`, \`cli\`, \`eval\`, \`web\`, \`diff\`, \`doc\`).
-  5. 🎭 **System Prompt Personas**: Preset personas plus custom system prompt creator.
-  6. 🧠 **6 Thinking Levels**: \`auto\`, \`minimum\`, \`low\`, \`medium\`, \`high\`, \`xhigh\`.
-  7. 🧹 **Context & Compaction**: Real-time context token usage meter with one-click compact.
-- **SQLite Server Database**: Multi-device, cross-browser chat persistence at \`%LOCALAPPDATA%\gufo\chat_portal.db\`.
-- **9 Built-in System Tools**: Standard llama.cpp host execution tools + external Model Context Protocol (MCP) servers.
+### 🔄 Upstream Merged
+- Fully merged upstream \`gufo-org/gufo\` **v0.20.0** release for AMD Strix Halo gfx1151.
+
+### 📊 Console Logger & Real-Time Monitoring
+- **Tabular Request Summaries**: Request completion log displays in a clean tabular box format in console.
+- **5-Second Interval Progress Updates**: Real-time console progress logged every 5 seconds during long prompt processing and decoding with instantaneous speed (t/s), average speed, and token counters.
+- **OpenAI API Speed Exposure**: \`prompt_tokens_per_second\`, \`completion_tokens_per_second\`, and \`total_tokens_per_second\` included in \`usage\` and \`timings\` for \`/v1/chat/completions\`, \`/v1/completions\`, and streaming terminal chunks.
+
+### 🚀 Web Portal & UI Enhancements
+- **Live Generation Speed**: Real-time \`eval: X.X t/s | Y tokens\` live tracking in the message footer and status bar.
+- **Scroll Intent & Stickiness**: Replaced threshold heuristic with user scroll intent detection (\`wheel\` / \`touchmove\`) and programmatic scroll guards to prevent autoscroll jumping during fast streaming.
+- **New Chat Attachment Landing View & Popover Menu**: Multi-modal image attachments, document uploads, workspace selector, system prompt personas, and 6 thinking levels.
+- **Feature Flags**: Supported \`--no-webui\` and \`--no-tools\`.
 
 ### ⚡ Strix Halo Engine & Memory Optimizations
 - **KV Cache Quantization for Qwen 3.8 Flash-Next**:
@@ -83,13 +84,11 @@ High-performance native local LLM inference engine optimized for AMD Ryzen AI MA
   - \`fp8\` (E4M3 format with per-32 f16 scales)
   - \`GUFO_KV_V4=1\` (K8V4: 4-bit values, saves 23.5% KV cache VRAM)
   - \`GUFO_KV_Q4=1\` (K4V8: 4-bit keys)
-  - \`K4V4\`: Cuts KV footprint from 6.44 GB (\`f16\`) down to 1.81 GB at 262,144 context!
+  - \`K4V4\`: Cuts KV footprint down to 1.81 GB at 262,144 context!
 - **Unsloth UD-IQ4_XS Quantization Support**:
   - Full support for \`UD-IQ4_XS\` models mixing IQ3_S/IQ4_XS experts and Q6_K heads.
-  - Reduces weights memory from 22-26 GB to 17-19 GB, fitting comfortable within 32 GB, 64 GB, and 96 GB carve-outs.
 - **Reduced VRAM and RAM Footprint**:
   - Zero-copy unified memory allocations on Windows 11.
-  - Multi-tier paging and recurrent state optimizations.
 
 ## Quickstart (Windows 11)
 
@@ -104,7 +103,8 @@ Write-Host "Wrote release notes to $releaseNotesPath" -ForegroundColor Green
 # 5. Publish to GitHub Release
 Write-Host "`n[4/4] Publishing release $Tag to GitHub ($Repo)..." -ForegroundColor Yellow
 $uploadScript = Join-Path $root "tools\windows\upload_release.ps1"
-powershell -ExecutionPolicy Bypass -File $uploadScript -Tag $Tag -Repo $Repo -Files @($zipPath) -Force:$Force
+$commitSha = (& git rev-parse HEAD).Trim()
+powershell -ExecutionPolicy Bypass -File $uploadScript -Tag $Tag -Repo $Repo -Files @($zipPath) -TargetCommitish $commitSha -Force:$Force
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "`n==========================================================" -ForegroundColor Green

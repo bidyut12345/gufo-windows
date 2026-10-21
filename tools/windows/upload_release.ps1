@@ -5,6 +5,7 @@ param(
         "dist\gufo-windows-v0.1.1-windows.zip",
         "dist\gufo-windows-v0.1.1-bin.zip"
     ),
+    [string]$TargetCommitish = "",
     [switch]$Force = $false
 )
 
@@ -30,9 +31,10 @@ try {
 } catch {
     Write-Host "Release for tag '$Tag' does not exist yet. Creating..."
     $releaseNotes = if (Test-Path "dist\RELEASE_NOTES.md") { [System.IO.File]::ReadAllText((Resolve-Path "dist\RELEASE_NOTES.md").Path) } else { "Release $Tag" }
+    $target = if ($TargetCommitish) { $TargetCommitish } else { (& git rev-parse HEAD).Trim() }
     $createBody = @{
         tag_name = $Tag
-        target_commitish = "main"
+        target_commitish = $target
         name = "Gufo for Windows $Tag"
         body = $releaseNotes
         draft = $false
