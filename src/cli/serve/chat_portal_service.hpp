@@ -9,7 +9,10 @@ namespace gufo::server {
 class ChatPortalService {
 public:
   static bool IsPortalRoute(const HttpRequest& req);
-  static HttpResponse Handle(const HttpRequest& req, ChatDatabase& db);
+  static HttpResponse Handle(
+      const HttpRequest& req, ChatDatabase& db,
+      std::shared_ptr<TextGenerationBackend> backend = nullptr,
+      std::optional<bool> tools_enabled = std::nullopt);
   static std::string ExtractBearerToken(const HttpRequest& req);
 };
 

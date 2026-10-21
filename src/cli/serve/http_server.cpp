@@ -1967,11 +1967,15 @@ void HttpServer::run(bool handle_signals) {
           " auth=" + (options_.api_key.empty() ? "off" : "bearer") +
           " max_connections=" + std::to_string(options_.max_connections) +
           " max_body_bytes=" + std::to_string(options_.max_request_body_bytes));
-  Logger::Info(
-      "server",
-      "event=chat_portal web_ui=http://" +
-          (host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") +
-          ":" + std::to_string(port_) + "/");
+  if (options_.enable_webui) {
+    Logger::Info(
+        "server",
+        "event=chat_portal web_ui=http://" +
+            (host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") +
+            ":" + std::to_string(port_) + "/");
+  } else {
+    Logger::Info("server", "event=chat_portal web_ui=disabled");
+  }
   while (!stopped_.load(std::memory_order_acquire)) {
     (void)device_lost();
     if (handle_signals) {
@@ -2087,11 +2091,18 @@ void HttpServer::reap_workers() {
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   if (ChatPortalService::IsPortalRoute(req)) {
-    return ChatPortalService::Handle(req, ChatDatabase::Instance());
+    if (!options_.enable_webui) {
+      return Err(404, "Not Found", "Chat portal web UI is disabled",
+                 "not_found", "webui_disabled");
+    }
+    return ChatPortalService::Handle(req, ChatDatabase::Instance(),
+                                     backend_, options_.tools_enabled);
   }
 
   if (!IsAuthorized(req, api_key_hash_)) {
-    const auto portal_token = ChatPortalService::ExtractBearerToken(req);
+    const auto portal_token = options_.enable_webui
+                                  ? ChatPortalService::ExtractBearerToken(req)
+                                  : std::string{};
     if (portal_token.empty() ||
         !ChatDatabase::Instance().AuthenticateToken(portal_token).has_value()) {
       auto response = Err(401, "Unauthorized", "missing or invalid API key",

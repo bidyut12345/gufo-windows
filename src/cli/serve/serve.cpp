@@ -249,7 +249,8 @@ void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
                       int* port, std::size_t* session_count,
                       std::size_t* max_connections,
                       std::size_t* max_request_body_bytes, std::string* api_key,
-                      ServerLogOptions* log) {
+                      ServerLogOptions* log, bool* no_webui = nullptr,
+                      std::optional<bool>* tools_enabled = nullptr) {
   parser.AddOption("-i", "--host", "IP", "Bind address", "Server", host);
   parser.AddOption("-p", "--port", "N", "Port to listen on", "Server", port);
   if (session_count != nullptr)
@@ -263,6 +264,28 @@ void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
                    "Maximum HTTP request body bytes", "Server",
                    max_request_body_bytes);
   parser.AddOption("", "--api-key", "KEY", "API key", "Server", api_key);
+  if (no_webui != nullptr) {
+    parser.AddFlag("", "--no-webui", "Disable Chat Portal web UI", "Server",
+                   no_webui);
+  }
+  if (tools_enabled != nullptr) {
+    parser.AddCustomOption(
+        "", "--tools", "yes|no", "Enable or disable tool execution (yes or no)",
+        "Server",
+        [tools_enabled](std::string_view flag, std::string_view value,
+                        std::string* error) {
+          if (value == "yes" || value == "on" || value == "true" || value == "1") {
+            *tools_enabled = true;
+            return true;
+          }
+          if (value == "no" || value == "off" || value == "false" || value == "0") {
+            *tools_enabled = false;
+            return true;
+          }
+          *error = std::string(flag) + " must be yes or no";
+          return false;
+        });
+  }
   parser.AddCustomOption(
       "", "--log-level", "LEVEL", kLogLevelHelp, "Logging",
       [log](std::string_view flag, std::string_view value, std::string* error) {
@@ -288,6 +311,8 @@ struct ServerOptionHelpTargets {
       static_cast<std::size_t>(8) * 1024 * 1024;
   std::string api_key;
   ServerLogOptions log;
+  bool no_webui = false;
+  std::optional<bool> tools{};
 };
 
 void AddServerOptionsForHelp(gufo::cli::ArgParser& parser,
@@ -296,7 +321,8 @@ void AddServerOptionsForHelp(gufo::cli::ArgParser& parser,
   AddServerOptions(parser, &targets->host, &targets->port,
                    include_sessions ? &targets->session_count : nullptr,
                    &targets->max_connections, &targets->max_request_body_bytes,
-                   &targets->api_key, &targets->log);
+                   &targets->api_key, &targets->log, &targets->no_webui,
+                   &targets->tools);
 }
 
 // Split a `NAME=VALUE` CLI spec. Returns false when either side is empty.
@@ -820,6 +846,8 @@ void PrintServeHelp(std::string_view program_name,
       << "                         Maximum HTTP request body bytes (default: "
          "8388608)\n"
       << "      --api-key <KEY>    Require Bearer authorization for requests\n"
+      << "      --no-webui         Disable Chat Portal web UI\n"
+      << "      --tools <yes|no>   Enable or disable tool execution (yes or no)\n"
       << "\nLogging:\n"
       << "      --log-level <LEVEL>\n"
       << "                         " << kLogLevelHelp << "\n"
@@ -876,6 +904,8 @@ int RunServe(std::span<const char* const> args) {
       static_cast<std::size_t>(8) * 1024 * 1024;
   std::string api_key;
   ServerLogOptions log_options;
+  bool no_webui = false;
+  std::optional<bool> tools_enabled{};
 
   // Identify the modality only after leading server options. The selected
   // parser consumes every option together, so --served-model-name -v and
@@ -885,7 +915,8 @@ int RunServe(std::span<const char* const> args) {
                                       bool include_sessions = true) {
     AddServerOptions(
         parser, &host, &port, include_sessions ? &session_count : nullptr,
-        &max_connections, &max_request_body_bytes, &api_key, &log_options);
+        &max_connections, &max_request_body_bytes, &api_key, &log_options,
+        &no_webui, &tools_enabled);
   };
   add_server_options(server_parser);
   std::string subcommand = "llm";
@@ -981,6 +1012,11 @@ int RunServe(std::span<const char* const> args) {
         " max_connections=" + std::to_string(max_connections) +
         " max_request_bytes=" + std::to_string(max_request_body_bytes) +
         " api_key=" + (api_key.empty() ? "unset" : "set") +
+        " web_ui=" + std::string(no_webui ? "disabled" : "enabled") +
+        " tools=" +
+        (tools_enabled.has_value()
+             ? (*tools_enabled ? "enabled" : "disabled")
+             : "default") +
         " log_level=" + std::string(server::LogLevelName(resolved));
     server::Logger::Debug("server", options_line);
     return true;
@@ -1638,6 +1674,8 @@ int RunServe(std::span<const char* const> args) {
                 device_lost.store(true);
                 ShutdownAfterDeviceLoss();
               },
+          .enable_webui = !no_webui,
+          .tools_enabled = tools_enabled,
       },
       images);
   std::string err;

@@ -956,6 +956,53 @@ bool ChatDatabase::ReplaceMessages(const std::string& user_id,
   return true;
 }
 
+bool ChatDatabase::UpdateLastAssistantMessage(const std::string& user_id,
+                                             const std::string& conv_id,
+                                             const std::string& content,
+                                             const std::string& reasoning_content) {
+  std::lock_guard lock(mutex_);
+  if (!db_) return false;
+
+  Stmt upd(db_,
+           "UPDATE messages SET content = ?, reasoning_content = ? "
+           "WHERE id = (SELECT id FROM messages WHERE conversation_id = ? AND user_id = ? AND role = 'assistant' "
+           "ORDER BY order_idx DESC LIMIT 1);");
+  if (!upd.valid()) return false;
+  upd.bind_text(1, content);
+  upd.bind_text(2, reasoning_content);
+  upd.bind_text(3, conv_id);
+  upd.bind_text(4, user_id);
+  if (sqlite3_step(upd) != SQLITE_DONE) return false;
+
+  if (sqlite3_changes(db_) == 0) {
+    // If no assistant row was updated, insert as new message
+    const std::string msg_id = "msg_" + RandomHex(8);
+    const std::string created = CurrentIsoTime();
+    Stmt ins(db_,
+             "INSERT INTO messages (id, conversation_id, user_id, role, content, reasoning_content, created_at, order_idx) "
+             "VALUES (?, ?, ?, 'assistant', ?, ?, ?, "
+             "COALESCE((SELECT MAX(order_idx) + 1 FROM messages WHERE conversation_id = ?), 1));");
+    if (!ins.valid()) return false;
+    ins.bind_text(1, msg_id);
+    ins.bind_text(2, conv_id);
+    ins.bind_text(3, user_id);
+    ins.bind_text(4, content);
+    ins.bind_text(5, reasoning_content);
+    ins.bind_text(6, created);
+    ins.bind_text(7, conv_id);
+    if (sqlite3_step(ins) != SQLITE_DONE) return false;
+  }
+
+  const std::string now = CurrentIsoTime();
+  Stmt upd_conv(db_, "UPDATE conversations SET updated_at = ? WHERE id = ?;");
+  if (upd_conv.valid()) {
+    upd_conv.bind_text(1, now);
+    upd_conv.bind_text(2, conv_id);
+    sqlite3_step(upd_conv);
+  }
+  return true;
+}
+
 UserSettingsRecord ChatDatabase::GetSettings(const std::string& user_id) {
   std::lock_guard lock(mutex_);
   UserSettingsRecord st;

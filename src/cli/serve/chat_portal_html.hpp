@@ -516,17 +516,14 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     .msg-author.assistant { color: #f4f4f5; }
 
     .msg-body {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
       border-radius: var(--radius);
-      padding: 12px 16px;
       font-size: 0.93rem;
       line-height: 1.6;
       position: relative;
     }
     .msg-group.user .msg-body {
       background: #181c24;
-      border-color: #27303f;
+      border: 1px solid #27303f;
     }
 
     /* Collapsible Thinking Process - DeepSeek / llama-server style */
@@ -572,8 +569,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       margin: 8px 0;
       border: 1px solid var(--border-strong);
       border-radius: var(--radius);
-      background: rgba(24, 24, 27, 0.65);
-      overflow: hidden;
+      background: rgba(24, 24, 27, 0.65);  
       font-size: 0.85rem;
       max-width: 100%;
     }
@@ -658,6 +654,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     }
 
     /* Markdown inside messages */
+    .md-content {
+      padding: 12px 16px;
+    }
     .md-content p { margin-bottom: 8px; }
     .md-content p:last-child { margin-bottom: 0; }
     .md-content pre {
@@ -740,6 +739,56 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       background: var(--bg-card);
       color: var(--text-muted);
       border-color: var(--border-strong);
+    }
+    .btn-msg-action.btn-resume {
+      color: #60a5fa;
+      border-color: rgba(96, 165, 250, 0.4);
+      background: rgba(96, 165, 250, 0.08);
+      font-weight: 500;
+    }
+    .btn-msg-action.btn-resume:hover {
+      background: rgba(96, 165, 250, 0.18);
+      color: #93c5fd;
+      border-color: rgba(96, 165, 250, 0.6);
+    }
+    .btn-msg-action.btn-resume svg {
+      fill: currentColor;
+      stroke: none;
+    }
+    .btn-msg-action svg {
+      width: 12px;
+      height: 12px;
+      stroke-width: 2;
+    }
+    .btn-msg-action:hover svg {
+      stroke: var(--text);
+    }
+    .msg-edit-box {
+      width: 100%;
+      margin-top: 6px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .msg-edit-textarea {
+      width: 100%;
+      min-height: 80px;
+      max-height: 400px;
+      padding: 10px 12px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--font-sans);
+      font-size: 0.93rem;
+      line-height: 1.5;
+      resize: vertical;
+      outline: none;
+      box-sizing: border-box;
+    }
+    .msg-edit-textarea:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
     }
     .msg-usage-badge {
       display: inline-flex;
@@ -891,10 +940,13 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     .chat-stats-footer {
       display: flex;
       justify-content: space-between;
+      align-items: center;
       font-size: 0.72rem;
       color: var(--text-dim);
       font-family: var(--font-mono);
-      padding: 0 4px;
+      padding: 3px 6px;
+      gap: 10px;
+      flex-wrap: wrap;
     }
 
     /* Completion View */
@@ -1181,6 +1233,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       font-family: inherit;
       font-size: 0.85rem;
       outline: none;
+      width: 100%;
     }
     .setting-input:focus, .setting-textarea:focus { border-color: var(--border-strong); }
     .setting-range-row {
@@ -1794,6 +1847,155 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       color: var(--text-dim);
       font-family: var(--font-mono);
     }
+    .hero-prompt-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .hero-prompt-thumb {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 6px 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      user-select: none;
+    }
+    .hero-prompt-thumb:hover {
+      background: var(--bg-hover);
+      border-color: var(--border-strong);
+      transform: translateY(-1px);
+    }
+    .hero-prompt-thumb.active {
+      background: rgba(124, 58, 237, 0.15);
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent);
+    }
+    .hero-prompt-thumb-icon {
+      font-size: 1.25rem;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .hero-prompt-thumb-info {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-width: 0;
+    }
+    .hero-prompt-thumb-title {
+      font-size: 0.76rem;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .hero-prompt-thumb-sub {
+      font-size: 0.65rem;
+      color: var(--text-dim);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .chat-meta-indicators {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.69rem;
+      color: var(--text-dim);
+      font-family: var(--font-sans);
+      flex-wrap: wrap;
+    }
+    .meta-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      cursor: pointer;
+      padding: 1px 4px;
+      border-radius: var(--radius-sm);
+      transition: all 0.15s ease;
+      color: var(--text-dim);
+    }
+    .meta-indicator:hover {
+      color: var(--text);
+      background: var(--bg-hover);
+    }
+    .meta-sep {
+      opacity: 0.35;
+      font-size: 0.6rem;
+    }
+    .settings-prompt-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 6px;
+    }
+    .settings-prompt-item {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      transition: all 0.15s ease;
+    }
+    .settings-prompt-item:hover {
+      border-color: var(--border-strong);
+      background: var(--bg-elevated);
+    }
+    .settings-prompt-item.active {
+      border-color: var(--accent);
+      background: rgba(124, 58, 237, 0.06);
+    }
+    .settings-prompt-item-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .settings-prompt-icon {
+      font-size: 1.2rem;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .settings-prompt-title {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .settings-prompt-desc {
+      font-size: 0.68rem;
+      color: var(--text-dim);
+      line-height: 1.2;
+    }
+    .settings-prompt-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .settings-prompt-preview {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      line-height: 1.4;
+      background: rgba(0, 0, 0, 0.25);
+      border: 1px solid rgba(255, 255, 255, 0.04);
+      border-radius: var(--radius-sm);
+      padding: 6px 8px;
+      max-height: 64px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--font-mono);
+    }
 
     /* Human-in-the-loop Model Inquiry Cards */
     .inquiry-card {
@@ -2280,10 +2482,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
         <span>Settings</span>
       </button>
-      <button id="btn-top-file-browser" class="btn-top" title="Browse Workspace Files">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-        <span>Files</span>
-      </button>
       <div class="user-menu-wrapper">
         <button id="btn-auth-user" class="btn-top" title="User Account & Workspace Options">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
@@ -2300,13 +2498,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             <div class="user-menu-text">
               <div class="user-menu-title">Workspace File Browser</div>
               <div class="user-menu-desc">Explore, upload &amp; manage chat files</div>
-            </div>
-          </button>
-          <button id="btn-menu-workdir-setup" class="user-menu-item" type="button">
-            <span class="user-menu-icon">⚙️</span>
-            <div class="user-menu-text">
-              <div class="user-menu-title">Working Directory Setup</div>
-              <div class="user-menu-desc">Change chat folder under username</div>
             </div>
           </button>
           <div class="user-menu-divider"></div>
@@ -2341,9 +2532,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           <button id="side-nav-comp" class="sidebar-view-btn" type="button">
             <span>📝</span> Completion
           </button>
-          <button id="side-nav-files" class="sidebar-view-btn" type="button">
-            <span>📁</span> Files
-          </button>
           <button id="side-nav-monitor" class="sidebar-view-btn" type="button">
             <span>📊</span> Monitor
           </button>
@@ -2355,19 +2543,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <!-- Injected dynamically -->
       </div>
 
-      <!-- Sandboxed User Files Explorer Pane -->
-      <div id="files-pane" class="sidebar-list" style="display:none; flex-direction:column; padding:8px 10px;">
-        <div class="files-header-bar" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid var(--border);">
-          <div style="font-size:0.75rem; font-weight:600; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" id="files-cwd-label">UserData/</div>
-          <div style="display:flex; gap:4px;">
-            <button id="btn-files-up" class="btn-top" style="padding:2px 6px; font-size:0.72rem;" title="Up one folder">⬆️</button>
-            <button id="btn-files-refresh" class="btn-top" style="padding:2px 6px; font-size:0.72rem;" title="Refresh files">🔄</button>
-          </div>
-        </div>
-        <div id="files-list-container" style="flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:2px;">
-          <!-- Injected dynamically -->
-        </div>
-      </div>
+
 
       <div class="sidebar-bottom">
         <div class="user-info">
@@ -2497,9 +2673,9 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                       <div class="attach-card-label">Tool Permission</div>
                       <span id="popup-perm-label" style="font-size:0.68rem; color:var(--text-dim);">Ask before run</span>
                     </div>
-                    <div class="segmented-control" id="tool-perm-control" style="grid-template-columns:1fr 1fr; margin-top:4px;">
-                      <button type="button" class="seg-btn active" data-perm="ask" title="Prompt for approval before running tools">🛡️ Ask</button>
-                      <button type="button" class="seg-btn" data-perm="allow" title="Allow autonomous tool execution without asking">⚡ Allow all</button>
+                    <div class="segmented-control" id="tool-perm-control" style="grid-template-columns:1fr 1fr; margin-top:4px;" onclick="event.stopPropagation()">
+                      <button type="button" class="seg-btn active" data-perm="ask" onclick="setToolPermission('ask'); event.stopPropagation();" title="Prompt for approval before running tools">🛡️ Ask</button>
+                      <button type="button" class="seg-btn" data-perm="allow" onclick="setToolPermission('allow'); event.stopPropagation();" title="Allow autonomous tool execution without asking">⚡ Allow all</button>
                     </div>
                   </div>
 
@@ -2508,13 +2684,13 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                   <!-- 6. Thinking level (auto, minimum, low, medium, high, xhigh) -->
                   <div class="attach-popup-card">
                     <div class="attach-card-label">Thinking Level</div>
-                    <div class="segmented-control" id="thinking-level-control">
-                      <button type="button" class="seg-btn active" data-level="auto" title="Default thinking budget">Auto</button>
-                      <button type="button" class="seg-btn" data-level="minimum" title="Fast/concise reasoning (512 tokens)">Min</button>
-                      <button type="button" class="seg-btn" data-level="low" title="Low reasoning budget (2,048 tokens)">Low</button>
-                      <button type="button" class="seg-btn" data-level="medium" title="Medium reasoning budget (4,096 tokens)">Med</button>
-                      <button type="button" class="seg-btn" data-level="high" title="High reasoning budget (8,192 tokens)">High</button>
-                      <button type="button" class="seg-btn" data-level="xhigh" title="Maximum reasoning budget (16,384 tokens)">XHigh</button>
+                    <div class="segmented-control" id="thinking-level-control" onclick="event.stopPropagation()">
+                      <button type="button" class="seg-btn active" data-level="auto" onclick="setThinkingLevel('auto'); event.stopPropagation();" title="Default thinking budget">Auto</button>
+                      <button type="button" class="seg-btn" data-level="minimum" onclick="setThinkingLevel('minimum'); event.stopPropagation();" title="Fast/concise reasoning (512 tokens)">Min</button>
+                      <button type="button" class="seg-btn" data-level="low" onclick="setThinkingLevel('low'); event.stopPropagation();" title="Low reasoning budget (2,048 tokens)">Low</button>
+                      <button type="button" class="seg-btn" data-level="medium" onclick="setThinkingLevel('medium'); event.stopPropagation();" title="Medium reasoning budget (4,096 tokens)">Med</button>
+                      <button type="button" class="seg-btn" data-level="high" onclick="setThinkingLevel('high'); event.stopPropagation();" title="High reasoning budget (8,192 tokens)">High</button>
+                      <button type="button" class="seg-btn" data-level="xhigh" onclick="setThinkingLevel('xhigh'); event.stopPropagation();" title="Maximum reasoning budget (16,384 tokens)">XHigh</button>
                     </div>
                   </div>
 
@@ -2547,8 +2723,18 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             </div>
           </div>
           <div class="chat-stats-footer">
-            <span id="footer-speed-metrics">eval: 0.0 t/s | prompt: 0.0 t/s</span>
-            <span>Gufo Chat gfx1151</span>
+            <div class="chat-meta-indicators">
+              <span id="input-meta-prompt" class="meta-indicator" onclick="cycleSystemPrompt()" title="Click to cycle prompt persona">🦉 Gufo</span>
+              <span class="meta-sep">•</span>
+              <span id="input-meta-thinking" class="meta-indicator" onclick="cycleThinkingLevel()" title="Click to cycle thinking level">🧠 Auto</span>
+              <span class="meta-sep">•</span>
+              <span id="input-meta-perm" class="meta-indicator" onclick="cycleToolPermission()" title="Click to toggle tool permission">🛡️ Ask</span>
+              <span class="meta-sep">•</span>
+              <span id="input-meta-ctx" class="meta-indicator" onclick="openAttachPopup()" title="Click to view context meter">📊 0 ctx</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span id="footer-speed-metrics">eval: 0.0 t/s | prompt: 0.0 t/s</span>
+            </div>
           </div>
         </div>
       </div>
@@ -2707,9 +2893,32 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     <!-- Tab 1: Inference & Sampling -->
     <div id="drawer-pane-inference" class="drawer-body">
       <div class="setting-group">
-        <label class="setting-label">System Prompt</label>
-        <textarea id="set-system-prompt" class="setting-textarea" rows="3"></textarea>
-        <span class="setting-desc">Sets default system context prepended to conversations.</span>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <div>
+            <label class="setting-label" style="margin:0;">System Prompt &amp; Personas</label>
+            <span class="setting-desc" style="display:block; margin-top:2px;">Manage AI personas, custom behavior prompts, and default context.</span>
+          </div>
+          <button id="btn-settings-add-prompt" class="btn-dialog-submit" type="button" style="padding:4px 10px; font-size:0.75rem; white-space:nowrap;">+ Add New</button>
+        </div>
+
+        <!-- Currently Active Prompt Box -->
+        <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:10px; margin-bottom:12px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+            <div style="font-size:0.72rem; font-weight:600; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.04em;">Active System Prompt</div>
+            <span id="settings-active-prompt-tag" class="hero-card-badge">🦉 Gufo Assistant</span>
+          </div>
+          <textarea id="set-system-prompt" class="setting-textarea" rows="3" placeholder="System prompt instructions..."></textarea>
+          <div style="display:flex; justify-content:flex-end; gap:6px; margin-top:6px;">
+            <button id="btn-save-active-prompt-text" class="btn-top" type="button" style="padding:3px 10px; font-size:0.72rem; color:var(--accent);">Apply Text</button>
+          </div>
+        </div>
+
+        <!-- List of System Prompts -->
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <span style="font-size:0.76rem; font-weight:600; color:var(--text);">Prompt Library &amp; Presets</span>
+          <span id="settings-prompts-count" style="font-size:0.7rem; color:var(--text-dim); font-family:var(--font-mono);"></span>
+        </div>
+        <div id="settings-prompt-list" class="settings-prompt-list"></div>
       </div>
 
       <div class="setting-group">
@@ -2906,13 +3115,14 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       <div class="dialog-header">
         <div style="display:flex; align-items:center; gap:8px;">
           <span style="font-size:1.15rem;">✨</span>
-          <span style="font-weight:700; font-size:1rem;">Add Custom System Prompt</span>
+          <span id="new-prompt-dialog-title" style="font-weight:700; font-size:1rem;">Add Custom System Prompt</span>
         </div>
         <button id="btn-close-new-prompt" class="btn-top" style="padding:2px 8px;">&times;</button>
       </div>
       <div class="dialog-body">
+        <input type="hidden" id="edit-prompt-idx" value="">
         <div style="font-size:0.8rem; color:var(--text-muted); line-height:1.4;">
-          Create a personalized system prompt persona. Custom prompts are saved locally and immediately selectable from the attachment popup menu.
+          Create or edit a personalized system prompt persona. Custom prompts are saved locally and available across conversations.
         </div>
         <div class="setting-group">
           <label class="setting-label">Prompt Name</label>
@@ -2923,7 +3133,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           <textarea id="new-prompt-text-inp" class="setting-textarea" rows="4" placeholder="You are an expert in..."></textarea>
         </div>
         <div style="display:flex; gap:8px; margin-top:8px;">
-          <button id="btn-save-new-prompt" class="btn-dialog-submit" style="flex:1;">Save &amp; Select</button>
+          <button id="btn-save-new-prompt" class="btn-dialog-submit" style="flex:1;">Save Prompt</button>
           <button id="btn-cancel-new-prompt" class="btn-top" style="padding:0 14px;">Cancel</button>
         </div>
       </div>
@@ -3122,9 +3332,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       tabNavMonitor: $('tab-nav-monitor'),
       sideNavChat: $('side-nav-chat'),
       sideNavComp: $('side-nav-comp'),
-      sideNavFiles: $('side-nav-files'),
       sideNavMonitor: $('side-nav-monitor'),
-      filesPane: $('files-pane'),
       filesCwdLabel: $('files-cwd-label'),
       btnFilesUp: $('btn-files-up'),
       btnFilesRefresh: $('btn-files-refresh'),
@@ -3203,11 +3411,13 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       btnCompactContext: $('btn-compact-context'),
       // New System Prompt Dialog
       newPromptDialog: $('new-prompt-dialog'),
+      newPromptDialogTitle: $('new-prompt-dialog-title'),
       btnCloseNewPrompt: $('btn-close-new-prompt'),
       btnCancelNewPrompt: $('btn-cancel-new-prompt'),
       btnSaveNewPrompt: $('btn-save-new-prompt'),
       newPromptNameInp: $('new-prompt-name-inp'),
       newPromptTextInp: $('new-prompt-text-inp'),
+      editPromptIdx: $('edit-prompt-idx'),
       btnTopFileBrowser: $('btn-top-file-browser'),
       userPopupMenu: $('user-popup-menu'),
       userPopupName: $('user-popup-name'),
@@ -3281,6 +3491,11 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       drawerPaneInference: $('drawer-pane-inference'),
       drawerPaneTools: $('drawer-pane-tools'),
       setSystemPrompt: $('set-system-prompt'),
+      btnSettingsAddPrompt: $('btn-settings-add-prompt'),
+      settingsActivePromptTag: $('settings-active-prompt-tag'),
+      btnSaveActivePromptText: $('btn-save-active-prompt-text'),
+      settingsPromptsCount: $('settings-prompts-count'),
+      settingsPromptList: $('settings-prompt-list'),
       rangeTemp: $('range-temp'),
       valTemp: $('val-temp'),
       rangeTopP: $('range-top-p') || $('range-topp'),
@@ -3414,8 +3629,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       if (UI.monitorInterface) UI.monitorInterface.style.display = mode === 'monitor' ? 'flex' : 'none';
 
       if (mode === 'chat') {
-        if (UI.sideNavFiles) UI.sideNavFiles.classList.remove('active');
-        if (UI.filesPane) UI.filesPane.style.display = 'none';
         if (UI.chatList) UI.chatList.style.display = 'flex';
       }
 
@@ -3436,8 +3649,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     if (UI.tabNavComp) UI.tabNavComp.addEventListener('click', () => switchTab('comp'));
     if (UI.tabNavMonitor) UI.tabNavMonitor.addEventListener('click', () => switchTab('monitor'));
     if (UI.sideNavChat) UI.sideNavChat.addEventListener('click', () => {
-      if (UI.sideNavFiles) UI.sideNavFiles.classList.remove('active');
-      if (UI.filesPane) UI.filesPane.style.display = 'none';
       if (UI.chatList) UI.chatList.style.display = 'flex';
       switchTab('chat');
       toggleSidebar(false);
@@ -3449,21 +3660,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     // User Sandboxed File Explorer Handlers
     let currentFilesPath = '';
 
-    function openSidebarFiles() {
-      if (UI.sideNavChat) UI.sideNavChat.classList.remove('active');
-      if (UI.sideNavComp) UI.sideNavComp.classList.remove('active');
-      if (UI.sideNavFiles) UI.sideNavFiles.classList.add('active');
-      if (UI.chatList) UI.chatList.style.display = 'none';
-      if (UI.filesPane) UI.filesPane.style.display = 'flex';
-      toggleSidebar(true);
-      loadUserFiles('');
-    }
 
-    if (UI.sideNavFiles) {
-      UI.sideNavFiles.addEventListener('click', () => {
-        openSidebarFiles();
-      });
-    }
 
     async function loadUserFiles(subpath = '') {
       currentFilesPath = subpath;
@@ -3925,6 +4122,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         if (UI.rangeTopP) UI.rangeTopP.value = APP.settings.top_p;
         if (UI.valTopP) UI.valTopP.textContent = Number(APP.settings.top_p).toFixed(2);
         if (UI.inpMaxTokens) UI.inpMaxTokens.value = APP.settings.max_tokens;
+        renderSettingsPromptList();
       } else {
         loadTools();
       }
@@ -3942,6 +4140,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       if (UI.drawerTabTools) UI.drawerTabTools.classList.toggle('active', tab === 'tools');
       if (UI.drawerPaneInference) UI.drawerPaneInference.style.display = (tab === 'inference' ? 'flex' : 'none');
       if (UI.drawerPaneTools) UI.drawerPaneTools.style.display = (tab === 'tools' ? 'flex' : 'none');
+      if (tab === 'inference') renderSettingsPromptList();
     }
 
     if (UI.drawerTabInference) UI.drawerTabInference.addEventListener('click', () => switchDrawerTab('inference'));
@@ -4008,6 +4207,287 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       creative: 'You are an imaginative creative assistant and brainstormer, providing novel ideas, rich analogies, and diverse perspectives.'
     };
 
+    const PROMPT_PRESETS = [
+      { key: 'default', name: 'Gufo Assistant', tag: 'Balanced helper', icon: '🦉', desc: 'Helpful, respectful, and honest everyday AI assistant' },
+      { key: 'coder', name: 'Code Expert', tag: 'Architecture & code', icon: '💻', desc: 'Expert software engineer and systems architect, clean high-performance code' },
+      { key: 'concise', name: 'Concise & Direct', tag: 'No fluff', icon: '⚡', desc: 'Brief, clear, and straight to the point without filler or preamble' },
+      { key: 'reasoner', name: 'Deep Reasoner', tag: 'Logic & analysis', icon: '🧠', desc: 'Meticulous reasoning assistant, step-by-step logic and verification' },
+      { key: 'creative', name: 'Creative Writer', tag: 'Brainstorm & ideas', icon: '🎨', desc: 'Imaginative creative assistant, brainstormer, rich analogies' }
+    ];
+
+    function getActivePromptKey() {
+      const current = (APP.settings && APP.settings.system_prompt) ? APP.settings.system_prompt : '';
+      for (const p of PROMPT_PRESETS) {
+        if (DEFAULT_SYSTEM_PROMPTS[p.key] === current) return p.key;
+      }
+      if (APP.customPrompts) {
+        for (let i = 0; i < APP.customPrompts.length; i++) {
+          if (APP.customPrompts[i].prompt === current) return `custom_${i}`;
+        }
+      }
+      return current ? 'active_custom' : 'default';
+    }
+
+    function getActivePromptMeta() {
+      const key = getActivePromptKey();
+      const preset = PROMPT_PRESETS.find(p => p.key === key);
+      if (preset) return { key: preset.key, name: preset.name, icon: preset.icon };
+      if (key.startsWith('custom_')) {
+        const idx = parseInt(key.split('_')[1], 10);
+        if (APP.customPrompts && APP.customPrompts[idx]) {
+          return { key, name: APP.customPrompts[idx].name, icon: '⭐' };
+        }
+      }
+      return { key: 'custom', name: 'Custom', icon: '🎭' };
+    }
+
+    function openNewPromptModal() {
+      closeAttachPopup();
+      if (UI.newPromptNameInp) UI.newPromptNameInp.value = '';
+      if (UI.newPromptTextInp) UI.newPromptTextInp.value = '';
+      if (UI.editPromptIdx) UI.editPromptIdx.value = '';
+      if (UI.newPromptDialogTitle) UI.newPromptDialogTitle.textContent = 'Add Custom System Prompt';
+      if (UI.newPromptDialog) UI.newPromptDialog.classList.add('show');
+    }
+
+    function openEditPromptModal(promptObj) {
+      closeAttachPopup();
+      if (UI.newPromptNameInp) UI.newPromptNameInp.value = promptObj.name || '';
+      if (UI.newPromptTextInp) UI.newPromptTextInp.value = promptObj.prompt || '';
+      if (UI.editPromptIdx) UI.editPromptIdx.value = promptObj.isDefault ? `preset_${promptObj.key}` : String(promptObj.customIdx);
+      if (UI.newPromptDialogTitle) {
+        UI.newPromptDialogTitle.textContent = promptObj.isDefault ? `Duplicate & Edit "${promptObj.name}"` : `Edit "${promptObj.name}"`;
+      }
+      if (UI.newPromptDialog) UI.newPromptDialog.classList.add('show');
+    }
+
+    async function deleteCustomPrompt(idx, name) {
+      if (!confirm(`Delete custom prompt "${name}"? This cannot be undone.`)) return;
+      if (idx >= 0 && idx < APP.customPrompts.length) {
+        const deleted = APP.customPrompts.splice(idx, 1)[0];
+        localStorage.setItem('gufo_custom_prompts', JSON.stringify(APP.customPrompts));
+        if (APP.settings.system_prompt === deleted.prompt) {
+          await selectSystemPrompt('default');
+        } else {
+          renderSystemPromptDropdown();
+          calculateContextSize();
+          updateInputMetaBar();
+          if (!APP.activeConv || !APP.activeConv.messages || APP.activeConv.messages.length === 0) {
+            renderHeroDashboard();
+          }
+        }
+        renderSettingsPromptList();
+      }
+    }
+
+    function renderSettingsPromptList() {
+      if (!UI.settingsPromptList) return;
+      UI.settingsPromptList.innerHTML = '';
+
+      const activeKey = getActivePromptKey();
+      const currentPromptText = APP.settings.system_prompt || '';
+
+      if (UI.settingsActivePromptTag) {
+        const meta = getActivePromptMeta();
+        UI.settingsActivePromptTag.textContent = `${meta.icon} ${meta.name}`;
+      }
+      if (UI.setSystemPrompt && document.activeElement !== UI.setSystemPrompt) {
+        UI.setSystemPrompt.value = currentPromptText;
+      }
+
+      const allPrompts = [];
+
+      // 1. Standard Presets
+      PROMPT_PRESETS.forEach(p => {
+        allPrompts.push({
+          key: p.key,
+          name: p.name,
+          icon: p.icon,
+          tag: p.tag,
+          desc: p.desc,
+          prompt: DEFAULT_SYSTEM_PROMPTS[p.key] || '',
+          isDefault: true
+        });
+      });
+
+      // 2. Custom Presets
+      if (APP.customPrompts && APP.customPrompts.length > 0) {
+        APP.customPrompts.forEach((cp, idx) => {
+          allPrompts.push({
+            key: `custom_${idx}`,
+            name: cp.name,
+            icon: '⭐',
+            tag: 'Custom Persona',
+            desc: cp.prompt.slice(0, 100),
+            prompt: cp.prompt,
+            isDefault: false,
+            customIdx: idx
+          });
+        });
+      }
+
+      if (UI.settingsPromptsCount) {
+        UI.settingsPromptsCount.textContent = `${allPrompts.length} prompts`;
+      }
+
+      allPrompts.forEach(p => {
+        const isActive = (p.key === activeKey) || (p.prompt === currentPromptText);
+        const card = document.createElement('div');
+        card.className = `settings-prompt-item ${isActive ? 'active' : ''}`;
+
+        card.innerHTML = `
+          <div class="settings-prompt-item-header">
+            <div style="display:flex; align-items:center; gap:8px; min-width:0;">
+              <span class="settings-prompt-icon">${p.icon}</span>
+              <div style="min-width:0;">
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <span class="settings-prompt-title">${escapeHtml(p.name)}</span>
+                  ${p.isDefault ? '<span class="tag-pill" style="font-size:0.6rem;">Preset</span>' : '<span class="tag-pill" style="font-size:0.6rem; color:var(--accent); border-color:rgba(124,58,237,0.3);">Custom</span>'}
+                  ${isActive ? '<span class="hero-card-badge" style="background:rgba(34,197,94,0.15); color:#86efac; border-color:rgba(34,197,94,0.3); font-size:0.6rem;">✓ Active</span>' : ''}
+                </div>
+                <div class="settings-prompt-desc">${escapeHtml(p.tag || '')}</div>
+              </div>
+            </div>
+            <div class="settings-prompt-actions">
+              ${!isActive ? `<button class="btn-top btn-prompt-use" type="button" title="Set as active system prompt" style="padding:2px 8px; font-size:0.7rem; color:var(--text);">Use</button>` : ''}
+              <button class="btn-top btn-prompt-edit" type="button" title="Edit prompt" style="padding:2px 6px; font-size:0.75rem;">✏️</button>
+              ${!p.isDefault ? `<button class="btn-top btn-prompt-del" type="button" title="Delete custom prompt" style="padding:2px 6px; font-size:0.85rem; line-height:1; color:var(--danger); border-color:rgba(239,68,68,0.25);">&times;</button>` : ''}
+            </div>
+          </div>
+          <div class="settings-prompt-preview">${escapeHtml(p.prompt)}</div>
+        `;
+
+        const useBtn = card.querySelector('.btn-prompt-use');
+        if (useBtn) {
+          useBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            selectSystemPrompt(p.key);
+            renderSettingsPromptList();
+          });
+        }
+
+        const editBtn = card.querySelector('.btn-prompt-edit');
+        if (editBtn) {
+          editBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            openEditPromptModal(p);
+          });
+        }
+
+        const delBtn = card.querySelector('.btn-prompt-del');
+        if (delBtn) {
+          delBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            deleteCustomPrompt(p.customIdx, p.name);
+          });
+        }
+
+        UI.settingsPromptList.appendChild(card);
+      });
+    }
+
+    function updateHeroWorkdirDisplay() {
+      const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+      const userPrefix = `UserData/${username}/`;
+      let wdName = `UserData/${username}/...`;
+      if (APP.activeConv && APP.activeConv.working_directory) {
+        let wd = APP.activeConv.working_directory;
+        if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
+        wdName = `UserData/${username}/${wd}`;
+      } else if (APP.newChatWorkdir) {
+        let wd = APP.newChatWorkdir;
+        if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
+        wdName = `UserData/${username}/${wd}`;
+      }
+      const el = document.getElementById('hero-workdir-sub');
+      if (el) el.textContent = wdName;
+      updateAttachPopupUI();
+    }
+
+    function updateInputMetaBar() {
+      const pMeta = getActivePromptMeta();
+      const elPrompt = document.getElementById('input-meta-prompt');
+      if (elPrompt) {
+        elPrompt.textContent = `${pMeta.icon} ${pMeta.name}`;
+        elPrompt.title = `System prompt: ${pMeta.name} (click to cycle)`;
+      }
+
+      const elThinking = document.getElementById('input-meta-thinking');
+      if (elThinking) {
+        const lvl = APP.thinkingLevel || 'auto';
+        const displayLvl = lvl.charAt(0).toUpperCase() + lvl.slice(1);
+        elThinking.textContent = `🧠Think: ${displayLvl}`;
+        elThinking.title = `Thinking level: ${lvl} (click to cycle)`;
+      }
+
+      const elPerm = document.getElementById('input-meta-perm');
+      if (elPerm) {
+        const isAllow = APP.toolPermission === 'allow';
+        elPerm.textContent = isAllow ? '⚡ Allow all' : '🛡️ Ask';
+        elPerm.title = isAllow ? 'Tools execute autonomously without asking (click to toggle)' : 'Ask approval before executing tools (click to toggle)';
+      }
+
+      calculateContextSize();
+    }
+
+    async function selectSystemPrompt(key) {
+      let promptText = '';
+      if (DEFAULT_SYSTEM_PROMPTS[key]) {
+        promptText = DEFAULT_SYSTEM_PROMPTS[key];
+      } else if (key.startsWith('custom_')) {
+        const idx = parseInt(key.split('_')[1], 10);
+        if (APP.customPrompts && APP.customPrompts[idx]) {
+          promptText = APP.customPrompts[idx].prompt;
+        }
+      }
+      if (!promptText) return;
+
+      APP.settings.system_prompt = promptText;
+      if (UI.setSystemPrompt) UI.setSystemPrompt.value = promptText;
+      if (UI.popupSystemPromptSelect) {
+        UI.popupSystemPromptSelect.value = key;
+      }
+
+      if (APP.activeId) {
+        try {
+          await apiFetch(`/api/conversations/${APP.activeId}`, {
+            method: 'PATCH',
+            body: { system_prompt: promptText }
+          });
+          if (APP.activeConv) APP.activeConv.system_prompt = promptText;
+        } catch (_) {}
+      }
+
+      try {
+        await apiFetch('/api/settings', { method: 'POST', body: APP.settings });
+      } catch (_) {}
+
+      const activeMeta = getActivePromptMeta();
+      const heroPromptBadge = document.getElementById('hero-prompt-badge');
+      if (heroPromptBadge) {
+        heroPromptBadge.textContent = `${activeMeta.icon} ${activeMeta.name}`;
+      }
+      const promptThumbs = document.querySelectorAll('.hero-prompt-thumb');
+      promptThumbs.forEach(t => {
+        t.classList.toggle('active', t.dataset.key === key);
+      });
+
+      calculateContextSize();
+      updateInputMetaBar();
+      renderSettingsPromptList();
+    }
+
+    function cycleSystemPrompt() {
+      const curKey = getActivePromptKey();
+      const keys = PROMPT_PRESETS.map(p => p.key);
+      if (APP.customPrompts) {
+        for (let i = 0; i < APP.customPrompts.length; i++) keys.push(`custom_${i}`);
+      }
+      const curIdx = keys.indexOf(curKey);
+      const nextIdx = (curIdx + 1) % keys.length;
+      selectSystemPrompt(keys[nextIdx]);
+    }
+
     function openAttachPopup() {
       if (!UI.attachPopupMenu) return;
       updateAttachPopupUI();
@@ -4040,7 +4520,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       if (UI.chkMasterTools) {
         UI.chkMasterTools.checked = APP.toolsEnabled;
       }
-      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.enabled).length;
+      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.name !== 'ask_user' && t.enabled).length;
       const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
       const total = activeInbuilt + activeCustom;
       if (UI.attachToolsStatusText) {
@@ -4061,6 +4541,10 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
       // 7. Context size calculation
       calculateContextSize();
+    }
+
+    function updateWorkingDirUI() {
+      updateAttachPopupUI();
     }
 
     function renderToolGroupsSubmenu() {
@@ -4125,20 +4609,11 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       const currentPrompt = APP.settings.system_prompt || '';
       UI.popupSystemPromptSelect.innerHTML = '';
 
-      // Standard presets
-      const standardKeys = [
-        { key: 'default', label: 'Gufo Assistant (Default)' },
-        { key: 'coder', label: 'Expert Software Engineer' },
-        { key: 'concise', label: 'Concise & Direct' },
-        { key: 'reasoner', label: 'Deep Reasoning & Logic' },
-        { key: 'creative', label: 'Creative & Brainstorm' }
-      ];
-
       let matched = false;
-      standardKeys.forEach(p => {
+      PROMPT_PRESETS.forEach(p => {
         const opt = document.createElement('option');
         opt.value = p.key;
-        opt.textContent = p.label;
+        opt.textContent = `${p.icon} ${p.name}`;
         if (DEFAULT_SYSTEM_PROMPTS[p.key] === currentPrompt) {
           opt.selected = true;
           matched = true;
@@ -4174,45 +4649,14 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     }
 
     if (UI.popupSystemPromptSelect) {
-      UI.popupSystemPromptSelect.addEventListener('change', async (e) => {
-        const val = e.target.value;
-        let newPromptText = '';
-        if (DEFAULT_SYSTEM_PROMPTS[val]) {
-          newPromptText = DEFAULT_SYSTEM_PROMPTS[val];
-        } else if (val.startsWith('custom_')) {
-          const idx = parseInt(val.split('_')[1], 10);
-          if (APP.customPrompts[idx]) {
-            newPromptText = APP.customPrompts[idx].prompt;
-          }
-        }
-        if (newPromptText) {
-          APP.settings.system_prompt = newPromptText;
-          if (UI.setSystemPrompt) UI.setSystemPrompt.value = newPromptText;
-          if (APP.activeId) {
-            try {
-              await apiFetch(`/api/conversations/${APP.activeId}`, {
-                method: 'PATCH',
-                body: { system_prompt: newPromptText }
-              });
-              if (APP.activeConv) APP.activeConv.system_prompt = newPromptText;
-            } catch (_) {}
-          }
-          try {
-            await apiFetch('/api/settings', { method: 'POST', body: APP.settings });
-          } catch (_) {}
-          calculateContextSize();
-        }
+      UI.popupSystemPromptSelect.addEventListener('change', (e) => {
+        selectSystemPrompt(e.target.value);
       });
     }
 
     // New Custom System Prompt Dialog handlers
     if (UI.btnPopupNewPrompt) {
-      UI.btnPopupNewPrompt.addEventListener('click', () => {
-        closeAttachPopup();
-        if (UI.newPromptNameInp) UI.newPromptNameInp.value = '';
-        if (UI.newPromptTextInp) UI.newPromptTextInp.value = '';
-        if (UI.newPromptDialog) UI.newPromptDialog.classList.add('show');
-      });
+      UI.btnPopupNewPrompt.addEventListener('click', openNewPromptModal);
     }
 
     function closeNewPromptModal() {
@@ -4232,14 +4676,47 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         const name = (UI.newPromptNameInp ? UI.newPromptNameInp.value : '').trim();
         const text = (UI.newPromptTextInp ? UI.newPromptTextInp.value : '').trim();
         if (!name || !text) {
-          alert('Please provide both a preset name and prompt instructions.');
+          alert('Please provide both a prompt name and prompt instructions.');
           return;
         }
 
-        APP.customPrompts.push({ name, prompt: text });
+        const editVal = UI.editPromptIdx ? UI.editPromptIdx.value : '';
+        let targetKey = '';
+
+        if (editVal !== '' && !editVal.startsWith('preset_')) {
+          const idx = parseInt(editVal, 10);
+          if (APP.customPrompts[idx]) {
+            APP.customPrompts[idx] = { name, prompt: text };
+            targetKey = `custom_${idx}`;
+          }
+        } else {
+          APP.customPrompts.push({ name, prompt: text });
+          targetKey = `custom_${APP.customPrompts.length - 1}`;
+        }
+
         localStorage.setItem('gufo_custom_prompts', JSON.stringify(APP.customPrompts));
+        closeNewPromptModal();
+        renderSystemPromptDropdown();
+        await selectSystemPrompt(targetKey);
+        renderSettingsPromptList();
+        if (!APP.activeConv || !APP.activeConv.messages || APP.activeConv.messages.length === 0) {
+          renderHeroDashboard();
+        }
+      });
+    }
+
+    if (UI.btnSettingsAddPrompt) {
+      UI.btnSettingsAddPrompt.addEventListener('click', openNewPromptModal);
+    }
+
+    if (UI.btnSaveActivePromptText) {
+      UI.btnSaveActivePromptText.addEventListener('click', async () => {
+        const text = (UI.setSystemPrompt ? UI.setSystemPrompt.value : '').trim();
+        if (!text) {
+          alert('System prompt cannot be empty.');
+          return;
+        }
         APP.settings.system_prompt = text;
-        if (UI.setSystemPrompt) UI.setSystemPrompt.value = text;
         if (APP.activeId) {
           try {
             await apiFetch(`/api/conversations/${APP.activeId}`, {
@@ -4253,16 +4730,39 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           await apiFetch('/api/settings', { method: 'POST', body: APP.settings });
         } catch (_) {}
 
-        closeNewPromptModal();
-        renderSystemPromptDropdown();
         calculateContextSize();
+        updateInputMetaBar();
+        renderSettingsPromptList();
+        renderSystemPromptDropdown();
+        if (!APP.activeConv || !APP.activeConv.messages || APP.activeConv.messages.length === 0) {
+          renderHeroDashboard();
+        }
+        alert('Active system prompt updated!');
       });
     }
 
     // 6. Thinking Level Control (auto, minimum, low, medium, high, xhigh)
+    function setThinkingLevel(level) {
+      if (!['auto', 'minimum', 'low', 'medium', 'high', 'xhigh'].includes(level)) level = 'auto';
+      APP.thinkingLevel = level;
+      localStorage.setItem('gufo_thinking_level', APP.thinkingLevel);
+      renderThinkingLevelButtons();
+      const heroThinkBadge = document.getElementById('hero-think-badge');
+      if (heroThinkBadge) {
+        heroThinkBadge.textContent = `${level} reasoning`;
+      }
+      updateInputMetaBar();
+    }
+
+    function cycleThinkingLevel() {
+      const levels = ['auto', 'minimum', 'low', 'medium', 'high', 'xhigh'];
+      const curIdx = levels.indexOf(APP.thinkingLevel);
+      const nextIdx = (curIdx + 1) % levels.length;
+      setThinkingLevel(levels[nextIdx]);
+    }
+
     function renderThinkingLevelButtons() {
-      if (!UI.thinkingLevelControl) return;
-      const btns = UI.thinkingLevelControl.querySelectorAll('.seg-btn');
+      const btns = document.querySelectorAll('#thinking-level-control .seg-btn, .hero-think-btn');
       btns.forEach(btn => {
         btn.classList.toggle('active', btn.dataset.level === APP.thinkingLevel);
       });
@@ -4272,21 +4772,35 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       UI.thinkingLevelControl.addEventListener('click', (e) => {
         const btn = e.target.closest('.seg-btn');
         if (!btn) return;
-        APP.thinkingLevel = btn.dataset.level || 'auto';
-        localStorage.setItem('gufo_thinking_level', APP.thinkingLevel);
-        renderThinkingLevelButtons();
+        setThinkingLevel(btn.dataset.level || 'auto');
       });
     }
 
     // Tool Permission Control (Ask before running / Allow all)
+    function setToolPermission(perm) {
+      if (!['ask', 'allow'].includes(perm)) perm = 'ask';
+      APP.toolPermission = perm;
+      localStorage.setItem('gufo_tool_permission', APP.toolPermission);
+      renderToolPermissionButtons();
+      const heroPermBadge = document.getElementById('hero-perm-badge');
+      if (heroPermBadge) {
+        heroPermBadge.textContent = perm === 'allow' ? 'Allow all (autonomous)' : 'Ask before running';
+      }
+      updateInputMetaBar();
+    }
+
+    function cycleToolPermission() {
+      setToolPermission(APP.toolPermission === 'allow' ? 'ask' : 'allow');
+    }
+
     function renderToolPermissionButtons() {
-      if (!UI.toolPermControl) return;
-      const btns = UI.toolPermControl.querySelectorAll('.seg-btn');
+      const btns = document.querySelectorAll('#tool-perm-control .seg-btn, .hero-perm-btn');
       btns.forEach(btn => {
         btn.classList.toggle('active', btn.dataset.perm === APP.toolPermission);
       });
-      if (UI.popupPermLabel) {
-        UI.popupPermLabel.textContent = APP.toolPermission === 'allow' ? 'Allow all' : 'Ask';
+      const popupPermLabel = document.getElementById('popup-perm-label');
+      if (popupPermLabel) {
+        popupPermLabel.textContent = APP.toolPermission === 'allow' ? 'Allow all' : 'Ask';
       }
     }
 
@@ -4294,9 +4808,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       UI.toolPermControl.addEventListener('click', (e) => {
         const btn = e.target.closest('.seg-btn');
         if (!btn) return;
-        APP.toolPermission = btn.dataset.perm || 'ask';
-        localStorage.setItem('gufo_tool_permission', APP.toolPermission);
-        renderToolPermissionButtons();
+        setToolPermission(btn.dataset.perm || 'ask');
       });
     }
 
@@ -4325,6 +4837,11 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       }
       if (UI.popupContextPct) {
         UI.popupContextPct.textContent = `${pct.toFixed(1)}% used`;
+      }
+      const elCtx = document.getElementById('input-meta-ctx');
+      if (elCtx) {
+        elCtx.textContent = `📊 ${estimatedTokens.toLocaleString()} ctx (${pct.toFixed(1)}%)`;
+        elCtx.title = `Estimated context: ${estimatedTokens.toLocaleString()} / 262k tokens (${pct.toFixed(1)}%)`;
       }
       return { estimatedTokens, maxContext, pct };
     }
@@ -4446,7 +4963,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
     document.addEventListener('click', (e) => {
       if (UI.attachPopupMenu && UI.attachPopupMenu.style.display === 'flex') {
-        if (!e.target.closest('.attach-menu-container') && !e.target.closest('#new-prompt-dialog')) {
+        if (!e.target.closest('.attach-menu-container') && !e.target.closest('#new-prompt-dialog') && !e.target.closest('.hero-attach-card')) {
           closeAttachPopup();
         }
       }
@@ -4553,56 +5070,81 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
     if (UI.btnConvWorkdirReset) {
       UI.btnConvWorkdirReset.addEventListener('click', async () => {
-        if (!APP.activeId) return;
-        try {
-          const res = await apiFetch(`/api/conversations/${APP.activeId}`, {
-            method: 'PATCH',
-            body: { working_directory: 'default' }
-          });
-          if (res.ok) {
-            const data = await res.json();
-            const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
-            const userPrefix = `UserData/${username}/`;
-            let wd = data.working_directory || '';
-            if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
-
-            if (APP.activeConv) APP.activeConv.working_directory = wd;
-            const targetConv = APP.conversations.find(c => c.id === APP.activeId);
-            if (targetConv) targetConv.working_directory = wd;
-            if (UI.convWorkdirInp) UI.convWorkdirInp.value = wd;
-            if (UI.convWorkdirDisplayBadge) UI.convWorkdirDisplayBadge.textContent = userPrefix + wd;
-            updateAttachPopupUI();
+        if (!APP.activeId) {
+          const conv = APP.activeConv || (APP.conversations.length > 0 ? APP.conversations[0] : null);
+          if (conv) {
+            APP.activeId = conv.id;
+            APP.activeConv = conv;
           }
-        } catch (e) {
-          console.error('Failed to reset conversation working directory:', e);
         }
+        if (APP.activeId) {
+          try {
+            const res = await apiFetch(`/api/conversations/${APP.activeId}`, {
+              method: 'PATCH',
+              body: { working_directory: 'default' }
+            });
+            if (res.ok) {
+              const data = await res.json();
+              const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
+              const userPrefix = `UserData/${username}/`;
+              let wd = data.working_directory || '';
+              if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
+
+              if (APP.activeConv) APP.activeConv.working_directory = wd;
+              const targetConv = APP.conversations.find(c => c.id === APP.activeId);
+              if (targetConv) targetConv.working_directory = wd;
+              if (UI.convWorkdirInp) UI.convWorkdirInp.value = wd;
+              if (UI.convWorkdirDisplayBadge) UI.convWorkdirDisplayBadge.textContent = userPrefix + wd;
+            }
+          } catch (e) {
+            console.error('Failed to reset conversation working directory:', e);
+          }
+        } else {
+          APP.newChatWorkdir = '';
+          if (APP.activeConv) APP.activeConv.working_directory = '';
+        }
+        updateHeroWorkdirDisplay();
       });
     }
 
     if (UI.btnConvWorkdirSave) {
       UI.btnConvWorkdirSave.addEventListener('click', async () => {
-        if (!APP.activeId) return;
         let newPath = UI.convWorkdirInp ? UI.convWorkdirInp.value.trim() : '';
         const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
         const userPrefix = `UserData/${username}/`;
         if (newPath.startsWith(userPrefix)) newPath = newPath.slice(userPrefix.length);
-        try {
-          const res = await apiFetch(`/api/conversations/${APP.activeId}`, {
-            method: 'PATCH',
-            body: { working_directory: newPath }
-          });
-          if (res.ok) {
-            const data = await res.json();
-            let wd = data.working_directory || newPath;
-            if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
-            if (APP.activeConv) APP.activeConv.working_directory = wd;
-            const targetConv = APP.conversations.find(c => c.id === APP.activeId);
-            if (targetConv) targetConv.working_directory = wd;
-            updateAttachPopupUI();
+
+        if (!APP.activeId) {
+          const conv = APP.activeConv || (APP.conversations.length > 0 ? APP.conversations[0] : null);
+          if (conv) {
+            APP.activeId = conv.id;
+            APP.activeConv = conv;
           }
-        } catch (e) {
-          console.error('Failed to save conversation working directory:', e);
         }
+
+        if (APP.activeId) {
+          try {
+            const res = await apiFetch(`/api/conversations/${APP.activeId}`, {
+              method: 'PATCH',
+              body: { working_directory: newPath }
+            });
+            if (res.ok) {
+              const data = await res.json();
+              let wd = data.working_directory || newPath;
+              if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
+              if (APP.activeConv) APP.activeConv.working_directory = wd;
+              const targetConv = APP.conversations.find(c => c.id === APP.activeId);
+              if (targetConv) targetConv.working_directory = wd;
+            }
+          } catch (e) {
+            console.error('Failed to save conversation working directory:', e);
+          }
+        } else {
+          APP.newChatWorkdir = newPath;
+          if (APP.activeConv) APP.activeConv.working_directory = newPath;
+        }
+
+        updateHeroWorkdirDisplay();
         closeConvWorkdirModal();
       });
     }
@@ -4885,28 +5427,39 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     // Set Currently Browsed Folder as Active Chat Working Directory
     if (UI.btnFbSetWorkdir) {
       UI.btnFbSetWorkdir.addEventListener('click', async () => {
-        if (!APP.activeId) {
-          alert('No active chat selected.');
-          return;
-        }
         const newPath = currentModalPath || '';
         const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
-        try {
-          const res = await apiFetch(`/api/conversations/${APP.activeId}`, {
-            method: 'PATCH',
-            body: { working_directory: newPath }
-          });
-          if (res.ok) {
-            const data = await res.json();
-            if (APP.activeConv) APP.activeConv.working_directory = data.working_directory || newPath;
-            const targetConv = APP.conversations.find(c => c.id === APP.activeId);
-            if (targetConv) targetConv.working_directory = data.working_directory || newPath;
-            updateAttachPopupUI();
-            updateModalWorkdirBadge();
-            alert(`Chat working directory updated:\nUserData/${username}/${newPath ? newPath : '(root)'}`);
+        if (!APP.activeId) {
+          const conv = APP.activeConv || (APP.conversations.length > 0 ? APP.conversations[0] : null);
+          if (conv) {
+            APP.activeId = conv.id;
+            APP.activeConv = conv;
           }
-        } catch (e) {
-          alert('Failed to set chat working directory: ' + e.message);
+        }
+        if (APP.activeId) {
+          try {
+            const res = await apiFetch(`/api/conversations/${APP.activeId}`, {
+              method: 'PATCH',
+              body: { working_directory: newPath }
+            });
+            if (res.ok) {
+              const data = await res.json();
+              if (APP.activeConv) APP.activeConv.working_directory = data.working_directory || newPath;
+              const targetConv = APP.conversations.find(c => c.id === APP.activeId);
+              if (targetConv) targetConv.working_directory = data.working_directory || newPath;
+              updateHeroWorkdirDisplay();
+              updateModalWorkdirBadge();
+              alert(`Chat working directory updated:\nUserData/${username}/${newPath ? newPath : '(root)'}`);
+            }
+          } catch (e) {
+            alert('Failed to set chat working directory: ' + e.message);
+          }
+        } else {
+          APP.newChatWorkdir = newPath;
+          if (APP.activeConv) APP.activeConv.working_directory = newPath;
+          updateHeroWorkdirDisplay();
+          updateModalWorkdirBadge();
+          alert(`Chat working directory updated:\nUserData/${username}/${newPath ? newPath : '(root)'}`);
         }
       });
     }
@@ -5038,7 +5591,10 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           if (data.server_current_directory) {
             APP.serverCurrentDirectory = data.server_current_directory;
           }
-          if (typeof data.master_enabled === 'boolean') {
+          if (data.server_tools_override) {
+            APP.toolsEnabled = !!data.master_enabled;
+            localStorage.setItem('gufo_tools_enabled', APP.toolsEnabled ? '1' : '0');
+          } else if (typeof data.master_enabled === 'boolean') {
             if (localStorage.getItem('gufo_tools_enabled') === null) {
               APP.toolsEnabled = data.master_enabled;
             }
@@ -5055,7 +5611,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     }
 
     function updateToolsPill() {
-      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.enabled).length;
+      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.name !== 'ask_user' && t.enabled).length;
       const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
       const total = activeInbuilt + activeCustom;
 
@@ -5079,11 +5635,12 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     function renderInbuiltTools() {
       if (!UI.inbuiltToolsList) return;
       UI.inbuiltToolsList.innerHTML = '';
-      if (!APP.tools.inbuilt || APP.tools.inbuilt.length === 0) {
+      const visibleTools = (APP.tools.inbuilt || []).filter(t => t.name !== 'ask_user');
+      if (visibleTools.length === 0) {
         UI.inbuiltToolsList.innerHTML = '<div style="color:var(--text-dim); font-size:0.8rem; padding:8px;">No inbuilt tools available.</div>';
         return;
       }
-      APP.tools.inbuilt.forEach(t => {
+      visibleTools.forEach(t => {
         const item = document.createElement('div');
         item.className = 'tool-card-item';
         const paramNames = (t.parameters && t.parameters.properties) ? Object.keys(t.parameters.properties).join(', ') : 'none';
@@ -5373,6 +5930,13 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         const title = document.createElement('span');
         title.className = 'chat-title-text';
         title.textContent = c.title || 'Untitled chat';
+        if (c.is_generating) {
+          const genDot = document.createElement('span');
+          genDot.style.cssText = 'color:var(--accent); font-size:0.8rem; margin-right:4px; display:inline-block;';
+          genDot.title = 'Generating response...';
+          genDot.textContent = '⚡ ';
+          title.prepend(genDot);
+        }
 
         const actions = document.createElement('div');
         actions.className = 'chat-item-actions';
@@ -5455,6 +6019,11 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           APP.activeConv = await res.json();
           renderMessages(APP.activeConv.messages || []);
           updateAttachPopupUI();
+          updateHeroWorkdirDisplay();
+          updateInputMetaBar();
+          if (APP.activeConv.is_generating) {
+            resumeLiveStream(id, !!APP.activeConv.is_resume);
+          }
         }
       } catch (err) {}
     }
@@ -5505,7 +6074,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         return;
       }
 
-      messages.forEach(m => appendMessage(m));
+      messages.forEach((m, idx) => appendMessage(m, idx));
       isUserScrolledUp = false;
       if (UI.btnScrollBottom) UI.btnScrollBottom.classList.remove('visible');
       scrollDown(true);
@@ -5514,18 +6083,46 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     function renderHeroDashboard() {
       const username = (APP.user && APP.user.username) ? APP.user.username : 'Guest';
       const userPrefix = `UserData/${username}/`;
-      let wdName = `UserData/${username}/...`;
-      if (APP.activeConv && APP.activeConv.working_directory) {
-        let wd = APP.activeConv.working_directory;
-        if (wd.startsWith(userPrefix)) wd = wd.slice(userPrefix.length);
-        wdName = `UserData/${username}/${wd}`;
-      }
-      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.enabled).length;
+      let rawWd = '';
+      if (APP.activeConv && APP.activeConv.working_directory) rawWd = APP.activeConv.working_directory;
+      else if (APP.newChatWorkdir) rawWd = APP.newChatWorkdir;
+      if (rawWd.startsWith(userPrefix)) rawWd = rawWd.slice(userPrefix.length);
+      const wdName = rawWd ? `UserData/${username}/${rawWd}` : `UserData/${username}/...`;
+
+      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.name !== 'ask_user' && t.enabled).length;
       const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
       const totalTools = activeInbuilt + activeCustom;
       const toolsDesc = APP.toolsEnabled ? `${totalTools} tools active` : 'Tools disabled';
       const permDesc = APP.toolPermission === 'allow' ? 'Allow all (autonomous)' : 'Ask before running';
       const thinkDesc = `${APP.thinkingLevel} reasoning`;
+
+      const activePromptMeta = getActivePromptMeta();
+      const activePromptKey = getActivePromptKey();
+
+      let renderedPromptThumbs = PROMPT_PRESETS.map(p => `
+        <div class="hero-prompt-thumb ${p.key === activePromptKey ? 'active' : ''}" data-key="${p.key}" onclick="event.stopPropagation(); selectSystemPrompt('${p.key}')" title="${escapeHtml(p.desc)}">
+          <div class="hero-prompt-thumb-icon">${p.icon}</div>
+          <div class="hero-prompt-thumb-info">
+            <div class="hero-prompt-thumb-title">${escapeHtml(p.name)}</div>
+            <div class="hero-prompt-thumb-sub">${escapeHtml(p.tag)}</div>
+          </div>
+        </div>
+      `).join('');
+
+      if (APP.customPrompts && APP.customPrompts.length > 0) {
+        renderedPromptThumbs += APP.customPrompts.map((cp, idx) => {
+          const k = `custom_${idx}`;
+          return `
+            <div class="hero-prompt-thumb ${k === activePromptKey ? 'active' : ''}" data-key="${k}" onclick="event.stopPropagation(); selectSystemPrompt('${k}')" title="${escapeHtml(cp.prompt)}">
+              <div class="hero-prompt-thumb-icon">⭐</div>
+              <div class="hero-prompt-thumb-info">
+                <div class="hero-prompt-thumb-title">${escapeHtml(cp.name)}</div>
+                <div class="hero-prompt-thumb-sub">Custom preset</div>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
 
       UI.messagesContainer.innerHTML = `
         <div class="llama-hero">
@@ -5533,6 +6130,25 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           <div class="llama-hero-title">Gufo Chat</div>
           <div class="llama-hero-subtitle">High-performance LLM inference running natively on AMD Strix Halo gfx1151. Multi-device chat history synced to SQLite database.</div>
           <div class="hero-attach-grid">
+            <!-- 1. System Prompt & Persona selection with thumbnail icons -->
+            <div class="hero-attach-card" style="grid-column: 1 / -1; cursor: default;">
+              <div class="hero-attach-card-header">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span class="hero-attach-card-icon">🎭</span>
+                  <span class="hero-attach-card-title">System Prompt &amp; Persona</span>
+                </div>
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span id="hero-prompt-badge" class="hero-card-badge">${activePromptMeta.icon} ${escapeHtml(activePromptMeta.name)}</span>
+                  <button type="button" class="btn-mini-action" onclick="openNewPromptModal()" title="Add custom system prompt persona">+ New</button>
+                </div>
+              </div>
+              <div class="hero-attach-card-sub">Choose AI persona or behavior instructions for this conversation:</div>
+              <div class="hero-prompt-grid">
+                ${renderedPromptThumbs}
+              </div>
+            </div>
+
+            <!-- 2. Attach Images -->
             <div class="hero-attach-card" onclick="if(UI.fileUploaderImage) UI.fileUploaderImage.click()">
               <div class="hero-attach-card-header">
                 <div style="display:flex; align-items:center; gap:8px;">
@@ -5544,6 +6160,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               <div class="hero-attach-card-sub">Add multimodal visual input to your conversation context</div>
             </div>
 
+            <!-- 3. Attach Files -->
             <div class="hero-attach-card" onclick="if(UI.fileUploaderDoc) UI.fileUploaderDoc.click()">
               <div class="hero-attach-card-header">
                 <div style="display:flex; align-items:center; gap:8px;">
@@ -5552,9 +6169,10 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                 </div>
                 <span class="tag-pill">Context</span>
               </div>
-              <div class="hero-attach-card-sub">Attach code, logs, documents, or data files directly to the prompt</div>
+              <div class="hero-attach-card-sub">Attach code, logs, documents, or data files directly to prompt</div>
             </div>
 
+            <!-- 4. Working Directory -->
             <div class="hero-attach-card" onclick="openConvWorkdirModal()">
               <div class="hero-attach-card-header">
                 <div style="display:flex; align-items:center; gap:8px;">
@@ -5563,69 +6181,141 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                 </div>
                 <span class="tag-pill">Per-Chat</span>
               </div>
-              <div class="hero-attach-card-sub">${escapeHtml(wdName)}</div>
+              <div id="hero-workdir-sub" class="hero-attach-card-sub">${escapeHtml(wdName)}</div>
             </div>
 
-            <div class="hero-attach-card" onclick="openSidebarFiles()">
-              <div class="hero-attach-card-header">
-                <div style="display:flex; align-items:center; gap:8px;">
-                  <span class="hero-attach-card-icon">🗂️</span>
-                  <span class="hero-attach-card-title">File Explorer</span>
-                </div>
-                <span class="tag-pill">UserData</span>
-              </div>
-              <div class="hero-attach-card-sub">Explore and preview files inside your personal sandbox</div>
-            </div>
-
+            <!-- 5. Tools & MCP -->
             <div class="hero-attach-card" onclick="openDrawer('tools')">
               <div class="hero-attach-card-header">
                 <div style="display:flex; align-items:center; gap:8px;">
                   <span class="hero-attach-card-icon">⚙️</span>
-                  <span class="hero-attach-card-title">Tools & MCP</span>
+                  <span class="hero-attach-card-title">Tools &amp; MCP</span>
                 </div>
                 <span class="hero-card-badge">${escapeHtml(toolsDesc)}</span>
               </div>
               <div class="hero-attach-card-sub">Filesystem, shell, code search, web, and external MCP servers</div>
             </div>
 
-            <div class="hero-attach-card" onclick="openAttachPopup()">
+            <!-- 6. Tool Permission -->
+            <div class="hero-attach-card" onclick="cycleToolPermission()">
               <div class="hero-attach-card-header">
                 <div style="display:flex; align-items:center; gap:8px;">
                   <span class="hero-attach-card-icon">🛡️</span>
                   <span class="hero-attach-card-title">Tool Permission</span>
                 </div>
-                <span class="hero-card-badge">${escapeHtml(permDesc)}</span>
+                <span id="hero-perm-badge" class="hero-card-badge">${escapeHtml(permDesc)}</span>
               </div>
               <div class="hero-attach-card-sub">Choose between human approval ("Ask") and autonomous execution ("Allow all")</div>
+              <div class="segmented-control" style="grid-template-columns:1fr 1fr; margin-top:6px;" onclick="event.stopPropagation()">
+                <button type="button" class="seg-btn hero-perm-btn ${APP.toolPermission === 'ask' ? 'active' : ''}" data-perm="ask" onclick="setToolPermission('ask')" title="Prompt for approval before running tools">🛡️ Ask</button>
+                <button type="button" class="seg-btn hero-perm-btn ${APP.toolPermission === 'allow' ? 'active' : ''}" data-perm="allow" onclick="setToolPermission('allow')" title="Allow autonomous tool execution without asking">⚡ Allow all</button>
+              </div>
             </div>
 
-            <div class="hero-attach-card" onclick="openAttachPopup()">
+            <!-- 7. Thinking Level -->
+            <div class="hero-attach-card" onclick="cycleThinkingLevel()">
               <div class="hero-attach-card-header">
                 <div style="display:flex; align-items:center; gap:8px;">
                   <span class="hero-attach-card-icon">🧠</span>
                   <span class="hero-attach-card-title">Thinking Level</span>
                 </div>
-                <span class="hero-card-badge">${escapeHtml(thinkDesc)}</span>
+                <span id="hero-think-badge" class="hero-card-badge">${escapeHtml(thinkDesc)}</span>
               </div>
               <div class="hero-attach-card-sub">Configure reasoning depth: auto, minimum, low, medium, high, xhigh</div>
-            </div>
-
-            <div class="hero-attach-card" onclick="openAttachPopup()">
-              <div class="hero-attach-card-header">
-                <div style="display:flex; align-items:center; gap:8px;">
-                  <span class="hero-attach-card-icon">📊</span>
-                  <span class="hero-attach-card-title">Context & Presets</span>
-                </div>
-                <span class="tag-pill">262k</span>
+              <div class="segmented-control" style="grid-template-columns:repeat(6, 1fr); margin-top:6px;" onclick="event.stopPropagation()">
+                <button type="button" class="seg-btn hero-think-btn ${APP.thinkingLevel === 'auto' ? 'active' : ''}" data-level="auto" onclick="setThinkingLevel('auto')" title="Default thinking budget">Auto</button>
+                <button type="button" class="seg-btn hero-think-btn ${APP.thinkingLevel === 'minimum' ? 'active' : ''}" data-level="minimum" onclick="setThinkingLevel('minimum')" title="Fast/concise reasoning (512 tokens)">Min</button>
+                <button type="button" class="seg-btn hero-think-btn ${APP.thinkingLevel === 'low' ? 'active' : ''}" data-level="low" onclick="setThinkingLevel('low')" title="Low reasoning budget (2,048 tokens)">Low</button>
+                <button type="button" class="seg-btn hero-think-btn ${APP.thinkingLevel === 'medium' ? 'active' : ''}" data-level="medium" onclick="setThinkingLevel('medium')" title="Medium reasoning budget (4,096 tokens)">Med</button>
+                <button type="button" class="seg-btn hero-think-btn ${APP.thinkingLevel === 'high' ? 'active' : ''}" data-level="high" onclick="setThinkingLevel('high')" title="High reasoning budget (8,192 tokens)">High</button>
+                <button type="button" class="seg-btn hero-think-btn ${APP.thinkingLevel === 'xhigh' ? 'active' : ''}" data-level="xhigh" onclick="setThinkingLevel('xhigh')" title="Maximum reasoning budget (16,384 tokens)">XHigh</button>
               </div>
-              <div class="hero-attach-card-sub">Manage system prompt personas, compact history, and view context tokens</div>
             </div>
           </div>
         </div>
       `;
     }
 
-    function appendMessage(m) {
+    function findMessageIndex(m, fallbackIdx) {
+      if (APP.activeConv && Array.isArray(APP.activeConv.messages)) {
+        if (typeof fallbackIdx === 'number' && fallbackIdx >= 0 && fallbackIdx < APP.activeConv.messages.length) {
+          if (APP.activeConv.messages[fallbackIdx] === m || APP.activeConv.messages[fallbackIdx].content === m.content) {
+            return fallbackIdx;
+          }
+        }
+        const idx = APP.activeConv.messages.indexOf(m);
+        if (idx !== -1) return idx;
+        for (let i = APP.activeConv.messages.length - 1; i >= 0; --i) {
+          if (APP.activeConv.messages[i].role === m.role && APP.activeConv.messages[i].content === m.content) {
+            return i;
+          }
+        }
+      }
+      return typeof fallbackIdx === 'number' ? fallbackIdx : -1;
+    }
+
+    async function editAndResubmitMessage(targetIdx, newText) {
+      if (APP.isGenerating && APP.abortController) {
+        APP.abortController.abort();
+        APP.isGenerating = false;
+      }
+      if (!APP.activeId || !APP.activeConv || !APP.activeConv.messages) return;
+      if (targetIdx < 0 || targetIdx >= APP.activeConv.messages.length) return;
+
+      // Keep messages up to targetIdx and update content
+      APP.activeConv.messages = APP.activeConv.messages.slice(0, targetIdx + 1);
+      APP.activeConv.messages[targetIdx].content = newText;
+
+      try {
+        const res = await apiFetch(`/api/conversations/${APP.activeId}/messages`, {
+          method: 'PUT',
+          body: { messages: APP.activeConv.messages }
+        });
+        if (res.ok) {
+          const convRes = await apiFetch(`/api/conversations/${APP.activeId}`);
+          if (convRes.ok) {
+            APP.activeConv = await convRes.json();
+          }
+        }
+      } catch (err) {
+        console.error('Failed to update messages on server:', err);
+      }
+
+      renderMessages(APP.activeConv.messages || []);
+      await triggerAssistantTurn();
+    }
+
+    async function retryUserMessage(targetIdx) {
+      if (APP.isGenerating && APP.abortController) {
+        APP.abortController.abort();
+        APP.isGenerating = false;
+      }
+      if (!APP.activeId || !APP.activeConv || !APP.activeConv.messages) return;
+      if (targetIdx < 0 || targetIdx >= APP.activeConv.messages.length) return;
+
+      // Keep messages up to targetIdx
+      APP.activeConv.messages = APP.activeConv.messages.slice(0, targetIdx + 1);
+
+      try {
+        const res = await apiFetch(`/api/conversations/${APP.activeId}/messages`, {
+          method: 'PUT',
+          body: { messages: APP.activeConv.messages }
+        });
+        if (res.ok) {
+          const convRes = await apiFetch(`/api/conversations/${APP.activeId}`);
+          if (convRes.ok) {
+            APP.activeConv = await convRes.json();
+          }
+        }
+      } catch (err) {
+        console.error('Failed to update messages on server:', err);
+      }
+
+      renderMessages(APP.activeConv.messages || []);
+      await triggerAssistantTurn();
+    }
+
+    function appendMessage(m, msgIdx) {
       if (m.role === 'tool') {
         const card = document.createElement('div');
         card.className = 'tool-call-card';
@@ -5692,10 +6382,92 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       // Actions
       const actions = document.createElement('div');
       actions.className = 'msg-actions';
+
+      if (isUser) {
+        const btnEdit = document.createElement('button');
+        btnEdit.className = 'btn-msg-action';
+        btnEdit.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg> Edit';
+        btnEdit.title = 'Edit message';
+        btnEdit.onclick = () => {
+          if (body.querySelector('.msg-edit-box')) return;
+          const origContent = m.content || '';
+          content.style.display = 'none';
+          actions.style.display = 'none';
+
+          const editBox = document.createElement('div');
+          editBox.className = 'msg-edit-box';
+
+          const textarea = document.createElement('textarea');
+          textarea.className = 'msg-edit-textarea';
+          textarea.value = origContent;
+
+          const btnRow = document.createElement('div');
+          btnRow.style.cssText = 'display:flex; justify-content:flex-end; gap:8px;';
+
+          const btnCancel = document.createElement('button');
+          btnCancel.className = 'btn-secondary';
+          btnCancel.textContent = 'Cancel';
+          btnCancel.style.cssText = 'padding:4px 12px; font-size:0.8rem; border-radius:var(--radius-sm); border:1px solid var(--border); background:var(--bg-card); color:var(--text-muted); cursor:pointer;';
+          btnCancel.onclick = () => {
+            editBox.remove();
+            content.style.display = '';
+            actions.style.display = 'flex';
+          };
+
+          const btnSave = document.createElement('button');
+          btnSave.className = 'btn-primary';
+          btnSave.textContent = 'Save & Submit';
+          btnSave.style.cssText = 'padding:4px 12px; font-size:0.8rem; border-radius:var(--radius-sm); border:none; background:var(--primary); color:#fff; font-weight:500; cursor:pointer;';
+          btnSave.onclick = () => {
+            const updated = textarea.value.trim();
+            if (!updated) return;
+            const target = findMessageIndex(m, msgIdx);
+            editAndResubmitMessage(target, updated);
+          };
+
+          textarea.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+              e.preventDefault();
+              btnSave.click();
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              btnCancel.click();
+            }
+          });
+
+          btnRow.appendChild(btnCancel);
+          btnRow.appendChild(btnSave);
+          editBox.appendChild(textarea);
+          editBox.appendChild(btnRow);
+          body.appendChild(editBox);
+
+          textarea.focus();
+          textarea.selectionStart = textarea.selectionEnd = textarea.value.length;
+        };
+        actions.appendChild(btnEdit);
+
+        const btnRetry = document.createElement('button');
+        btnRetry.className = 'btn-msg-action';
+        btnRetry.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> Retry';
+        btnRetry.title = 'Retry message';
+        btnRetry.onclick = () => {
+          const target = findMessageIndex(m, msgIdx);
+          retryUserMessage(target);
+        };
+        actions.appendChild(btnRetry);
+      }
+
       const btnCopy = document.createElement('button');
       btnCopy.className = 'btn-msg-action';
-      btnCopy.innerHTML = '&#128203; Copy';
-      btnCopy.onclick = () => navigator.clipboard.writeText(m.content || '');
+      btnCopy.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy';
+      btnCopy.title = 'Copy message';
+      btnCopy.onclick = () => {
+        navigator.clipboard.writeText(m.content || '');
+        btnCopy.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Copied!';
+        setTimeout(() => {
+          btnCopy.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy';
+        }, 1500);
+      };
       actions.appendChild(btnCopy);
 
       group.appendChild(author);
@@ -5846,15 +6618,47 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     if (UI.btnSend) UI.btnSend.addEventListener('click', sendMessage);
     if (UI.btnStop) {
       UI.btnStop.addEventListener('click', () => {
+        if (APP.activeId) {
+          apiFetch(`/api/conversations/${APP.activeId}/stop`, { method: 'POST' }).catch(() => {});
+        }
         if (APP.abortController) APP.abortController.abort();
       });
     }
 
+    const ASK_USER_TOOL = {
+      type: 'function',
+      function: {
+        name: 'ask_user',
+        description: 'Ask the user a question with optional choice buttons or text write-in when you need more information, clarification, or confirmation.',
+        parameters: {
+          type: 'object',
+          properties: {
+            question: {
+              type: 'string',
+              description: 'The question or prompt to present to the user.'
+            },
+            options: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Optional list of quick selectable choices for the user (e.g. ["Yes", "No"]).'
+            },
+            allow_text_input: {
+              type: 'boolean',
+              description: 'Whether the user can provide a freeform text answer (default true).'
+            }
+          },
+          required: ['question']
+        }
+      }
+    };
+
     function getActiveToolsList() {
-      if (!APP.toolsEnabled) return [];
-      const tools = [];
+      // ask_user tool always stays active without needing to be configured in settings
+      const tools = [{ ...ASK_USER_TOOL }];
+      if (!APP.toolsEnabled) return tools;
       if (APP.tools.inbuilt) {
         for (const t of APP.tools.inbuilt) {
+          if (t.name === 'ask_user') continue;
           if (t.enabled) {
             tools.push({
               type: 'function',
@@ -6050,7 +6854,12 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         renderAttachedFilesBar();
       }
 
-      appendMessage({ role: 'user', content: displayMsgText });
+      if (!APP.activeConv) APP.activeConv = { id: APP.activeId, messages: [] };
+      if (!APP.activeConv.messages) APP.activeConv.messages = [];
+      const userIdx = APP.activeConv.messages.length;
+      APP.activeConv.messages.push({ role: 'user', content: text });
+
+      appendMessage({ role: 'user', content: displayMsgText }, userIdx);
       isUserScrolledUp = false;
       if (UI.btnScrollBottom) UI.btnScrollBottom.classList.remove('visible');
       scrollDown(true);
@@ -6066,7 +6875,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       }
 
       // Rename chat on first message
-      if (APP.activeConv && (!APP.activeConv.messages || APP.activeConv.messages.length === 0)) {
+      if (APP.activeConv && APP.activeConv.messages && APP.activeConv.messages.length <= 1) {
         const titleSource = rawText || (hasFiles ? 'Attached Files Analysis' : 'New Chat');
         renameChat(APP.activeId, titleSource.slice(0, 28) + (titleSource.length > 28 ? '...' : ''));
       }
@@ -6076,6 +6885,519 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       UI.chatInput.style.height = 'auto';
       const imageToSend = APP.attachedImage;
       UI.btnRemoveThumb.click();
+
+      await triggerAssistantTurn(imageToSend);
+    }
+
+    async function resumeAssistantTurn(state) {
+      if (APP.isGenerating) return;
+
+      const { group, body, content, accordion, actions } = state;
+      let assistantText = state.assistantText || '';
+      let thoughtText = state.thoughtText || '';
+
+      if (state.btnResume && state.btnResume.parentNode) {
+        state.btnResume.remove();
+        state.btnResume = null;
+      }
+
+      const notice = content.querySelector('.generation-stopped-notice');
+      if (notice) notice.remove();
+
+      APP.isGenerating = true;
+      UI.btnSend.style.display = 'none';
+      UI.btnStop.style.display = 'flex';
+      UI.slotText.textContent = '1/1 slots (processing)';
+      if (UI.footerSpeedMetrics) {
+        UI.footerSpeedMetrics.textContent = 'generating...';
+      }
+
+      APP.abortController = new AbortController();
+      let wasCancelled = false;
+      let genTokens = 0;
+      let startTime = performance.now();
+      let accumulatedUsage = null;
+      let accumulatedTimings = null;
+
+      try {
+        const reqModel = APP.modelId || (UI.modelPill.textContent !== 'loading model...' ? UI.modelPill.textContent : 'default');
+
+        const msgs = [];
+        if (APP.settings.system_prompt) {
+          msgs.push({ role: 'system', content: APP.settings.system_prompt });
+        }
+        if (APP.activeConv && APP.activeConv.messages) {
+          const allMsgs = APP.activeConv.messages;
+          const lastIdx = allMsgs.length - 1;
+          for (let i = 0; i < allMsgs.length; i++) {
+            if (i === lastIdx && allMsgs[i].role === 'assistant') {
+              continue;
+            }
+            msgs.push({ role: allMsgs[i].role, content: allMsgs[i].content });
+          }
+        }
+
+        if (assistantText) {
+          msgs.push({ role: 'assistant', content: assistantText });
+        }
+
+        msgs.push({
+          role: 'user',
+          content: 'Continue generating from exactly where you left off. Start immediately with the continuation, without repeating anything already written.'
+        });
+
+        const payload = {
+          model: reqModel,
+          messages: msgs,
+          stream: true,
+          stream_options: { include_usage: true },
+          include_usage: true,
+          temperature: Number(APP.settings.temperature) || 0.6,
+          top_p: Number(APP.settings.top_p) || 0.95,
+          max_tokens: parseInt(APP.settings.max_tokens, 10) || 4096
+        };
+
+        if (assistantText.length > 0) {
+          payload.think = false;
+          payload.reasoning_budget_tokens = 0;
+          payload.chat_template_kwargs = { thinking: false };
+        } else {
+          let thinkBudget = null;
+          if (APP.thinkingLevel === 'minimum') thinkBudget = 512;
+          else if (APP.thinkingLevel === 'low') thinkBudget = 2048;
+          else if (APP.thinkingLevel === 'medium') thinkBudget = 4096;
+          else if (APP.thinkingLevel === 'high') thinkBudget = 8192;
+          else if (APP.thinkingLevel === 'xhigh') {
+            thinkBudget = 16384;
+            payload.max_tokens = Math.max(payload.max_tokens, 16384);
+          }
+          if (thinkBudget) {
+            payload.think = true;
+            payload.reasoning_budget_tokens = thinkBudget;
+            payload.thinking_budget_tokens = thinkBudget;
+            payload.thinking = { type: 'enabled', budget_tokens: thinkBudget };
+            payload.chat_template_kwargs = { thinking: true, thinking_budget: thinkBudget };
+          }
+        }
+
+        payload.is_resume = true;
+        const fetchUrl = APP.activeId ? `/api/conversations/${APP.activeId}/generate` : '/v1/chat/completions';
+        const res = await fetch(fetchUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(APP.token ? { 'Authorization': `Bearer ${APP.token}` } : {})
+          },
+          body: JSON.stringify(payload),
+          signal: APP.abortController.signal
+        });
+
+        if (!res.ok) {
+          let errMsg = `HTTP ${res.status}`;
+          try {
+            const errData = await res.json();
+            if (errData && errData.error) {
+              errMsg = typeof errData.error === 'string' ? errData.error : (errData.error.message || errMsg);
+            }
+          } catch (_) {}
+          throw new Error(errMsg);
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) continue;
+            const dataStr = trimmed.slice(5).trim();
+            if (dataStr === '[DONE]') break;
+
+            try {
+              const chunk = JSON.parse(dataStr);
+              if (chunk.usage) accumulatedUsage = chunk.usage;
+              if (chunk.timings) accumulatedTimings = chunk.timings;
+
+              const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+              if (delta) {
+                if (delta.reasoning_content || delta.thought) {
+                  const t = delta.reasoning_content || delta.thought;
+                  thoughtText += t;
+                  if (accordion) {
+                    accordion.style.display = 'block';
+                    accordion.querySelector('.thought-text').textContent = thoughtText;
+                    scrollDown();
+                  }
+                }
+
+                if (delta.content) {
+                  if (thoughtText && accordion && !accordion.querySelector('.thought-text').classList.contains('collapsed')) {
+                    accordion.querySelector('.thought-text').classList.add('collapsed');
+                    accordion.querySelector('span').innerHTML = '&#9654; Thought Process';
+                  }
+
+                  assistantText += delta.content;
+                  genTokens++;
+                  content.innerHTML = parseMarkdown(assistantText);
+                  scrollDown();
+                }
+              }
+            } catch (e) {}
+          }
+        }
+      } catch (err) {
+        if (err.name === 'AbortError' || (APP.abortController && APP.abortController.signal && APP.abortController.signal.aborted)) {
+          wasCancelled = true;
+          const noticeEl = document.createElement('p');
+          noticeEl.className = 'generation-stopped-notice';
+          noticeEl.style.cssText = 'color:var(--text-dim); font-style:italic; margin-top:8px; font-size:0.85rem;';
+          noticeEl.textContent = '[generation stopped]';
+          content.appendChild(noticeEl);
+        } else {
+          content.innerHTML += `<p style="color:var(--danger); margin-top:8px;">[Error: ${escapeHtml(err.message)}]</p>`;
+        }
+      } finally {
+        APP.isGenerating = false;
+        APP.abortController = null;
+        UI.btnSend.style.display = 'flex';
+        UI.btnStop.style.display = 'none';
+        UI.slotText.textContent = '1/1 slots (idle)';
+        if (UI.footerSpeedMetrics && UI.footerSpeedMetrics.textContent === 'generating...') {
+          UI.footerSpeedMetrics.textContent = 'eval: 0.0 t/s | prompt: 0.0 t/s';
+        }
+
+        // Update state references
+        state.assistantText = assistantText;
+        state.thoughtText = thoughtText;
+
+        // Update copy button in actions
+        const btnCopy = actions.querySelector('.btn-msg-action:not(.btn-resume)');
+        if (btnCopy) {
+          btnCopy.onclick = () => {
+            navigator.clipboard.writeText(assistantText || '');
+            btnCopy.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Copied!';
+            setTimeout(() => {
+              btnCopy.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy';
+            }, 1500);
+          };
+        }
+
+        // Update activeConv & DB
+        if (APP.activeConv && APP.activeConv.messages && APP.activeConv.messages.length > 0) {
+          const lastIdx = APP.activeConv.messages.length - 1;
+          if (APP.activeConv.messages[lastIdx].role === 'assistant') {
+            APP.activeConv.messages[lastIdx].content = assistantText;
+            APP.activeConv.messages[lastIdx].reasoning_content = thoughtText;
+          } else {
+            APP.activeConv.messages.push({
+              role: 'assistant',
+              content: assistantText,
+              reasoning_content: thoughtText
+            });
+          }
+
+          if (APP.activeId && !fetchUrl.includes('/api/conversations/')) {
+            try {
+              await apiFetch(`/api/conversations/${APP.activeId}/messages`, {
+                method: 'PUT',
+                body: { messages: APP.activeConv.messages }
+              });
+            } catch (_) {}
+          }
+        }
+
+        // If it got cancelled AGAIN, show the resume button again!
+        // If it completed normally, wasCancelled is false, so no resume button is shown!
+        if (wasCancelled) {
+          const newBtnResume = document.createElement('button');
+          newBtnResume.className = 'btn-msg-action btn-resume';
+          newBtnResume.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg> Resume';
+          newBtnResume.title = 'Resume / Continue generation';
+          newBtnResume.onclick = () => {
+            state.btnResume = newBtnResume;
+            resumeAssistantTurn(state);
+          };
+          actions.prepend(newBtnResume);
+        }
+
+        calculateContextSize();
+        scrollDown();
+      }
+    }
+
+    async function resumeLiveStream(convId, isResume = false) {
+      if (APP.isGenerating) return;
+      if (APP.activeId !== convId) return;
+
+      APP.isGenerating = true;
+      UI.btnSend.style.display = 'none';
+      UI.btnStop.style.display = 'flex';
+      UI.slotText.textContent = '1/1 slots (processing)';
+      if (UI.footerSpeedMetrics) {
+        UI.footerSpeedMetrics.textContent = 'generating...';
+      }
+
+      APP.abortController = new AbortController();
+
+      let group = null;
+      let body = null;
+      let accordion = null;
+      let content = null;
+      let assistantText = '';
+      let thoughtText = '';
+
+      if (isResume) {
+        const lastGroup = UI.messagesContainer.querySelector('.msg-group:last-child');
+        if (lastGroup && lastGroup.classList.contains('assistant')) {
+          group = lastGroup;
+          body = group.querySelector('.msg-body');
+          accordion = group.querySelector('.thought-accordion');
+          content = group.querySelector('.md-content');
+          if (APP.activeConv && APP.activeConv.messages && APP.activeConv.messages.length > 0) {
+            const lastMsg = APP.activeConv.messages[APP.activeConv.messages.length - 1];
+            if (lastMsg.role === 'assistant') {
+              assistantText = lastMsg.content || '';
+              thoughtText = lastMsg.reasoning_content || '';
+            }
+          }
+        }
+      }
+
+      if (!group) {
+        group = document.createElement('div');
+        group.className = 'msg-group assistant';
+        const author = document.createElement('div');
+        author.className = 'msg-author assistant';
+        author.textContent = 'Gufo';
+
+        body = document.createElement('div');
+        body.className = 'msg-body';
+
+        accordion = document.createElement('div');
+        accordion.className = 'thought-accordion';
+        accordion.style.display = 'none';
+        accordion.innerHTML = `
+          <div class="thought-summary" onclick="toggleThoughtBlock(this)">
+            <span>&#9660; Thinking...</span>
+          </div>
+          <div class="thought-text"></div>
+        `;
+        body.appendChild(accordion);
+
+        content = document.createElement('div');
+        content.className = 'md-content';
+        body.appendChild(content);
+
+        group.appendChild(author);
+        group.appendChild(body);
+        UI.messagesContainer.appendChild(group);
+        scrollDown(true);
+      }
+
+      let startTime = performance.now();
+      let genTokens = 0;
+      let accumulatedUsage = null;
+      let accumulatedTimings = null;
+      let wasCancelled = false;
+
+      try {
+        const streamUrl = `/api/conversations/${convId}/stream`;
+        const res = await fetch(streamUrl, {
+          method: 'GET',
+          headers: {
+            ...(APP.token ? { 'Authorization': `Bearer ${APP.token}` } : {})
+          },
+          signal: APP.abortController.signal
+        });
+
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) continue;
+            const dataStr = trimmed.slice(5).trim();
+            if (dataStr === '[DONE]') break;
+
+            try {
+              const chunk = JSON.parse(dataStr);
+              if (chunk.usage) accumulatedUsage = chunk.usage;
+              if (chunk.timings) accumulatedTimings = chunk.timings;
+
+              const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+              if (delta) {
+                if (delta.reasoning_content || delta.thought) {
+                  const t = delta.reasoning_content || delta.thought;
+                  thoughtText += t;
+                  if (accordion) {
+                    accordion.style.display = 'block';
+                    accordion.querySelector('.thought-text').textContent = thoughtText;
+                    scrollDown();
+                  }
+                }
+
+                if (delta.content) {
+                  if (thoughtText && accordion && !accordion.querySelector('.thought-text').classList.contains('collapsed')) {
+                    accordion.querySelector('.thought-text').classList.add('collapsed');
+                    accordion.querySelector('span').innerHTML = '&#9654; Thought Process';
+                  }
+
+                  assistantText += delta.content;
+                  genTokens++;
+                  if (content) {
+                    content.innerHTML = parseMarkdown(assistantText);
+                    scrollDown();
+                  }
+                }
+              }
+            } catch (e) {}
+          }
+        }
+      } catch (err) {
+        if (err.name === 'AbortError' || (APP.abortController && APP.abortController.signal && APP.abortController.signal.aborted)) {
+          wasCancelled = true;
+          if (content) {
+            content.innerHTML += '<p class="generation-stopped-notice" style="color:var(--text-dim); font-style:italic; margin-top:8px; font-size:0.85rem;">[generation stopped]</p>';
+          }
+        } else {
+          if (content) {
+            content.innerHTML += `<p style="color:var(--danger); margin-top:8px;">[Error: ${escapeHtml(err.message)}]</p>`;
+          }
+        }
+      } finally {
+        APP.isGenerating = false;
+        APP.abortController = null;
+        UI.btnSend.style.display = 'flex';
+        UI.btnStop.style.display = 'none';
+        UI.slotText.textContent = '1/1 slots (idle)';
+
+        const oldActions = group.querySelector('.msg-actions');
+        if (oldActions) oldActions.remove();
+
+        const actions = document.createElement('div');
+        actions.className = 'msg-actions';
+
+        if (wasCancelled && (assistantText || thoughtText)) {
+          const btnResume = document.createElement('button');
+          btnResume.className = 'btn-msg-action btn-resume';
+          btnResume.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg> Resume';
+          btnResume.title = 'Resume / Continue generation';
+          btnResume.onclick = () => {
+            resumeAssistantTurn({
+              group,
+              body,
+              content,
+              accordion,
+              actions,
+              btnResume,
+              assistantText,
+              thoughtText
+            });
+          };
+          actions.appendChild(btnResume);
+        }
+
+        const btnCopy = document.createElement('button');
+        btnCopy.className = 'btn-msg-action';
+        btnCopy.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy';
+        btnCopy.title = 'Copy message';
+        btnCopy.onclick = () => {
+          navigator.clipboard.writeText(assistantText || '');
+          btnCopy.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Copied!';
+          setTimeout(() => {
+            btnCopy.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy';
+          }, 1500);
+        };
+        actions.appendChild(btnCopy);
+
+        const finalCompTokens = accumulatedUsage ? (accumulatedUsage.completion_tokens ?? genTokens) : genTokens;
+        const finalPromptTokens = accumulatedUsage ? (accumulatedUsage.prompt_tokens ?? 0) : 0;
+        const finalCachedTokens = accumulatedUsage ? (accumulatedUsage.cached_tokens ?? (accumulatedUsage.prompt_tokens_details && accumulatedUsage.prompt_tokens_details.cached_tokens ? accumulatedUsage.prompt_tokens_details.cached_tokens : 0)) : 0;
+        const finalTotalTokens = accumulatedUsage ? (accumulatedUsage.total_tokens ?? (finalPromptTokens + finalCompTokens)) : (finalPromptTokens + finalCompTokens);
+
+        const evalTps = (accumulatedUsage && accumulatedUsage.completion_tokens_per_second)
+          ? Number(accumulatedUsage.completion_tokens_per_second).toFixed(1)
+          : (accumulatedTimings && accumulatedTimings.predicted_per_second)
+            ? Number(accumulatedTimings.predicted_per_second).toFixed(1)
+            : (finalCompTokens > 0 ? (finalCompTokens / Math.max(0.001, (performance.now() - startTime) / 1000)).toFixed(1) : null);
+
+        const promptTps = (accumulatedUsage && accumulatedUsage.prompt_tokens_per_second)
+          ? Number(accumulatedUsage.prompt_tokens_per_second).toFixed(1)
+          : (accumulatedTimings && accumulatedTimings.prompt_per_second)
+            ? Number(accumulatedTimings.prompt_per_second).toFixed(1)
+            : null;
+
+        if (finalCompTokens > 0 || finalPromptTokens > 0) {
+          const usageBadge = document.createElement('div');
+          usageBadge.className = 'msg-usage-badge';
+          let badgeHtml = `<span class="usage-item" title="Completion tokens"><span class="usage-accent">${finalCompTokens}</span> tokens</span>`;
+          if (finalPromptTokens > 0) {
+            badgeHtml += ` &bull; <span class="usage-item" title="Prompt tokens"><span class="usage-val">${finalPromptTokens}</span> prompt</span>`;
+            if (finalCachedTokens > 0) {
+              badgeHtml += ` <span class="usage-item" style="color:var(--success);" title="Cached prompt tokens">(${finalCachedTokens} cached)</span>`;
+            }
+          }
+          if (evalTps && Number(evalTps) > 0) {
+            badgeHtml += ` &bull; <span class="usage-item" title="Generation speed"><span class="usage-val">${evalTps}</span> t/s</span>`;
+          }
+          if (promptTps && Number(promptTps) > 0) {
+            badgeHtml += ` &bull; <span class="usage-item" title="Prefill speed"><span class="usage-val">${promptTps}</span> prompt t/s</span>`;
+          }
+          usageBadge.innerHTML = badgeHtml;
+          actions.appendChild(usageBadge);
+
+          let footerText = `eval: ${evalTps || '0.0'} t/s`;
+          if (promptTps && Number(promptTps) > 0) footerText += ` | prompt: ${promptTps} t/s`;
+          if (finalCachedTokens > 0) footerText += ` | cached: ${finalCachedTokens}`;
+          footerText += ` | total: ${finalTotalTokens} tokens`;
+          UI.footerSpeedMetrics.textContent = footerText;
+        }
+
+        group.appendChild(actions);
+        scrollDown();
+
+        if (APP.activeConv && APP.activeConv.messages) {
+          const lastIdx = APP.activeConv.messages.length - 1;
+          if (lastIdx >= 0 && APP.activeConv.messages[lastIdx].role === 'assistant') {
+            APP.activeConv.messages[lastIdx].content = assistantText;
+            APP.activeConv.messages[lastIdx].reasoning_content = thoughtText;
+          } else {
+            APP.activeConv.messages.push({
+              role: 'assistant',
+              content: assistantText,
+              reasoning_content: thoughtText
+            });
+          }
+        }
+        const item = APP.conversations.find(c => c.id === convId);
+        if (item) item.is_generating = false;
+        renderChatList();
+      }
+    }
+
+    async function triggerAssistantTurn(imageToSend = null) {
+      if (APP.isGenerating) return;
 
       // Start Stream UI
       APP.isGenerating = true;
@@ -6093,20 +7415,18 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         });
       }
 
-      if (imageToSend) {
-        msgs.push({
-          role: 'user',
-          content: [
-            { type: 'text', text: text },
+      if (imageToSend && msgs.length > 0) {
+        const lastMsg = msgs[msgs.length - 1];
+        if (lastMsg.role === 'user') {
+          lastMsg.content = [
+            { type: 'text', text: typeof lastMsg.content === 'string' ? lastMsg.content : '' },
             { type: 'image_url', image_url: { url: imageToSend } }
-          ]
-        });
-      } else {
-        msgs.push({ role: 'user', content: text });
+          ];
+        }
       }
 
       const activeTools = getActiveToolsList();
-      if (activeTools.length > 0 && APP.settings.working_directory) {
+      if (activeTools.some(t => t.function && t.function.name !== 'ask_user') && APP.settings.working_directory) {
         msgs.unshift({
           role: 'system',
           content: `Host server working directory: ${APP.settings.working_directory}`
@@ -6158,6 +7478,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           let accumulatedToolCalls = [];
           let accumulatedUsage = null;
           let accumulatedTimings = null;
+          let wasCancelled = false;
 
           if (UI.footerSpeedMetrics) {
             UI.footerSpeedMetrics.textContent = 'generating...';
@@ -6189,10 +7510,14 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
             if (thinkBudget) {
               payload.think = true;
+              payload.reasoning_budget_tokens = thinkBudget;
+              payload.thinking_budget_tokens = thinkBudget;
+              payload.thinking = { type: 'enabled', budget_tokens: thinkBudget };
               payload.chat_template_kwargs = { thinking: true, thinking_budget: thinkBudget };
             } else {
               // auto
               payload.think = true;
+              payload.reasoning_budget_tokens = -1;
               payload.chat_template_kwargs = { thinking: true };
             }
             if (activeTools.length > 0) {
@@ -6200,7 +7525,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               payload.tool_choice = 'auto';
             }
 
-            const res = await fetch('/v1/chat/completions', {
+            const fetchUrl = APP.activeId ? `/api/conversations/${APP.activeId}/generate` : '/v1/chat/completions';
+            const res = await fetch(fetchUrl, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -6290,22 +7616,49 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               }
             }
           } catch (err) {
-            if (err.name === 'AbortError') {
-              content.innerHTML += '<p style="color:var(--text-dim); font-style:italic;">[generation stopped]</p>';
+            if (err.name === 'AbortError' || (APP.abortController && APP.abortController.signal && APP.abortController.signal.aborted)) {
+              wasCancelled = true;
+              content.innerHTML += '<p class="generation-stopped-notice" style="color:var(--text-dim); font-style:italic; margin-top:8px; font-size:0.85rem;">[generation stopped]</p>';
             } else {
-              content.innerHTML += `<p style="color:var(--danger);">[Error: ${escapeHtml(err.message)}]</p>`;
+              content.innerHTML += `<p style="color:var(--danger); margin-top:8px;">[Error: ${escapeHtml(err.message)}]</p>`;
             }
-            break;
           }
 
           // Add Message Actions & Token Usage Badge to the completed assistant turn
           const actions = document.createElement('div');
           actions.className = 'msg-actions';
 
+          if (wasCancelled && (assistantText || thoughtText)) {
+            const btnResume = document.createElement('button');
+            btnResume.className = 'btn-msg-action btn-resume';
+            btnResume.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg> Resume';
+            btnResume.title = 'Resume / Continue generation';
+            btnResume.onclick = () => {
+              resumeAssistantTurn({
+                group,
+                body,
+                content,
+                accordion,
+                actions,
+                btnResume,
+                assistantText,
+                thoughtText
+              });
+            };
+            actions.appendChild(btnResume);
+          }
+
           const btnCopy = document.createElement('button');
           btnCopy.className = 'btn-msg-action';
-          btnCopy.innerHTML = '&#128203; Copy';
-          btnCopy.onclick = () => navigator.clipboard.writeText(assistantText || '');
+          btnCopy.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy';
+          btnCopy.title = 'Copy message';
+          btnCopy.onclick = () => {
+            navigator.clipboard.writeText(assistantText || '');
+            btnCopy.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Copied!';
+            setTimeout(() => {
+              btnCopy.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy';
+            }, 1500);
+          };
           actions.appendChild(btnCopy);
 
           const finalCompTokens = accumulatedUsage ? (accumulatedUsage.completion_tokens ?? genTokens) : genTokens;
@@ -6365,7 +7718,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           scrollDown();
 
           // Check if model emitted text-based tool calls e.g. <tool_call>{"name":"...","arguments":{...}}</tool_call>
-          if (APP.toolsEnabled && activeTools.length > 0 && accumulatedToolCalls.length === 0 && assistantText.includes('<tool_call>')) {
+          if (activeTools.length > 0 && accumulatedToolCalls.length === 0 && assistantText.includes('<tool_call>')) {
             const matches = [...assistantText.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/g)];
             for (const m of matches) {
               try {
@@ -6381,9 +7734,22 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             }
           }
 
-          // Persist assistant message to DB
+          // Persist assistant message to memory & DB
           if (assistantText || thoughtText) {
-            if (APP.activeId) {
+            if (APP.activeConv && APP.activeConv.messages) {
+              const lastIdx = APP.activeConv.messages.length - 1;
+              if (lastIdx >= 0 && APP.activeConv.messages[lastIdx].role === 'assistant') {
+                APP.activeConv.messages[lastIdx].content = assistantText;
+                APP.activeConv.messages[lastIdx].reasoning_content = thoughtText;
+              } else {
+                APP.activeConv.messages.push({
+                  role: 'assistant',
+                  content: assistantText,
+                  reasoning_content: thoughtText
+                });
+              }
+            }
+            if (APP.activeId && !fetchUrl.includes('/api/conversations/')) {
               try {
                 await apiFetch(`/api/conversations/${APP.activeId}/messages`, {
                   method: 'POST',
@@ -6397,8 +7763,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             }
           }
 
-          // If tools are disabled or no tool calls were requested, we are done with the loop!
-          if (!APP.toolsEnabled || activeTools.length === 0 || accumulatedToolCalls.length === 0) {
+          // If generation was cancelled, or no tool calls were requested, we are done with the loop!
+          if (wasCancelled || activeTools.length === 0 || accumulatedToolCalls.length === 0) {
             break;
           }
 
@@ -6442,6 +7808,18 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                   });
                 } catch (_) {}
               }
+              continue;
+            }
+
+            // If master tools are disabled and the model tried to run other tools, inform it
+            if (!APP.toolsEnabled) {
+              const resultStr = JSON.stringify({ error: "Tool execution is disabled by user setting." });
+              msgs.push({
+                role: 'tool',
+                tool_call_id: tc.id,
+                name: tc.name,
+                content: resultStr
+              });
               continue;
             }
 
@@ -6684,9 +8062,11 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       } else {
         updateUserBadge();
       }
-      updateWorkingDirUI();
+      updateAttachPopupUI();
       await loadConversations();
       updateAttachPopupUI();
+      updateHeroWorkdirDisplay();
+      updateInputMetaBar();
     }
 
     init();

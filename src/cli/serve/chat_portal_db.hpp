@@ -141,6 +141,10 @@ class ChatDatabase {
                   const ChatMessageRecord& msg);
   bool ReplaceMessages(const std::string& user_id, const std::string& conv_id,
                        const std::vector<ChatMessageRecord>& messages);
+  bool UpdateLastAssistantMessage(const std::string& user_id,
+                                  const std::string& conv_id,
+                                  const std::string& content,
+                                  const std::string& reasoning_content);
 
   UserSettingsRecord GetSettings(const std::string& user_id);
   void SaveSettings(const UserSettingsRecord& settings);

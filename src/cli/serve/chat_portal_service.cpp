@@ -1,12 +1,17 @@
 #include "src/cli/serve/chat_portal_service.hpp"
 
+#include <condition_variable>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <string_view>
+#include <thread>
 
 #include "src/cli/serve/chat_portal_html.hpp"
 #include "src/cli/serve/chat_portal_tools.hpp"
 #include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/openai_chat.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::server {
@@ -72,6 +77,242 @@ HttpResponse JsonErr(int status, const std::string& reason,
   return JsonResponse(status, reason, obj.dump());
 }
 
+struct ActiveConversationJob : public std::enable_shared_from_this<ActiveConversationJob> {
+  std::string conv_id;
+  std::string user_id;
+  bool is_resume{false};
+  std::atomic<bool> cancelled{false};
+  std::atomic<bool> completed{false};
+
+  std::mutex mutex;
+  std::vector<std::string> event_history;
+  std::string accumulated_content;
+  std::string accumulated_thought;
+
+  struct Subscriber {
+    std::uint64_t id{0};
+    std::shared_ptr<std::mutex> sub_mutex;
+    std::shared_ptr<std::condition_variable> sub_cv;
+    std::shared_ptr<std::vector<std::string>> queue;
+    std::shared_ptr<std::atomic<bool>> disconnected;
+  };
+  std::vector<Subscriber> subscribers;
+  std::uint64_t next_sub_id{1};
+
+  std::jthread worker_thread;
+
+  void Cancel() {
+    cancelled.store(true);
+  }
+
+  void BroadcastEvent(std::string_view event_str) {
+    std::lock_guard<std::mutex> lock(mutex);
+    event_history.emplace_back(event_str);
+    ParseAndAccumulateDelta(event_str);
+
+    for (auto it = subscribers.begin(); it != subscribers.end(); ) {
+      if (it->disconnected->load()) {
+        it = subscribers.erase(it);
+      } else {
+        {
+          std::lock_guard<std::mutex> sl(*it->sub_mutex);
+          it->queue->emplace_back(event_str);
+        }
+        it->sub_cv->notify_one();
+        ++it;
+      }
+    }
+  }
+
+  void StreamToClient(const HttpResponse::BodyWriter& writer) {
+    auto sub_mutex = std::make_shared<std::mutex>();
+    auto sub_cv = std::make_shared<std::condition_variable>();
+    auto queue = std::make_shared<std::vector<std::string>>();
+    auto disconnected = std::make_shared<std::atomic<bool>>(false);
+    std::uint64_t sub_id = 0;
+    std::vector<std::string> backlog;
+    bool already_completed = false;
+
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      backlog = event_history;
+      already_completed = completed.load();
+      if (!already_completed) {
+        sub_id = next_sub_id++;
+        subscribers.push_back({sub_id, sub_mutex, sub_cv, queue, disconnected});
+      }
+    }
+
+    // 1. Send all past backlog events
+    for (const auto& ev : backlog) {
+      if (!writer(ev)) {
+        disconnected->store(true);
+        RemoveSubscriber(sub_id);
+        return;
+      }
+    }
+
+    if (already_completed) return;
+
+    // 2. Loop and stream new incoming events
+    while (!disconnected->load()) {
+      std::vector<std::string> pending;
+      {
+        std::unique_lock<std::mutex> sl(*sub_mutex);
+        sub_cv->wait_for(sl, std::chrono::milliseconds(250), [&] {
+          return !queue->empty() || completed.load() || disconnected->load();
+        });
+        if (disconnected->load()) break;
+        pending.swap(*queue);
+      }
+
+      for (const auto& ev : pending) {
+        if (!writer(ev)) {
+          disconnected->store(true);
+          RemoveSubscriber(sub_id);
+          return;
+        }
+      }
+
+      if (completed.load() && pending.empty()) {
+        break;
+      }
+    }
+
+    RemoveSubscriber(sub_id);
+  }
+
+  void RemoveSubscriber(std::uint64_t id) {
+    if (id == 0) return;
+    std::lock_guard<std::mutex> lock(mutex);
+    for (auto it = subscribers.begin(); it != subscribers.end(); ++it) {
+      if (it->id == id) {
+        subscribers.erase(it);
+        break;
+      }
+    }
+  }
+
+  void OnFinished(ChatDatabase& db) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      completed.store(true);
+      const std::string done_ev = "data: [DONE]\n\n";
+      bool has_done = !event_history.empty() && event_history.back() == done_ev;
+      if (!has_done) {
+        event_history.push_back(done_ev);
+        for (const auto& sub : subscribers) {
+          {
+            std::lock_guard<std::mutex> sl(*sub.sub_mutex);
+            sub.queue->push_back(done_ev);
+          }
+          sub.sub_cv->notify_one();
+        }
+      }
+    }
+
+    // Save to database
+    if (!accumulated_content.empty() || !accumulated_thought.empty()) {
+      if (is_resume) {
+        db.UpdateLastAssistantMessage(user_id, conv_id, accumulated_content, accumulated_thought);
+      } else {
+        ChatMessageRecord msg;
+        msg.role = "assistant";
+        msg.content = accumulated_content;
+        msg.reasoning_content = accumulated_thought;
+        db.AddMessage(user_id, conv_id, msg);
+      }
+    }
+  }
+
+  void ParseAndAccumulateDelta(std::string_view event_str) {
+    std::string_view s = event_str;
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\r' || s.front() == '\n')) s.remove_prefix(1);
+    if (!s.starts_with("data:")) return;
+    s.remove_prefix(5);
+    while (!s.empty() && s.front() == ' ') s.remove_prefix(1);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\r' || s.back() == '\n')) s.remove_suffix(1);
+    if (s == "[DONE]" || s.empty()) return;
+
+    try {
+      const auto chunk = json::parse(s);
+      if (const auto* choices = chunk.find("choices"); choices && choices->is_array() && !choices->empty()) {
+        if (const auto* delta = choices->items().front().find("delta"); delta && delta->is_object()) {
+          if (const auto* r = delta->find("reasoning_content"); r && r->is_string()) {
+            accumulated_thought.append(r->str());
+          }
+          if (const auto* t = delta->find("thought"); t && t->is_string()) {
+            accumulated_thought.append(t->str());
+          }
+          if (const auto* c = delta->find("content"); c && c->is_string()) {
+            accumulated_content.append(c->str());
+          }
+        }
+      }
+    } catch (...) {}
+  }
+};
+
+class ConversationGenerationManager {
+ public:
+  static ConversationGenerationManager& Instance() {
+    static ConversationGenerationManager inst;
+    return inst;
+  }
+
+  std::shared_ptr<ActiveConversationJob> GetJob(const std::string& conv_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = jobs_.find(conv_id);
+    if (it != jobs_.end()) {
+      return it->second;
+    }
+    return nullptr;
+  }
+
+  bool IsGenerating(const std::string& conv_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = jobs_.find(conv_id);
+    if (it != jobs_.end()) {
+      return !it->second->completed.load();
+    }
+    return false;
+  }
+
+  std::shared_ptr<ActiveConversationJob> CreateJob(const std::string& conv_id,
+                                                  const std::string& user_id,
+                                                  bool is_resume) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    CleanupFinishedJobsLocked();
+    auto job = std::make_shared<ActiveConversationJob>();
+    job->conv_id = conv_id;
+    job->user_id = user_id;
+    job->is_resume = is_resume;
+    jobs_[conv_id] = job;
+    return job;
+  }
+
+  void RemoveJob(const std::string& conv_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    jobs_.erase(conv_id);
+  }
+
+ private:
+  ConversationGenerationManager() = default;
+
+  void CleanupFinishedJobsLocked() {
+    for (auto it = jobs_.begin(); it != jobs_.end(); ) {
+      if (it->second->completed.load()) {
+        it = jobs_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  std::mutex mutex_;
+  std::map<std::string, std::shared_ptr<ActiveConversationJob>> jobs_;
+};
+
 }  // namespace
 
 bool ChatPortalService::IsPortalRoute(const HttpRequest& req) {
@@ -98,7 +339,9 @@ std::string ChatPortalService::ExtractBearerToken(const HttpRequest& req) {
 }
 
 HttpResponse ChatPortalService::Handle(const HttpRequest& req,
-                                       ChatDatabase& db) {
+                                       ChatDatabase& db,
+                                       std::shared_ptr<TextGenerationBackend> backend,
+                                       std::optional<bool> tools_enabled) {
   if (req.method == "OPTIONS") {
     HttpResponse resp;
     resp.status = 204;
@@ -229,6 +472,7 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       obj["working_directory"] = c.working_directory;
       obj["updated_at"] = c.updated_at;
       obj["message_count"] = static_cast<int>(c.messages.size());
+      obj["is_generating"] = ConversationGenerationManager::Instance().IsGenerating(c.id);
       arr.push_back(std::move(obj));
     }
     return JsonOk(arr);
@@ -311,6 +555,135 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       }
     }
 
+    // POST /api/conversations/<id>/generate
+    if (sub_route == "/generate" && req.method == "POST") {
+      if (!backend || !backend->ready()) {
+        return JsonErr(503, "Service Unavailable", "Inference backend is not ready");
+      }
+
+      auto& manager = ConversationGenerationManager::Instance();
+      auto existing_job = manager.GetJob(conv_id);
+      if (existing_job && !existing_job->completed.load()) {
+        HttpResponse resp;
+        resp.status = 200;
+        resp.reason = "OK";
+        resp.headers.emplace_back("Content-Type", "text/event-stream");
+        resp.headers.emplace_back("Cache-Control", "no-cache");
+        resp.headers.emplace_back("X-Accel-Buffering", "no");
+        resp.headers.emplace_back("Access-Control-Allow-Origin", "*");
+        resp.streaming_body = [existing_job](const HttpResponse::BodyWriter& writer) {
+          existing_job->StreamToClient(writer);
+        };
+        return resp;
+      }
+
+      bool is_resume = false;
+      try {
+        const auto b = json::parse(req.body);
+        if (const auto* r = b.find("is_resume"); r && r->is_bool()) {
+          is_resume = r->as_bool();
+        }
+      } catch (...) {}
+
+      auto job = manager.CreateJob(conv_id, user->id, is_resume);
+      if (is_resume) {
+        const auto conv = db.GetConversation(user->id, conv_id);
+        if (conv) {
+          for (auto it = conv->messages.rbegin(); it != conv->messages.rend(); ++it) {
+            if (it->role == "assistant") {
+              job->accumulated_content = it->content;
+              job->accumulated_thought = it->reasoning_content;
+              break;
+            }
+          }
+        }
+      }
+
+      HttpRequest chat_req = req;
+      chat_req.path = "/v1/chat/completions";
+      chat_req.is_cancelled = [job] { return job->cancelled.load(); };
+
+      HttpResponse chat_resp = HandleOpenAiChat(chat_req, *backend);
+      if (chat_resp.status != 200 || !chat_resp.streaming_body) {
+        manager.RemoveJob(conv_id);
+        return chat_resp;
+      }
+
+      auto body_fn = std::move(chat_resp.streaming_body);
+      job->worker_thread = std::jthread([job, body_fn = std::move(body_fn), &db]() mutable {
+        try {
+          body_fn([job](std::string_view chunk) -> bool {
+            if (job->cancelled.load()) return false;
+            job->BroadcastEvent(chunk);
+            return true;
+          });
+        } catch (...) {}
+        job->OnFinished(db);
+      });
+
+      HttpResponse resp;
+      resp.status = 200;
+      resp.reason = "OK";
+      resp.headers.emplace_back("Content-Type", "text/event-stream");
+      resp.headers.emplace_back("Cache-Control", "no-cache");
+      resp.headers.emplace_back("X-Accel-Buffering", "no");
+      resp.headers.emplace_back("Access-Control-Allow-Origin", "*");
+      resp.streaming_body = [job](const HttpResponse::BodyWriter& writer) {
+        job->StreamToClient(writer);
+      };
+      return resp;
+    }
+
+    // GET /api/conversations/<id>/stream
+    if (sub_route == "/stream" && req.method == "GET") {
+      auto job = ConversationGenerationManager::Instance().GetJob(conv_id);
+      if (!job) {
+        HttpResponse resp;
+        resp.status = 200;
+        resp.reason = "OK";
+        resp.headers.emplace_back("Content-Type", "text/event-stream");
+        resp.headers.emplace_back("Cache-Control", "no-cache");
+        resp.headers.emplace_back("Access-Control-Allow-Origin", "*");
+        resp.body = "data: [DONE]\n\n";
+        return resp;
+      }
+
+      HttpResponse resp;
+      resp.status = 200;
+      resp.reason = "OK";
+      resp.headers.emplace_back("Content-Type", "text/event-stream");
+      resp.headers.emplace_back("Cache-Control", "no-cache");
+      resp.headers.emplace_back("X-Accel-Buffering", "no");
+      resp.headers.emplace_back("Access-Control-Allow-Origin", "*");
+      resp.streaming_body = [job](const HttpResponse::BodyWriter& writer) {
+        job->StreamToClient(writer);
+      };
+      return resp;
+    }
+
+    // POST /api/conversations/<id>/stop
+    if (sub_route == "/stop" && req.method == "POST") {
+      auto job = ConversationGenerationManager::Instance().GetJob(conv_id);
+      if (job) {
+        job->Cancel();
+      }
+      json::Value out = json::Value::object();
+      out["status"] = "ok";
+      return JsonOk(out);
+    }
+
+    // GET /api/conversations/<id>/status
+    if (sub_route == "/status" && req.method == "GET") {
+      const bool is_gen = ConversationGenerationManager::Instance().IsGenerating(conv_id);
+      json::Value out = json::Value::object();
+      out["is_generating"] = is_gen;
+      if (is_gen) {
+        auto job = ConversationGenerationManager::Instance().GetJob(conv_id);
+        if (job) out["is_resume"] = job->is_resume;
+      }
+      return JsonOk(out);
+    }
+
     // GET /api/conversations/<id>
     if (sub_route.empty() && req.method == "GET") {
       const auto conv = db.GetConversation(user->id, conv_id);
@@ -325,6 +698,12 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       obj["working_directory"] = conv->working_directory;
       obj["created_at"] = conv->created_at;
       obj["updated_at"] = conv->updated_at;
+      const bool is_gen = ConversationGenerationManager::Instance().IsGenerating(conv_id);
+      obj["is_generating"] = is_gen;
+      if (is_gen) {
+        auto job = ConversationGenerationManager::Instance().GetJob(conv_id);
+        if (job) obj["is_resume"] = job->is_resume;
+      }
 
       json::Value msgs_arr = json::Value::array();
       for (const auto& m : conv->messages) {
@@ -473,9 +852,16 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
     if (const auto* me = user_conf.find("master_enabled"); me && me->is_bool()) {
       master_enabled = me->as_bool();
     }
+    if (tools_enabled.has_value()) {
+      master_enabled = *tools_enabled;
+      out["server_tools_override"] = true;
+    }
 
     json::Value inbuilt_arr = json::Value::array();
     for (const auto& t : ToolEngine::GetInbuiltTools()) {
+      if (t.name == "ask_user") {
+        continue;
+      }
       json::Value tobj = json::Value::object();
       tobj["name"] = t.name;
       tobj["description"] = t.description;
@@ -548,6 +934,9 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
     try {
       const auto body = json::parse(req.body);
       const std::string name = body.contains("name") ? body.member_str("name") : body.member_str("tool_name");
+      if (tools_enabled.has_value() && !*tools_enabled && name != "ask_user") {
+        return JsonErr(403, "Forbidden", "Tool execution is disabled by server --tools flag");
+      }
       const auto* args_ptr = body.find("arguments");
       json::Value args = (args_ptr && args_ptr->is_object()) ? *args_ptr : json::Value::object();
       std::string working_dir = body.member_str("working_directory");
