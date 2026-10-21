@@ -15,6 +15,18 @@ parity remain unqualified.
 | Target verification, widths 2–8 and ragged cohorts | Full logits/features match scalar | Full logits/features match scalar |
 | Serving and state | Cancellation, continuation, RAM/disk restore and seeded replay pass | Same; also eight 32K continuation forks |
 
+## Draft integration on October 21
+
+Rebased onto main `e060aeed` (#699), preserving Flash-Next's requirement for
+an established accepted copy before skipping a sampled neural proposal.
+The shared lookup's source predicate and resume requirement have a combined
+regression test. After rebasing, the Flash-Next lookup tests and Qwen27B
+DFlash2 lookup, private RNG, request reset and restore checks pass. The
+affected Flash-Next engine and continuation adapter also compile.
+
+The serving measurements below predate this rebase. These focused integration
+checks do not replace the remaining latency qualification or a full sweep.
+
 ## October 21 coding and prose follow-up
 
 The retained change affects only five-token IQ4_XS FFN projections. It keeps
