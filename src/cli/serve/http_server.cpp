@@ -424,10 +424,22 @@ json::Value UsageJson(const TextGenerationBackend::Result& result) {
           ? (static_cast<double>(result.completion_tokens) /
              (result.decode_ms / 1000.0))
           : 0.0;
+  const double total_elapsed_s = (result.prefill_ms + result.decode_ms) / 1000.0;
+  const double total_per_second =
+      (total_elapsed_s > 0.0 && (result.prompt_tokens + result.completion_tokens) > 0)
+          ? (static_cast<double>(result.prompt_tokens + result.completion_tokens) / total_elapsed_s)
+          : 0.0;
 
   usage["cached_tokens"] = result.cached_prompt_tokens;
   usage["prompt_tokens_per_second"] = prompt_per_second;
   usage["completion_tokens_per_second"] = predicted_per_second;
+  usage["prompt_per_second"] = prompt_per_second;
+  usage["predicted_per_second"] = predicted_per_second;
+  usage["prompt_tokens_per_sec"] = prompt_per_second;
+  usage["completion_tokens_per_sec"] = predicted_per_second;
+  usage["prefill_speed_tps"] = prompt_per_second;
+  usage["decode_speed_tps"] = predicted_per_second;
+  usage["total_tokens_per_second"] = total_per_second;
   usage["draft_tokens"] = result.draft_tokens;
   usage["draft_tokens_accepted"] = result.draft_accepted_tokens;
   return usage;
@@ -1030,16 +1042,16 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                   return;
                 const auto trailing = decoder.Push({}, true);
                 const auto timings = GenerationTimings(result);
+                const auto usage = UsageJson(result);
                 if (!write_chunk(
                         trailing,
                         result.finish_reason ==
                                 TextGenerationBackend::FinishReason::kLength
                             ? "length"
                             : "stop",
-                        nullptr, &timings))
+                        &usage, &timings))
                   return;
                 if (include_usage) {
-                  const auto usage = UsageJson(result);
                   if (!write_chunk({}, {}, &usage))
                     return;
                 }

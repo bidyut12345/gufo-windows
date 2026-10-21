@@ -226,17 +226,27 @@ inline json::Value GenerationTimings(
       result.prefill_tokens > 0
           ? result.prefill_ms / static_cast<double>(result.prefill_tokens)
           : 0.0;
-  timings["prompt_per_second"] = PrefillTokensPerSecond(result);
+  const double prompt_tps = PrefillTokensPerSecond(result);
+  timings["prompt_per_second"] = prompt_tps;
+  timings["prompt_tokens_per_second"] = prompt_tps;
   timings["predicted_n"] = result.completion_tokens;
   timings["predicted_ms"] = result.decode_ms;
   timings["predicted_per_token_ms"] =
       result.completion_tokens > 0
           ? result.decode_ms / static_cast<double>(result.completion_tokens)
           : 0.0;
-  timings["predicted_per_second"] =
+  const double decode_tps =
       result.decode_ms > 0.0 ? static_cast<double>(result.completion_tokens) *
                                    1000.0 / result.decode_ms
                              : 0.0;
+  timings["predicted_per_second"] = decode_tps;
+  timings["completion_tokens_per_second"] = decode_tps;
+  const double total_elapsed_ms = result.prefill_ms + result.decode_ms;
+  timings["total_tokens_per_second"] =
+      total_elapsed_ms > 0.0
+          ? static_cast<double>(result.prompt_tokens + result.completion_tokens) *
+                1000.0 / total_elapsed_ms
+          : 0.0;
   timings["cache_n"] = result.cached_prompt_tokens;
   timings["cache_restore_ms"] = result.cache_restore_ms;
   timings["cache_snapshot_ms"] = result.cache_snapshot_ms;
@@ -261,6 +271,12 @@ inline json::Value PromptProgressJson(
   value["cache"] = progress.cache;
   value["processed"] = progress.processed;
   value["time_ms"] = progress.time_ms;
+  const double speed =
+      progress.time_ms > 0.0
+          ? static_cast<double>(progress.processed) * 1000.0 / progress.time_ms
+          : 0.0;
+  value["speed_tps"] = speed;
+  value["prompt_tokens_per_second"] = speed;
   return value;
 }
 

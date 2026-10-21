@@ -110,6 +110,10 @@ struct ScheduledRequest {
   std::size_t inter_token_samples{0};
   std::size_t last_decode_progress_tokens{0};
   double last_decode_progress_ms{0.0};
+  std::optional<TextGenerationScheduler::Clock::time_point> last_decode_progress_time;
+  std::optional<TextGenerationScheduler::Clock::time_point> last_prefill_progress_time;
+  std::size_t last_prefill_progress_tokens{0};
+  double last_prefill_progress_ms{0.0};
   std::optional<TextGenerationScheduler::Clock::time_point> prefill_start;
   bool decode_due{false};
   std::optional<TextRunnerToken> preview_token;
@@ -592,7 +596,19 @@ struct TextGenerationScheduler::Impl {
   void LogPrefillProgress(const std::shared_ptr<ScheduledRequest>& request,
                           std::size_t chunk_tokens,
                           double chunk_ms) const noexcept {
-    if (!scheduler_policy.log_progress || !Logger::Enabled(LogLevel::kInfo)) {
+    if (!Logger::Enabled(LogLevel::kInfo)) {
+      return;
+    }
+    const auto now = Clock::now();
+    bool time_due = false;
+    if (!request->last_prefill_progress_time.has_value()) {
+      request->last_prefill_progress_time = now;
+      request->last_prefill_progress_tokens = request->result.prefill_tokens;
+      request->last_prefill_progress_ms = request->result.prefill_ms;
+    } else if (now - *request->last_prefill_progress_time >= std::chrono::seconds(5)) {
+      time_due = true;
+    }
+    if (!time_due && !scheduler_policy.log_progress) {
       return;
     }
     try {
@@ -603,57 +619,97 @@ struct TextGenerationScheduler::Impl {
           std::min(request->result.prefill_tokens, total);
       const double percentage =
           total > 0 ? static_cast<double>(processed) * 100.0 / total : 100.0;
+      const std::size_t interval_tokens =
+          request->result.prefill_tokens >= request->last_prefill_progress_tokens
+              ? request->result.prefill_tokens - request->last_prefill_progress_tokens
+              : chunk_tokens;
+      const double interval_ms =
+          request->result.prefill_ms >= request->last_prefill_progress_ms
+              ? request->result.prefill_ms - request->last_prefill_progress_ms
+              : chunk_ms;
+      const double current_tps = TokensPerSecond(interval_tokens, interval_ms);
+      const double avg_tps = TokensPerSecond(request->result.prefill_tokens,
+                                             request->result.prefill_ms);
       std::ostringstream message;
       message << "request=" << request->id
               << " phase=prefill tokens=" << processed << '/' << total
-              << " percentage=" << std::fixed << std::setprecision(1)
-              << percentage
-              << " chunk_tps=" << TokensPerSecond(chunk_tokens, chunk_ms)
-              << " avg_tps="
-              << TokensPerSecond(request->result.prefill_tokens,
-                                 request->result.prefill_ms);
+              << " (" << std::fixed << std::setprecision(1) << percentage << "%)"
+              << " speed=" << current_tps << " t/s"
+              << " avg_speed=" << avg_tps << " t/s"
+              << " total_prompt_tokens=" << request->result.prompt_tokens;
       Logger::Info("progress", message.str());
+      request->last_prefill_progress_time = now;
+      request->last_prefill_progress_tokens = request->result.prefill_tokens;
+      request->last_prefill_progress_ms = request->result.prefill_ms;
     } catch (...) {
     }
   }
 
   void LogDecodeProgress(const std::shared_ptr<ScheduledRequest>& request,
-                         bool final = false) const noexcept {
-    if (!scheduler_policy.log_progress || !Logger::Enabled(LogLevel::kInfo)) {
+                         bool /*final*/ = false) const noexcept {
+    if (!Logger::Enabled(LogLevel::kInfo)) {
       return;
     }
     const std::size_t generated = request->result.tokens.size();
-    if (generated == 0 || generated == request->last_decode_progress_tokens ||
-        (!final &&
-         generated / kDecodeProgressInterval ==
-             request->last_decode_progress_tokens / kDecodeProgressInterval)) {
+    if (generated == 0) {
+      return;
+    }
+    const auto now = Clock::now();
+    bool time_due = false;
+    if (!request->last_decode_progress_time.has_value()) {
+      request->last_decode_progress_time = now;
+      request->last_decode_progress_tokens = generated;
+      request->last_decode_progress_ms = request->result.decode_ms;
+    } else if (now - *request->last_decode_progress_time >= std::chrono::seconds(5)) {
+      time_due = true;
+    }
+
+    const bool interval_tokens_due =
+        scheduler_policy.log_progress &&
+        (generated == request->last_decode_progress_tokens ||
+         generated / kDecodeProgressInterval !=
+             request->last_decode_progress_tokens / kDecodeProgressInterval);
+
+    if (!time_due && !interval_tokens_due) {
       return;
     }
     try {
       const std::size_t chunk_tokens =
-          generated - request->last_decode_progress_tokens;
+          generated >= request->last_decode_progress_tokens
+              ? generated - request->last_decode_progress_tokens
+              : generated;
       const double chunk_ms =
-          request->result.decode_ms - request->last_decode_progress_ms;
+          request->result.decode_ms >= request->last_decode_progress_ms
+              ? request->result.decode_ms - request->last_decode_progress_ms
+              : request->result.decode_ms;
       const double percentage =
           request->token_limit > 0
               ? static_cast<double>(generated) * 100.0 / request->token_limit
               : 100.0;
+      const double current_tps = TokensPerSecond(chunk_tokens, chunk_ms);
+      const double avg_tps = TokensPerSecond(generated, request->result.decode_ms);
+
       std::ostringstream message;
       message << "request=" << request->id
-              << " phase=decode tokens=" << generated << '/'
-              << request->token_limit << " percentage=" << std::fixed
-              << std::setprecision(1) << percentage
-              << " chunk_tps=" << TokensPerSecond(chunk_tokens, chunk_ms)
-              << " avg_tps="
-              << TokensPerSecond(generated, request->result.decode_ms);
+              << " phase=decode tokens=" << generated;
+      if (request->token_limit > 0) {
+        message << '/' << request->token_limit
+                << " (" << std::fixed << std::setprecision(1) << percentage << "%)";
+      }
+      message << " speed=" << current_tps << " t/s"
+              << " avg_speed=" << avg_tps << " t/s"
+              << " total_tokens=" << (request->result.prompt_tokens + generated);
       if (request->result.draft_tokens > 0) {
         message << " draft_accepted=" << request->result.draft_accepted_tokens
                 << " draft_proposed=" << request->result.draft_tokens
-                << " acceptance_percentage="
-                << static_cast<double>(request->result.draft_accepted_tokens) *
-                       100.0 / request->result.draft_tokens;
+                << " acceptance="
+                << std::fixed << std::setprecision(1)
+                << (static_cast<double>(request->result.draft_accepted_tokens) *
+                        100.0 / request->result.draft_tokens)
+                << "%";
       }
       Logger::Info("progress", message.str());
+      request->last_decode_progress_time = now;
       request->last_decode_progress_tokens = generated;
       request->last_decode_progress_ms = request->result.decode_ms;
     } catch (...) {
@@ -1298,10 +1354,18 @@ struct TextGenerationScheduler::Impl {
       // Bound work for short waiting prefills and captures as well as decoders.
       // Long prefills alone retain the model's efficient chunk size.
       const bool bounded_prefill =
-          incremental_prefill_supported && (decoder_runnable || peer_waiting);
-      const std::size_t budget = bounded_prefill
-                                     ? prefill_policy.decode_active_tokens
-                                     : request->runner_request.prompt_tokens();
+          incremental_prefill_supported &&
+          (decoder_runnable || peer_waiting ||
+           request->runner_request.prompt_tokens() -
+                   request->runner_request.prefill_position() >
+               std::max<std::size_t>(prefill_policy.decode_active_tokens, 4096));
+      const std::size_t budget =
+          bounded_prefill
+              ? std::max<std::size_t>(prefill_policy.decode_active_tokens,
+                                      (decoder_runnable || peer_waiting)
+                                          ? prefill_policy.decode_active_tokens
+                                          : 4096)
+              : request->runner_request.prompt_tokens();
       if ((decoder_runnable || runner_pool->capacity() > 1) &&
           !incremental_prefill_supported) {
         request->result.prefill_fallback_reason =

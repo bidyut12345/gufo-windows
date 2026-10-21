@@ -2084,10 +2084,22 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
           ? (static_cast<double>(result.completion_tokens) /
              (result.decode_ms / 1000.0))
           : 0.0;
+  const double total_elapsed_s = (result.prefill_ms + result.decode_ms) / 1000.0;
+  const double total_per_second =
+      (total_elapsed_s > 0.0 && (result.prompt_tokens + result.completion_tokens) > 0)
+          ? (static_cast<double>(result.prompt_tokens + result.completion_tokens) / total_elapsed_s)
+          : 0.0;
 
   usage["cached_tokens"] = result.cached_prompt_tokens;
   usage["prompt_tokens_per_second"] = prompt_per_second;
   usage["completion_tokens_per_second"] = predicted_per_second;
+  usage["prompt_per_second"] = prompt_per_second;
+  usage["predicted_per_second"] = predicted_per_second;
+  usage["prompt_tokens_per_sec"] = prompt_per_second;
+  usage["completion_tokens_per_sec"] = predicted_per_second;
+  usage["prefill_speed_tps"] = prompt_per_second;
+  usage["decode_speed_tps"] = predicted_per_second;
+  usage["total_tokens_per_second"] = total_per_second;
   usage["draft_tokens"] = result.draft_tokens;
   usage["draft_tokens_accepted"] = result.draft_accepted_tokens;
 
@@ -2754,6 +2766,16 @@ public:
     usage["output_tokens_details"]["reasoning_tokens"] =
         result.reasoning_tokens;
     usage["total_tokens"] = result.prompt_tokens + result.completion_tokens;
+    const double prompt_per_second = PrefillTokensPerSecond(result);
+    const double predicted_per_second =
+        (result.decode_ms > 0.0 && result.completion_tokens > 0)
+            ? (static_cast<double>(result.completion_tokens) /
+               (result.decode_ms / 1000.0))
+            : 0.0;
+    usage["prompt_tokens_per_second"] = prompt_per_second;
+    usage["completion_tokens_per_second"] = predicted_per_second;
+    usage["prompt_per_second"] = prompt_per_second;
+    usage["predicted_per_second"] = predicted_per_second;
     response_["usage"] = std::move(usage);
     response_["timings"] = GenerationTimings(result);
     Lifecycle(limited || unfinished_tool_ ? "response.incomplete"
@@ -3064,6 +3086,7 @@ HttpResponse StreamingResponse(
               // of the optional OpenAI usage chunk. Proxies need these even
               // when a client does not request stream_options.include_usage.
               terminal_chunk["timings"] = GenerationTimings(result);
+              terminal_chunk["usage"] = Usage(result);
               if (!writer(Sse(terminal_chunk))) {
                 return;
               }
