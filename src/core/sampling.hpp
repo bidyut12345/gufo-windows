@@ -192,15 +192,9 @@ private:
   [[nodiscard]] SamplingDistribution LinearDistribution(
       std::span<const float> logits) const;
   void PrepareSelected(std::span<const float> logits);
-<<<<<<< HEAD
-  /// top-p and min-p over the sorted candidate_scratch_ (PrepareSelected's
-  /// second half).
-  void FinishSelected(double full_softmax_sum, bool has_full_softmax_sum);
-=======
   void FilterSelected(double full_softmax_sum = 0,
                       bool has_full_softmax_sum = false);
   [[nodiscard]] SamplingDistribution SelectedDistribution();
->>>>>>> origin/main
   void StartReasoning();
   void AdvanceReasoning(TokenId token);
 

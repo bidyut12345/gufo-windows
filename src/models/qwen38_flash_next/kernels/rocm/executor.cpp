@@ -4778,6 +4778,47 @@ bool Executor::ReadVerificationRows(std::uint32_t row, std::span<float> logits,
                error_msg);
 }
 
+bool Executor::GreedyArgmaxNodes(std::uint32_t n_logits,
+                                 std::string* error_msg) const {
+  // Appended to the kVerifyGreedy body: ranks every verified row including
+  // the frontier and parks the candidates in pinned memory for
+  // ReadGreedyPredictions(). Runs inside capture like any other node. The
+  // frontier row's argmax is the next cycle's greedy anchor.
+  if (n_logits < 1 || s_.mtp_ids == nullptr) {
+    return true;
+  }
+  const auto rows = n_logits;
+  if (rows > kArgmaxParts) {
+    AssignError(error_msg, "greedy MTP verification exceeds the argmax parts");
+    return false;
+  }
+  const auto vocab = config().vocab_size;
+  gufo::hip::LaunchBatchedGPUArgmax(
+      VerificationLogits(), s_.mtp_ids, rows, vocab,
+      {reinterpret_cast<float*>(s_.mtp_scratch_ids),
+       MtpCandidateWorkspaceSize(vocab)},
+      stream_);
+  GatherArgmaxCandidates(VerificationLogits(), s_.mtp_ids, s_.mtp_argmax, rows,
+                         vocab, stream_);
+  return Check(hipMemcpyAsync(mtp_predictions_host_, s_.mtp_argmax,
+                              rows * sizeof(ArgmaxCandidate),
+                              hipMemcpyDeviceToHost, stream_),
+               "greedy MTP predictions download", error_msg);
+}
+
+bool Executor::ReadGreedyPredictions(std::span<ArgmaxCandidate> predictions,
+                                     std::string* error_msg) const {
+  if (predictions.empty() ||
+      predictions.size_bytes() >
+          options_.max_speculative * sizeof(ArgmaxCandidate)) {
+    AssignError(error_msg, "invalid greedy MTP prediction read");
+    return false;
+  }
+  std::memcpy(predictions.data(), mtp_predictions_host_,
+              predictions.size_bytes());
+  return true;
+}
+
 bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                                     const sampling::SamplerState& sampler,
                                     std::span<const std::int32_t> drafts,

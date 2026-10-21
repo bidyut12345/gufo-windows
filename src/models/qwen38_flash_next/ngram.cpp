@@ -213,7 +213,8 @@ void NgramTable::StoreRow(std::uint32_t row, const std::uint8_t* src,
 }
 
 bool NgramTable::ReadOne(std::uint32_t row, float* dst,
-                         std::vector<std::uint8_t>& buf, NgramCounters* owner) {
+                         std::vector<std::uint8_t>& buf, NgramCounters* owner,
+                         void* io_event) {
   if (row >= rows_) {
     return false;
   }
@@ -315,6 +316,7 @@ void NgramTable::Worker() {
     std::uint8_t* base{nullptr};
     std::uint32_t row{0};
     float* dst{nullptr};
+    NgramCounters* owner{nullptr};
   };
   std::array<Pending, kPipeDepth> slots;
   for (auto& slot : slots) {
@@ -352,9 +354,12 @@ void NgramTable::Worker() {
     std::size_t live = 0;
     for (std::size_t i = 0; i < count && live < kPipeDepth; ++i) {
       if (ReadCached(batch[i].row, batch[i].dst)) {
+        if (batch[i].owner != nullptr)
+          batch[i].owner->cache_hits_.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
       Pending& p = slots[live];
+      p.owner = batch[i].owner;
       const std::uint64_t offset =
           base_offset_ + std::uint64_t{batch[i].row} * row_bytes_;
       p.offset = offset;
@@ -389,7 +394,7 @@ void NgramTable::Worker() {
       if (!done || bytes < p.needed) {
         // Rare short window (the last row of the file): finish it with the
         // blocking retry loop.
-        ok = ReadOne(p.row, p.dst, p.buf, p.event) && ok;
+        ok = ReadOne(p.row, p.dst, p.buf, p.owner, p.event) && ok;
         continue;
       }
       StoreRow(p.row, p.base + (p.offset - p.begin), p.dst);

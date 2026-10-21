@@ -6479,8 +6479,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
         const btnRetry = document.createElement('button');
         btnRetry.className = 'btn-msg-action';
-        btnRetry.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> Retry';
-        btnRetry.title = 'Retry message';
+        btnRetry.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> Regnerate';
+        btnRetry.title = 'Regnerate message';
         btnRetry.onclick = () => {
           const target = findMessageIndex(m, msgIdx);
           retryUserMessage(target);
@@ -6528,12 +6528,55 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     };
 
     let isUserScrolledUp = false;
+    let programmaticScroll = false;
 
     if (UI.messagesContainer) {
+      // Detect manual user intent to scroll up (wheel or touch gesture)
+      UI.messagesContainer.addEventListener('wheel', (e) => {
+        if (e.deltaY < 0) {
+          isUserScrolledUp = true;
+          if (UI.btnScrollBottom) UI.btnScrollBottom.classList.add('visible');
+        } else if (e.deltaY > 0) {
+          const distFromBottom = UI.messagesContainer.scrollHeight - UI.messagesContainer.scrollTop - UI.messagesContainer.clientHeight;
+          if (distFromBottom <= 100) {
+            isUserScrolledUp = false;
+            if (UI.btnScrollBottom) UI.btnScrollBottom.classList.remove('visible');
+          }
+        }
+      }, { passive: true });
+
+      let touchStartY = 0;
+      UI.messagesContainer.addEventListener('touchstart', (e) => {
+        if (e.touches && e.touches[0]) touchStartY = e.touches[0].clientY;
+      }, { passive: true });
+
+      UI.messagesContainer.addEventListener('touchmove', (e) => {
+        if (e.touches && e.touches[0]) {
+          const deltaY = e.touches[0].clientY - touchStartY;
+          if (deltaY > 10) {
+            isUserScrolledUp = true;
+            if (UI.btnScrollBottom) UI.btnScrollBottom.classList.add('visible');
+          } else if (deltaY < -10) {
+            const distFromBottom = UI.messagesContainer.scrollHeight - UI.messagesContainer.scrollTop - UI.messagesContainer.clientHeight;
+            if (distFromBottom <= 100) {
+              isUserScrolledUp = false;
+              if (UI.btnScrollBottom) UI.btnScrollBottom.classList.remove('visible');
+            }
+          }
+        }
+      }, { passive: true });
+
       UI.messagesContainer.addEventListener('scroll', () => {
-        const threshold = 60;
+        if (programmaticScroll) {
+          programmaticScroll = false;
+          return;
+        }
         const distFromBottom = UI.messagesContainer.scrollHeight - UI.messagesContainer.scrollTop - UI.messagesContainer.clientHeight;
-        isUserScrolledUp = distFromBottom > threshold;
+        if (distFromBottom <= 80) {
+          isUserScrolledUp = false;
+        } else if (distFromBottom > 160) {
+          isUserScrolledUp = true;
+        }
         if (UI.btnScrollBottom) {
           UI.btnScrollBottom.classList.toggle('visible', isUserScrolledUp);
         }
@@ -6545,6 +6588,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         isUserScrolledUp = false;
         if (UI.btnScrollBottom) UI.btnScrollBottom.classList.remove('visible');
         if (UI.messagesContainer) {
+          programmaticScroll = true;
           UI.messagesContainer.scrollTo({ top: UI.messagesContainer.scrollHeight, behavior: 'smooth' });
         }
       });
@@ -6553,7 +6597,24 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     function scrollDown(force = false) {
       if (!UI.messagesContainer) return;
       if (force || !isUserScrolledUp) {
+        programmaticScroll = true;
         UI.messagesContainer.scrollTop = UI.messagesContainer.scrollHeight;
+      }
+    }
+
+    function updateLiveSpeed(genTokens, startTime) {
+      if (!startTime || genTokens <= 0) return;
+      const elapsedSec = (performance.now() - startTime) / 1000;
+      if (elapsedSec > 0.1) {
+        const tps = (genTokens / elapsedSec).toFixed(1);
+        if (UI.footerSpeedMetrics) {
+          UI.footerSpeedMetrics.textContent = `eval: ${tps} t/s | ${genTokens} tokens`;
+        }
+        if (UI.slotText) {
+          UI.slotText.textContent = `1/1 slots (generating: ${tps} t/s)`;
+        }
+        APP.lastSeenGenSpeed = Number(tps);
+        APP.lastSeenGenTokens = genTokens;
       }
     }
 
@@ -7072,6 +7133,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                 if (delta.reasoning_content || delta.thought) {
                   const t = delta.reasoning_content || delta.thought;
                   thoughtText += t;
+                  genTokens++;
+                  updateLiveSpeed(genTokens, startTime);
                   if (accordion) {
                     accordion.style.display = 'block';
                     accordion.querySelector('.thought-text').textContent = thoughtText;
@@ -7083,10 +7146,12 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                   if (thoughtText && accordion && !accordion.querySelector('.thought-text').classList.contains('collapsed')) {
                     accordion.querySelector('.thought-text').classList.add('collapsed');
                     accordion.querySelector('span').innerHTML = '&#9654; Thought Process';
+                    scrollDown(true);
                   }
 
                   assistantText += delta.content;
                   genTokens++;
+                  updateLiveSpeed(genTokens, startTime);
                   content.innerHTML = parseMarkdown(assistantText);
                   scrollDown();
                 }
@@ -7291,6 +7356,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                 if (delta.reasoning_content || delta.thought) {
                   const t = delta.reasoning_content || delta.thought;
                   thoughtText += t;
+                  genTokens++;
+                  updateLiveSpeed(genTokens, startTime);
                   if (accordion) {
                     accordion.style.display = 'block';
                     accordion.querySelector('.thought-text').textContent = thoughtText;
@@ -7302,10 +7369,12 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                   if (thoughtText && accordion && !accordion.querySelector('.thought-text').classList.contains('collapsed')) {
                     accordion.querySelector('.thought-text').classList.add('collapsed');
                     accordion.querySelector('span').innerHTML = '&#9654; Thought Process';
+                    scrollDown(true);
                   }
 
                   assistantText += delta.content;
                   genTokens++;
+                  updateLiveSpeed(genTokens, startTime);
                   if (content) {
                     content.innerHTML = parseMarkdown(assistantText);
                     scrollDown();
@@ -7628,6 +7697,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                     if (delta.reasoning_content || delta.thought) {
                       const t = delta.reasoning_content || delta.thought;
                       thoughtText += t;
+                      genTokens++;
+                      updateLiveSpeed(genTokens, startTime);
                       accordion.style.display = 'block';
                       accordion.querySelector('.thought-text').textContent = thoughtText;
                       scrollDown();
@@ -7637,10 +7708,12 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                       if (thoughtText && !accordion.querySelector('.thought-text').classList.contains('collapsed')) {
                         accordion.querySelector('.thought-text').classList.add('collapsed');
                         accordion.querySelector('span').innerHTML = '&#9654; Thought Process';
+                        scrollDown(true);
                       }
 
                       assistantText += delta.content;
                       genTokens++;
+                      updateLiveSpeed(genTokens, startTime);
                       content.innerHTML = parseMarkdown(assistantText);
                       scrollDown();
                     }

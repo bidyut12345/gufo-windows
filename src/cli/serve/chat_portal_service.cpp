@@ -610,7 +610,9 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       }
 
       auto body_fn = std::move(chat_resp.streaming_body);
-      job->worker_thread = std::jthread([job, body_fn = std::move(body_fn), &db]() mutable {
+      auto stream_log = chat_resp.stream_log;
+      const auto start_time = std::chrono::steady_clock::now();
+      job->worker_thread = std::jthread([job, body_fn = std::move(body_fn), stream_log, start_time, conv_id, &db]() mutable {
         try {
           body_fn([job](std::string_view chunk) -> bool {
             if (job->cancelled.load()) return false;
@@ -619,6 +621,16 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
           });
         } catch (...) {}
         job->OnFinished(db);
+        if (stream_log && !stream_log->details.empty()) {
+          const auto duration_ms = std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - start_time).count();
+          std::string details = std::move(stream_log->details);
+          stream_log->details.clear();
+          server::Logger::LogRequest(conv_id, "POST", "/api/conversations/" + conv_id + "/generate",
+                                     200, duration_ms, details,
+                                     job->cancelled.load() ? "cancelled" : "completed",
+                                     server::LogLevel::kInfo);
+        }
       });
 
       HttpResponse resp;
@@ -628,6 +640,7 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
       resp.headers.emplace_back("Cache-Control", "no-cache");
       resp.headers.emplace_back("X-Accel-Buffering", "no");
       resp.headers.emplace_back("Access-Control-Allow-Origin", "*");
+      resp.stream_log = stream_log;
       resp.streaming_body = [job](const HttpResponse::BodyWriter& writer) {
         job->StreamToClient(writer);
       };

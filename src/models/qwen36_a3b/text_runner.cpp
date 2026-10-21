@@ -529,16 +529,10 @@ private:
     return m_->tokenizer->IsStopToken(t) || (m_->im_end && t == *m_->im_end);
   }
 
-  /// Samples row `row` of the last pass: from its top-64 candidates when
-  /// that is provably exact, otherwise from the full logits row.
-  std::int32_t SampleRow(State& s, const Candidates& c, std::uint32_t row,
+  /// Samples row `row` of the last pass from the full logits row.
+  std::int32_t SampleRow(State& s, const Candidates& /*c*/, std::uint32_t row,
                          sampling::SamplerState& sampler) const {
-    std::array<sampling::TokenId, Candidates::kCount> ids{};
-    for (std::size_t i = 0; i < ids.size(); ++i)
-      ids[i] = static_cast<sampling::TokenId>(c.ids[i]);
     const auto vocab = s.engine().config().vocab;
-    if (const auto t = sampler.SampleFromTop(c.logits, ids, vocab))
-      return static_cast<std::int32_t>(*t);
     std::vector<float> logits(vocab);
     std::string error;
     Check(s.engine().RowLogits(row, logits.data(), &error), "logits", error);
