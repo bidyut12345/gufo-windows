@@ -30,20 +30,38 @@ retain their original date.
 | --- | ---: | ---: | ---: | ---: | ---: |
 | AR | 0 | 634.59 | 635.34 | 12.37 | 12.37 |
 | AR | 32,768 | 452.62 | 460.92 | 11.13 | 11.13 |
-| DFlash2 mixed | 0 | 585.54 | 590.41 | 26.98 | 26.92 |
-| DFlash2 mixed | 32,768 | 413.72 | 421.60 | 21.75 | 21.72 |
-| DFlash2 repetitive | 0 | 584.43 | 590.87 | 64.96 | 65.04 |
-| DFlash2 repetitive | 32,768 | 442.15 | 447.63 | 24.02 | 24.00 |
+| DFlash2 mixed | 0 | 585.54 | 582.53 | 26.98 | 26.91 |
+| DFlash2 mixed | 32,768 | 413.72 | 422.05 | 21.75 | 21.74 |
+| DFlash2 repetitive | 0 | 584.43 | 576.56 | 64.96 | 76.51 |
+| DFlash2 repetitive | 32,768 | 442.15 | 450.42 | 24.02 | 53.93 |
 
-Every completion hash, prompt/cache count and draft count matches main.
-Prefill improves by 0.1–1.9%; generation remains within 0.3%. The bounded
-sampling selector separately takes 84–86 µs versus 125–128 µs for the full
-vocabulary sort; these greedy rows do not measure that sampled-path gain.
+Every completion hash and prompt/cache count matches main. Prompt lookup
+skips neural drafting for verified copies: repetitive generation improves
+17.8% at d0 and 124.5% at 32K. Mixed generation stays within 0.3%; prefill
+changes range from −1.3% to +2.0%. AR retains the first-stage measurements;
+the later changes affect speculative proposals and four-token verification.
+Mixed rows retain the pre-boundary-fix measurements: those requests have no
+lookup copies. Repetitive rows use the final build.
+The bounded sampling selector separately takes 84–86 µs versus 125–128 µs
+for the full vocabulary sort; these greedy rows do not measure that gain.
+
+Default-sampled public workflow substitutes use the same frozen 8K archive.
+Extraction produces the same 720 tokens at 68.90 → 68.95 tok/s. Generated URI
+tests pass against correct code and three injected bugs at 59.48 → 62.59
+tok/s (465 → 449 output tokens). A file-edit tool call produces identical
+187-token contents at 55.83 → 59.84 tok/s; both builds omit the required final
+newline, so that strict fixture fails and its later agent steps are unqualified.
+These observations are not a complete agent benchmark.
+
+A separate matched default-sampled copying fixture improves 70.40 → 77.15
+tok/s. Two/four concurrent copies improve approximately 50.4 → 54.9 and
+27.5 → 30.0 tok/s per request, with identical outputs and cache work.
 
 The older repetitive 32K row below is a different history and completion:
 32,733 cached / 2,023 prefilled tokens and 109/114 accepted drafts, versus
-32,767 / 2,055 and 84/182 on both current builds. Its 51.20 tok/s therefore
-is not a matched control for the current 24.02 tok/s.
+32,767 / 2,055 and 84/182 on current main. The candidate accepts 108/120
+proposals on that same current history. The older 51.20 tok/s therefore
+is not a matched control for current main's 24.02 tok/s.
 Functional timing limitations are recorded in [QUALITY.md](QUALITY.md#october-21-prefill-and-sampling-review).
 
 ## Single user, autoregressive

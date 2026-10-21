@@ -1,14 +1,15 @@
-#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_PROMPT_LOOKUP_HPP_
-#define GUFO_MODELS_QWEN38_FLASH_NEXT_PROMPT_LOOKUP_HPP_
+#ifndef GUFO_CORE_SPECULATIVE_PROMPT_LOOKUP_HPP_
+#define GUFO_CORE_SPECULATIVE_PROMPT_LOOKUP_HPP_
 
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <span>
 #include <vector>
 
-namespace gufo::models::qwen38_flash_next {
+namespace gufo::speculative {
 
 /// Prompt lookup: proposals copied from the session's own committed tokens.
 /// The drafter's context (committed tokens plus the cycle's chain so far)
@@ -36,6 +37,7 @@ namespace gufo::models::qwen38_flash_next {
 ///
 /// Proposals depend only on the prefix, so rejection sampling (with the
 /// proposal as a point mass) keeps the target distribution exact.
+template<typename TokenId = std::int32_t>
 class PromptLookup {
 public:
   static constexpr std::size_t kKeyTokens = 3;
@@ -118,8 +120,7 @@ public:
   /// A shorter history, or one whose last indexed token changed, restarts
   /// the index; proposals are verified anyway, so this only keeps a missed
   /// Clear() from proposing stale copies.
-  void Extend(std::span<const std::int32_t> committed,
-              bool prompt_only = false) {
+  void Extend(std::span<const TokenId> committed, bool prompt_only = false) {
     if (prompt_only && request_start_ != kNoResume) {
       committed = committed.first(std::min(committed.size(), request_start_));
     }
@@ -153,9 +154,22 @@ public:
   /// Best match for the context `committed` + `tail` among the indexed
   /// committed tokens, or a zero-length match. `tail` holds the uncommitted
   /// chain (anchor and drafts); `committed` must extend the indexed prefix.
-  [[nodiscard]] Match Find(std::span<const std::int32_t> committed,
-                           std::span<const std::int32_t> tail,
+  [[nodiscard]] Match Find(std::span<const TokenId> committed,
+                           std::span<const TokenId> tail,
                            std::size_t minimum = kMinMatch,
+                           bool require_resume = false) const {
+    return Find(
+        committed, tail, minimum, [](std::size_t) { return true; },
+        require_resume);
+  }
+
+  /// A backend may reject a source whose continuation crosses message framing.
+  /// Keep searching earlier matches instead of repeatedly proposing the same
+  /// rejected boundary. The ordinary Flash-Next policy accepts every source.
+  template<std::predicate<std::size_t> AcceptSource>
+  [[nodiscard]] Match Find(std::span<const TokenId> committed,
+                           std::span<const TokenId> tail, std::size_t minimum,
+                           AcceptSource accept_source,
                            bool require_resume = false) const {
     const std::size_t context = committed.size() + tail.size();
     const std::size_t available =
@@ -170,12 +184,12 @@ public:
     const auto at = [&](std::size_t i) {
       return i < committed.size() ? committed[i] : tail[i - committed.size()];
     };
-    std::int32_t key_tokens[kKeyTokens];
+    TokenId key_tokens[kKeyTokens];
     for (std::size_t i = 0; i < kKeyTokens; ++i) {
       key_tokens[i] = at(context - kKeyTokens + i);
     }
     Match best{};
-    std::uint32_t end = head_.Find(Key(key_tokens));
+    std::uint32_t end = head_.Find(Key(std::span<const TokenId>(key_tokens)));
     for (std::size_t n = 0; n < kMaxCandidates && end != kNone; ++n) {
       // An occurrence ending at `end` proposes committed[end...]. The key
       // itself matched; extend backwards against the context.
@@ -194,7 +208,8 @@ public:
           require_resume
               ? resumes && length >= minimum
               : length >= minimum || (resumes && length >= kResumeMinMatch);
-      if (end < prev_.size() && length > best.length && allowed) {
+      if (end < prev_.size() && length > best.length && allowed &&
+          accept_source(end)) {
         best = {end, length};
       }
       end = prev_[end];
@@ -301,7 +316,7 @@ private:
 
   /// Token ids fit in 21 bits (vocabularies up to 2M), so a key packs
   /// exactly: equal keys are equal token triples.
-  static std::uint64_t Key(std::span<const std::int32_t> tokens) {
+  static std::uint64_t Key(std::span<const TokenId> tokens) {
     std::uint64_t key = 0;
     for (const auto t : tokens) {
       key = (key << 21) |
@@ -313,11 +328,11 @@ private:
 
   Heads head_;
   std::vector<std::uint32_t> prev_;
-  std::int32_t last_{0};           ///< committed[prev_.size() - 1] when indexed
+  TokenId last_{0};                ///< committed[prev_.size() - 1] when indexed
   std::size_t resume_{kNoResume};  ///< where the last copy's source continues
   std::size_t request_start_{kNoResume};
 };
 
-}  // namespace gufo::models::qwen38_flash_next
+}  // namespace gufo::speculative
 
-#endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_PROMPT_LOOKUP_HPP_
+#endif  // GUFO_CORE_SPECULATIVE_PROMPT_LOOKUP_HPP_

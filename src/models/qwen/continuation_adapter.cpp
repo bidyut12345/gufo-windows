@@ -37,9 +37,10 @@ struct Metadata {
 };
 static_assert(sizeof(Metadata) <= kContinuationMetadataBytes);
 struct DraftMetadata {
-  std::uint32_t version{1}, injected{}, pending_rows{}, primed{};
+  std::uint32_t version{2}, injected{}, pending_rows{}, primed{};
   float controller{};
   std::uint32_t last_full_width{};
+  speculative::PromptLookup<tokenization::TokenId>::State lookup;
 };
 static_assert(sizeof(DraftMetadata) <= kContinuationMetadataBytes);
 struct FrontierMetadata {
@@ -611,6 +612,7 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
     metadata.primed = draft.primed_;
     metadata.controller = draft.controller_.State();
     metadata.last_full_width = draft.controller_.LastFullWidth();
+    metadata.lookup = draft.lookup_.Save();
     std::memcpy(host.data(), &metadata, sizeof(metadata));
     source = host.data();
     is_host = true;
@@ -916,12 +918,18 @@ bool ContinuationAdapter::Validate(
                   sizeof(draft_metadata));
       auto& draft = *state.draft;
       const auto width = draft.executor_->GetTargetFeaturesSize();
-      if (draft_metadata.version != 1 || draft_metadata.primed > 1 ||
+      if ((draft_metadata.version != 1 && draft_metadata.version != 2) ||
+          draft_metadata.primed > 1 ||
           draft_metadata.injected > metadata.position ||
           draft_metadata.pending_rows > 8 ||
           draft_metadata.pending_rows !=
               metadata.position - draft_metadata.injected ||
           (!draft_metadata.primed && metadata.position))
+        return refuse();
+      if (draft_metadata.version == 1)
+        draft_metadata.lookup = {};
+      if (!speculative::PromptLookup<tokenization::TokenId>::Valid(
+              draft_metadata.lookup, metadata.position))
         return refuse();
       for (std::size_t i = layout_.Components().size(); i < components_.size();
            ++i)
@@ -940,6 +948,8 @@ bool ContinuationAdapter::Validate(
                     draft.pending_target_features_.size() * sizeof(float));
       draft.executor_->injected_context_len_ = draft_metadata.injected;
       draft.controller_ = controller;
+      draft.lookup_.Restore(draft_metadata.lookup);
+      draft.lookup_proposal_ = false;
       draft.primed_ = draft_metadata.primed;
       draft.proposal_active_ = false;
       draft.proposed_tokens_.clear();

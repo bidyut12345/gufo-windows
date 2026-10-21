@@ -12,6 +12,7 @@
 
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
+#include "src/core/speculative/prompt_lookup.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
@@ -20,7 +21,6 @@
 #include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
-#include "src/models/qwen38_flash_next/prompt_lookup.hpp"
 
 namespace gufo::core {
 class GgufReader;
@@ -368,7 +368,7 @@ private:
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
-  PromptLookup lookup_;
+  speculative::PromptLookup<> lookup_;
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(

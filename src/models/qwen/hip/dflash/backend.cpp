@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "src/core/sampling.hpp"
-#include "src/models/qwen/hip/cycle_profile.hpp"
+#include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 
 namespace gufo::hip {
@@ -23,7 +23,7 @@ namespace {
 
 constexpr std::array<std::uint8_t, 8> kDFlashDraftPersistentMagic = {
     'G', 'D', 'F', 'D', 'R', 'F', '0', '1'};
-constexpr std::uint32_t kDFlashDraftPersistentVersion = 3;
+constexpr std::uint32_t kDFlashDraftPersistentVersion = 4;
 constexpr std::size_t kDFlashDraftPersistentHeaderBytes = 80;
 constexpr std::uint32_t kDFlashDraftPrimedFlag = 1U << 0U;
 
@@ -72,24 +72,25 @@ template<typename T>
 class QwenDFlashDraftSnapshot final
     : public speculative::IDraftBackendSnapshot {
 public:
-  QwenDFlashDraftSnapshot(std::unique_ptr<QwenDFlashGpuSnapshot> gpu_snapshot,
-                          std::vector<float> pending_target_features,
-                          std::size_t target_feature_width,
-                          QwenDFlashGpuDraftConfig config,
-                          float controller_state, std::uint32_t last_full_width,
-                          bool primed)
+  QwenDFlashDraftSnapshot(
+      std::unique_ptr<QwenDFlashGpuSnapshot> gpu_snapshot,
+      std::vector<float> pending_target_features,
+      std::size_t target_feature_width, QwenDFlashGpuDraftConfig config,
+      float controller_state, std::uint32_t last_full_width, bool primed,
+      speculative::PromptLookup<tokenization::TokenId>::State lookup)
       : gpu_snapshot(std::move(gpu_snapshot)),
         pending_target_features(std::move(pending_target_features)),
         target_feature_width(target_feature_width),
         config(config),
         controller_state(controller_state),
         last_full_width(last_full_width),
-        primed(primed) {}
+        primed(primed),
+        lookup(lookup) {}
 
   [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
     return (gpu_snapshot != nullptr ? gpu_snapshot->PayloadBytes() : 0) +
            pending_target_features.size() * sizeof(float) +
-           sizeof(controller_state) + sizeof(last_full_width);
+           sizeof(controller_state) + sizeof(last_full_width) + sizeof(lookup);
   }
 
   [[nodiscard]] std::size_t PersistentPayloadBytes() const override {
@@ -148,6 +149,8 @@ public:
                                    static_cast<std::uint32_t>(config.policy));
     PutLittleEndian<std::uint32_t>(destination, 64, config.max_draft_tokens);
     PutLittleEndian<std::uint32_t>(destination, 68, last_full_width);
+    PutLittleEndian<std::uint32_t>(destination, 72, lookup.resume);
+    PutLittleEndian<std::uint32_t>(destination, 76, lookup.request_start);
 
     const std::size_t gpu_offset = kDFlashDraftPersistentHeaderBytes;
     const std::size_t pending_offset =
@@ -179,6 +182,7 @@ public:
   float controller_state{0.0F};
   std::uint32_t last_full_width{0};
   bool primed{false};
+  speculative::PromptLookup<tokenization::TokenId>::State lookup;
 };
 
 }  // namespace
@@ -189,16 +193,18 @@ QwenDFlashGpuDraftBackend::QwenDFlashGpuDraftBackend(
     : executor_(std::move(executor)),
       config_(config),
       controller_(
-          config.policy,
-          qwen27::LookupDFlashCap() != 0
-              ? std::min(config.max_draft_tokens, qwen27::LookupDFlashCap())
-              : config.max_draft_tokens,
+          config.policy, config.max_draft_tokens,
           // The tied output tensor distinguishes the qualified Q8 target
           // (Q8_0 head) from Q4 (Q6_K head) for verification cost selection.
           executor_->GetModel().GetWeights().output.type ==
-              core::GgmlType::kQ8_0),
-      lookup_limit_(qwen27::LookupDFlashCap() != 0 ? config.max_draft_tokens
-                                                   : 0U) {}
+              core::GgmlType::kQ8_0) {
+  const auto& tokenizer = executor_->GetModel().GetTokenizer();
+  const std::array names{tokenization::kImStart, tokenization::kImEnd,
+                         tokenization::kEndOfText};
+  for (std::size_t i = 0; i < names.size(); ++i)
+    lookup_boundaries_[i] = tokenizer.FindSpecialToken(names[i]).value_or(
+        tokenization::kInvalidTokenId);
+}
 
 std::unique_ptr<QwenDFlashGpuDraftBackend> QwenDFlashGpuDraftBackend::Create(
     std::shared_ptr<const QwenDFlashGpuModel> model,
@@ -299,6 +305,15 @@ speculative::DraftProposal QwenDFlashGpuDraftBackend::ProposeSampled(
                      rng_state);
 }
 
+speculative::DraftProposal QwenDFlashGpuDraftBackend::ProposeForRequest(
+    const speculative::DraftProposalRequest& request) {
+  if (!std::isfinite(request.temperature) || request.temperature < 0 ||
+      (request.temperature > 0 && request.rng_state == nullptr))
+    throw std::invalid_argument("invalid DFlash request sampling");
+  return ProposeImpl(request.tokens, request.position, request.max_tokens,
+                     request.temperature, request.rng_state, request.sampler);
+}
+
 std::vector<speculative::DraftProposal> QwenDFlashGpuDraftBackend::ProposeBatch(
     std::span<const speculative::DraftProposalRequest> requests) {
   if (requests.size() < 2 || requests.size() > 8)
@@ -390,6 +405,12 @@ std::vector<speculative::DraftProposal> QwenDFlashGpuDraftBackend::ProposeBatch(
                            budgets[index], request.position, greedy_batch_size);
     if (count == 0)
       continue;
+    if (auto copied =
+            backend.TryLookup(request.tokens, request.position, budgets[index],
+                              request.temperature > 0.0F)) {
+      proposals[index] = std::move(*copied);
+      continue;
+    }
     backend.proposed_tokens_.clear();
     if (request.temperature > 0.0F) {
       for (std::uint32_t row = 0; row < count; ++row)
@@ -403,7 +424,8 @@ std::vector<speculative::DraftProposal> QwenDFlashGpuDraftBackend::ProposeBatch(
                       count,
                       request.temperature,
                       std::span(uniforms[index]).first(count),
-                      {}});
+                      {},
+                      request.sampler});
   }
   if (blocks.empty())
     return proposals;
@@ -416,6 +438,74 @@ std::vector<speculative::DraftProposal> QwenDFlashGpuDraftBackend::ProposeBatch(
     proposals[index] = std::move(generated[block]);
   }
   return proposals;
+}
+
+std::optional<speculative::DraftProposal> QwenDFlashGpuDraftBackend::TryLookup(
+    std::span<const tokenization::TokenId> tokens, std::uint32_t position,
+    std::uint32_t limit, bool sampled) {
+  lookup_proposal_ = false;
+  // Some native callers supply only the anchor, not an indexed history.
+  if (limit == 0 || tokens.size() != std::size_t{position} + 1 ||
+      !lookup_.Step(position))
+    return std::nullopt;
+  using Lookup = speculative::PromptLookup<tokenization::TokenId>;
+  // Parallel DFlash already predicts short schema and reasoning fragments
+  // well. Relax the greedy copy gate only after neural acceptance falls below
+  // its neutral estimate. This private, snapshotted history uses no timings
+  // or new RNG draws; sampled requests retain the longer match.
+  const bool weak_neural =
+      controller_.State() <
+      std::min(3.0F, static_cast<float>(config_.max_draft_tokens));
+  const auto minimum =
+      !sampled && weak_neural ? Lookup::kMinMatch : Lookup::kSampledMinMatch;
+  const auto state = lookup_.Save();
+  if (state.resume == Lookup::kNoState &&
+      tokens.size() - state.request_start < minimum)
+    return std::nullopt;
+  const auto committed = tokens.first(position);
+  lookup_.Extend(committed, sampled);
+  const auto cap = std::min(limit, config_.max_draft_tokens);
+  const auto match =
+      lookup_.Find(committed, tokens.last(1), minimum, [&](std::size_t start) {
+        const auto count =
+            std::min(std::size_t{cap}, lookup_.IndexedTokens() - start);
+        // A repeated passage often matches closest to the end of a user
+        // message. Copying its closing tag/header repeatedly wastes target
+        // verification. An earlier matching passage can supply the same text
+        // without crossing that boundary. Thinking and tool tags remain valid.
+        return std::ranges::none_of(
+            committed.subspan(start, count), [&](auto token) {
+              return std::ranges::find(lookup_boundaries_, token) !=
+                     lookup_boundaries_.end();
+            });
+      });
+  if (match.length == 0)
+    return std::nullopt;
+  const auto count =
+      std::min({std::size_t{limit}, std::size_t{config_.max_draft_tokens},
+                lookup_.IndexedTokens() - match.start});
+  const auto copied = committed.subspan(match.start, count);
+  if (count == 0 || std::ranges::any_of(copied, [&](auto token) {
+        return std::size_t(token) >=
+               executor_->GetModel().GetConfig().vocab_size;
+      }))
+    return std::nullopt;
+  speculative::DraftProposal proposal;
+  proposal.start_pos = position;
+  proposal.tokens.assign(copied.begin(), copied.end());
+  proposal.from_lookup = true;
+  if (sampled) {
+    // A deterministic copy is q(token)=1, conditional only on prior history.
+    // The ordinary p/q verifier still accepts or corrects every token.
+    proposal.candidates_per_token = 1;
+    proposal.candidate_ids = proposal.tokens;
+    proposal.candidate_probabilities.assign(count, 1.0F);
+  }
+  proposed_tokens_ = proposal.tokens;
+  lookup_start_ = match.start;
+  lookup_proposal_ = true;
+  proposal_active_ = true;
+  return proposal;
 }
 
 std::uint32_t QwenDFlashGpuDraftBackend::PendingFeatureCount(
@@ -474,7 +564,7 @@ bool QwenDFlashGpuDraftBackend::AppendTargetContext(
 speculative::DraftProposal QwenDFlashGpuDraftBackend::ProposeImpl(
     std::span<const tokenization::TokenId> prompt_tokens,
     std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
-    std::uint64_t* rng_state) {
+    std::uint64_t* rng_state, const sampling::SamplerState* sampler) {
   CheckContinuation();
   if (!primed_ || prompt_tokens.empty() || current_pos == 0) {
     throw std::logic_error("DFlash GPU draft backend is not primed");
@@ -490,35 +580,10 @@ speculative::DraftProposal QwenDFlashGpuDraftBackend::ProposeImpl(
   const std::uint32_t context_budget =
       current_pos < config_.max_context ? config_.max_context - current_pos - 1U
                                         : 0;
-  lookup_tokens_ = 0;
-  const bool use_lookup =
-      lookup_limit_ != 0 && prompt_tokens.size() == current_pos + 1U;
-  if (use_lookup)
-    lookup_.Extend(prompt_tokens);
-  if (use_lookup && !qwen27::LookupAppends()) {
-    const auto match = lookup_.Find(prompt_tokens);
-    const std::size_t count = std::min<std::size_t>(
-        {max_tokens, context_budget, lookup_limit_,
-         match.length != 0 ? prompt_tokens.size() - match.start : 0});
-    if (count != 0) {
-      const auto first = prompt_tokens.begin() + match.start;
-      proposal.tokens.assign(first, first + count);
-      if (temperature > 0.0F) {
-        // A point-mass proposal: accepted with the target probability.
-        proposal.candidates_per_token = 1;
-        proposal.candidate_ids = proposal.tokens;
-        proposal.candidate_probabilities.assign(count, 1.0F);
-      }
-      proposed_tokens_ = proposal.tokens;
-      proposal_active_ = true;
-      lookup_tokens_ = static_cast<std::uint32_t>(count);
-      if (qwen27::DraftLog() != nullptr) {
-        proposed_position_ = current_pos;
-        proposed_probabilities_.assign(count, 1.0F);
-      }
-      return proposal;
-    }
-  }
+  if (auto copied =
+          TryLookup(prompt_tokens, current_pos,
+                    std::min(max_tokens, context_budget), temperature > 0.0F))
+    return std::move(*copied);
   const std::uint32_t count =
       controller_.Choose(std::min(max_tokens, context_budget), current_pos);
   if (count == 0) {
@@ -540,62 +605,11 @@ speculative::DraftProposal QwenDFlashGpuDraftBackend::ProposeImpl(
   proposed_tokens_ = executor_->ForwardBlock(
       prompt_tokens.back(), current_pos, count, temperature, sample_uniforms,
       nullptr, temperature > 0.0F ? &proposal.candidate_ids : nullptr,
-      temperature > 0.0F ? &proposal.candidate_probabilities : nullptr);
+      temperature > 0.0F ? &proposal.candidate_probabilities : nullptr, {},
+      sampler);
 
   proposal.tokens = proposed_tokens_;
   proposal_active_ = !proposal.tokens.empty();
-  const std::uint32_t lookup_room = std::min(
-      {max_tokens, context_budget, lookup_limit_ != 0 ? lookup_limit_ : 0U});
-  if (use_lookup && qwen27::LookupAppends() &&
-      proposal.tokens.size() == count && count < lookup_room) {
-    // Append mode: when the context plus DFlash2's drafts continues an
-    // earlier passage, copy what followed it after the drafts.
-    std::vector<tokenization::TokenId> context(prompt_tokens.begin(),
-                                               prompt_tokens.end());
-    context.insert(context.end(), proposal.tokens.begin(),
-                   proposal.tokens.end());
-    const auto match = lookup_.Find(context);
-    const std::size_t extra =
-        match.length == 0 ? 0
-                          : std::min<std::size_t>(lookup_room - count,
-                                                  context.size() - match.start);
-    const std::size_t width = proposal.candidates_per_token;
-    for (std::size_t i = 0; i < extra; ++i) {
-      const auto token = context[match.start + i];
-      proposal.tokens.push_back(token);
-      if (width != 0) {
-        // A point mass, padded with distinct zero-probability ids to the
-        // DFlash2 row width.
-        proposal.candidate_ids.push_back(token);
-        proposal.candidate_probabilities.push_back(1.0F);
-        for (tokenization::TokenId id = 0;
-             proposal.candidate_ids.size() % width != 0; ++id) {
-          if (id == token)
-            continue;
-          proposal.candidate_ids.push_back(id);
-          proposal.candidate_probabilities.push_back(0.0F);
-        }
-      }
-    }
-    lookup_tokens_ = static_cast<std::uint32_t>(extra);
-    proposed_tokens_ = proposal.tokens;
-  }
-  if (qwen27::DraftLog() != nullptr) {
-    // The probability the draft gave each proposed token (0 when greedy).
-    proposed_position_ = current_pos;
-    proposed_probabilities_.assign(proposal.tokens.size(), 0.0F);
-    const std::size_t width = proposal.candidates_per_token;
-    for (std::size_t row = 0; width != 0 && row < proposal.tokens.size();
-         ++row) {
-      for (std::size_t c = 0; c < width; ++c) {
-        if (proposal.candidate_ids[row * width + c] == proposal.tokens[row]) {
-          proposed_probabilities_[row] =
-              proposal.candidate_probabilities[row * width + c];
-          break;
-        }
-      }
-    }
-  }
   return proposal;
 }
 
@@ -608,25 +622,11 @@ void QwenDFlashGpuDraftBackend::AcceptFeedback(
     throw std::logic_error("DFlash GPU proposal feedback is invalid");
   }
 
-  // Lookup proposals say nothing about DFlash2 acceptance.
-  const std::size_t drafted = proposed_tokens_.size() - lookup_tokens_;
-  if (drafted != 0)
-    controller_.Observe(std::min(accepted.size(), drafted), drafted);
-  qwen27::LookupStats::Get().Record(
-      lookup_tokens_,
-      accepted.size() > drafted ? accepted.size() - drafted : 0);
-  lookup_tokens_ = 0;
-  if (std::FILE* log = qwen27::DraftLog();
-      log != nullptr &&
-      proposed_probabilities_.size() == proposed_tokens_.size()) {
-    std::fprintf(log, "%u %zu %zu", proposed_position_, proposed_tokens_.size(),
-                 accepted.size());
-    for (std::size_t i = 0; i < proposed_tokens_.size(); ++i)
-      std::fprintf(log, " %u:%.4f", proposed_tokens_[i],
-                   proposed_probabilities_[i]);
-    std::fputc('\n', log);
-    std::fflush(log);
-  }
+  if (lookup_proposal_)
+    lookup_.Observe(lookup_start_, proposed_tokens_.size(), accepted.size());
+  else
+    controller_.Observe(accepted.size(), proposed_tokens_.size());
+  lookup_proposal_ = false;
   proposal_active_ = false;
   proposed_tokens_.clear();
 }
@@ -653,7 +653,9 @@ void QwenDFlashGpuDraftBackend::DiscardPendingTargetContext(
 
 std::size_t QwenDFlashGpuDraftBackend::SnapshotPayloadBytes() const {
   const std::size_t gpu_bytes = CheckedPersistentAdd(
-      executor_->SnapshotPayloadBytes(), sizeof(float) + sizeof(std::uint32_t));
+      executor_->SnapshotPayloadBytes(),
+      sizeof(float) + sizeof(std::uint32_t) +
+          sizeof(speculative::PromptLookup<tokenization::TokenId>::State));
   if (pending_target_features_.size() >
       (std::numeric_limits<std::size_t>::max() - gpu_bytes) / sizeof(float)) {
     throw std::overflow_error("DFlash snapshot size overflows");
@@ -670,7 +672,7 @@ QwenDFlashGpuDraftBackend::Snapshot() const {
   return std::make_unique<QwenDFlashDraftSnapshot>(
       executor_->SaveSnapshot(), pending_target_features_,
       executor_->GetTargetFeaturesSize(), config_, controller_.State(),
-      controller_.LastFullWidth(), primed_);
+      controller_.LastFullWidth(), primed_, lookup_.Save());
 }
 
 void QwenDFlashGpuDraftBackend::RestoreSnapshot(
@@ -694,8 +696,15 @@ void QwenDFlashGpuDraftBackend::RestoreSnapshot(
   auto controller = controller_;
   controller.Restore(dflash_snapshot->controller_state,
                      dflash_snapshot->last_full_width);
+  if (!speculative::PromptLookup<tokenization::TokenId>::Valid(
+          dflash_snapshot->lookup,
+          dflash_snapshot->gpu_snapshot->ValidContext() +
+              dflash_snapshot->pending_target_features.size() / feature_width))
+    throw std::invalid_argument("DFlash lookup snapshot has invalid positions");
   executor_->RestoreSnapshot(*dflash_snapshot->gpu_snapshot);
   controller_ = controller;
+  lookup_.Restore(dflash_snapshot->lookup);
+  lookup_proposal_ = false;
   pending_target_features_ = dflash_snapshot->pending_target_features;
   proposed_tokens_.clear();
   primed_ = dflash_snapshot->primed;
@@ -708,11 +717,13 @@ void QwenDFlashGpuDraftBackend::RestorePersistentSnapshot(
   if (payload.size() < kDFlashDraftPersistentHeaderBytes ||
       !std::equal(kDFlashDraftPersistentMagic.begin(),
                   kDFlashDraftPersistentMagic.end(), payload.begin()) ||
-      GetLittleEndian<std::uint32_t>(payload, 8) !=
-          kDFlashDraftPersistentVersion ||
+      (GetLittleEndian<std::uint32_t>(payload, 8) !=
+           kDFlashDraftPersistentVersion &&
+       GetLittleEndian<std::uint32_t>(payload, 8) != 3) ||
       GetLittleEndian<std::uint32_t>(payload, 12) !=
           kDFlashDraftPersistentHeaderBytes ||
-      GetLittleEndian<std::uint64_t>(payload, 72) != 0) {
+      (GetLittleEndian<std::uint32_t>(payload, 8) == 3 &&
+       GetLittleEndian<std::uint64_t>(payload, 72) != 0)) {
     throw std::invalid_argument("DFlash draft persistent header is invalid");
   }
   const std::uint32_t flags = GetLittleEndian<std::uint32_t>(payload, 16);
@@ -750,6 +761,14 @@ void QwenDFlashGpuDraftBackend::RestorePersistentSnapshot(
   }
   auto controller = controller_;
   controller.Restore(controller_state, last_full_width);
+  speculative::PromptLookup<tokenization::TokenId>::State lookup;
+  if (GetLittleEndian<std::uint32_t>(payload, 8) >= 4)
+    lookup = {GetLittleEndian<std::uint32_t>(payload, 72),
+              GetLittleEndian<std::uint32_t>(payload, 76)};
+  if (!speculative::PromptLookup<tokenization::TokenId>::Valid(
+          lookup, injected_context + pending_count / feature_width))
+    throw std::invalid_argument(
+        "DFlash persistent lookup positions are invalid");
   const bool primed = (flags & kDFlashDraftPrimedFlag) != 0;
   if (!primed && (injected_context != 0 || pending_count != 0)) {
     throw std::invalid_argument("DFlash draft unprimed payload contains state");
@@ -779,6 +798,8 @@ void QwenDFlashGpuDraftBackend::RestorePersistentSnapshot(
   }
   pending_target_features_ = std::move(pending_target_features);
   controller_ = controller;
+  lookup_.Restore(lookup);
+  lookup_proposal_ = false;
   proposed_tokens_.clear();
   primed_ = primed;
   proposal_active_ = false;
@@ -794,10 +815,10 @@ void QwenDFlashGpuDraftBackend::Reset() noexcept {
   }
   executor_->Reset();
   controller_.Reset();
+  lookup_.Clear();
+  lookup_proposal_ = false;
   pending_target_features_.clear();
   proposed_tokens_.clear();
-  lookup_.Clear();
-  lookup_tokens_ = 0;
   primed_ = false;
   proposal_active_ = false;
 }

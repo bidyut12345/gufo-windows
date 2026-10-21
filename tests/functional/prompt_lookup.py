@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flash-Next MTP lookup: exact copies, sampled peers, stops and warm replay.
+"""Flash-Next MTP and Qwen27B DFlash2 lookup: exact copies, sampled peers, stops and warm replay.
 
 Run explicitly with a production server command; this is not a hosted CI test.
 Each request retains its own timings. Native session tests cover full logits,
@@ -27,13 +27,16 @@ from run import execution_coverage, option, provenance, server, write_json
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--max-concurrency", type=int, choices=(2, 4, 6, 8), default=8)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if len(command) < 3 or command[1:3] != ["serve", "llm"]:
         parser.error("pass a production gufo serve llm command after --")
-    if option(command, "--speculative") != "mtp":
-        parser.error("this test requires Flash-Next with --speculative mtp")
+    mode = option(command, "--speculative")
+    if mode not in ("mtp", "dflash2"):
+        parser.error("this test requires --speculative mtp or dflash2")
+    cohort_size = args.max_concurrency
     for flag in ("--host", "--port", "--sessions", "--served-model-name"):
         if option(command, flag) is not None:
             parser.error(f"the runner owns {flag}")
@@ -43,7 +46,7 @@ def main():
         reserve.bind(("127.0.0.1", 0))
         port = reserve.getsockname()[1]
     command += ["--host", "127.0.0.1", "--port", str(port),
-                "--sessions", "8", "--served-model-name", "lookup-test"]
+                "--sessions", str(cohort_size), "--served-model-name", "lookup-test"]
     if option(command, "--context") is None:
         command += ["--context", "4096"]
     if option(command, "--max-pending-per-client") is None:
@@ -74,7 +77,7 @@ def main():
             with OpenAI(base_url=base + "/v1", api_key="unused", max_retries=0,
                         http_client=transport) as client:
                 sources, bodies, controls = [], [], []
-                for row in range(8):
+                for row in range(cohort_size):
                     source = ("Monday, Tuesday, Wednesday, Thursday, Friday, "
                               if row % 2 else
                               "red, blue, green, yellow, orange, purple, ") * 24
@@ -111,7 +114,7 @@ def main():
                     assert match, "missing accepted lookup metric"
                     return int(match[1])
 
-                for width in (2, 4, 6, 8):
+                for width in range(2, cohort_size + 1, 2):
                     start = copied()
                     ready = threading.Barrier(width)
 
@@ -143,20 +146,20 @@ def main():
                     client, {**ordinary, "max_completion_tokens": 1}))
                 ordinary_control = record(
                     "mixed-isolated", chat_result(client, ordinary, True))
-                mixed = [ordinary if row % 2 else bodies[row] for row in range(8)]
-                ready = threading.Barrier(8)
+                mixed = [ordinary if row % 2 else bodies[row] for row in range(cohort_size)]
+                ready = threading.Barrier(cohort_size)
                 start = copied()
 
                 def run_mixed(body):
                     ready.wait(timeout=30)
                     return chat_result(client, body, True)
 
-                with ThreadPoolExecutor(max_workers=8) as pool:
+                with ThreadPoolExecutor(max_workers=cohort_size) as pool:
                     results = list(pool.map(run_mixed, mixed))
-                record("mixed-greedy-C8", results)
+                record(f"mixed-greedy-C{cohort_size}", results)
                 assert copied() > start, "mixed greedy cohort accepted no copies"
                 assert max(r["usage"]["gufo"]["physical_execution_width"]
-                           for r in results) == 8, "mixed cohort never ran at C8"
+                           for r in results) == cohort_size, "mixed cohort never ran at requested width"
                 for row, result in enumerate(results):
                     same(ordinary_control if row % 2 else controls[row], result)
 
@@ -244,7 +247,7 @@ def main():
                         assert replay["usage"]["gufo"]["prefill_tokens"] == 0, replay
                 report["accepted_lookup_tokens"] = copied()
         join_server_timings(output)
-        report["execution"] = execution_coverage(output, "mtp")
+        report["execution"] = execution_coverage(output, mode)
         report["status"] = "passed"
     except BaseException:
         report["status"] = "failed"

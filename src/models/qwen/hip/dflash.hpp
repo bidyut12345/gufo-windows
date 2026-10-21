@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN_HIP_DFLASH_HPP_
 #define GUFO_MODELS_QWEN_HIP_DFLASH_HPP_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -12,6 +13,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/speculative/draft_backend.hpp"
+#include "src/core/speculative/prompt_lookup.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
 #include "src/models/qwen/hip/dflash/prompt_lookup_27b.hpp"
@@ -22,6 +24,10 @@
 #include <hip/hip_runtime.h>
 
 namespace gufo::hip {
+
+namespace kernels {
+struct DFlashSampling;
+}
 
 /// Optional synchronous host observation for the independent reference test.
 /// The span is valid only during the callback; production leaves it empty.
@@ -45,6 +51,7 @@ struct QwenDFlashBlockRequest {
   float temperature{0.0F};
   std::span<const float> uniforms;
   DFlashTrace trace;
+  const sampling::SamplerState* sampler{nullptr};
 };
 
 class QwenDFlashGpuSnapshot final {
@@ -108,6 +115,10 @@ public:
       const noexcept {
     return weights_.dflash_config;
   }
+  [[nodiscard]] const tokenization::QwenTokenizer& GetTokenizer()
+      const noexcept {
+    return target_model_->GetTokenizer();
+  }
   [[nodiscard]] std::size_t GetPackedWeightBytes() const noexcept {
     return packed_weight_bytes_;
   }
@@ -161,7 +172,8 @@ public:
       std::vector<float>* out_confidences = nullptr,
       std::vector<tokenization::TokenId>* out_candidate_ids = nullptr,
       std::vector<float>* out_candidate_probabilities = nullptr,
-      const DFlashTrace& trace = {});
+      const DFlashTrace& trace = {},
+      const sampling::SamplerState* sampler = nullptr);
 
   /// Shared projections with independent attention, convolution and selector
   /// boundaries. A single request retains the ordinary block execution.
@@ -192,6 +204,8 @@ public:
   }
 
 private:
+  [[nodiscard]] kernels::DFlashSampling PrepareDraftSampling(
+      const sampling::SamplerState* sampler, hipStream_t stream);
   QwenDFlashGpuExecutor(std::shared_ptr<const QwenDFlashGpuModel> model,
                         std::uint32_t max_context);
   friend class models::qwen::ContinuationAdapter;
@@ -311,6 +325,8 @@ public:
   [[nodiscard]] bool SupportsSampledProposals() const noexcept override {
     return true;
   }
+  [[nodiscard]] speculative::DraftProposal ProposeForRequest(
+      const speculative::DraftProposalRequest& request) override;
   [[nodiscard]] std::vector<speculative::DraftProposal> ProposeBatch(
       std::span<const speculative::DraftProposalRequest> requests) override;
 
@@ -330,6 +346,7 @@ public:
     try {
       CheckContinuation();
       controller_.Reset();
+      lookup_.BeginRequest();
     } catch (...) {
       if (continuation_hooks_)
         continuation_hooks_->WriteFailed();
@@ -360,11 +377,19 @@ private:
   [[nodiscard]] speculative::DraftProposal ProposeImpl(
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
-      std::uint64_t* rng_state);
+      std::uint64_t* rng_state,
+      const sampling::SamplerState* sampler = nullptr);
+  [[nodiscard]] std::optional<speculative::DraftProposal> TryLookup(
+      std::span<const tokenization::TokenId> tokens, std::uint32_t position,
+      std::uint32_t limit, bool sampled);
 
   std::unique_ptr<QwenDFlashGpuExecutor> executor_;
   QwenDFlashGpuDraftConfig config_;
   speculative::DFlashLengthController controller_;
+  std::array<tokenization::TokenId, 3> lookup_boundaries_{};
+  speculative::PromptLookup<tokenization::TokenId> lookup_;
+  std::size_t lookup_start_{0};
+  bool lookup_proposal_{false};
   std::vector<float> pending_target_features_;
   std::vector<tokenization::TokenId> proposed_tokens_;
   // Diagnostics only (GUFO_QWEN27_DRAFTLOG): the pending proposal's draft

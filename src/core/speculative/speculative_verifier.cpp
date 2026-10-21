@@ -474,14 +474,12 @@ SpeculativeVerifier::PreparedStep SpeculativeVerifier::PrepareStep(
     return prepared;
   auto& working_sampler =
       prepared.sampled ? *prepared.working_sampler : request.sampler;
-  prepared.proposal =
-      prepared.random_sampling
-          ? draft_backend_->ProposeSampled(request.sequence, request.position,
-                                           prepared.max_draft_tokens,
-                                           request.sampler.config().temperature,
-                                           working_sampler.mutable_rng_state())
-          : draft_backend_->Propose(request.sequence, request.position,
-                                    prepared.max_draft_tokens);
+  prepared.proposal = draft_backend_->ProposeForRequest(
+      {draft_backend_, request.sequence, request.position,
+       prepared.max_draft_tokens,
+       prepared.random_sampling ? request.sampler.config().temperature : 0.0F,
+       prepared.random_sampling ? working_sampler.mutable_rng_state() : nullptr,
+       &working_sampler});
   PrepareProposalVerification(prepared, request, defer_target_only);
   return prepared;
 }
@@ -801,6 +799,8 @@ SpeculativeVerifier::ProcessVerificationChunk(
   StepResult result;
   result.draft_count = num_draft;
   result.accepted_count = accepted_count;
+  result.lookup_tokens = proposal.from_lookup ? num_draft : 0;
+  result.lookup_accepted_tokens = proposal.from_lookup ? accepted_count : 0;
   result.emitted_tokens.insert(
       result.emitted_tokens.end(), proposal.tokens.begin(),
       proposal.tokens.begin() + static_cast<std::ptrdiff_t>(accepted_count));
@@ -873,7 +873,8 @@ std::vector<SpeculativeVerifier::StepResult> SpeculativeVerifier::VerifyBatch(
           {verifier.draft_backend_, request.sequence, request.position,
            step.max_draft_tokens,
            step.random_sampling ? request.sampler.config().temperature : 0.0F,
-           step.random_sampling ? sampler.mutable_rng_state() : nullptr});
+           step.random_sampling ? sampler.mutable_rng_state() : nullptr,
+           &sampler});
     }
   }
   if (!draft_requests.empty()) {
@@ -1100,6 +1101,8 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
   StepResult result;
   result.draft_count = num_draft;
   result.accepted_count = accepted_count;
+  result.lookup_tokens = proposal.from_lookup ? num_draft : 0;
+  result.lookup_accepted_tokens = proposal.from_lookup ? accepted_count : 0;
 
   // Build emitted tokens: accepted draft tokens + correction token
   for (std::size_t i = 0; i < accepted_count; ++i) {

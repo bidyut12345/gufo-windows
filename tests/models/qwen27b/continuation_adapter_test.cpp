@@ -786,6 +786,83 @@ void CheckDraftComponents(std::shared_ptr<const hip::QwenGpuModel> model,
   Require(Capture(adapter, *source, pool).bytes ==
               Capture(adapter, *destination, pool).bytes,
           "draft controller or pending features diverged after feedback");
+  // Establish an actual sampled copy before checkpointing its private resume
+  // state. Teacher-forcing a repeated suffix isolates cache behavior from the
+  // model's preference for any particular continuation.
+  Load(adapter, *source, checkpoint, pool);
+  Require(adapter.Validate(*source, checkpoint.positions),
+          "reload copy source");
+  adapter.GetFrontier(*source) = {};
+  bool copied = false;
+  const auto advance = [&](Token token) {
+    (void)a.ForwardToken(token, tokens.size());
+    tokens.push_back(token);
+    da.UpdateTargetHidden(a.CopyLastHidden());
+  };
+  for (std::size_t round = 0; round < 32 && !copied; ++round) {
+    const auto anchor = fixture[tokens.size() % fixture.size()];
+    auto sequence = tokens;
+    sequence.push_back(anchor);
+    const auto proposal =
+        da.ProposeSampled(sequence, tokens.size(), 4, 0.8F, &rng_a);
+    copied = proposal.from_lookup;
+    if (copied)
+      for (std::size_t i = 0; i < proposal.tokens.size(); ++i)
+        Require(proposal.tokens[i] ==
+                    fixture[(tokens.size() + 1 + i) % fixture.size()],
+                "copy differs from the independent repeating fixture");
+    da.AcceptFeedback(
+        copied ? std::span(proposal.tokens) : std::span<const Token>{},
+        fixture.front());
+    advance(anchor);
+    if (copied)
+      for (auto token : proposal.tokens)
+        advance(token);
+  }
+  Require(copied, "component fixture never exercised lookup");
+  const auto copy_checkpoint = Capture(adapter, *source, pool);
+  Load(adapter, *destination, copy_checkpoint, pool);
+  Require(adapter.Validate(*destination, copy_checkpoint.positions),
+          "lookup component restore failed");
+  Require(Capture(adapter, *destination, pool).bytes == copy_checkpoint.bytes,
+          "lookup private state changed after restore");
+  auto sequence = tokens;
+  sequence.push_back(fixture[tokens.size() % fixture.size()]);
+  rng_b = rng_a;
+  const auto initial_rng = rng_a;
+  const auto original =
+      da.ProposeSampled(sequence, tokens.size(), 4, 0.8F, &rng_a);
+  const auto restored =
+      db.ProposeSampled(sequence, tokens.size(), 4, 0.8F, &rng_b);
+  Require(original.from_lookup && restored.from_lookup &&
+              original.tokens == restored.tokens &&
+              original.candidate_probabilities ==
+                  restored.candidate_probabilities &&
+              rng_a == initial_rng && rng_b == initial_rng,
+          "component restore lost a sampled copy or consumed RNG");
+  // Draft metadata is the first of its metadata, layer K/V and feature parts.
+  const auto metadata_index = adapter.Components().size() -
+                              2 * draft_model->GetDFlashConfig().num_layers - 2;
+  auto legacy = copy_checkpoint;
+  Require(legacy.bytes[metadata_index].size() == 64,
+          "draft metadata fixture layout changed");
+  legacy.bytes[metadata_index][0] = std::byte{1};
+  std::fill(legacy.bytes[metadata_index].begin() + 24,
+            legacy.bytes[metadata_index].begin() + 32, std::byte{0});
+  Load(adapter, *destination, legacy, pool);
+  Require(adapter.Validate(*destination, legacy.positions),
+          "old draft component metadata must remain readable");
+  const auto old = db.ProposeSampled(sequence, tokens.size(), 4, 0.8F, &rng_b);
+  Require(!old.from_lookup && rng_b != initial_rng,
+          "old metadata must start without a previous request's copy state");
+  auto invalid = copy_checkpoint;
+  std::fill(invalid.bytes[metadata_index].begin() + 28,
+            invalid.bytes[metadata_index].begin() + 32, std::byte{0xff});
+  invalid.bytes[metadata_index][28] = std::byte{0xfe};
+  Load(adapter, *destination, invalid, pool);
+  Require(!adapter.Validate(*destination, invalid.positions),
+          "component restore accepted a lookup boundary beyond the history");
+  std::cout << "draft_components_lookup,PASS\n";
   std::cout << "draft_components,PASS\n";
 }
 }  // namespace

@@ -50,8 +50,8 @@ slots with duplicate deep conversations. This checks that a short request
 after cancellation can reuse a redundant slot while another live copy retains
 the generated frontier. It also rejects the roughly 280 ms restore stall.
 
-Flash-Next prompt lookup has a focused MTP runner. It requires actual accepted
-copies, compares isolated and C2/C4/C6/C8 requests under greedy and the model's
+Flash-Next MTP and Qwen27B DFlash2 prompt lookup have a focused runner. It
+requires actual accepted copies, compares isolated and C2/C4/C6/C8 requests under greedy and the model's
 default sampling, mixes greedy copies with new text at C8, and checks stops
 followed by full replay. It also checks top-k 64/65, disabled top-k and a
 65-token minimum support across warm replay and stops, covering compact
@@ -64,7 +64,11 @@ nix develop -c python3 tests/functional/prompt_lookup.py \
   --speculative mtp --mtp-model /path/to/mtp.gguf
 ```
 
-The runner owns eight sessions and the loopback listener. It retains individual
+For Qwen27B, substitute `--speculative dflash2 --dflash-model /path/to/draft.gguf`.
+Use `--max-concurrency 4` before `--` for a focused C2/C4 check; the default
+covers C2/C4/C6/C8.
+
+The runner owns its sessions and the loopback listener. It retains individual
 request timings and server logs, and stays outside hosted CI and `--suite all`.
 The native Flash-Next session test additionally checks full logits, RNG and
 snapshot restoration into previously used sessions.

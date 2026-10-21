@@ -39,7 +39,7 @@ struct Metadata {
   std::uint32_t residual_valid{}, image_bytes{};
   NgramHistory ngram;
   MtpLengthState policy;
-  PromptLookup::State lookup;
+  speculative::PromptLookup<>::State lookup;
   std::array<std::uint8_t, 32> image{};
 };
 static_assert(sizeof(Metadata) <= kContinuationMetadataBytes);
@@ -797,7 +797,7 @@ bool ContinuationAdapter::Validate(
       (metadata.residual_valid && !metadata.draft) ||
       (metadata.image_bytes != 0 && metadata.image_bytes != 32) ||
       !policy.Restore(metadata.policy) ||
-      !PromptLookup::Valid(metadata.lookup, metadata.target))
+      !speculative::PromptLookup<>::Valid(metadata.lookup, metadata.target))
     return refuse();
   try {
     if (layout_.Positions(metadata.target, metadata.draft, metadata.blocks,
