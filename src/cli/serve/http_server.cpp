@@ -195,6 +195,7 @@ bool IsPeerDisconnected(int fd) noexcept {
 #endif
   if ((descriptor.revents & POLLIN) == 0)
     return false;
+  char byte;
   const auto count =
       ::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
   return count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
@@ -1773,6 +1774,7 @@ void LoadingResponder::serve() {
       if (remaining <= 0 ||
           net::PollSocket(&client, 1, static_cast<int>(remaining)) <= 0)
         break;
+      char buffer[2048];
       const ssize_t received =
           ::recv(client_fd, buffer, static_cast<int>(sizeof(buffer)), 0);
       if (received <= 0)
