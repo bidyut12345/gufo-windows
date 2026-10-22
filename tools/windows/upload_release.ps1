@@ -50,7 +50,16 @@ if (-not $release) {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases" -Headers $headers -Method Post -Body $jsonBytes -ContentType "application/json; charset=utf-8"
     Write-Host "Created release ID: $($release.id)" -ForegroundColor Green
 } else {
-    Write-Host "Found existing release ID: $($release.id)" -ForegroundColor Green
+    Write-Host "Updating existing release ID: $($release.id)..." -ForegroundColor Green
+    $updatePayload = @{
+        name = "Gufo for Windows $Tag"
+        body = $bodyText
+    }
+    if ($TargetCommitish) {
+        $updatePayload["target_commitish"] = $TargetCommitish
+    }
+    $updateBytes = [System.Text.Encoding]::UTF8.GetBytes(($updatePayload | ConvertTo-Json -Depth 5))
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/$($release.id)" -Headers $headers -Method Patch -Body $updateBytes -ContentType "application/json; charset=utf-8"
 }
 
 # Upload files
