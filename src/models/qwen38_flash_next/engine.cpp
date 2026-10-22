@@ -190,11 +190,21 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
       break;
   }
   exec.max_context = options.max_context;
+  m->config_ = c;
+  m->model_name_ = std::string(m->reader_->GetMetadataString("general.name")
+                                   .value_or("Qwen3.8-Flash-Next"));
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
     return nullptr;
   }
+  // Weights have been uploaded to GPU VRAM and executor is ready.
+  // Release the host GGUF readers and file mappings to unmap the 100+ GiB
+  // virtual memory from the process address space.
+  m->weights_.reset();
+  m->mtp_weights_.reset();
+  m->reader_.reset();
+  m->mtp_reader_.reset();
   return m;
 }
 
@@ -250,7 +260,7 @@ bool Model::IsStopToken(std::int32_t token) const noexcept {
 }
 
 std::uint32_t Model::VocabSize() const noexcept {
-  return weights_->config.vocab_size;
+  return config_.vocab_size;
 }
 
 std::uint32_t Model::PrefillCapacity() const noexcept {
@@ -273,12 +283,11 @@ bool Model::InDraftSubset(std::int32_t token) const {
 }
 
 std::string Model::ModelName() const {
-  return std::string(reader_->GetMetadataString("general.name")
-                         .value_or("Qwen3.8-Flash-Next"));
+  return model_name_;
 }
 
 const Config& Model::config() const noexcept {
-  return weights_->config;
+  return config_;
 }
 
 std::size_t Model::ResidentBytes() const noexcept {
