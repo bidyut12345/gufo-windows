@@ -2961,24 +2961,10 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       <button id="btn-save-drawer" class="btn-dialog-submit" style="margin-top:10px;">Save Settings</button>
     </div>
 
-    <!-- Tab 2: Tools & MCP Settings (Moved to main setting right side dialog!) -->
+    <!-- Tab 2: Tools & MCP Settings -->
     <div id="drawer-pane-tools" class="drawer-body" style="display:none;">
-      <!-- Master Autonomous Tool Execution Switch -->
-      <div style="background:var(--bg-elevated); border:1px solid var(--border-strong); border-radius:var(--radius); padding:10px 14px; display:flex; justify-content:space-between; align-items:center;">
-        <div>
-          <div style="font-weight:600; font-size:0.86rem; color:var(--text); display:flex; align-items:center; gap:6px;">
-            <span>⚡ Autonomous Tool Execution</span>
-          </div>
-          <div style="font-size:0.75rem; color:var(--text-dim); margin-top:2px;">Turn off to disable all tool calling and run pure conversation mode.</div>
-        </div>
-        <label class="switch-toggle" title="Enable or disable autonomous tools">
-          <input type="checkbox" id="modal-chk-master-tools" checked>
-          <span class="slider"></span>
-        </label>
-      </div>
-
       <!-- Tools Subtabs -->
-      <div class="tools-tabs" style="background:transparent; padding:0; border-bottom:1px solid var(--border); margin-top:4px;">
+      <div class="tools-tabs" style="background:transparent; padding:0; border-bottom:1px solid var(--border); margin-top:0;">
         <button id="tab-inbuilt-tools" class="tools-tab-btn active" type="button">Inbuilt Tools</button>
         <button id="tab-mcp-servers" class="tools-tab-btn" type="button">MCP Servers</button>
         <button id="tab-custom-tools" class="tools-tab-btn" type="button">Custom Tools</button>
