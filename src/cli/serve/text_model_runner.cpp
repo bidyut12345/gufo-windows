@@ -1544,6 +1544,8 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
     state.SetCancellationCheck({});
   // Fallback captures and admission must finish before pinning starts. The
   // chunk's GPU work can overlap preparation; cached decode never calls it.
+  if (impl_->snapshot_future.valid())
+    impl_->FinishSnapshot();
   impl_->lease.PreparePrefill(std::min(remaining, max_input_tokens));
   // The following step starts at this frontier and stops at the next one, so
   // a runner may read its inputs during this step.

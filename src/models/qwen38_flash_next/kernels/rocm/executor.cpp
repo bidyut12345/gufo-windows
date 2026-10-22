@@ -4400,10 +4400,7 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
                 pending->extras_.push_back({offset, bytes, destination});
                 extra_used += bytes;
               }
-              if (pending)
-                transfer->Enqueue(destination, device, bytes, kind);
-              else
-                transfer->Copy(destination, device, bytes);
+              transfer->Enqueue(destination, device, bytes, kind);
             }
             return true;
           }) != 0;
