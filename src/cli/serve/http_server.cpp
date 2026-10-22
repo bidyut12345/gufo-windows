@@ -101,10 +101,21 @@ private:
 // Socket I/O helpers
 // ---------------------------------------------------------------------------
 
+#if defined(_WIN32)
+inline ssize_t SocketRead(int fd, void* buf, std::size_t want) {
+  return ::recv(static_cast<SOCKET>(fd), static_cast<char*>(buf),
+                static_cast<int>(std::min<std::size_t>(want, 65536)), 0);
+}
+#else
+inline ssize_t SocketRead(int fd, void* buf, std::size_t want) {
+  return ::read(fd, buf, want);
+}
+#endif
+
 bool ReadUntil(std::string& out, int fd, std::string_view delim) {
   char buf[4096];
   while (out.find(delim) == std::string::npos) {
-    const ssize_t n = gufo::platform::SocketRead(fd, buf, sizeof(buf));
+    const ssize_t n = SocketRead(fd, buf, sizeof(buf));
     if (n <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(n));
@@ -120,7 +131,7 @@ bool ReadN(std::string& out, int fd, std::size_t n) {
   char buf[4096];
   while (got < n) {
     const std::size_t want = std::min(sizeof(buf), n - got);
-    const ssize_t r = gufo::platform::SocketRead(fd, buf, want);
+    const ssize_t r = SocketRead(fd, buf, want);
     if (r <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(r));
@@ -184,9 +195,8 @@ bool IsPeerDisconnected(int fd) noexcept {
 #endif
   if ((descriptor.revents & POLLIN) == 0)
     return false;
-  char byte;
   const auto count =
-      gufo::platform::SocketRecv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+      ::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
   return count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
                         errno != EINTR);
 }
@@ -1693,12 +1703,15 @@ LoadingResponder::LoadingResponder(const std::string& host, int port) {
   const int yes = 1;
   const int no = 0;
 #ifdef _WIN32
-  gufo::platform::SetSocketOption(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, yes);
+  const BOOL yes_win = TRUE;
+  ::setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               reinterpret_cast<const char*>(&yes_win), sizeof(yes_win));
 #else
   ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 #endif
   if ((addr.ss_family == AF_INET6 &&
-       gufo::platform::SetSocketOption(fd, IPPROTO_IPV6, IPV6_V6ONLY, no) !=
+       ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+                    reinterpret_cast<const char*>(&no), sizeof(no)) !=
            0) ||
       ::bind(fd, reinterpret_cast<sockaddr*>(&addr), addr_length) < 0 ||
       ::listen(fd, 16) < 0) {
@@ -1760,9 +1773,8 @@ void LoadingResponder::serve() {
       if (remaining <= 0 ||
           net::PollSocket(&client, 1, static_cast<int>(remaining)) <= 0)
         break;
-      char buffer[2048];
       const ssize_t received =
-          gufo::platform::SocketRecv(client_fd, buffer, sizeof(buffer), 0);
+          ::recv(client_fd, buffer, static_cast<int>(sizeof(buffer)), 0);
       if (received <= 0)
         break;
       head.append(buffer, static_cast<std::size_t>(received));
@@ -1910,8 +1922,9 @@ bool HttpServer::start(std::string* error) {
 #ifdef _WIN32
   // Windows SO_REUSEADDR lets another process steal a bound port; exclusive
   // use is the Linux SO_REUSEADDR behavior for a listening server.
-  gufo::platform::SetSocketOption(listen_fd_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
-                                  yes);
+  const BOOL yes_win = TRUE;
+  ::setsockopt(listen_fd_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               reinterpret_cast<const char*>(&yes_win), sizeof(yes_win));
 #else
   ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 #endif
@@ -1919,8 +1932,8 @@ bool HttpServer::start(std::string* error) {
   // follows net.ipv6.bindv6only, which differs between hosts.
   const int no = 0;
   if (addr.ss_family == AF_INET6 &&
-      gufo::platform::SetSocketOption(listen_fd_, IPPROTO_IPV6, IPV6_V6ONLY,
-                                      no) != 0) {
+      ::setsockopt(listen_fd_, IPPROTO_IPV6, IPV6_V6ONLY,
+                   reinterpret_cast<const char*>(&no), sizeof(no)) != 0) {
     if (error != nullptr)
       *error = "setsockopt(IPV6_V6ONLY) failed";
     net::CloseSocket(listen_fd_);

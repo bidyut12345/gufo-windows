@@ -640,7 +640,6 @@ void PrintServeHelp(std::string_view program_name,
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
-    bool enable_yarn = false;
     std::string trace_path;
 
     gufo::cli::ArgParser parser(
@@ -1256,7 +1255,6 @@ int RunServe(std::span<const char* const> args) {
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
-    bool enable_yarn = false;
     std::string trace_path;
 
     gufo::cli::ArgParser llm_parser(
