@@ -6343,6 +6343,34 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
     function appendMessage(m, msgIdx) {
       if (m.role === 'tool') {
+        const isAsk = isAskUserTool(m.name) || (m.content && (m.content.startsWith('[ask_user]:') || m.content.startsWith('[ask_question]:')));
+        if (isAsk) {
+          let ansText = m.content || '';
+          try {
+            const raw = m.content.includes(':') ? m.content.substring(m.content.indexOf(':') + 1).trim() : m.content;
+            const p = JSON.parse(raw);
+            if (p && p.response) ansText = p.response;
+          } catch (_) {}
+          const card = document.createElement('div');
+          card.className = 'tool-call-card inquiry-card';
+          card.style.borderColor = 'rgba(59, 130, 246, 0.4)';
+          card.style.background = 'rgba(59, 130, 246, 0.05)';
+          card.innerHTML = `
+            <div class="tool-call-header" style="cursor:default;">
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span style="font-size:1.1rem;">❓</span>
+                <span class="tool-call-name" style="color:var(--text);">Model Clarification Question</span>
+              </div>
+              <span class="tool-status-pill tool-status-success">✓ Answered</span>
+            </div>
+            <div style="padding:8px 14px 10px 14px; font-size:0.88rem; color:var(--text);">
+              You answered: <b style="color:var(--accent);">${escapeHtml(ansText)}</b>
+            </div>
+          `;
+          UI.messagesContainer.appendChild(card);
+          return card;
+        }
+
         const card = document.createElement('div');
         card.className = 'tool-call-card';
         card.innerHTML = `
@@ -6882,18 +6910,21 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         card.style.background = 'rgba(59, 130, 246, 0.08)';
 
         let rawQ = parsedArgs.question || parsedArgs.prompt || parsedArgs.query ||
-                   parsedArgs.message || parsedArgs.text || parsedArgs.q;
+                   parsedArgs.message || parsedArgs.text || parsedArgs.q ||
+                   parsedArgs.input || parsedArgs.title || parsedArgs.description;
         if (!rawQ && parsedArgs.questions && Array.isArray(parsedArgs.questions) && parsedArgs.questions.length > 0) {
           const firstQ = parsedArgs.questions[0];
-          rawQ = typeof firstQ === 'string' ? firstQ : (firstQ.question || firstQ.prompt || firstQ.text);
+          rawQ = typeof firstQ === 'string' ? firstQ : (firstQ.question || firstQ.prompt || firstQ.text || firstQ.query || firstQ.message);
         }
+        if (!rawQ && typeof parsedArgs === 'string') rawQ = parsedArgs;
+        if (!rawQ && parsedArgs.raw) rawQ = parsedArgs.raw;
         const qText = rawQ || 'Gufo is asking for your input:';
 
-        let rawOpts = parsedArgs.options || parsedArgs.choices || parsedArgs.suggestions;
+        let rawOpts = parsedArgs.options || parsedArgs.choices || parsedArgs.suggestions || parsedArgs.items;
         if (!rawOpts && parsedArgs.questions && Array.isArray(parsedArgs.questions) && parsedArgs.questions.length > 0 && parsedArgs.questions[0].options) {
           rawOpts = parsedArgs.questions[0].options;
         }
-        const options = Array.isArray(rawOpts) ? rawOpts.map(o => typeof o === 'string' ? o : (o.text || o.label || JSON.stringify(o))) : [];
+        const options = Array.isArray(rawOpts) ? rawOpts.map(o => typeof o === 'string' ? o : (o.text || o.label || o.title || JSON.stringify(o))) : [];
         const allowText = parsedArgs.allow_text_input !== false && parsedArgs.allow_text !== false;
 
         let optionsHtml = '';
@@ -7112,6 +7143,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       let startTime = performance.now();
       let accumulatedUsage = null;
       let accumulatedTimings = null;
+      let fetchUrl = APP.activeId ? `/api/conversations/${APP.activeId}/generate` : '/v1/chat/completions';
 
       try {
         const reqModel = APP.modelId || (UI.modelPill.textContent !== 'loading model...' ? UI.modelPill.textContent : 'default');
@@ -7175,7 +7207,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         }
 
         payload.is_resume = true;
-        const fetchUrl = APP.activeId ? `/api/conversations/${APP.activeId}/generate` : '/v1/chat/completions';
+        fetchUrl = APP.activeId ? `/api/conversations/${APP.activeId}/generate` : '/v1/chat/completions';
         const res = await fetch(fetchUrl, {
           method: 'POST',
           headers: {
@@ -7691,6 +7723,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           let accumulatedUsage = null;
           let accumulatedTimings = null;
           let wasCancelled = false;
+          let fetchUrl = APP.activeId ? `/api/conversations/${APP.activeId}/generate` : '/v1/chat/completions';
 
           if (UI.footerSpeedMetrics) {
             UI.footerSpeedMetrics.textContent = 'generating...';
@@ -7737,7 +7770,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               payload.tool_choice = 'auto';
             }
 
-            const fetchUrl = APP.activeId ? `/api/conversations/${APP.activeId}/generate` : '/v1/chat/completions';
+            fetchUrl = APP.activeId ? `/api/conversations/${APP.activeId}/generate` : '/v1/chat/completions';
             const res = await fetch(fetchUrl, {
               method: 'POST',
               headers: {
