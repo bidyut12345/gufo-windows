@@ -444,6 +444,35 @@ const std::vector<InbuiltToolDefinition>& ToolEngine::GetInbuiltTools() {
       list.push_back(std::move(tool));
     }
 
+    // 11. ask_question (alias for ask_user)
+    {
+      InbuiltToolDefinition tool;
+      tool.name = "ask_question";
+      tool.description = "Ask the user a question with optional choice buttons or text write-in when you need more information, clarification, or confirmation.";
+      tool.parameters = json::parse(R"json({
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "The question or prompt to present to the user."
+          },
+          "options": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional list of quick selectable choices for the user (e.g. ['Yes', 'No'])."
+          },
+          "allow_text_input": {
+            "type": "boolean",
+            "description": "Whether the user can provide a freeform text answer (default true)."
+          }
+        },
+        "required": ["question"]
+      })json");
+      tool.enabled_by_default = true;
+      tool.dangerous = false;
+      list.push_back(std::move(tool));
+    }
+
     return list;
   }();
 
@@ -451,8 +480,9 @@ const std::vector<InbuiltToolDefinition>& ToolEngine::GetInbuiltTools() {
 }
 
 const InbuiltToolDefinition* ToolEngine::FindInbuiltTool(const std::string& name) {
+  const std::string canonical = (name == "ask_question" || name == "askUser") ? "ask_user" : name;
   for (const auto& t : GetInbuiltTools()) {
-    if (t.name == name) {
+    if (t.name == canonical || t.name == name) {
       return &t;
     }
   }
@@ -465,9 +495,19 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
                                        const std::string& user_root_dir) {
   ToolExecutionResult res;
 
-  if (name == "ask_user") {
+  if (name == "ask_user" || name == "ask_question" || name == "askUser") {
     res.success = true;
-    res.output = arguments.member_str("question");
+    if (arguments.find("question") && arguments.find("question")->is_string()) {
+      res.output = arguments.member_str("question");
+    } else if (arguments.find("prompt") && arguments.find("prompt")->is_string()) {
+      res.output = arguments.member_str("prompt");
+    } else if (arguments.find("message") && arguments.find("message")->is_string()) {
+      res.output = arguments.member_str("message");
+    } else if (arguments.find("query") && arguments.find("query")->is_string()) {
+      res.output = arguments.member_str("query");
+    } else {
+      res.output = arguments.dump();
+    }
     return res;
   }
 

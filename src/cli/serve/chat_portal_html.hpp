@@ -3551,6 +3551,15 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       return d.innerHTML;
     }
 
+    function isAskUserTool(name) {
+      if (!name) return false;
+      const lower = String(name).toLowerCase().replace(/[^a-z0-9_]/g, '');
+      return lower === 'ask_user' || lower === 'askuser' ||
+             lower === 'ask_question' || lower === 'askquestion' ||
+             lower === 'user_inquiry' || lower === 'inquire' ||
+             lower === 'question';
+    }
+
     function parseMarkdown(md) {
       if (!md) return '';
       const codeBlocks = [];
@@ -4506,7 +4515,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       if (UI.chkMasterTools) {
         UI.chkMasterTools.checked = APP.toolsEnabled;
       }
-      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.name !== 'ask_user' && t.enabled).length;
+      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => !isAskUserTool(t.name) && t.enabled).length;
       const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
       const total = activeInbuilt + activeCustom;
       if (UI.attachToolsStatusText) {
@@ -5597,7 +5606,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     }
 
     function updateToolsPill() {
-      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.name !== 'ask_user' && t.enabled).length;
+      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => !isAskUserTool(t.name) && t.enabled).length;
       const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
       const total = activeInbuilt + activeCustom;
 
@@ -5621,7 +5630,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     function renderInbuiltTools() {
       if (!UI.inbuiltToolsList) return;
       UI.inbuiltToolsList.innerHTML = '';
-      const visibleTools = (APP.tools.inbuilt || []).filter(t => t.name !== 'ask_user');
+      const visibleTools = (APP.tools.inbuilt || []).filter(t => !isAskUserTool(t.name));
       if (visibleTools.length === 0) {
         UI.inbuiltToolsList.innerHTML = '<div style="color:var(--text-dim); font-size:0.8rem; padding:8px;">No inbuilt tools available.</div>';
         return;
@@ -6106,7 +6115,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       if (rawWd.startsWith(userPrefix)) rawWd = rawWd.slice(userPrefix.length);
       const wdName = rawWd ? `UserData/${username}/${rawWd}` : `UserData/${username}/...`;
 
-      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => t.name !== 'ask_user' && t.enabled).length;
+      const activeInbuilt = (APP.tools.inbuilt || []).filter(t => !isAskUserTool(t.name) && t.enabled).length;
       const activeCustom = (APP.tools.customTools || []).filter(t => t.enabled).length;
       const totalTools = activeInbuilt + activeCustom;
       const toolsDesc = APP.toolsEnabled ? `${totalTools} tools active` : 'Tools disabled';
@@ -6740,13 +6749,40 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       }
     };
 
+    const ASK_QUESTION_TOOL = {
+      type: 'function',
+      function: {
+        name: 'ask_question',
+        description: 'Ask the user a question or clarify intent with optional selectable choices or text input.',
+        parameters: {
+          type: 'object',
+          properties: {
+            question: {
+              type: 'string',
+              description: 'The question or prompt to present to the user.'
+            },
+            options: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Optional list of quick selectable choices for the user (e.g. ["Yes", "No"]).'
+            },
+            allow_text_input: {
+              type: 'boolean',
+              description: 'Whether the user can provide a freeform text answer (default true).'
+            }
+          },
+          required: ['question']
+        }
+      }
+    };
+
     function getActiveToolsList() {
-      // ask_user tool always stays active without needing to be configured in settings
-      const tools = [{ ...ASK_USER_TOOL }];
+      // ask_user and ask_question tools always stay active without needing to be configured in settings
+      const tools = [{ ...ASK_USER_TOOL }, { ...ASK_QUESTION_TOOL }];
       if (!APP.toolsEnabled) return tools;
       if (APP.tools.inbuilt) {
         for (const t of APP.tools.inbuilt) {
-          if (t.name === 'ask_user') continue;
+          if (isAskUserTool(t.name)) continue;
           if (t.enabled) {
             tools.push({
               type: 'function',
@@ -6778,6 +6814,65 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       return tools;
     }
 
+    function extractToolCallsFromText(str) {
+      if (!str || typeof str !== 'string') return [];
+      const calls = [];
+
+      // 1. Check for <tool_call>...</tool_call>
+      const tcMatches = [...str.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/gi)];
+      for (const m of tcMatches) {
+        const body = m[1].trim();
+        try {
+          const parsed = JSON.parse(body);
+          if (parsed && parsed.name) {
+            calls.push({
+              id: 'call_' + Math.random().toString(36).slice(2, 9),
+              name: parsed.name,
+              args: typeof parsed.arguments === 'object' ? JSON.stringify(parsed.arguments) : (parsed.arguments || '{}')
+            });
+            continue;
+          }
+        } catch (_) {}
+
+        const fnMatch = body.match(/<function=([a-zA-Z0-9_\-]+)>([\s\S]*?)<\/function>/i);
+        if (fnMatch) {
+          const fnName = fnMatch[1];
+          const innerParams = fnMatch[2];
+          const paramMatches = [...innerParams.matchAll(/<parameter=([a-zA-Z0-9_\-]+)>([\s\S]*?)<\/parameter>/gi)];
+          const argsObj = {};
+          for (const pm of paramMatches) {
+            argsObj[pm[1]] = pm[2].trim();
+          }
+          calls.push({
+            id: 'call_' + Math.random().toString(36).slice(2, 9),
+            name: fnName,
+            args: JSON.stringify(argsObj)
+          });
+        }
+      }
+
+      // 2. Direct <function=name>...</function> outside <tool_call>
+      if (calls.length === 0) {
+        const directFnMatches = [...str.matchAll(/<function=([a-zA-Z0-9_\-]+)>([\s\S]*?)<\/function>/gi)];
+        for (const fm of directFnMatches) {
+          const fnName = fm[1];
+          const innerParams = fm[2];
+          const paramMatches = [...innerParams.matchAll(/<parameter=([a-zA-Z0-9_\-]+)>([\s\S]*?)<\/parameter>/gi)];
+          const argsObj = {};
+          for (const pm of paramMatches) {
+            argsObj[pm[1]] = pm[2].trim();
+          }
+          calls.push({
+            id: 'call_' + Math.random().toString(36).slice(2, 9),
+            name: fnName,
+            args: JSON.stringify(argsObj)
+          });
+        }
+      }
+
+      return calls;
+    }
+
     // Interactive Model Clarification Question
     function askUserInquiry(tc, parsedArgs) {
       return new Promise((resolve) => {
@@ -6786,9 +6881,20 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         card.style.borderColor = 'var(--accent)';
         card.style.background = 'rgba(59, 130, 246, 0.08)';
 
-        const qText = parsedArgs.question || parsedArgs.q || 'Gufo is asking for your input:';
-        const options = Array.isArray(parsedArgs.options) ? parsedArgs.options : [];
-        const allowText = parsedArgs.allow_text_input !== false;
+        let rawQ = parsedArgs.question || parsedArgs.prompt || parsedArgs.query ||
+                   parsedArgs.message || parsedArgs.text || parsedArgs.q;
+        if (!rawQ && parsedArgs.questions && Array.isArray(parsedArgs.questions) && parsedArgs.questions.length > 0) {
+          const firstQ = parsedArgs.questions[0];
+          rawQ = typeof firstQ === 'string' ? firstQ : (firstQ.question || firstQ.prompt || firstQ.text);
+        }
+        const qText = rawQ || 'Gufo is asking for your input:';
+
+        let rawOpts = parsedArgs.options || parsedArgs.choices || parsedArgs.suggestions;
+        if (!rawOpts && parsedArgs.questions && Array.isArray(parsedArgs.questions) && parsedArgs.questions.length > 0 && parsedArgs.questions[0].options) {
+          rawOpts = parsedArgs.questions[0].options;
+        }
+        const options = Array.isArray(rawOpts) ? rawOpts.map(o => typeof o === 'string' ? o : (o.text || o.label || JSON.stringify(o))) : [];
+        const allowText = parsedArgs.allow_text_input !== false && parsedArgs.allow_text !== false;
 
         let optionsHtml = '';
         if (options.length > 0) {
@@ -7509,9 +7615,19 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       UI.btnStop.style.display = 'flex';
       UI.slotText.textContent = '1/1 slots (processing)';
 
+      const activeTools = getActiveToolsList();
       const msgs = [];
-      if (APP.settings.system_prompt) {
-        msgs.push({ role: 'system', content: APP.settings.system_prompt });
+      let sysPrompt = APP.settings.system_prompt || '';
+      if (activeTools.length > 0) {
+        const toolGuidance = "When you need clarification, user confirmation, or additional information before answering or taking an action, invoke the 'ask_user' (or 'ask_question') tool so the user can respond interactively.";
+        sysPrompt = sysPrompt ? `${sysPrompt}\n\n${toolGuidance}` : toolGuidance;
+      }
+      if (activeTools.some(t => t.function && !isAskUserTool(t.function.name)) && APP.settings.working_directory) {
+        const wdNote = `Host server working directory: ${APP.settings.working_directory}`;
+        sysPrompt = sysPrompt ? `${sysPrompt}\n\n${wdNote}` : wdNote;
+      }
+      if (sysPrompt) {
+        msgs.push({ role: 'system', content: sysPrompt });
       }
       if (APP.activeConv && APP.activeConv.messages) {
         APP.activeConv.messages.forEach(m => {
@@ -7527,14 +7643,6 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             { type: 'image_url', image_url: { url: imageToSend } }
           ];
         }
-      }
-
-      const activeTools = getActiveToolsList();
-      if (activeTools.some(t => t.function && t.function.name !== 'ask_user') && APP.settings.working_directory) {
-        msgs.unshift({
-          role: 'system',
-          content: `Host server working directory: ${APP.settings.working_directory}`
-        });
       }
       let turns = 0;
       const MAX_TURNS = 5;
@@ -7834,20 +7942,14 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           group.appendChild(actions);
           scrollDown();
 
-          // Check if model emitted text-based tool calls e.g. <tool_call>{"name":"...","arguments":{...}}</tool_call>
-          if (activeTools.length > 0 && accumulatedToolCalls.length === 0 && assistantText.includes('<tool_call>')) {
-            const matches = [...assistantText.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/g)];
-            for (const m of matches) {
-              try {
-                const parsed = JSON.parse(m[1].trim());
-                if (parsed.name) {
-                  accumulatedToolCalls.push({
-                    id: 'call_' + Math.random().toString(36).slice(2, 9),
-                    name: parsed.name,
-                    args: typeof parsed.arguments === 'object' ? JSON.stringify(parsed.arguments) : (parsed.arguments || '{}')
-                  });
-                }
-              } catch (_) {}
+          // Check if model emitted text-based tool calls in assistantText or thoughtText
+          if (activeTools.length > 0 && accumulatedToolCalls.length === 0) {
+            let extracted = extractToolCallsFromText(assistantText);
+            if (extracted.length === 0 && (!assistantText.trim() || isAskUserTool(assistantText))) {
+              extracted = extractToolCallsFromText(thoughtText);
+            }
+            if (extracted.length > 0) {
+              accumulatedToolCalls.push(...extracted);
             }
           }
 
@@ -7905,8 +8007,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               parsedArgs = { raw: tc.args };
             }
 
-            // 1. Interactive Model Inquiry (ask_user)
-            if (tc.name === 'ask_user') {
+            // 1. Interactive Model Inquiry (ask_user / ask_question / etc.)
+            if (isAskUserTool(tc.name)) {
               const answer = await askUserInquiry(tc, parsedArgs);
               const resultStr = JSON.stringify({ response: answer, answered: true });
 

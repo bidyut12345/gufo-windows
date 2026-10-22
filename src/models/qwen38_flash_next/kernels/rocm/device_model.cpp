@@ -187,45 +187,56 @@ struct Uploader {
         static_cast<const std::uint8_t*>(region.data) + t.file_offset;
     const std::size_t row_src_bytes = t.cols / 256 * 210;
     const std::size_t row_dst_bytes = t.cols / 32 * sizeof(quant::block_q8_0);
-    std::vector<std::uint8_t> staged(dst_bytes);
+    constexpr std::uint32_t kChunkRows = 4096;
     const std::uint32_t workers =
         std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
-    std::vector<std::thread> threads;
-    for (std::uint32_t w = 0; w < workers; ++w) {
-      threads.emplace_back([&, w] {
-        std::vector<float> chunk(t.cols);
-        const std::uint32_t begin = static_cast<std::uint32_t>(
-            static_cast<std::uint64_t>(t.rows) * w / workers);
-        const std::uint32_t end = static_cast<std::uint32_t>(
-            static_cast<std::uint64_t>(t.rows) * (w + 1) / workers);
-        for (std::uint32_t row = begin; row < end; ++row) {
-          quant::DequantizeQ6_K(src + row * row_src_bytes, chunk.data(),
-                                t.cols);
-          auto* out = reinterpret_cast<quant::block_q8_0*>(
-              staged.data() + static_cast<std::size_t>(row) * row_dst_bytes);
-          for (std::size_t b = 0; b < t.cols / 32; ++b) {
-            const float* v = chunk.data() + b * 32;
-            float amax = 0.0f;
-            for (std::size_t j = 0; j < 32; ++j) {
-              amax = std::max(amax, std::fabs(v[j]));
-            }
-            const float dblock = amax / 127.0f;
-            const float id = dblock != 0.0f ? 1.0f / dblock : 0.0f;
-            out[b].d = Fp32ToF16(dblock);
-            for (std::size_t j = 0; j < 32; ++j) {
-              out[b].qs[j] = static_cast<std::int8_t>(std::roundf(v[j] * id));
+    std::vector<std::uint8_t> staged(kChunkRows * row_dst_bytes);
+    for (std::uint32_t row_start = 0; row_start < t.rows;
+         row_start += kChunkRows) {
+      const std::uint32_t chunk_rows = std::min<std::uint32_t>(
+          kChunkRows, static_cast<std::uint32_t>(t.rows) - row_start);
+      const std::size_t chunk_dst_bytes = chunk_rows * row_dst_bytes;
+      std::vector<std::thread> threads;
+      for (std::uint32_t w = 0; w < workers; ++w) {
+        threads.emplace_back([&, w] {
+          std::vector<float> chunk(t.cols);
+          const std::uint32_t begin = static_cast<std::uint32_t>(
+              static_cast<std::uint64_t>(chunk_rows) * w / workers);
+          const std::uint32_t end = static_cast<std::uint32_t>(
+              static_cast<std::uint64_t>(chunk_rows) * (w + 1) / workers);
+          for (std::uint32_t r = begin; r < end; ++r) {
+            const std::uint32_t row = row_start + r;
+            quant::DequantizeQ6_K(
+                src + static_cast<std::size_t>(row) * row_src_bytes,
+                chunk.data(), t.cols);
+            auto* out = reinterpret_cast<quant::block_q8_0*>(
+                staged.data() + static_cast<std::size_t>(r) * row_dst_bytes);
+            for (std::size_t b = 0; b < t.cols / 32; ++b) {
+              const float* v = chunk.data() + b * 32;
+              float amax = 0.0f;
+              for (std::size_t j = 0; j < 32; ++j) {
+                amax = std::max(amax, std::fabs(v[j]));
+              }
+              const float dblock = amax / 127.0f;
+              const float id = dblock != 0.0f ? 1.0f / dblock : 0.0f;
+              out[b].d = Fp32ToF16(dblock);
+              for (std::size_t j = 0; j < 32; ++j) {
+                out[b].qs[j] = static_cast<std::int8_t>(std::roundf(v[j] * id));
+              }
             }
           }
-        }
-      });
-    }
-    for (auto& thread : threads) {
-      thread.join();
-    }
-    if (hipMemcpy(ptr, staged.data(), dst_bytes, hipMemcpyHostToDevice) !=
-        hipSuccess) {
-      Fail("Q8_0 upload failed for " + std::string(t.name));
-      return d;
+        });
+      }
+      for (auto& thread : threads) {
+        thread.join();
+      }
+      if (hipMemcpy(static_cast<std::uint8_t*>(ptr) +
+                        static_cast<std::size_t>(row_start) * row_dst_bytes,
+                    staged.data(), chunk_dst_bytes, hipMemcpyHostToDevice) !=
+          hipSuccess) {
+        Fail("Q8_0 upload failed for " + std::string(t.name));
+        return d;
+      }
     }
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + dst_bytes, 0,
                          kTailMargin, nullptr);
@@ -271,52 +282,62 @@ struct Uploader {
     }
     allocations.push_back(ptr);
     bytes += dst_bytes + kTailMargin;
-    std::vector<std::uint8_t> staged(dst_bytes);
+    constexpr std::uint32_t kChunkRows = 4096;
     const std::uint32_t workers =
         std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
-    std::vector<std::thread> threads;
-    for (std::uint32_t w = 0; w < workers; ++w) {
-      threads.emplace_back([&, w] {
-        const std::uint32_t begin = static_cast<std::uint32_t>(
-            static_cast<std::uint64_t>(t.rows) * w / workers);
-        const std::uint32_t end = static_cast<std::uint32_t>(
-            static_cast<std::uint64_t>(t.rows) * (w + 1) / workers);
-        for (std::uint32_t row = begin; row < end; ++row) {
-          const auto* in = reinterpret_cast<const quant::block_q8_0*>(
-              src + static_cast<std::size_t>(row) * row_src_bytes);
-          auto* out = reinterpret_cast<BlockQ4_0*>(
-              staged.data() + static_cast<std::size_t>(row) * row_dst_bytes);
-          for (std::size_t b = 0; b < t.cols / 32; ++b) {
-            const float dblock = Fp16ToF32(in[b].d);
-            float v[32];
-            for (std::size_t j = 0; j < 32; ++j) {
-              v[j] = dblock * static_cast<float>(in[b].qs[j]);
-            }
-            float amax = 0.0f;
-            for (std::size_t j = 0; j < 32; ++j) {
-              amax = std::max(amax, std::fabs(v[j]));
-            }
-            const float scale = amax / 7.0f;
-            const float id = scale != 0.0f ? 1.0f / scale : 0.0f;
-            out[b].d = Fp32ToF16(scale);
-            for (std::size_t j = 0; j < 16; ++j) {
-              const int lo = std::clamp(
-                  static_cast<int>(std::lroundf(v[j] * id)) + 8, 0, 15);
-              const int hi = std::clamp(
-                  static_cast<int>(std::lroundf(v[j + 16] * id)) + 8, 0, 15);
-              out[b].qs[j] = static_cast<std::uint8_t>(lo | (hi << 4));
+    std::vector<std::uint8_t> staged(kChunkRows * row_dst_bytes);
+    for (std::uint32_t row_start = 0; row_start < t.rows;
+         row_start += kChunkRows) {
+      const std::uint32_t chunk_rows = std::min<std::uint32_t>(
+          kChunkRows, static_cast<std::uint32_t>(t.rows) - row_start);
+      const std::size_t chunk_dst_bytes = chunk_rows * row_dst_bytes;
+      std::vector<std::thread> threads;
+      for (std::uint32_t w = 0; w < workers; ++w) {
+        threads.emplace_back([&, w] {
+          const std::uint32_t begin = static_cast<std::uint32_t>(
+              static_cast<std::uint64_t>(chunk_rows) * w / workers);
+          const std::uint32_t end = static_cast<std::uint32_t>(
+              static_cast<std::uint64_t>(chunk_rows) * (w + 1) / workers);
+          for (std::uint32_t r = begin; r < end; ++r) {
+            const std::uint32_t row = row_start + r;
+            const auto* in = reinterpret_cast<const quant::block_q8_0*>(
+                src + static_cast<std::size_t>(row) * row_src_bytes);
+            auto* out = reinterpret_cast<BlockQ4_0*>(
+                staged.data() + static_cast<std::size_t>(r) * row_dst_bytes);
+            for (std::size_t b = 0; b < t.cols / 32; ++b) {
+              const float dblock = Fp16ToF32(in[b].d);
+              float v[32];
+              for (std::size_t j = 0; j < 32; ++j) {
+                v[j] = dblock * static_cast<float>(in[b].qs[j]);
+              }
+              float amax = 0.0f;
+              for (std::size_t j = 0; j < 32; ++j) {
+                amax = std::max(amax, std::fabs(v[j]));
+              }
+              const float scale = amax / 7.0f;
+              const float id = scale != 0.0f ? 1.0f / scale : 0.0f;
+              out[b].d = Fp32ToF16(scale);
+              for (std::size_t j = 0; j < 16; ++j) {
+                const int lo = std::clamp(
+                    static_cast<int>(std::lroundf(v[j] * id)) + 8, 0, 15);
+                const int hi = std::clamp(
+                    static_cast<int>(std::lroundf(v[j + 16] * id)) + 8, 0, 15);
+                out[b].qs[j] = static_cast<std::uint8_t>(lo | (hi << 4));
+              }
             }
           }
-        }
-      });
-    }
-    for (auto& thread : threads) {
-      thread.join();
-    }
-    if (hipMemcpy(ptr, staged.data(), dst_bytes, hipMemcpyHostToDevice) !=
-        hipSuccess) {
-      Fail("Q4_0 upload failed for " + std::string(t.name));
-      return d;
+        });
+      }
+      for (auto& thread : threads) {
+        thread.join();
+      }
+      if (hipMemcpy(static_cast<std::uint8_t*>(ptr) +
+                        static_cast<std::size_t>(row_start) * row_dst_bytes,
+                    staged.data(), chunk_dst_bytes, hipMemcpyHostToDevice) !=
+          hipSuccess) {
+        Fail("Q4_0 upload failed for " + std::string(t.name));
+        return d;
+      }
     }
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + dst_bytes, 0,
                          kTailMargin, nullptr);

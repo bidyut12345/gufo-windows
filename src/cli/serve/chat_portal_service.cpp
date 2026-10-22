@@ -872,7 +872,7 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
 
     json::Value inbuilt_arr = json::Value::array();
     for (const auto& t : ToolEngine::GetInbuiltTools()) {
-      if (t.name == "ask_user") {
+      if (t.name == "ask_user" || t.name == "ask_question") {
         continue;
       }
       json::Value tobj = json::Value::object();
@@ -947,7 +947,7 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
     try {
       const auto body = json::parse(req.body);
       const std::string name = body.contains("name") ? body.member_str("name") : body.member_str("tool_name");
-      if (tools_enabled.has_value() && !*tools_enabled && name != "ask_user") {
+      if (tools_enabled.has_value() && !*tools_enabled && name != "ask_user" && name != "ask_question" && name != "askUser") {
         return JsonErr(403, "Forbidden", "Tool execution is disabled by server --tools flag");
       }
       const auto* args_ptr = body.find("arguments");
