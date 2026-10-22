@@ -54,7 +54,7 @@ struct SessionSnapshotHeader {
   std::uint32_t image_identity_bytes;
   std::uint32_t policy_concurrency;
   std::uint32_t reserved{0};
-  speculative::PromptLookup<>::State lookup;
+  PromptLookup::State lookup;
 };
 static_assert(std::is_trivially_copyable_v<SessionSnapshotHeader>);
 
@@ -98,10 +98,18 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   m->weights_ = std::make_unique<ModelWeights>(std::move(*weights));
+  if (options.rope_scaling.has_value()) {
+    if (!ValidateRopeScaling(*options.rope_scaling,
+                             m->weights_->config.context_length, error_msg)) {
+      return nullptr;
+    }
+    m->weights_->config.rope_scaling = *options.rope_scaling;
+  }
   const Config& c = m->weights_->config;
-  if (options.max_context == 0 || options.max_context > c.context_length) {
+  if (options.max_context == 0 || options.max_context > c.MaxContextLength()) {
     AssignError(error_msg, "context exceeds the model's " +
-                               std::to_string(c.context_length) + " tokens");
+                               std::to_string(c.MaxContextLength()) +
+                               " tokens");
     return nullptr;
   }
   try {
@@ -140,8 +148,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   m->device_ = rocm::DeviceModel::Upload(*m->weights_, *m->reader_,
                                          m->mtp_weights_.get(),
-                                         m->mtp_reader_.get(), error_msg,
-                                         options.managed_experts);
+                                         m->mtp_reader_.get(), error_msg);
   if (!m->device_) {
     return nullptr;
   }
@@ -182,6 +189,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                         .value = KvCacheDtype::kQ4_K};
       break;
   }
+  exec.max_context = options.max_context;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
@@ -569,7 +577,7 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot draft policy is invalid");
     return false;
   }
-  if (!speculative::PromptLookup<>::Valid(header.lookup, header.token_count)) {
+  if (!PromptLookup::Valid(header.lookup, header.token_count)) {
     AssignError(error_msg, "session snapshot prompt-lookup state is invalid");
     return false;
   }
@@ -738,7 +746,20 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     const auto capacity = remaining <= exec.max_batch()
                               ? exec.max_batch()
                               : model_->PrefillCapacity();
-    const std::size_t n = std::min<std::size_t>(capacity, remaining);
+    std::size_t n = std::min<std::size_t>(capacity, remaining);
+    // Extended-context attention can fall back from WMMA to the per-token
+    // kernel. Its checkpoint must end a pass: the fused in-pass path requires
+    // WMMA for both query groups. Preserve ordinary split-pass arithmetic on
+    // either side of the boundary. Use the actual launch capability rather
+    // than the model's independently configured native context length.
+    if ((checkpoint || consume) && boundary > tokens_.size() &&
+        boundary < tokens_.size() + n &&
+        tokens_.size() + n >
+            rocm::WmmaCausalAttentionContextLimit(
+                model_->config().num_heads, model_->config().num_kv_heads,
+                model_->config().head_dim, model_->config().compress_ratio)) {
+      n = boundary - tokens_.size();
+    }
     const auto chunk = tokens.subspan(off, n);
     if (MtpEnabled() && !tokens_.empty() &&
         !DraftCatchUp(chunk[0], false, error_msg)) {
@@ -1031,11 +1052,11 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
   if (stop_at_eos && model_->IsStopToken(pending.chain.back())) {
     return false;
   }
-  const auto match = lookup_.Find(
-      tokens_, pending.chain,
-      pending.sampled ? speculative::PromptLookup<>::kSampledMinMatch
-                      : speculative::PromptLookup<>::kMinMatch,
-      require_resume);
+  const auto match =
+      lookup_.Find(tokens_, pending.chain,
+                   pending.sampled ? PromptLookup::kSampledMinMatch
+                                   : PromptLookup::kMinMatch,
+                   require_resume);
   if (match.length == 0) {
     return false;
   }
@@ -1110,28 +1131,9 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       sampler.config().uses_random_sampling() || batch_drafts.has_value()
           ? 0
           : occupancy;
-  // Pure greedy single-session cycles pick their width from the same runtime
-  // cost controller the batch path uses (one row): live cycle timings replace
-  // the static cost table, so cheaper cycles widen speculation. Seeded
-  // requests replay their exact widths (and tokens) across restores, sampled
-  // requests keep the acceptance-history policy and its fixed cost table for
-  // seeded replay, and penalty-greedy requests verify through the
-  // penalty-aware path whose costs the controller does not measure.
-  std::optional<std::uint32_t> learned;
-  if (MtpEnabled() && cap > 1 && !batch_drafts && sampler.config().seed < 0 &&
-      !sampler.config().uses_random_sampling() &&
-      !sampler.config().penalties_enabled()) {
-    const MtpBatchController::Row row{&draft_length_,
-                                      static_cast<std::uint32_t>(cap - 1)};
-    learned = model_->batch_policy_.Choose(
-        std::span<const MtpBatchController::Row>(&row, 1),
-        static_cast<std::uint32_t>(tokens_.size()));
-  }
-
   const std::size_t width =
       MtpEnabled() && cap > 1
           ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
-                 : learned    ? std::min<std::uint32_t>(*learned, cap - 1)
                               : draft_length_.Choose(
                                     static_cast<std::uint32_t>(cap - 1),
                                     static_cast<std::uint32_t>(tokens_.size()),
@@ -1161,6 +1163,45 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const bool gpu_greedy = sampler.config().temperature == 0.0F;
   const bool gpu_verification =
       gpu_greedy || rocm::Executor::CanCompactMtpVerification(sampler);
+  bool chained = false;
+  if (!defer_head && gpu_greedy && !sampled &&
+      !sampler.config().penalties_enabled()) {
+    // Greedy MTP keeps every draft token on the device: the catch-up and
+    // all proposals run as one chained submission and the pinned chain
+    // feeds verification. No per-draft host round trip. Active penalties
+    // change the greedy winner, and the pinned chain's device argmax is
+    // raw — those requests verify through the penalty-aware path instead.
+    std::vector<std::int32_t> replay;
+    std::int32_t replay_row = 0;
+    if (!DraftReplay(anchor, &replay, &replay_row, error_msg)) {
+      return false;
+    }
+    if (!replay.empty() && !exec.MtpDraftChain(*session_, replay, replay_row,
+                                               width - 1, error_msg)) {
+      return false;
+    }
+    if (!replay.empty()) {
+      pending->chain.assign(exec.ChainTokens(width - 1).begin(),
+                            exec.ChainTokens(width - 1).end());
+      chained = true;
+    }
+  }
+  if (chained) {
+    // Chained cycles skip the host drafting path below; the copy cursor and
+    // index still advance like any other speculative step, so a request that
+    // later drafts on the host path starts from the boundary and index it
+    // would have had.
+    if (lookup_.Step(base))
+      lookup_.Extend(tokens_, sampled);
+    pending->width = width;
+    pending->base = base;
+    pending->speculative = true;
+    pending->sampled = sampled;
+    pending->gpu_greedy = gpu_greedy;
+    pending->gpu_verification = gpu_verification;
+    pending->greedy_pinned = true;
+    return true;
+  }
   // A cycle-local proposal stream needs no pending RNG state in snapshots.
   // Target verification keeps its own draws after this independent seed.
   pending->draft_rng =
@@ -1180,8 +1221,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   // Both execution paths use the same request-local copy rule. Scheduling
   // a peer must not change a sampled request's proposals or RNG sequence.
-  // A request's first speculative step copies nothing (see
-  // speculative::PromptLookup<>).
+  // A request's first speculative step copies nothing (see PromptLookup).
   pending->lookup_cap = lookup_.Step(base) ? cap : 0;
   if (pending->lookup_cap != 0) {
     lookup_.Extend(tokens_, sampled);
@@ -1498,7 +1538,7 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
   std::array<BatchOutcome, 8> outcomes{};
   std::array<std::uint64_t, 8> epochs{};
   std::array<sampling::SamplerState::DrawState, 8> draws{};
-  std::array<speculative::PromptLookup<>::State, 8> lookup_states{};
+  std::array<PromptLookup::State, 8> lookup_states{};
   std::vector<Request> active;
   active.reserve(requests.size());
   Model* model = nullptr;

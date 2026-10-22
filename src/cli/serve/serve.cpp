@@ -634,6 +634,7 @@ void PrintServeHelp(std::string_view program_name,
     models::qwen38_flash_next::KvCacheMode kv_cache_mode =
         models::qwen38_flash_next::KvCacheMode::kF16;
     bool managed_experts = false;
+    bool enable_yarn = false;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -658,6 +659,10 @@ void PrintServeHelp(std::string_view program_name,
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    parser.AddFlag("", "--enable-yarn",
+                   "Flash-Next: static YaRN, required for --context above the "
+                   "native 262144; it applies to every request",
+                   "Model", &enable_yarn);
     parser.AddFlag(
         "", "--managed-experts",
         "Place MoE routed experts in managed memory to reduce dedicated VRAM footprint",
@@ -1244,6 +1249,7 @@ int RunServe(std::span<const char* const> args) {
     models::qwen38_flash_next::KvCacheMode kv_cache_mode =
         models::qwen38_flash_next::KvCacheMode::kF16;
     bool managed_experts = false;
+    bool enable_yarn = false;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -1267,6 +1273,10 @@ int RunServe(std::span<const char* const> args) {
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    llm_parser.AddFlag("", "--enable-yarn",
+                       "Flash-Next: static YaRN, required for --context above "
+                       "the native 262144; it applies to every request",
+                       "Model", &enable_yarn);
     llm_parser.AddFlag(
         "", "--managed-experts",
         "Place MoE routed experts in managed memory to reduce dedicated VRAM footprint",
@@ -1606,7 +1616,8 @@ int RunServe(std::span<const char* const> args) {
         vision_model_path,
         server::TextRunnerRamCacheOptions{.capacity_bytes = cache_ram_bytes},
         kv_cache_mode,
-        managed_experts);
+        managed_experts,
+        enable_yarn);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

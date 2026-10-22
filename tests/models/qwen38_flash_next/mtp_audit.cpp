@@ -590,7 +590,10 @@ void AuditMtpCosts(q::rocm::Executor& exec,
                    {.token = sampled_head ? nullptr : &next[i],
                     .candidates = sampled_head ? &candidates[i] : nullptr,
                     .draft_subset = sampled_head}});
-            Require(exec.MtpHeads(heads, &error), error);
+            // The production batch loop seeds the shortlist when at least
+            // two head rounds follow the catch-up (drafts >= 2): one round
+            // seeds, later rounds rank the gathered rows.
+            Require(exec.MtpHeads(heads, &error, width > 2), error);
             for (unsigned i = 0; i < concurrency; ++i) {
               if (sampled_head) {
                 next[i] =
@@ -646,5 +649,98 @@ void AuditMtpCosts(q::rocm::Executor& exec,
         std::fflush(stdout);
       }
     }
+  }
+}
+
+// Pinned-chain cycle timing: replicates the production greedy MTP cycle
+// (MtpDraftChain -> kVerifyGreedy Forward -> ReadGreedyPredictions ->
+// Rollback -> MtpRewind) at full acceptance and reports the median complete
+// cycle per width. In-process, so compared builds share one thermal state;
+// use it to A/B one mechanism at a time.
+void AuditChainCosts(q::rocm::Executor& exec,
+                     const gufo::tokenization::QwenTokenizer& tokenizer,
+                     std::uint32_t depth) {
+  using Clock = std::chrono::steady_clock;
+  const auto elapsed = [](auto start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start)
+        .count();
+  };
+  const auto pattern = tokenizer.Encode(
+      "Virtual memory maps pages to storage. Red, green, blue. ");
+  std::string error;
+  const auto prefix_size = depth + 32;
+  const auto capacity = prefix_size + 512;
+  std::vector<std::int32_t> prefix(prefix_size);
+  for (std::size_t i = 0; i < prefix.size(); ++i)
+    prefix[i] = pattern[i % pattern.size()];
+  auto base =
+      exec.CreateSession(gufo::core::SessionMode::kSpeculative, capacity,
+                         &error);
+  Require(base != nullptr, error);
+  for (std::size_t offset = 0; offset < prefix.size();) {
+    const auto n =
+        std::min<std::size_t>(exec.max_batch(), prefix.size() - offset);
+    Require(exec.Forward(*base, std::span(prefix).subspan(offset, n), 0,
+                         nullptr, q::rocm::Executor::ForwardMode::kPrefill,
+                         &error),
+            error);
+    const auto next = prefix[(offset + n) % prefix.size()];
+    Require(exec.MtpForward(*base, std::span(&next, 1),
+                            std::min<std::size_t>(n, exec.max_speculative()) -
+                                1,
+                            {}, &error),
+            error);
+    offset += n;
+  }
+  std::vector<std::uint8_t> snapshot(exec.SnapshotBytes(*base, 0));
+  Require(exec.SaveSnapshot(*base, 0, snapshot, &error), error);
+  base.reset();
+
+  const std::int32_t anchor = prefix.back();
+  constexpr unsigned kCycles = 40;
+  constexpr unsigned kWarm = 8;
+  for (const unsigned width : {2U, 4U, 6U, 8U}) {
+    auto session =
+        exec.CreateSession(gufo::core::SessionMode::kSpeculative, capacity,
+                           &error);
+    Require(session != nullptr, error);
+    q::rocm::Executor::SnapshotInfo info;
+    Require(exec.RestoreSnapshot(*session, snapshot, &info, &error,
+                                 width - 1),
+            error);
+    // The draft trails by one position: rewind it so the first cycle's
+    // catch-up consumes `width` rows, matching the steady production shape.
+    exec.MtpRewind(*session, session->position() - width);
+    std::vector<double> samples(kCycles);
+    std::vector<q::rocm::ArgmaxCandidate> predictions(width);
+    std::vector<std::int32_t> replay(width, anchor);
+    for (unsigned cycle = 0; cycle < kCycles + kWarm; ++cycle) {
+      const auto start = Clock::now();
+      const std::uint32_t frontier = session->position();
+      const auto hidden_row = static_cast<std::int32_t>(
+          exec.max_speculative() - width);
+      Require(exec.MtpDraftChain(*session, replay, hidden_row, width - 1,
+                                 &error),
+              error);
+      const auto chain = exec.ChainTokens(width - 1);
+      const std::vector<std::int32_t> verify(chain.begin(), chain.end());
+      Require(exec.Forward(*session, verify, width, nullptr,
+                           q::rocm::Executor::ForwardMode::kVerifyGreedy,
+                           &error),
+              error);
+      Require(exec.ReadGreedyPredictions(predictions, &error), error);
+      Require(exec.Rollback(*session, width, &error, nullptr, false), error);
+      exec.MtpRewind(*session, frontier);
+      if (cycle >= kWarm)
+        samples[cycle - kWarm] = elapsed(start);
+      // Full acceptance: the next cycle replays this chain's proposals.
+      for (unsigned i = 1; i < width; ++i)
+        replay[i - 1] = chain[i];
+    }
+    std::sort(samples.begin(), samples.end());
+    std::printf("CHAIN_COST depth=%u width=%u median_ms=%.4f p25_ms=%.4f\n",
+                depth, width, samples[samples.size() / 2],
+                samples[samples.size() / 4]);
+    std::fflush(stdout);
   }
 }

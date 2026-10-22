@@ -808,7 +808,6 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   auto& view = *checkpoint->state;
   view.owner_ = this;
   view.max_context_ = source.max_context_;
-  view.kv_capacity_ = source.kv_capacity_;
   view.index_capacity_ = source.index_capacity_;
   view.position_ = source.position_ + prefix;
   view.mtp_enabled_ = source.mtp_enabled_;
@@ -1026,6 +1025,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     return nullptr;
   }
   const Config& c = model.config();
+  if (options.max_context > c.MaxContextLength()) {
+    AssignError(error_msg, "executor context exceeds the model context");
+    return nullptr;
+  }
+  e->context_capacity_ = std::max(c.context_length, options.max_context);
+  e->yarn_ = MakeYarnRope(c.rope_scaling, c.rotary_dim, c.rope_theta);
   const std::size_t T = e->options_.max_batch;
   e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
   if (e->blaslt_ == nullptr) {
@@ -1085,9 +1090,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
   s.block_out = f32(T * hidden);
   s.hc_defer_w = f32(T * c.hc_count);
-  const std::uint32_t max_blocks =
-      (c.context_length + c.compress_ratio - 1) / c.compress_ratio;
-  e->mask_words_ = (max_blocks + 31) / 32;
+  e->mask_words_ = c.SparseMaskWords(e->context_capacity_);
   const std::size_t linear_projection = std::max<std::size_t>(
       c.SsmConvChannels() + c.SsmValueDim(), c.ple_layer >= 0 ? hc_dim : 0);
   const std::size_t linear_floats =
@@ -1377,12 +1380,11 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     return nullptr;
   }
   const Config& c = config();
-  if (max_context == 0 || max_context > c.context_length) {
+  if (max_context == 0 || max_context > context_capacity_) {
     AssignError(error_msg, "session context exceeds the model context");
     return nullptr;
   }
   s->max_context_ = max_context;
-  s->kv_capacity_ = std::min<std::uint32_t>(max_context, 8192U);
   // Before sparse attention starts, pooling can lag by indexer_top_k
   // rows. Afterwards only an incomplete block precedes the current batch.
   // Completed block keys remain in block_k; their raw rows are dead.
@@ -1407,16 +1409,16 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
     } else {
       auto& at = s->attention_[il];
-      at.k_cache = Alloc<unsigned char>(a, s->kv_capacity_ * k_cache_row_bytes,
+      at.k_cache = Alloc<unsigned char>(a, max_context * k_cache_row_bytes,
                                         error_msg, &s->allocated_bytes_);
-      at.v_cache = Alloc<unsigned char>(a, s->kv_capacity_ * v_cache_row_bytes,
+      at.v_cache = Alloc<unsigned char>(a, max_context * v_cache_row_bytes,
                                         error_msg, &s->allocated_bytes_);
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
       at.block_k = Alloc<__half>(
           a,
-          static_cast<std::size_t>(s->kv_capacity_ / c.compress_ratio + 1) *
+          static_cast<std::size_t>(max_context / c.compress_ratio + 1) *
               c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
       // Selection rows the next chunk's partial first sparse group unions.
@@ -1436,15 +1438,15 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     s->mtp_.target_hidden = Alloc<float>(
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
         error_msg, &s->allocated_bytes_);
-    s->mtp_.k_cache = Alloc<unsigned char>(a, s->kv_capacity_ * k_cache_row_bytes,
+    s->mtp_.k_cache = Alloc<unsigned char>(a, max_context * k_cache_row_bytes,
                                            error_msg, &s->allocated_bytes_);
-    s->mtp_.v_cache = Alloc<unsigned char>(a, s->kv_capacity_ * v_cache_row_bytes,
+    s->mtp_.v_cache = Alloc<unsigned char>(a, max_context * v_cache_row_bytes,
                                            error_msg, &s->allocated_bytes_);
     s->mtp_.index_k =
         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
                      error_msg, &s->allocated_bytes_);
     s->mtp_.block_k = Alloc<__half>(
-        a, std::size_t{s->kv_capacity_ / c.compress_ratio + 1} * c.indexer_head_dim,
+        a, std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim,
         error_msg, &s->allocated_bytes_);
     s->mtp_.h = Alloc<float>(a, c.HcDim(), error_msg, &s->allocated_bytes_);
     if (!model_->draft_output().empty()) {
@@ -1585,241 +1587,6 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
     }
     session.rollback_depth_ = row + 1;
   }
-  return true;
-}
-
-bool Executor::EnsureKvCapacity(Session& s, std::uint32_t needed,
-                                std::string* error_msg) const {
-  if (needed <= s.kv_capacity_) {
-    return true;
-  }
-  if (needed > s.max_context_) {
-    AssignError(error_msg, "context request exceeds max context limit");
-    return false;
-  }
-
-  // Geometric growth: double the capacity until it satisfies `needed`,
-  // capped at `s.max_context_`.
-  std::uint32_t new_cap = s.kv_capacity_ == 0 ? 8192U : s.kv_capacity_;
-  while (new_cap < needed) {
-    if (new_cap >= s.max_context_ / 2) {
-      new_cap = s.max_context_;
-      break;
-    }
-    new_cap *= 2;
-  }
-  new_cap = std::min(new_cap, s.max_context_);
-
-  const auto& c = config();
-  const std::size_t kv_row = c.AttentionKvDim();
-  const std::size_t k_cache_row_bytes =
-      KvRowBytes(kv_row, options_.kv_dtypes.key);
-  const std::size_t v_cache_row_bytes =
-      KvRowBytes(kv_row, options_.kv_dtypes.value);
-
-  // Synchronize stream so in-flight work completes before reallocation
-  if (!Check(hipStreamSynchronize(stream_), "EnsureKvCapacity sync",
-             error_msg)) {
-    return false;
-  }
-
-  // Preserve any snapshot state referencing current buffers
-  try {
-    s.PreserveSnapshots(0, 0);
-  } catch (...) {
-    AssignError(error_msg,
-                "Failed to preserve snapshots during KV cache expansion");
-    return false;
-  }
-
-  const std::uint32_t copy_tokens = s.position_;
-  const std::uint32_t new_blocks =
-      c.compress_ratio ? (new_cap / c.compress_ratio + 1) : 0;
-  const std::size_t copy_block_bytes =
-      static_cast<std::size_t>(s.blocks_ + 1) * c.indexer_head_dim *
-      sizeof(__half);
-
-  // Resize trunk attention layers
-  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-    if (c.IsLinearLayer(il))
-      continue;
-    auto& at = s.attention_[il];
-
-    // 1. K cache
-    unsigned char* new_k = nullptr;
-    const std::size_t new_k_bytes =
-        static_cast<std::size_t>(new_cap) * k_cache_row_bytes;
-    if (hip::AllocateDevice(&new_k, new_k_bytes) != hipSuccess) {
-      AssignError(error_msg, "Failed to allocate expanded K cache");
-      return false;
-    }
-    if (copy_tokens > 0 && at.k_cache != nullptr) {
-      (void)hipMemcpyAsync(
-          new_k, at.k_cache,
-          static_cast<std::size_t>(copy_tokens) * k_cache_row_bytes,
-          hipMemcpyDeviceToDevice, stream_);
-    }
-    const std::size_t copy_k_bytes =
-        static_cast<std::size_t>(copy_tokens) * k_cache_row_bytes;
-    if (new_k_bytes > copy_k_bytes) {
-      (void)hipMemsetAsync(new_k + copy_k_bytes, 0,
-                           new_k_bytes - copy_k_bytes, stream_);
-    }
-    std::replace(s.allocations_.begin(), s.allocations_.end(),
-                 static_cast<void*>(at.k_cache), static_cast<void*>(new_k));
-    (void)hipFree(at.k_cache);
-    at.k_cache = new_k;
-
-    // 2. V cache
-    unsigned char* new_v = nullptr;
-    const std::size_t new_v_bytes =
-        static_cast<std::size_t>(new_cap) * v_cache_row_bytes;
-    if (hip::AllocateDevice(&new_v, new_v_bytes) != hipSuccess) {
-      AssignError(error_msg, "Failed to allocate expanded V cache");
-      return false;
-    }
-    if (copy_tokens > 0 && at.v_cache != nullptr) {
-      (void)hipMemcpyAsync(
-          new_v, at.v_cache,
-          static_cast<std::size_t>(copy_tokens) * v_cache_row_bytes,
-          hipMemcpyDeviceToDevice, stream_);
-    }
-    const std::size_t copy_v_bytes =
-        static_cast<std::size_t>(copy_tokens) * v_cache_row_bytes;
-    if (new_v_bytes > copy_v_bytes) {
-      (void)hipMemsetAsync(new_v + copy_v_bytes, 0,
-                           new_v_bytes - copy_v_bytes, stream_);
-    }
-    std::replace(s.allocations_.begin(), s.allocations_.end(),
-                 static_cast<void*>(at.v_cache), static_cast<void*>(new_v));
-    (void)hipFree(at.v_cache);
-    at.v_cache = new_v;
-
-    // 3. block_k
-    if (new_blocks > 0) {
-      __half* new_block_k = nullptr;
-      const std::size_t new_block_k_bytes =
-          static_cast<std::size_t>(new_blocks) * c.indexer_head_dim *
-          sizeof(__half);
-      if (hip::AllocateDevice(&new_block_k, new_block_k_bytes) != hipSuccess) {
-        AssignError(error_msg, "Failed to allocate expanded block_k");
-        return false;
-      }
-      if (copy_block_bytes > 0 && at.block_k != nullptr) {
-        (void)hipMemcpyAsync(new_block_k, at.block_k, copy_block_bytes,
-                             hipMemcpyDeviceToDevice, stream_);
-      }
-      if (new_block_k_bytes > copy_block_bytes) {
-        (void)hipMemsetAsync(
-            reinterpret_cast<char*>(new_block_k) + copy_block_bytes, 0,
-            new_block_k_bytes - copy_block_bytes, stream_);
-      }
-      std::replace(s.allocations_.begin(), s.allocations_.end(),
-                   static_cast<void*>(at.block_k),
-                   static_cast<void*>(new_block_k));
-      (void)hipFree(at.block_k);
-      at.block_k = new_block_k;
-    }
-  }
-
-  // Resize MTP if enabled
-  if (s.mtp_enabled_) {
-    const std::uint32_t mtp_copy_tokens = s.mtp_.position;
-    const std::size_t mtp_copy_block_bytes =
-        static_cast<std::size_t>(s.mtp_.blocks + 1) * c.indexer_head_dim *
-        sizeof(__half);
-
-    // MTP K cache
-    unsigned char* new_k = nullptr;
-    const std::size_t new_k_bytes =
-        static_cast<std::size_t>(new_cap) * k_cache_row_bytes;
-    if (hip::AllocateDevice(&new_k, new_k_bytes) != hipSuccess) {
-      AssignError(error_msg, "Failed to allocate expanded MTP K cache");
-      return false;
-    }
-    if (mtp_copy_tokens > 0 && s.mtp_.k_cache != nullptr) {
-      (void)hipMemcpyAsync(
-          new_k, s.mtp_.k_cache,
-          static_cast<std::size_t>(mtp_copy_tokens) * k_cache_row_bytes,
-          hipMemcpyDeviceToDevice, stream_);
-    }
-    const std::size_t copy_k_bytes =
-        static_cast<std::size_t>(mtp_copy_tokens) * k_cache_row_bytes;
-    if (new_k_bytes > copy_k_bytes) {
-      (void)hipMemsetAsync(new_k + copy_k_bytes, 0,
-                           new_k_bytes - copy_k_bytes, stream_);
-    }
-    std::replace(s.allocations_.begin(), s.allocations_.end(),
-                 static_cast<void*>(s.mtp_.k_cache), static_cast<void*>(new_k));
-    (void)hipFree(s.mtp_.k_cache);
-    s.mtp_.k_cache = new_k;
-
-    // MTP V cache
-    unsigned char* new_v = nullptr;
-    const std::size_t new_v_bytes =
-        static_cast<std::size_t>(new_cap) * v_cache_row_bytes;
-    if (hip::AllocateDevice(&new_v, new_v_bytes) != hipSuccess) {
-      AssignError(error_msg, "Failed to allocate expanded MTP V cache");
-      return false;
-    }
-    if (mtp_copy_tokens > 0 && s.mtp_.v_cache != nullptr) {
-      (void)hipMemcpyAsync(
-          new_v, s.mtp_.v_cache,
-          static_cast<std::size_t>(mtp_copy_tokens) * v_cache_row_bytes,
-          hipMemcpyDeviceToDevice, stream_);
-    }
-    const std::size_t copy_v_bytes =
-        static_cast<std::size_t>(mtp_copy_tokens) * v_cache_row_bytes;
-    if (new_v_bytes > copy_v_bytes) {
-      (void)hipMemsetAsync(new_v + copy_v_bytes, 0,
-                           new_v_bytes - copy_v_bytes, stream_);
-    }
-    std::replace(s.allocations_.begin(), s.allocations_.end(),
-                 static_cast<void*>(s.mtp_.v_cache), static_cast<void*>(new_v));
-    (void)hipFree(s.mtp_.v_cache);
-    s.mtp_.v_cache = new_v;
-
-    // MTP block_k
-    if (new_blocks > 0) {
-      __half* new_block_k = nullptr;
-      const std::size_t new_block_k_bytes =
-          static_cast<std::size_t>(new_blocks) * c.indexer_head_dim *
-          sizeof(__half);
-      if (hip::AllocateDevice(&new_block_k, new_block_k_bytes) != hipSuccess) {
-        AssignError(error_msg, "Failed to allocate expanded MTP block_k");
-        return false;
-      }
-      if (mtp_copy_block_bytes > 0 && s.mtp_.block_k != nullptr) {
-        (void)hipMemcpyAsync(new_block_k, s.mtp_.block_k, mtp_copy_block_bytes,
-                             hipMemcpyDeviceToDevice, stream_);
-      }
-      if (new_block_k_bytes > mtp_copy_block_bytes) {
-        (void)hipMemsetAsync(
-            reinterpret_cast<char*>(new_block_k) + mtp_copy_block_bytes, 0,
-            new_block_k_bytes - mtp_copy_block_bytes, stream_);
-      }
-      std::replace(s.allocations_.begin(), s.allocations_.end(),
-                   static_cast<void*>(s.mtp_.block_k),
-                   static_cast<void*>(new_block_k));
-      (void)hipFree(s.mtp_.block_k);
-      s.mtp_.block_k = new_block_k;
-    }
-  }
-
-  // Synchronize to ensure copies and zeroes complete
-  if (!Check(hipStreamSynchronize(stream_), "EnsureKvCapacity copy sync",
-             error_msg)) {
-    return false;
-  }
-
-  // Destroy captured graphs because pointers have changed
-  for (const auto& [key, graph] : s.graphs_) {
-    (void)hipGraphExecDestroy(graph);
-  }
-  s.graphs_.clear();
-  s.warmed_.clear();
-
-  s.kv_capacity_ = new_cap;
   return true;
 }
 
@@ -2953,14 +2720,18 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
-    // Every prefill takes the fused projection: its KV quantization must be
-    // the only one a cache row can see, or a chunk below the wide-batch
+    // Upstream takes the wide route only; with quantized KV caches every
+    // prefill keeps the fused projection: its KV quantization must be the
+    // only one a cache row can see, or a chunk below the wide-batch
     // threshold would write rows a long prefill reads differently (observed
     // as split-vs-whole logit deltas on the IQ4_XS q8_0-q4_k caches). The
     // wide route was verified bit-identical to the separate path for F16
     // caches, so F16 bytes do not change.
+    const bool f16_kv = options_.kv_dtypes.key == KvCacheDtype::kF16 &&
+                        options_.kv_dtypes.value == KvCacheDtype::kF16;
     const bool fused_projection =
-        !projections_ready && WidePrefill(n_tokens) &&
+        !projections_ready &&
+        (f16_kv ? WidePrefill(n_tokens) : prefill_phase) &&
         n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
         l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
         c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
@@ -2971,7 +2742,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
           l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
           s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
-          s.rope, options_.kv_dtypes);
+          s.rope, options_.kv_dtypes, yarn_);
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;
@@ -2985,7 +2756,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(), l.attn_k_norm.f32(),
           s_.q, s_.attn_gate, s.k_cache, s.v_cache, n_tokens, c.num_heads,
           c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
-          c.rms_eps, stream_, s.rope, prefill_phase, options_.kv_dtypes);
+          c.rms_eps, stream_, s.rope, prefill_phase, options_.kv_dtypes, yarn_);
       if (!prepared) {
         UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
                     n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
@@ -3009,9 +2780,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     RmsNormRows(s_.k, l.attn_k_norm.f32(), s_.k, n_tokens * c.num_kv_heads,
                 c.head_dim, 1, c.rms_eps, stream_);
     Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, pos,
-         c.rope_theta, stream_, s.rope);
+         c.rope_theta, stream_, s.rope, yarn_);
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
-         c.rope_theta, stream_, s.rope);
+         c.rope_theta, stream_, s.rope, yarn_);
+    StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
+    StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
     StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_,
             options_.kv_dtypes.key);
     StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_,
@@ -3039,11 +2812,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                 n_tokens * c.indexer_heads, c.indexer_head_dim, 1, c.rms_eps,
                 stream_);
     Rope(s_.iq, n_tokens, c.indexer_heads, c.indexer_head_dim, c.rotary_dim,
-         pos, c.rope_theta, stream_, s.rope);
+         pos, c.rope_theta, stream_, s.rope, yarn_);
     PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k, first_block,
                       pos, n_tokens, pool_grid, c.compress_ratio,
                       c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
-                      index_capacity, stream_, s.rope);
+                      index_capacity, stream_, s.rope, yarn_);
     // Align score rows to full cache lines. The selector still considers
     // only complete causal blocks, so padding cannot change the ranking.
     // Wide prefill is never captured: compact score rows to the populated
@@ -3187,13 +2960,13 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
   const bool split = !MatrixRows(n_tokens);
-  rocm::Attention(
-      s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
-      split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens, pos,
-      c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
-      split ? s_.attn_lists : nullptr, split ? s_.attn_counts : nullptr,
-      c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
-      options_.kv_dtypes);
+  rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
+                  split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
+                  pos, c.num_heads, c.num_kv_heads, c.head_dim,
+                  c.compress_ratio, stream_, split ? s_.attn_lists : nullptr,
+                  split ? s_.attn_counts : nullptr,
+                  c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
+                  options_.kv_dtypes);
   const std::uint32_t q_dim = c.AttentionQDim();
   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
   // A decode batch's output projection reads the gate's Q8_1 rows.
@@ -3336,7 +3109,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
         wide_tiles ? routed_64_tiles_ : routed_n_tiles_;
     const std::uint32_t separate_rows = wide_tiles ? 64 : routed_tile_rows_;
     const bool gated_ok =
-        routed_64_tiles_ != 0
+        pair_ok && routed_64_tiles_ != 0
             ? RoutedGatedF16Gemm(
                   l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
                   s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
@@ -3431,9 +3204,9 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   const DeviceTensor& output = model_->output();
   const DeviceTensor& q4_draft = model_->output_draft();
   const std::uint32_t prefix = model_->draft_output().rows;
-  const std::uint32_t rows =
-      draft != nullptr ? prefix + kMtpDraftExtraRows
-                       : shortlist ? kMtpDraftShortlist : output.rows;
+  const std::uint32_t rows = draft != nullptr ? prefix + kMtpDraftExtraRows
+                             : shortlist      ? kMtpDraftShortlist
+                                              : output.rows;
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg)) {
     return false;
   }
@@ -3445,12 +3218,11 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     // spanning every row; its logits only rank proposals, which the target
     // verifies exactly. A chained step ranks the gathered shortlist rows,
     // so a shortlist miss can lower acceptance but never change the output.
-    logits_ok =
-        qfn_mmq_moe_vec(GGML_TYPE_Q4_0,
-                        shortlist ? s_.mtp_short_w : q4_draft.data, s_.mixed,
-                        s_.mtp_zero_ids, s_.logits, static_cast<int>(rows),
-                        static_cast<int>(output.cols), 1, 1, 1, stream_,
-                        nullptr, nullptr) == 0;
+    logits_ok = qfn_mmq_moe_vec(
+                    GGML_TYPE_Q4_0, shortlist ? s_.mtp_short_w : q4_draft.data,
+                    s_.mixed, s_.mtp_zero_ids, s_.logits,
+                    static_cast<int>(rows), static_cast<int>(output.cols), 1, 1,
+                    1, stream_, nullptr, nullptr) == 0;
     if (!logits_ok)
       AssignError(error_msg, "Q4_0 draft head GEMV failed");
   } else {
@@ -3608,8 +3380,6 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     AssignError(error_msg, "session context is full");
     return false;
   }
-  if (!EnsureKvCapacity(session, session.position_ + n, error_msg))
-    return false;
   for (auto t : tokens) {
     if (t < 0 || static_cast<std::uint32_t>(t) >= c.vocab_size) {
       AssignError(error_msg, "token out of range");
@@ -4065,12 +3835,21 @@ struct SnapshotHeader {
   std::uint32_t mtp_residual_valid;
   std::uint32_t hidden_rows;
   std::uint32_t image_count;
+  // Rotated K depends on the rope scaling at every position.
+  float rope_factor;
+  std::uint32_t rope_original_context;
+  float rope_beta_fast;
+  float rope_beta_slow;
   std::array<std::int32_t, Config::kMaxPleNgram - 1> ngram_prev;
   std::uint32_t mask_words;          ///< selection bitmap words per query
   std::uint32_t mask_tail_position;  ///< position the selection tails end at
   std::uint64_t payload_bytes;
 };
 static_assert(std::is_trivially_copyable_v<SnapshotHeader>);
+// The four rope fields must not push payload_bytes off its 8-byte alignment.
+// 8 (magic) + 19 u32 geometry/identity fields + the four rope fields land
+// payload_bytes at 120 with the two mask words before it; still 8-aligned.
+static_assert(offsetof(SnapshotHeader, payload_bytes) == 120);
 
 namespace {
 
@@ -4097,6 +3876,17 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
   h.image_count = std::ranges::count_if(
       session.VisionLayout().images,
       [&](const auto& image) { return image.offset < h.position; });
+  // Disabled scaling has one disk-cache identity ("absolute-v1" from
+  // RopePositionPolicy) regardless of whatever original_context/beta the
+  // config happens to carry, so the header must normalize to the same
+  // defaults rather than echo them raw (else two "off" configs that differ
+  // only in those unused fields would collide on identity but disagree on
+  // SameGeometry, and neither could restore the other's snapshot).
+  const RopeScaling rope = NormalizedRopeScaling(c.rope_scaling);
+  h.rope_factor = rope.factor;
+  h.rope_original_context = rope.original_context;
+  h.rope_beta_fast = rope.beta_fast;
+  h.rope_beta_slow = rope.beta_slow;
   return h;
 }
 
@@ -4110,6 +3900,10 @@ bool SameGeometry(const SnapshotHeader& h, const SnapshotHeader& mine) {
          h.indexer_head_dim == mine.indexer_head_dim &&
          h.compress_ratio == mine.compress_ratio && h.hc_dim == mine.hc_dim &&
          h.ple_elems == mine.ple_elems && h.has_mtp == mine.has_mtp &&
+         h.rope_factor == mine.rope_factor &&
+         h.rope_original_context == mine.rope_original_context &&
+         h.rope_beta_fast == mine.rope_beta_fast &&
+         h.rope_beta_slow == mine.rope_beta_slow &&
          h.mask_words == mine.mask_words;
 }
 
@@ -4400,7 +4194,10 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
                 pending->extras_.push_back({offset, bytes, destination});
                 extra_used += bytes;
               }
-              transfer->Enqueue(destination, device, bytes, kind);
+              if (pending)
+                transfer->Enqueue(destination, device, bytes, kind);
+              else
+                transfer->Copy(destination, device, bytes);
             }
             return true;
           }) != 0;
@@ -4515,9 +4312,6 @@ bool Executor::RestoreSnapshot(Session& session,
   }
   if (layout.images.empty())
     session.ConfigureVision(nullptr, nullptr, stream_);
-  if (!EnsureKvCapacity(session, h.position, error_msg)) {
-    return false;
-  }
   // The session's queued work targets buffers the copies overwrite.
   if (!Check(hipStreamSynchronize(stream_), "restore drain", error_msg)) {
     return false;
@@ -4775,47 +4569,6 @@ bool Executor::ReadVerificationRows(std::uint32_t row, std::span<float> logits,
                error_msg);
 }
 
-bool Executor::GreedyArgmaxNodes(std::uint32_t n_logits,
-                                 std::string* error_msg) const {
-  // Appended to the kVerifyGreedy body: ranks every verified row including
-  // the frontier and parks the candidates in pinned memory for
-  // ReadGreedyPredictions(). Runs inside capture like any other node. The
-  // frontier row's argmax is the next cycle's greedy anchor.
-  if (n_logits < 1 || s_.mtp_ids == nullptr) {
-    return true;
-  }
-  const auto rows = n_logits;
-  if (rows > kArgmaxParts) {
-    AssignError(error_msg, "greedy MTP verification exceeds the argmax parts");
-    return false;
-  }
-  const auto vocab = config().vocab_size;
-  gufo::hip::LaunchBatchedGPUArgmax(
-      VerificationLogits(), s_.mtp_ids, rows, vocab,
-      {reinterpret_cast<float*>(s_.mtp_scratch_ids),
-       MtpCandidateWorkspaceSize(vocab)},
-      stream_);
-  GatherArgmaxCandidates(VerificationLogits(), s_.mtp_ids, s_.mtp_argmax, rows,
-                         vocab, stream_);
-  return Check(hipMemcpyAsync(mtp_predictions_host_, s_.mtp_argmax,
-                              rows * sizeof(ArgmaxCandidate),
-                              hipMemcpyDeviceToHost, stream_),
-               "greedy MTP predictions download", error_msg);
-}
-
-bool Executor::ReadGreedyPredictions(std::span<ArgmaxCandidate> predictions,
-                                     std::string* error_msg) const {
-  if (predictions.empty() ||
-      predictions.size_bytes() >
-          options_.max_speculative * sizeof(ArgmaxCandidate)) {
-    AssignError(error_msg, "invalid greedy MTP prediction read");
-    return false;
-  }
-  std::memcpy(predictions.data(), mtp_predictions_host_,
-              predictions.size_bytes());
-  return true;
-}
-
 bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                                     const sampling::SamplerState& sampler,
                                     std::span<const std::int32_t> drafts,
@@ -4886,6 +4639,47 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
   const bool completed = Check(hipStreamSynchronize(stream_),
                                "greedy MTP verification", error_msg);
   return copied && completed;
+}
+
+bool Executor::GreedyArgmaxNodes(std::uint32_t n_logits,
+                                 std::string* error_msg) const {
+  // Appended to the kVerifyGreedy body: ranks every verified row including
+  // the frontier and parks the candidates in pinned memory for
+  // ReadGreedyPredictions(). Runs inside capture like any other node. The
+  // frontier row's argmax is the next cycle's greedy anchor.
+  if (n_logits < 1 || s_.mtp_ids == nullptr) {
+    return true;
+  }
+  const auto rows = n_logits;
+  if (rows > kArgmaxParts) {
+    AssignError(error_msg, "greedy MTP verification exceeds the argmax parts");
+    return false;
+  }
+  const auto vocab = config().vocab_size;
+  gufo::hip::LaunchBatchedGPUArgmax(
+      VerificationLogits(), s_.mtp_ids, rows, vocab,
+      {reinterpret_cast<float*>(s_.mtp_scratch_ids),
+       MtpCandidateWorkspaceSize(vocab)},
+      stream_);
+  GatherArgmaxCandidates(VerificationLogits(), s_.mtp_ids, s_.mtp_argmax, rows,
+                         vocab, stream_);
+  return Check(hipMemcpyAsync(mtp_predictions_host_, s_.mtp_argmax,
+                              rows * sizeof(ArgmaxCandidate),
+                              hipMemcpyDeviceToHost, stream_),
+               "greedy MTP predictions download", error_msg);
+}
+
+bool Executor::ReadGreedyPredictions(std::span<ArgmaxCandidate> predictions,
+                                     std::string* error_msg) const {
+  if (predictions.empty() ||
+      predictions.size_bytes() >
+          options_.max_speculative * sizeof(ArgmaxCandidate)) {
+    AssignError(error_msg, "invalid greedy MTP prediction read");
+    return false;
+  }
+  std::memcpy(predictions.data(), mtp_predictions_host_,
+              predictions.size_bytes());
+  return true;
 }
 
 bool Executor::CanCompactMtpVerification(
@@ -4991,9 +4785,6 @@ bool Executor::MtpForward(Session& session,
   const std::uint32_t pos = session.mtp_.position;
   if (pos + n > session.max_context_) {
     AssignError(error_msg, "MTP context is full");
-    return false;
-  }
-  if (!EnsureKvCapacity(session, pos + n, error_msg)) {
     return false;
   }
   if (session.continuation_hooks_)
@@ -5301,7 +5092,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
             s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr, nullptr,
             attn.k_cache, attn.v_cache, n, 0, c.num_kv_heads, c.head_dim,
             c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
-            c.rms_eps, stream_, attn.rope, false, options_.kv_dtypes)) {
+            c.rms_eps, stream_, attn.rope, false, options_.kv_dtypes, yarn_)) {
       AssignError(error_msg, "MTP cache projection failed");
       return false;
     }
@@ -5312,11 +5103,11 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     StoreRows(s_.ik, attn.index_k, n, c.indexer_head_dim,
               &session.control_->mtp_position, capacity, stream_);
     if (pos + n > c.indexer_top_k) {
-      PoolIndexerBlocks(attn.index_k, l.indexer_k_norm.f32(), attn.block_k,
-                        &session.control_->mtp_blocks,
-                        &session.control_->mtp_position, n, pool_grid,
-                        c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
-                        c.rope_theta, c.rms_eps, capacity, stream_, attn.rope);
+      PoolIndexerBlocks(
+          attn.index_k, l.indexer_k_norm.f32(), attn.block_k,
+          &session.control_->mtp_blocks, &session.control_->mtp_position, n,
+          pool_grid, c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
+          c.rope_theta, c.rms_eps, capacity, stream_, attn.rope, yarn_);
     }
     return true;
   }

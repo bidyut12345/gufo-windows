@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -12,7 +13,6 @@
 
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
-#include "src/core/speculative/prompt_lookup.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
@@ -21,6 +21,7 @@
 #include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/prompt_lookup.hpp"
 
 namespace gufo::core {
 class GgufReader;
@@ -41,8 +42,13 @@ class SnapshotState;
 struct PrefillCheckpoint;
 }  // namespace rocm
 
+/// Tokens the MTP draft head may propose.
 enum class DraftVocabulary {
   kFull,
+  /// Special tokens plus every token whose text is ASCII (English, code,
+  /// numbers, markup and the unaccented pieces of Latin-script languages)
+  /// or ASCII with common typographic marks: about half of the vocabulary,
+  /// so each draft step reads half of the output head.
   kLatinText,
 };
 
@@ -61,6 +67,11 @@ struct ModelOptions {
   /// both planes, or Q8_0 keys with Q4_K super-block values. Lossy beyond
   /// F16; snapshots of different modes are not interchangeable.
   KvCacheMode kv_cache_mode = KvCacheMode::kF16;
+  /// Static YaRN scaling, derived by the caller (serve, bench) from the
+  /// requested context via `RopeScalingForContext`. Empty leaves the
+  /// artifact's own setting, which is always off: no GGUF metadata key sets
+  /// it today.
+  std::optional<RopeScaling> rope_scaling{};
   bool mtp_survival = false;
   bool prompt_lookup = false;
   DraftVocabulary draft_vocabulary = DraftVocabulary::kFull;
@@ -368,7 +379,7 @@ private:
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
-  speculative::PromptLookup<> lookup_;
+  PromptLookup lookup_;
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(

@@ -19,25 +19,11 @@ enum class KvCacheMode : std::uint8_t {
 /// Canonical `--kv-cache` names, indexed by KvCacheMode.
 inline constexpr std::string_view kKvCacheModeNames[] = {"f16", "q8_0",
                                                          "q8_0-q4_k"};
-inline constexpr std::string_view kKvCacheModeList =
-    "f16, q8, q8_0, fp8, q8_0-q4_k, K8V4";
+inline constexpr std::string_view kKvCacheModeList = "f16, q8_0, q8_0-q4_k";
 
 /// Parses a canonical mode name into *mode; returns false with *mode
 /// untouched for anything else.
 constexpr bool ParseKvCacheMode(std::string_view name, KvCacheMode* mode) {
-  if (name == "f16") {
-    *mode = KvCacheMode::kF16;
-    return true;
-  }
-  if (name == "q8" || name == "q8_0" || name == "fp8") {
-    *mode = KvCacheMode::kQ8_0;
-    return true;
-  }
-  if (name == "q8_0-q4_k" || name == "q8_q4" || name == "q4_k" ||
-      name == "k8v4" || name == "K8V4") {
-    *mode = KvCacheMode::kQ8_0Q4K;
-    return true;
-  }
   for (std::size_t i = 0; i < std::size(kKvCacheModeNames); ++i) {
     if (name == kKvCacheModeNames[i]) {
       *mode = static_cast<KvCacheMode>(i);

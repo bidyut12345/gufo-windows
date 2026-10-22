@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -270,11 +271,256 @@ struct Result {
   double ref_sq = 0.0;
 };
 
+
+/// Random Q6_K blocks: 128 low-nibble bytes, 64 high-bit bytes, 16 int8
+
+/// scales and one scale, matching ggml's dequantize_row_q6_K layout.
+
+Experts MakeQ6K(std::size_t e, std::size_t m, std::size_t k,
+                std::uint32_t seed) {
+  Experts w;
+  const std::size_t blocks = e * m * (k / 256);
+  w.packed.resize(blocks * 210);
+  w.values.resize(e * m * k);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint8_t* blk = w.packed.data() + b * 210;
+    const __half d = __float2half(Uniform(&seed, 0.02F) + 0.03F);
+    std::memcpy(blk + 208, &d, 2);
+    std::uint8_t* ql = blk;
+    std::uint8_t* qh = blk + 128;
+    std::int8_t* sc = reinterpret_cast<std::int8_t*>(blk + 192);
+    for (int i = 0; i < 128; ++i) {
+      ql[i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+    }
+    for (int i = 0; i < 64; ++i) {
+      qh[i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+    }
+    for (int i = 0; i < 16; ++i) {
+      sc[i] = static_cast<std::int8_t>(NextRandom(&seed) & 0xFF);
+    }
+    const float df = __half2float(d);
+    for (int n = 0; n < 256; n += 128) {
+      const std::uint8_t* qln = ql + n / 2;
+      const std::uint8_t* qhn = qh + n / 4;
+      const std::int8_t* scn = sc + n / 16;
+      for (int l = 0; l < 32; ++l) {
+        const int is = l / 16;
+        const int q1 =
+            static_cast<std::int8_t>((qln[l] & 0xF) | ((qhn[l] & 0x03) << 4)) -
+            32;
+        const int q2 = static_cast<std::int8_t>((qln[l + 32] & 0xF) |
+                                                ((qhn[l] & 0x0c) << 2)) -
+                       32;
+        const int q3 =
+            static_cast<std::int8_t>((qln[l] >> 4) | ((qhn[l] & 0x30) << 0)) -
+            32;
+        const int q4 = static_cast<std::int8_t>((qln[l + 32] >> 4) |
+                                                ((qhn[l] & 0xc0) >> 2)) -
+                       32;
+        w.values[b * 256 + n + l] =
+            df * static_cast<float>(scn[is]) * static_cast<float>(q1);
+        w.values[b * 256 + n + l + 32] =
+            df * static_cast<float>(scn[is + 2]) * static_cast<float>(q2);
+        w.values[b * 256 + n + l + 64] =
+            df * static_cast<float>(scn[is + 4]) * static_cast<float>(q3);
+        w.values[b * 256 + n + l + 96] =
+            df * static_cast<float>(scn[is + 6]) * static_cast<float>(q4);
+      }
+    }
+  }
+  return w;
+}
+
+// IQ3_S grid codes and the IQ4_NL codebook (vendored from llama.cpp,
+// ggml-common.h) for the host-side reference dequantization.
+constexpr std::uint32_t kIq3sGrid[512] = {
+    0x01010101U, 0x01010103U, 0x01010105U, 0x0101010bU, 0x0101010fU,
+    0x01010301U, 0x01010303U, 0x01010305U, 0x01010309U, 0x0101030dU,
+    0x01010501U, 0x01010503U, 0x0101050bU, 0x01010707U, 0x01010901U,
+    0x01010905U, 0x0101090bU, 0x0101090fU, 0x01010b03U, 0x01010b07U,
+    0x01010d01U, 0x01010d05U, 0x01010f03U, 0x01010f09U, 0x01010f0fU,
+    0x01030101U, 0x01030103U, 0x01030105U, 0x01030109U, 0x01030301U,
+    0x01030303U, 0x0103030bU, 0x01030501U, 0x01030507U, 0x0103050fU,
+    0x01030703U, 0x0103070bU, 0x01030909U, 0x01030d03U, 0x01030d0bU,
+    0x01030f05U, 0x01050101U, 0x01050103U, 0x0105010bU, 0x0105010fU,
+    0x01050301U, 0x01050307U, 0x0105030dU, 0x01050503U, 0x0105050bU,
+    0x01050701U, 0x01050709U, 0x01050905U, 0x0105090bU, 0x0105090fU,
+    0x01050b03U, 0x01050b07U, 0x01050f01U, 0x01050f07U, 0x01070107U,
+    0x01070303U, 0x0107030bU, 0x01070501U, 0x01070505U, 0x01070703U,
+    0x01070707U, 0x0107070dU, 0x01070909U, 0x01070b01U, 0x01070b05U,
+    0x01070d0fU, 0x01070f03U, 0x01070f0bU, 0x01090101U, 0x01090307U,
+    0x0109030fU, 0x01090503U, 0x01090509U, 0x01090705U, 0x01090901U,
+    0x01090907U, 0x01090b03U, 0x01090f01U, 0x010b0105U, 0x010b0109U,
+    0x010b0501U, 0x010b0505U, 0x010b050dU, 0x010b0707U, 0x010b0903U,
+    0x010b090bU, 0x010b090fU, 0x010b0d0dU, 0x010b0f07U, 0x010d010dU,
+    0x010d0303U, 0x010d0307U, 0x010d0703U, 0x010d0b05U, 0x010d0f03U,
+    0x010f0101U, 0x010f0105U, 0x010f0109U, 0x010f0501U, 0x010f0505U,
+    0x010f050dU, 0x010f0707U, 0x010f0b01U, 0x010f0b09U, 0x03010101U,
+    0x03010103U, 0x03010105U, 0x03010109U, 0x03010301U, 0x03010303U,
+    0x03010307U, 0x0301030bU, 0x0301030fU, 0x03010501U, 0x03010505U,
+    0x03010703U, 0x03010709U, 0x0301070dU, 0x03010b09U, 0x03010b0dU,
+    0x03010d03U, 0x03010f05U, 0x03030101U, 0x03030103U, 0x03030107U,
+    0x0303010dU, 0x03030301U, 0x03030309U, 0x03030503U, 0x03030701U,
+    0x03030707U, 0x03030903U, 0x03030b01U, 0x03030b05U, 0x03030f01U,
+    0x03030f0dU, 0x03050101U, 0x03050305U, 0x0305030bU, 0x0305030fU,
+    0x03050501U, 0x03050509U, 0x03050705U, 0x03050901U, 0x03050907U,
+    0x03050b0bU, 0x03050d01U, 0x03050f05U, 0x03070103U, 0x03070109U,
+    0x0307010fU, 0x03070301U, 0x03070307U, 0x03070503U, 0x0307050fU,
+    0x03070701U, 0x03070709U, 0x03070903U, 0x03070d05U, 0x03070f01U,
+    0x03090107U, 0x0309010bU, 0x03090305U, 0x03090309U, 0x03090703U,
+    0x03090707U, 0x03090905U, 0x0309090dU, 0x03090b01U, 0x03090b09U,
+    0x030b0103U, 0x030b0301U, 0x030b0307U, 0x030b0503U, 0x030b0701U,
+    0x030b0705U, 0x030b0b03U, 0x030d0501U, 0x030d0509U, 0x030d050fU,
+    0x030d0909U, 0x030d090dU, 0x030f0103U, 0x030f0107U, 0x030f0301U,
+    0x030f0305U, 0x030f0503U, 0x030f070bU, 0x030f0903U, 0x030f0d05U,
+    0x030f0f01U, 0x05010101U, 0x05010103U, 0x05010107U, 0x0501010bU,
+    0x0501010fU, 0x05010301U, 0x05010305U, 0x05010309U, 0x0501030dU,
+    0x05010503U, 0x05010507U, 0x0501050fU, 0x05010701U, 0x05010705U,
+    0x05010903U, 0x05010907U, 0x0501090bU, 0x05010b01U, 0x05010b05U,
+    0x05010d0fU, 0x05010f01U, 0x05010f07U, 0x05010f0bU, 0x05030101U,
+    0x05030105U, 0x05030301U, 0x05030307U, 0x0503030fU, 0x05030505U,
+    0x0503050bU, 0x05030703U, 0x05030709U, 0x05030905U, 0x05030b03U,
+    0x05050103U, 0x05050109U, 0x0505010fU, 0x05050503U, 0x05050507U,
+    0x05050701U, 0x0505070fU, 0x05050903U, 0x05050b07U, 0x05050b0fU,
+    0x05050f03U, 0x05050f09U, 0x05070101U, 0x05070105U, 0x0507010bU,
+    0x05070303U, 0x05070505U, 0x05070509U, 0x05070703U, 0x05070707U,
+    0x05070905U, 0x05070b01U, 0x05070d0dU, 0x05090103U, 0x0509010fU,
+    0x05090501U, 0x05090507U, 0x05090705U, 0x0509070bU, 0x05090903U,
+    0x05090f05U, 0x05090f0bU, 0x050b0109U, 0x050b0303U, 0x050b0505U,
+    0x050b070fU, 0x050b0901U, 0x050b0b07U, 0x050b0f01U, 0x050d0101U,
+    0x050d0105U, 0x050d010fU, 0x050d0503U, 0x050d0b0bU, 0x050d0d03U,
+    0x050f010bU, 0x050f0303U, 0x050f050dU, 0x050f0701U, 0x050f0907U,
+    0x050f0b01U, 0x07010105U, 0x07010303U, 0x07010307U, 0x0701030bU,
+    0x0701030fU, 0x07010505U, 0x07010703U, 0x07010707U, 0x0701070bU,
+    0x07010905U, 0x07010909U, 0x0701090fU, 0x07010b03U, 0x07010d07U,
+    0x07010f03U, 0x07030103U, 0x07030107U, 0x0703010bU, 0x07030309U,
+    0x07030503U, 0x07030507U, 0x07030901U, 0x07030d01U, 0x07030f05U,
+    0x07030f0dU, 0x07050101U, 0x07050305U, 0x07050501U, 0x07050705U,
+    0x07050709U, 0x07050b01U, 0x07070103U, 0x07070301U, 0x07070309U,
+    0x07070503U, 0x07070507U, 0x0707050fU, 0x07070701U, 0x07070903U,
+    0x07070907U, 0x0707090fU, 0x07070b0bU, 0x07070f07U, 0x07090107U,
+    0x07090303U, 0x0709030dU, 0x07090505U, 0x07090703U, 0x07090b05U,
+    0x07090d01U, 0x07090d09U, 0x070b0103U, 0x070b0301U, 0x070b0305U,
+    0x070b050bU, 0x070b0705U, 0x070b0909U, 0x070b0b0dU, 0x070b0f07U,
+    0x070d030dU, 0x070d0903U, 0x070f0103U, 0x070f0107U, 0x070f0501U,
+    0x070f0505U, 0x070f070bU, 0x09010101U, 0x09010109U, 0x09010305U,
+    0x09010501U, 0x09010509U, 0x0901050fU, 0x09010705U, 0x09010903U,
+    0x09010b01U, 0x09010f01U, 0x09030105U, 0x0903010fU, 0x09030303U,
+    0x09030307U, 0x09030505U, 0x09030701U, 0x0903070bU, 0x09030907U,
+    0x09030b03U, 0x09030b0bU, 0x09050103U, 0x09050107U, 0x09050301U,
+    0x0905030bU, 0x09050503U, 0x09050707U, 0x09050901U, 0x09050b0fU,
+    0x09050d05U, 0x09050f01U, 0x09070109U, 0x09070303U, 0x09070307U,
+    0x09070501U, 0x09070505U, 0x09070703U, 0x0907070bU, 0x09090101U,
+    0x09090105U, 0x09090509U, 0x0909070fU, 0x09090901U, 0x09090f03U,
+    0x090b010bU, 0x090b010fU, 0x090b0503U, 0x090b0d05U, 0x090d0307U,
+    0x090d0709U, 0x090d0d01U, 0x090f0301U, 0x090f030bU, 0x090f0701U,
+    0x090f0907U, 0x090f0b03U, 0x0b010105U, 0x0b010301U, 0x0b010309U,
+    0x0b010505U, 0x0b010901U, 0x0b010909U, 0x0b01090fU, 0x0b010b05U,
+    0x0b010d0dU, 0x0b010f09U, 0x0b030103U, 0x0b030107U, 0x0b03010bU,
+    0x0b030305U, 0x0b030503U, 0x0b030705U, 0x0b030f05U, 0x0b050101U,
+    0x0b050303U, 0x0b050507U, 0x0b050701U, 0x0b05070dU, 0x0b050b07U,
+    0x0b070105U, 0x0b07010fU, 0x0b070301U, 0x0b07050fU, 0x0b070909U,
+    0x0b070b03U, 0x0b070d0bU, 0x0b070f07U, 0x0b090103U, 0x0b090109U,
+    0x0b090501U, 0x0b090705U, 0x0b09090dU, 0x0b0b0305U, 0x0b0b050dU,
+    0x0b0b0b03U, 0x0b0b0b07U, 0x0b0d0905U, 0x0b0f0105U, 0x0b0f0109U,
+    0x0b0f0505U, 0x0d010303U, 0x0d010307U, 0x0d01030bU, 0x0d010703U,
+    0x0d010707U, 0x0d010d01U, 0x0d030101U, 0x0d030501U, 0x0d03050fU,
+    0x0d030d09U, 0x0d050305U, 0x0d050709U, 0x0d050905U, 0x0d050b0bU,
+    0x0d050d05U, 0x0d050f01U, 0x0d070101U, 0x0d070309U, 0x0d070503U,
+    0x0d070901U, 0x0d09050bU, 0x0d090907U, 0x0d090d05U, 0x0d0b0101U,
+    0x0d0b0107U, 0x0d0b0709U, 0x0d0b0d01U, 0x0d0d010bU, 0x0d0d0901U,
+    0x0d0f0303U, 0x0d0f0307U, 0x0f010101U, 0x0f010109U, 0x0f01010fU,
+    0x0f010501U, 0x0f010505U, 0x0f01070dU, 0x0f010901U, 0x0f010b09U,
+    0x0f010d05U, 0x0f030105U, 0x0f030303U, 0x0f030509U, 0x0f030907U,
+    0x0f03090bU, 0x0f050103U, 0x0f050109U, 0x0f050301U, 0x0f05030dU,
+    0x0f050503U, 0x0f050701U, 0x0f050b03U, 0x0f070105U, 0x0f070705U,
+    0x0f07070bU, 0x0f070b07U, 0x0f090103U, 0x0f09010bU, 0x0f090307U,
+    0x0f090501U, 0x0f090b01U, 0x0f0b0505U, 0x0f0b0905U, 0x0f0d0105U,
+    0x0f0d0703U, 0x0f0f0101U,
+};
+
+constexpr float kValuesIq4Nl[16] = {-127.F, -104.F, -83.F, -65.F, -49.F, -35.F,
+                                    -22.F,  -10.F,  1.F,   13.F,  25.F,  38.F,
+                                    53.F,   69.F,   89.F,  113.F};
+
+/// Random IQ4_NL blocks: d and 16 codebook-index bytes.
+Experts MakeIQ4NL(std::size_t e, std::size_t m, std::size_t k,
+                  std::uint32_t seed) {
+  Experts w;
+  const std::size_t blocks = e * m * (k / 32);
+  w.packed.resize(blocks * 18);
+  w.values.resize(e * m * k);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint8_t* blk = w.packed.data() + b * 18;
+    const __half d = __float2half(Uniform(&seed, 0.02F) + 0.03F);
+    std::memcpy(blk, &d, 2);
+    const float df = __half2float(d);
+    for (int i = 0; i < 16; ++i) {
+      blk[2 + i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+    }
+    for (int j = 0; j < 32; ++j) {
+      const int code = j < 16 ? (blk[2 + j] & 0xF) : (blk[2 + j - 16] >> 4);
+      w.values[b * 32 + j] = df * kValuesIq4Nl[code];
+    }
+  }
+  return w;
+}
+
+/// Random IQ3_S blocks: d, 64 grid-index bytes, 8 high-bit bytes, 32 sign
+
+/// bytes and 4 scale bytes over the 256-value superblock.
+Experts MakeIQ3S(std::size_t e, std::size_t m, std::size_t k,
+                 std::uint32_t seed) {
+  Experts w;
+  const std::size_t blocks = e * m * (k / 256);
+  w.packed.resize(blocks * 110);
+  w.values.resize(e * m * k);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint8_t* blk = w.packed.data() + b * 110;
+    const __half d = __float2half(Uniform(&seed, 0.02F) + 0.03F);
+    std::memcpy(blk, &d, 2);
+    for (int i = 0; i < 64; ++i) {
+      blk[2 + i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+    }
+    for (int i = 0; i < 8; ++i) {
+      blk[66 + i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+    }
+    for (int i = 0; i < 32; ++i) {
+      blk[74 + i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+    }
+    for (int i = 0; i < 4; ++i) {
+      blk[106 + i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0x0F);
+    }
+    const float df = __half2float(d);
+    for (int c = 0; c < 8; ++c) {
+      const float ls = static_cast<float>(
+          1 + 2 * ((blk[106 + c / 2] >> (4 * (c & 1))) & 0xF));
+      for (int l = 0; l < 8; ++l) {
+        const std::uint32_t idx =
+            blk[2 + 8 * c + l] |
+            ((static_cast<std::uint32_t>(blk[66 + c] >> l) & 1U) << 8);
+        const std::uint32_t grid = kIq3sGrid[idx];
+        const std::uint8_t sb = blk[74 + 4 * c + l / 2];
+        const std::uint32_t bits = (l & 1) != 0 ? sb >> 4 : sb & 0xF;
+        for (int j = 0; j < 4; ++j) {
+          const float g = static_cast<float>((grid >> (8 * j)) & 0xFFU);
+          const float v = ((bits >> j) & 1U) != 0U ? -g : g;
+          w.values[b * 256 + 32 * c + 4 * l + j] = df * ls * v;
+        }
+      }
+    }
+  }
+  return w;
+}
+
 const char* TypeName(q::WeightType type) {
   return type == q::WeightType::kQ4_K   ? "Q4_K"
          : type == q::WeightType::kQ5_K ? "Q5_K"
          : type == q::WeightType::kQ5_1 ? "Q5_1"
-                                        : "Q8_0";
+         : type == q::WeightType::kIQ3_S ? "IQ3_S"
+         : type == q::WeightType::kIQ4_NL ? "IQ4_NL"
+                                          : "Q8_0";
+
 }
 
 /// Runs the MMQ tier and the F16 route over the same routing and reports
@@ -286,10 +532,12 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
            std::uint32_t seed, std::uint32_t tile_rows = 48,
            float input_scale = 2.0F) {
   const Experts w =
-      type == q::WeightType::kQ4_K   ? MakeQ4K(experts, m, k, seed)
-      : type == q::WeightType::kQ5_K ? MakeQ5K(experts, m, k, seed)
-      : type == q::WeightType::kQ5_1 ? MakeQ5_1(experts, m, k, seed)
-                                     : MakeQ8_0(experts, m, k, seed);
+      type == q::WeightType::kQ4_K     ? MakeQ4K(experts, m, k, seed)
+      : type == q::WeightType::kQ5_K   ? MakeQ5K(experts, m, k, seed)
+      : type == q::WeightType::kQ5_1   ? MakeQ5_1(experts, m, k, seed)
+      : type == q::WeightType::kIQ3_S  ? MakeIQ3S(experts, m, k, seed)
+      : type == q::WeightType::kIQ4_NL ? MakeIQ4NL(experts, m, k, seed)
+                                       : MakeQ8_0(experts, m, k, seed);
   const std::size_t slots = n_tokens * used;
   // Skewed top-k without replacement: the low experts see most rows.
   std::vector<std::int32_t> ids(slots);
@@ -332,10 +580,12 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   std::vector<float> zero_out(slots * m, 0.0F);
   float* d_mmq = Upload(zero_out);
 
-  const auto mmq_raw = type == q::WeightType::kQ4_K   ? qfn_mmq_q4_K_moe_raw
-                       : type == q::WeightType::kQ5_K ? qfn_mmq_q5_K_moe_raw
-                       : type == q::WeightType::kQ5_1 ? qfn_mmq_q5_1_moe_raw
-                                                      : qfn_mmq_q8_0_moe_raw;
+  const auto mmq_raw = type == q::WeightType::kQ4_K     ? qfn_mmq_q4_K_moe_raw
+                       : type == q::WeightType::kQ5_K   ? qfn_mmq_q5_K_moe_raw
+                       : type == q::WeightType::kQ5_1   ? qfn_mmq_q5_1_moe_raw
+                       : type == q::WeightType::kIQ3_S  ? qfn_mmq_iq3_s_moe_raw
+                       : type == q::WeightType::kIQ4_NL ? qfn_mmq_iq4_nl_moe_raw
+                                                        : qfn_mmq_q8_0_moe_raw;
   const int rc =
       mmq_raw(d_w, d_x, d_ids, d_mmq, static_cast<int>(m), static_cast<int>(k),
               static_cast<int>(n_tokens), static_cast<int>(experts),
@@ -512,8 +762,9 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
         // numerical value must match, including subnormal F16 values.
         if (!std::isfinite(a) || !std::isfinite(b) || a != b) {
           throw std::runtime_error(
-              "paired routed SwiGLU differs at " + std::to_string(i) + ": " +
-              std::to_string(a) + " vs " + std::to_string(b));
+              "paired routed SwiGLU differs at slot " + std::to_string(i / m) +
+              " row " + std::to_string(i % m) + ": " + std::to_string(a) +
+              " vs " + std::to_string(b));
         }
       }
       const auto guard = Download(d_pair + slots * m, kHalfGuard);
@@ -556,12 +807,14 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
       r.ref_sq += ref * ref;
     }
   }
+
   std::cout << TypeName(type) << " routed n=" << n_tokens << " used=" << used
             << " E=" << experts << " m=" << m << " k=" << k
             << ": worst |F16 - MMQ| " << r.vs_mmq << ", worst |F16 - F64| "
             << r.vs_ref << ", worst |MMQ - F64| " << r.mmq_vs_ref
             << ", MMQ NMSE " << r.mmq_sq_error / r.ref_sq << " (scale "
             << r.scale << ", widest bucket " << max_bucket << ")\n";
+
   for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
                   static_cast<void*>(d_ids), static_cast<void*>(d_counts),
                   static_cast<void*>(d_bounds), static_cast<void*>(d_cursors),
@@ -694,9 +947,11 @@ void CheckVectorGrouping(bool down = false) {
   constexpr std::size_t guard = 16;
   constexpr float poison = -1234567.0F;
   const std::vector<q::WeightType> formats =
-      down ? std::vector{q::WeightType::kQ5_1, q::WeightType::kQ8_0}
+      down ? std::vector{q::WeightType::kQ5_1, q::WeightType::kQ8_0,
+                         q::WeightType::kQ6_K}
            : std::vector{q::WeightType::kQ4_K, q::WeightType::kQ5_K,
-                         q::WeightType::kQ5_1, q::WeightType::kQ8_0};
+                         q::WeightType::kQ5_1, q::WeightType::kQ8_0,
+                         q::WeightType::kQ6_K};
   std::vector<float> x(tokens * cols);
   std::uint32_t seed = 37;
   // Mix ordinary and small activations: saturated SwiGLU alone misses
@@ -719,6 +974,8 @@ void CheckVectorGrouping(bool down = false) {
   for (int rows : {down ? 2560 : 64, down ? 2561 : 65}) {
     std::vector<Experts> weights, paired_weights;
     if (down) {
+      // Q6_K has no down view: its 256-element blocks do not divide the
+      // 640-element expert FFN, and the loader rejects Q6_K expert tensors.
       weights = {MakeQ5_1(experts, rows, cols, 17),
                  MakeQ8_0(experts, rows, cols, 23)};
       paired_weights = {MakeQ5_1(experts, rows, cols, 79),
@@ -726,10 +983,12 @@ void CheckVectorGrouping(bool down = false) {
     } else {
       weights = {
           MakeQ4K(experts, rows, cols, 11), MakeQ5K(experts, rows, cols, 13),
-          MakeQ5_1(experts, rows, cols, 17), MakeQ8_0(experts, rows, cols, 23)};
+          MakeQ5_1(experts, rows, cols, 17), MakeQ8_0(experts, rows, cols, 23),
+          MakeQ6K(experts, rows, cols, 29)};
       paired_weights = {
           MakeQ4K(experts, rows, cols, 71), MakeQ5K(experts, rows, cols, 73),
-          MakeQ5_1(experts, rows, cols, 79), MakeQ8_0(experts, rows, cols, 83)};
+          MakeQ5_1(experts, rows, cols, 79), MakeQ8_0(experts, rows, cols, 83),
+          MakeQ6K(experts, rows, cols, 89)};
     }
     const std::size_t count = tokens * used * rows;
     const std::vector<float> dirty(count + 2 * guard, poison);
@@ -755,13 +1014,16 @@ void CheckVectorGrouping(bool down = false) {
       return output;
     };
     for (std::size_t f = 0; f < weights.size(); ++f) {
-      // Every format starts with an F16 scale. A nonfinite projection must
-      // still produce zero, just as an inactive expert does.
+      // Every format starts with an F16 scale — except Q6_K, whose scale
+      // sits at the end of the block behind ql/qh/scales. A nonfinite
+      // projection must still produce zero, just as an inactive expert does.
       const __half infinite_scale = __float2half(INFINITY);
-      std::memcpy(weights[f].packed.data(), &infinite_scale,
+      const std::size_t scale_offset =
+          formats[f] == q::WeightType::kQ6_K ? 208 : 0;
+      std::memcpy(weights[f].packed.data() + scale_offset, &infinite_scale,
                   sizeof(infinite_scale));
-      std::memcpy(paired_weights[f].packed.data(), &infinite_scale,
-                  sizeof(infinite_scale));
+      std::memcpy(paired_weights[f].packed.data() + scale_offset,
+                  &infinite_scale, sizeof(infinite_scale));
       auto* wb = Upload(paired_weights[f].packed);
       auto* w = Upload(weights[f].packed);
       CheckHip(hipMemcpy(scalar, dirty.data(), dirty.size() * sizeof(float),
@@ -795,10 +1057,26 @@ void CheckVectorGrouping(bool down = false) {
           throw std::runtime_error("batched routed vector launch failed");
         const auto output = check_output(batch, n);
         if (std::memcmp(reference.data() + guard, output.data() + guard,
-                        n * used * rows * sizeof(float)) != 0)
+                        n * used * rows * sizeof(float)) != 0) {
+          for (int t = 0; t < n; ++t) {
+            for (int j = 0; j < used; ++j) {
+              for (int rr = 0; rr < rows; ++rr) {
+                const std::size_t o =
+                    (static_cast<std::size_t>(t) * used + j) * rows + rr;
+                if (reference[guard + o] != output[guard + o]) {
+                  throw std::runtime_error(
+                      "routed vector grouping changed format " +
+                      std::to_string(f) + " width " + std::to_string(n) +
+                      " at token " + std::to_string(t) + " slot " +
+                      std::to_string(j) + " row " + std::to_string(rr));
+                }
+              }
+            }
+          }
           throw std::runtime_error("routed vector grouping changed format " +
                                    std::to_string(f) + " width " +
                                    std::to_string(n));
+        }
       }
       for (int n : {1, 4, 7}) {
         CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
@@ -936,6 +1214,14 @@ int main() {
     // Q8_0 down view (five layers keep Q8_0 down projections).
     ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x0C0FFEE0U,
                 64)) &&
+         ok;
+    // IQ3_S gate/up view and IQ4_NL gate/up and down views.
+    ok = Ok(Run(q::WeightType::kIQ3_S, 300, 10, 64, 640, 2560, 0x00C0FFEEU)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kIQ4_NL, 3000, 1, 64, 2560, 640, 0x00BAD002U,
+                48)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kIQ4_NL, 97, 1, 8, 129, 640, 0x00BAD003U, 64)) &&
          ok;
     // Ragged rows against the 128-row tile and a tiny batch.
     ok = Ok(Run(q::WeightType::kQ4_K, 40, 4, 8, 201, 512, 0xDEADBEEFU)) && ok;

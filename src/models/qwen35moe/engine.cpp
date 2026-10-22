@@ -953,7 +953,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     auto proposed = dflash_executor_->ForwardBlock(
         static_cast<tokenization::TokenId>(anchor), base,
         static_cast<std::uint32_t>(width - 1), 0.0F, {}, nullptr, nullptr,
-        nullptr, {}, &candidates);
+        nullptr, {}, nullptr, &candidates);
     if (proposed.empty()) {
       // The context end left no room for proposals; decode AR.
       pending->speculative = false;

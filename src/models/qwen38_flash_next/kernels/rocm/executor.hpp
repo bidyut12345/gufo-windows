@@ -217,7 +217,6 @@ private:
   const Executor* owner_{nullptr};
   qwen::vision::DeviceInput vision_input_;
   std::uint32_t max_context_{0};
-  std::uint32_t kv_capacity_{0};
   bool mtp_enabled_{false};
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
@@ -281,6 +280,9 @@ public:
     /// super-blocks at 4.5 bits per element for the value plane. Attention
     /// dequantizes on load.
     KvDtypes kv_dtypes{};
+    /// Largest session context. Zero selects the native context; values
+    /// above it require YaRN (Config::MaxContextLength()).
+    std::uint32_t max_context{0};
   };
 
   ~Executor();
@@ -297,8 +299,6 @@ public:
       std::string* error_msg = nullptr) const;
   [[nodiscard]] bool EnsureRollback(Session& session, std::uint32_t depth,
                                     std::string* error_msg) const;
-  [[nodiscard]] bool EnsureKvCapacity(Session& session, std::uint32_t needed,
-                                      std::string* error_msg) const;
   [[nodiscard]] std::size_t SessionBytes(
       core::SessionMode mode, std::uint32_t max_context,
       std::uint32_t rollback_depth) const noexcept;
@@ -836,6 +836,11 @@ private:
     return selected_logits_ != nullptr ? selected_logits_ : s_.logits;
   }
   std::uint32_t mask_words_{0};
+  /// Session capacity the sparse-mask rows and score scratch are sized for:
+  /// max(native context, Options::max_context).
+  std::uint32_t context_capacity_{0};
+  /// YaRN constants every rope launch receives (disabled: original path).
+  YarnRope yarn_{};
   /// Bounded score scratch, shared by sequential selector chunks.
   std::size_t select_score_floats_{0};
   std::vector<void*> allocations_;

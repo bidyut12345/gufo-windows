@@ -79,19 +79,9 @@ public:
   [[nodiscard]] Placement placement() const noexcept { return placement_; }
 
   [[nodiscard]] hipError_t Allocate(void** pointer, std::size_t bytes) const {
-#if defined(_WIN32)
-    hipError_t status = hipMalloc(pointer, bytes);
-    if (status == hipErrorOutOfMemory) {
-      (void)hipGetLastError();
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      status = hipMalloc(pointer, bytes);
-    }
-    return status;
-#else
     if (placement_ == Placement::kMalloc)
       return AllocateDeviceOrManaged(pointer, bytes);
     return AllocateManaged(pointer, bytes);
-#endif
   }
 
   template<typename T>
@@ -101,17 +91,11 @@ public:
 
 private:
   static Placement Decide(std::uint64_t total_weight_bytes) {
-#if defined(_WIN32)
-    // On Windows, hipMalloc draws from the combined local and non-local
-    // video memory pool (up to ~110 GiB) backed by WDDM.
-    return Placement::kMalloc;
-#else
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
     if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess)
       return Placement::kManaged;
     return ChooseWeightPlacement(free_bytes, total_weight_bytes);
-#endif
   }
 
   Placement placement_;

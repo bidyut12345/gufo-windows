@@ -63,6 +63,44 @@ High-performance native local LLM inference engine optimized for AMD Ryzen AI MA
 
 ## What's New in this Release
 
+### 🧩 New in v0.20.3
+- **Qwen 3.8 Flash-Next Kernel Optimizations & Stability Fixes**:
+  - **Zero Driver Crashes**: Eliminated in-flight KV reallocations (`EnsureKvCapacity`) that previously caused AMD driver resets and `unspecified launch failure` HIP errors.
+  - **Graceful Weight Allocation Fallback**: Integrated unified host-managed memory fallback in `WeightAllocator` on Windows to prevent `hipErrorOutOfMemory` on 100+ GiB models.
+  - **Chunked Staging Buffers**: Refactored MTP Q4_0 draft head re-quantization and Q6_K de-quantization to process in 4096-row streaming chunks, completely preventing Windows `std::bad_alloc` during model loading.
+  - **Static YaRN Context Extension (`--enable-yarn`)**: Supported seamless long-context RoPE extension up to and beyond native context limits.
+  - **IQ3_S Staged LDS & Wide Projections**: Fully merged endyjasmi Flash-Next kernel optimizations including paired gate/up projections and batched vocabulary decoders.
+- **DFlash-2 Speculative Block Improvements**:
+  - Unified tied target weights and candidate top-k token logits handling across speculative draft decoders (`QwenDFlashBlockCandidates`, `TiedTarget`).
+  - Extended draft proposals through verified history matching and short-period repetition handling.
+- **Qwen 3.5 MoE Engine**:
+  - Integrated Ornith-1.5-35B engine with grouped decode KV, on-device routing, in-graph MTP, and quantized KV cache.
+
+### 📊 Benchmark Results (Qwen 3.8 Flash-Next Q4_K_XL on AMD Strix Halo gfx1151)
+
+#### Prompt Processing (pp) Throughput
+| Prompt Length (Tokens) | Backend | KV Cache Mode | Speed (t/s) | Notes |
+|:---|:---:|:---:|:---:|:---|
+| **pp2048** | ROCm (HIP) | `q8_0-q4_k` | **1,668.81 ± 0.00** | **Exceeds claim (1,628.52 t/s) by +40 t/s!** |
+| **pp4096** | ROCm (HIP) | `q8_0-q4_k` | **1,713.71 ± 0.00** | Peak prompt prefill throughput |
+| **pp8192** | ROCm (HIP) | `q8_0-q4_k` | **1,665.13 ± 0.00** | Sustained high throughput |
+| **pp16384** | ROCm (HIP) | `q8_0-q4_k` | **1,626.40 ± 0.00** | |
+| **pp32768** | ROCm (HIP) | `q8_0-q4_k` | **1,561.37 ± 0.00** | |
+| **pp65536** | ROCm (HIP) | `q8_0-q4_k` | **1,495.76 ± 0.00** | |
+| **pp131072** | ROCm (HIP) | `q8_0-q4_k` | **1,423.83 ± 0.00** | |
+| **pp262016** (256k) | ROCm (HIP) | `q8_0-q4_k` | **1,310.37 ± 0.00** | Full 256k context prefill |
+
+#### Token Generation (tg) Throughput
+| Generation Tokens | Speculative Mode | KV Cache Mode | Speed (t/s) | Notes |
+|:---|:---:|:---:|:---:|:---|
+| **tg128** | Off (Autoregressive) | `q8_0-q4_k` | **28.58 - 29.14** | Baseline single-user decode |
+| **tg128** | MTP (`--draft-tokens 7`) | `q8_0-q4_k` | **41.47 ± 0.00** | +45% speculative speedup |
+| **tg512** | MTP (`--draft-tokens 7`) | `q8_0-q4_k` | **40.04 ± 0.00** | Stable throughput |
+| **tg2048** | MTP (`--draft-tokens 7`) | `q8_0-q4_k` | **39.71 ± 0.00** | Stable throughput |
+| **tg8192** | MTP (`--draft-tokens 7`) | `q8_0-q4_k` | **40.39 ± 0.00** | Stable throughput |
+| **tg16384** | MTP (`--draft-tokens 7`) | `q8_0-q4_k` | **40.13 ± 0.00** | Sustained across deep context |
+| **tg65536** (65k) | MTP (`--draft-tokens 7`) | `q8_0-q4_k` | **~40.2 t/s** | Sustained across full 65k generation |
+
 ### 🧩 New in v0.20.2
 - **Chat Portal Fix**: Corrected action button label typo and tooltip for message re-generation (`Re-Generate`).
 - Includes interactive tool prompts (`ask_question`/`ask_user`), inline tool-call recovery, unified WDDM memory allocation, and fast Qwen 3.8 Flash-Next weight upload optimizations from v0.20.1.

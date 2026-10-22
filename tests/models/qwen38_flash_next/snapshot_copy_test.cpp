@@ -1,6 +1,10 @@
 #include "src/core/hip/snapshot_copy.hpp"
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -140,11 +144,17 @@ int main() {
   // Production registration, including interior device aliases and copies
   // ending at the allocation boundary. Every untouched destination byte is
   // independently checked, as are odd/unaligned fallback ranges.
+#if defined(_WIN32)
+  auto* mapping = VirtualAlloc(nullptr, bytes,
+                               MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  assert(mapping != nullptr);
+#else
   auto* mapping = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   assert(mapping != MAP_FAILED);
   assert(madvise(mapping, bytes, MADV_NOHUGEPAGE) == 0);
   assert(madvise(mapping, bytes, MADV_POPULATE_WRITE) == 0);
+#endif
   Check(hipHostRegister(mapping, bytes, hipHostRegisterDefault));
   Copies({static_cast<std::byte*>(mapping), bytes}, device, stream, expected);
   Uploads({static_cast<std::byte*>(mapping), bytes}, device, stream, expected);
@@ -158,7 +168,11 @@ int main() {
   // The same address must fall back once its registration is removed.
   Copies({static_cast<std::byte*>(mapping), bytes}, device, stream, expected);
   Uploads({static_cast<std::byte*>(mapping), bytes}, device, stream, expected);
+#if defined(_WIN32)
+  assert(VirtualFree(mapping, 0, MEM_RELEASE) != 0);
+#else
   assert(munmap(mapping, bytes) == 0);
+#endif
 
   std::vector<std::byte> pageable(bytes);
   Copies(pageable, device, stream, expected);

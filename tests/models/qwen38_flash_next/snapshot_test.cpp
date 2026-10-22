@@ -278,7 +278,8 @@ void CheckBorrowedSnapshots(const std::shared_ptr<qfn::Model>& model,
 
 void CheckCheckpointRetention(const std::shared_ptr<qfn::Model>& model,
                               std::span<const std::int32_t> prompt,
-                              gufo::core::SessionMode mode) {
+                              gufo::core::SessionMode mode,
+                              qfn::KvCacheMode kv_mode) {
   std::string error;
   auto source = model->CreateSession(mode, 8192, &error);
   Require(source && source->Sync(prompt.first(32), &error), error);
@@ -292,7 +293,15 @@ void CheckCheckpointRetention(const std::shared_ptr<qfn::Model>& model,
   Require(large != nullptr, error);
   source->Reset();
   Require(source->Sync(prompt.first(16), &error), error);
-  Require(large->DeviceBytes() > before + (80ULL << 20),
+  // The deep-only row delta scales with the cache format: per token and
+  // full-attention layer F16 stores 2 KiB (K+V), Q8_0 1.0625 KiB, and
+  // Q8_0+Q4_K 832 bytes. Scale the F16-calibrated floor to match.
+  const double kv_factor =
+      kv_mode == qfn::KvCacheMode::kQ8_0Q4K ? 832.0 / 2048.0
+      : kv_mode == qfn::KvCacheMode::kQ8_0  ? 1152.0 / 2048.0
+                                            : 1.0;
+  Require(large->DeviceBytes() >
+              before + static_cast<std::uint64_t>(80.0 * (1 << 20) * kv_factor),
           "deep checkpoint did not preserve its overwritten rows");
   large.reset();
   // Count owned backing blocks rather than HIP's global heap cache. A short
@@ -349,214 +358,289 @@ void CheckDeviceExhaustion(const std::shared_ptr<qfn::Model>& model,
             << " host fallback exact\n";
 }
 
+// One resident session keeps this extended-context regression bounded in UMA
+// memory. Borrowed checkpoints preserve the warm prefix while its short tail
+// is replayed through the independent ordinary Sync path.
+void CheckExtendedPrefillCheckpoint(const std::shared_ptr<qfn::Model>& model,
+                                    gufo::core::SessionMode mode,
+                                    std::uint32_t boundary) {
+  std::string error;
+  auto session = model->CreateSession(mode, model->MaxContext(), &error);
+  Require(session != nullptr, error);
+  const auto pattern = model->Tokenize("Continue: red, blue, green. ");
+  Require(!pattern.empty(), "empty extended prompt pattern");
+  std::vector<std::int32_t> prompt(boundary + 7);
+  for (std::size_t i = 0; i < prompt.size(); ++i)
+    prompt[i] = pattern[i % pattern.size()];
+  Require(session->Sync(std::span(prompt).first(boundary - 11), &error), error);
+  auto warm = session->SaveSnapshot(&error);
+  Require(warm != nullptr, error);
+  const auto claim = session->PrefillCheckpointBytes(boundary);
+  std::unique_ptr<qfn::SessionSnapshot> checkpoint;
+  double capture_ms = -1;
+  Require(
+      session->SyncThrough(prompt, boundary, &checkpoint, &error, &capture_ms),
+      error);
+  Require(checkpoint && checkpoint->SizeBytes() == claim &&
+              std::isfinite(capture_ms) && capture_ms > 0,
+          "extended checkpoint capture differs from its admission claim");
+  const std::vector<float> final_logits(session->Logits().begin(),
+                                        session->Logits().end());
+  const auto expected = Decode(*session, 8, {.temperature = 0}, 8);
+  Require(session->RestoreSnapshot(*checkpoint, &error), error);
+  const std::vector<float> boundary_logits(session->Logits().begin(),
+                                           session->Logits().end());
+  Require(session->RestoreSnapshot(*warm, &error), error);
+  checkpoint.reset();
+  Require(session->Sync(std::span(prompt).first(boundary), &error), error);
+  Require(std::memcmp(boundary_logits.data(), session->Logits().data(),
+                      session->Logits().size_bytes()) == 0,
+          "extended checkpoint changed boundary logits");
+  Require(session->Sync(prompt, &error), error);
+  Require(std::memcmp(final_logits.data(), session->Logits().data(),
+                      session->Logits().size_bytes()) == 0,
+          "extended checkpoint changed split-pass logits");
+  RequireSame(expected, Decode(*session, 8, {.temperature = 0}, 8),
+              "extended checkpoint continuation");
+  std::cout << "extended checkpoint mode=" << static_cast<int>(mode)
+            << " boundary=" << boundary << " exact\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 5 || std::string_view(argv[1]) != "--model" ||
-      std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr
-        << "Usage: snapshot_test --model FIRST.gguf --mtp-model MTP.gguf\n";
+  qfn::KvCacheMode kv_mode = qfn::KvCacheMode::kF16;
+  bool extended = false;
+  bool valid = argc >= 5 && std::string_view(argv[1]) == "--model" &&
+               std::string_view(argv[3]) == "--mtp-model";
+  for (int i = 5; valid && i < argc; ++i) {
+    if (std::string_view(argv[i]) == "--extended") {
+      extended = true;
+    } else if (std::string_view(argv[i]) == "--kv-cache" && i + 1 < argc) {
+      if (!qfn::ParseKvCacheMode(argv[i + 1], &kv_mode)) {
+        std::cerr << "Unknown --kv-cache mode: " << argv[i + 1] << '\n';
+        valid = false;
+      }
+      ++i;
+    } else {
+      valid = false;
+    }
+  }
+  if (!valid) {
+    std::cerr << "Usage: snapshot_test --model FIRST.gguf --mtp-model MTP.gguf "
+                 "[--extended] [--kv-cache f16|q8_0|q8_0-q4_k]\n";
     return 77;
   }
-  try {
-    std::string error;
-    constexpr std::uint32_t kContext = 8192;
-    auto model = qfn::Model::Load(argv[2],
-                                  {.max_context = kContext,
-                                   .mtp_model_path = argv[4],
-                                   .max_draft_tokens = 7},
-                                  &error);
-    Require(model != nullptr, error);
-    const auto pattern = model->Tokenize(
-        "The quick brown fox jumps over the lazy dog. "
-        "Strix Halo executes this deterministic benchmark sequence. ");
-    Require(!pattern.empty(), "empty prompt pattern");
-    // Partial prefill batch and three unpooled raw indexer rows at the end
-    // of the ring. Continuing (and speculative rollback) crosses its wrap.
-    std::vector<std::int32_t> prompt(4095);
-    for (std::size_t i = 0; i < prompt.size(); ++i)
-      prompt[i] = pattern[i % pattern.size()];
-    CheckPrefillCheckpoint(model, prompt,
-                           gufo::core::SessionMode::kAutoregressive);
-    CheckPrefillCheckpoint(model, prompt,
-                           gufo::core::SessionMode::kSpeculative);
-    std::vector<std::int32_t> overflow_prompt(prompt);
-    overflow_prompt.insert(overflow_prompt.end(), prompt.begin(),
-                           prompt.begin() + 2051);
-    std::vector<std::int32_t> warm_prompt(prompt);
-    warm_prompt.insert(warm_prompt.end(), prompt.begin(), prompt.begin() + 33);
+  return 77;
+}
+try {
+  std::string error;
+  const std::uint32_t kContext = extended ? 409600 : 8192;
+  auto model = qfn::Model::Load(
+      argv[2],
+      {.max_context = kContext,
+       .mtp_model_path = argv[4],
+       .max_draft_tokens = 7,
+       .kv_cache_mode = kv_mode,
+       .rope_scaling = qfn::RopeScalingForContext(kContext, 262144)},
+      &error);
+  Require(model != nullptr, error);
+  if (extended) {
     for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
                             gufo::core::SessionMode::kSpeculative}) {
-      CheckPrefillCheckpoint(model, warm_prompt, mode, prompt.size());
-      CheckPrefillCheckpoint(model, overflow_prompt, mode, prompt.size());
-      CheckPrefillCheckpoint(
-          model, std::span<const std::int32_t>(prompt).first(2040), mode);
-      CheckPrefillCheckpoint(model, prompt, mode, 0, 0);
-      CheckPrefillCheckpoint(
-          model, std::span<const std::int32_t>(warm_prompt).first(2055), mode);
+      for (const auto boundary : {262145U, 294913U})
+        CheckExtendedPrefillCheckpoint(model, mode, boundary);
     }
-    CheckBorrowedSnapshots(model, prompt,
-                           gufo::core::SessionMode::kAutoregressive);
-    CheckBorrowedSnapshots(model, prompt,
-                           gufo::core::SessionMode::kSpeculative);
-    CheckCheckpointRetention(model, prompt,
-                             gufo::core::SessionMode::kAutoregressive);
-    CheckCheckpointRetention(model, prompt,
-                             gufo::core::SessionMode::kSpeculative);
-    CheckDeviceExhaustion(model, prompt,
-                          gufo::core::SessionMode::kAutoregressive);
-    CheckDeviceExhaustion(model, prompt, gufo::core::SessionMode::kSpeculative);
-    const sampling::SamplingConfig config{
-        .temperature = 0.8F, .top_k = 40, .top_p = 0.9F, .seed = 7};
-    constexpr std::size_t kTokens = 48;
-
-    auto origin = model->CreateSession(
-        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
-                        : gufo::core::SessionMode::kAutoregressive,
-        kContext, &error);
-    Require(origin != nullptr, error);
-    Require(origin->Sync(prompt, &error), error);
-    const std::vector<float> prompt_logits(origin->Logits().begin(),
-                                           origin->Logits().end());
-
-    auto start = std::chrono::steady_clock::now();
-    auto at_prompt = origin->SaveSnapshot(&error);
-    Require(at_prompt != nullptr, error);
-    const double save_ms = Millis(start);
-    Require(at_prompt->SizeBytes() == origin->SnapshotBytes(),
-            "snapshot size differs from the estimate");
-    std::cout << "snapshot tokens=" << prompt.size()
-              << " bytes=" << at_prompt->SizeBytes() << " save_ms=" << save_ms
-              << "\n";
-
-    const Decoded expected = Decode(*origin, kTokens, config, 8);
-    Require(expected.stats.drafted > 0, "MTP did not draft");
-
-    // Restore into a fresh session.
-    auto restored = model->CreateSession(
-        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
-                        : gufo::core::SessionMode::kAutoregressive,
-        kContext, &error);
-    Require(restored != nullptr, error);
-    start = std::chrono::steady_clock::now();
-    Require(restored->RestoreSnapshot(*at_prompt, &error), error);
-    std::cout << "restore_ms=" << Millis(start) << "\n";
-    Require(std::equal(prompt.begin(), prompt.end(), restored->Tokens().begin(),
-                       restored->Tokens().end()),
-            "restored tokens differ");
-    Require(restored->Position() == prompt.size(), "restored position");
-    Require(std::memcmp(prompt_logits.data(), restored->Logits().data(),
-                        prompt_logits.size() * sizeof(float)) == 0,
-            "restored logits differ");
-    RequireSame(expected, Decode(*restored, kTokens, config, 8),
-                "fresh session restore");
-
-    // The persistent byte form restores the same way.
-    std::vector<std::uint8_t> bytes(at_prompt->SizeBytes());
-    Require(at_prompt->CopyTo(bytes), "snapshot copy");
-    auto persisted = model->CreateSession(
-        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
-                        : gufo::core::SessionMode::kAutoregressive,
-        kContext, &error);
-    Require(persisted != nullptr, error);
-    Require(persisted->RestoreSnapshot(bytes, &error), error);
-    RequireSame(expected, Decode(*persisted, kTokens, config, 8),
-                "persistent restore");
-
-    // Restoring over a session that already decoded discards its state.
-    Require(origin->RestoreSnapshot(*at_prompt, &error), error);
-    RequireSame(expected, Decode(*origin, kTokens, config, 8),
-                "restore over a used session");
-
-    // Single-token decoding from a restored session also matches.
-    Require(origin->RestoreSnapshot(*at_prompt, &error), error);
-    const Decoded single = Decode(*origin, 16, config, 1);
-    Require(restored->RestoreSnapshot(*at_prompt, &error), error);
-    Require(single.tokens == Decode(*restored, 16, config, 1).tokens,
-            "single-token decode differs after restore");
-
-    // A mid-decode snapshot carries the draft block's caught-up state and
-    // the partial batch of kept trunk rows.
-    Require(origin->RestoreSnapshot(*at_prompt, &error), error);
-    const Decoded first_half = Decode(*origin, 16, config, 8);
-    auto mid = origin->SaveSnapshot(&error);
-    Require(mid != nullptr, error);
-    const Decoded second_half = Decode(*origin, kTokens, config, 8);
-    Require(restored->RestoreSnapshot(*mid, &error), error);
-    Require(restored->Position() == prompt.size() + first_half.tokens.size(),
-            "mid-decode position");
-    // Controller state is part of a stochastic continuation's replay.
-    RequireSame(second_half, Decode(*restored, kTokens, config, 8),
-                "mid-decode restore");
-
-    // Capture a rejected proposal before its residual has been evaluated.
-    // The context snapshot and the request-owned sampler must replay together.
-    auto pending = model->CreateSession(
-        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
-                        : gufo::core::SessionMode::kAutoregressive,
-        kContext, &error);
-    const auto short_prompt = std::span(prompt).first(16);
-    Require(pending && pending->Sync(short_prompt, &error), error);
-    const std::vector<sampling::TokenId> short_history(short_prompt.begin(),
-                                                       short_prompt.end());
-    sampling::SamplerState sampler({.temperature = 2.0F, .seed = 73},
-                                   short_history);
-    bool rejected = false;
-    for (unsigned attempt = 0; attempt < 32 && !rejected; ++attempt) {
-      qfn::Session::DecodeResult step;
-      Require(pending->DecodeStep(2, sampler, &step, &error, false), error);
-      rejected = step.tokens.size() == 1;
-    }
-    Require(rejected, "snapshot test did not exercise a deferred residual");
-    auto residual_snapshot = pending->SaveSnapshot(&error);
-    Require(residual_snapshot != nullptr, error);
-    auto replay_sampler = sampler;
-    const auto residual_expected = Decode(*pending, 16, sampler, 8);
-    Require(restored->RestoreSnapshot(*residual_snapshot, &error), error);
-    RequireSame(residual_expected, Decode(*restored, 16, replay_sampler, 8),
-                "deferred residual restore");
-    Require(sampler.rng_state() == replay_sampler.rng_state(),
-            "deferred residual restore changed RNG");
-
-    // Extending the restored context keeps the prefix.
-    Require(restored->RestoreSnapshot(*at_prompt, &error), error);
-    std::vector<std::int32_t> extended = prompt;
-    extended.insert(extended.end(), expected.tokens.begin(),
-                    expected.tokens.end());
-    Require(restored->Sync(extended, &error), error);
-    Require(origin->RestoreSnapshot(*at_prompt, &error), error);
-    Require(origin->Sync(extended, &error), error);
-    Require(std::memcmp(origin->Logits().data(), restored->Logits().data(),
-                        prompt_logits.size() * sizeof(float)) == 0,
-            "extension after restore differs");
-
-    // Cached state from older prefill arithmetic must be rebuilt.
-    auto incompatible = bytes;
-    const std::uint32_t old_version = qfn::Session::kSnapshotPayloadVersion - 1;
-    std::memcpy(incompatible.data() + 8, &old_version, sizeof(old_version));
-    Require(!restored->RestoreSnapshot(incompatible, &error),
-            "incompatible snapshot version accepted");
-    Require(restored->Position() == extended.size(),
-            "incompatible snapshot disturbed the session");
-
-    // Rejections: truncated payload, and a context too small to hold it.
-    Require(!restored->RestoreSnapshot(
-                std::span<const std::uint8_t>(bytes).first(bytes.size() / 2),
-                &error),
-            "truncated payload accepted");
-    Require(restored->Position() == extended.size(),
-            "rejected payload disturbed the session");
-    auto small = model->CreateSession(
-        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
-                        : gufo::core::SessionMode::kAutoregressive,
-        2048, &error);
-    Require(small != nullptr, error);
-    Require(!small->RestoreSnapshot(*at_prompt, &error),
-            "oversized snapshot accepted");
-    std::cout << "snapshot round trips exact=1\n";
     return 0;
-  } catch (const std::exception& e) {
-    std::cerr << "FAIL: " << e.what() << "\n";
-    return 1;
   }
+  const auto pattern = model->Tokenize(
+      "The quick brown fox jumps over the lazy dog. "
+      "Strix Halo executes this deterministic benchmark sequence. ");
+  Require(!pattern.empty(), "empty prompt pattern");
+  // Partial prefill batch and three unpooled raw indexer rows at the end
+  // of the ring. Continuing (and speculative rollback) crosses its wrap.
+  std::vector<std::int32_t> prompt(4095);
+  for (std::size_t i = 0; i < prompt.size(); ++i)
+    prompt[i] = pattern[i % pattern.size()];
+  CheckPrefillCheckpoint(model, prompt,
+                         gufo::core::SessionMode::kAutoregressive);
+  CheckPrefillCheckpoint(model, prompt, gufo::core::SessionMode::kSpeculative);
+  std::vector<std::int32_t> overflow_prompt(prompt);
+  overflow_prompt.insert(overflow_prompt.end(), prompt.begin(),
+                         prompt.begin() + 2051);
+  std::vector<std::int32_t> warm_prompt(prompt);
+  warm_prompt.insert(warm_prompt.end(), prompt.begin(), prompt.begin() + 33);
+  for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
+                          gufo::core::SessionMode::kSpeculative}) {
+    CheckPrefillCheckpoint(model, warm_prompt, mode, prompt.size());
+    CheckPrefillCheckpoint(model, overflow_prompt, mode, prompt.size());
+    CheckPrefillCheckpoint(
+        model, std::span<const std::int32_t>(prompt).first(2040), mode);
+    CheckPrefillCheckpoint(model, prompt, mode, 0, 0);
+    CheckPrefillCheckpoint(
+        model, std::span<const std::int32_t>(warm_prompt).first(2055), mode);
+  }
+  CheckBorrowedSnapshots(model, prompt,
+                         gufo::core::SessionMode::kAutoregressive);
+  CheckBorrowedSnapshots(model, prompt, gufo::core::SessionMode::kSpeculative);
+  CheckCheckpointRetention(model, prompt,
+                           gufo::core::SessionMode::kAutoregressive, kv_mode);
+  CheckCheckpointRetention(model, prompt, gufo::core::SessionMode::kSpeculative,
+                           kv_mode);
+  CheckDeviceExhaustion(model, prompt,
+                        gufo::core::SessionMode::kAutoregressive);
+  CheckDeviceExhaustion(model, prompt, gufo::core::SessionMode::kSpeculative);
+  const sampling::SamplingConfig config{
+      .temperature = 0.8F, .top_k = 40, .top_p = 0.9F, .seed = 7};
+  constexpr std::size_t kTokens = 48;
+
+  auto origin = model->CreateSession(
+      model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                      : gufo::core::SessionMode::kAutoregressive,
+      kContext, &error);
+  Require(origin != nullptr, error);
+  Require(origin->Sync(prompt, &error), error);
+  const std::vector<float> prompt_logits(origin->Logits().begin(),
+                                         origin->Logits().end());
+
+  auto start = std::chrono::steady_clock::now();
+  auto at_prompt = origin->SaveSnapshot(&error);
+  Require(at_prompt != nullptr, error);
+  const double save_ms = Millis(start);
+  Require(at_prompt->SizeBytes() == origin->SnapshotBytes(),
+          "snapshot size differs from the estimate");
+  std::cout << "snapshot tokens=" << prompt.size()
+            << " bytes=" << at_prompt->SizeBytes() << " save_ms=" << save_ms
+            << "\n";
+
+  const Decoded expected = Decode(*origin, kTokens, config, 8);
+  Require(expected.stats.drafted > 0, "MTP did not draft");
+
+  // Restore into a fresh session.
+  auto restored = model->CreateSession(
+      model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                      : gufo::core::SessionMode::kAutoregressive,
+      kContext, &error);
+  Require(restored != nullptr, error);
+  start = std::chrono::steady_clock::now();
+  Require(restored->RestoreSnapshot(*at_prompt, &error), error);
+  std::cout << "restore_ms=" << Millis(start) << "\n";
+  Require(std::equal(prompt.begin(), prompt.end(), restored->Tokens().begin(),
+                     restored->Tokens().end()),
+          "restored tokens differ");
+  Require(restored->Position() == prompt.size(), "restored position");
+  Require(std::memcmp(prompt_logits.data(), restored->Logits().data(),
+                      prompt_logits.size() * sizeof(float)) == 0,
+          "restored logits differ");
+  RequireSame(expected, Decode(*restored, kTokens, config, 8),
+              "fresh session restore");
+
+  // The persistent byte form restores the same way.
+  std::vector<std::uint8_t> bytes(at_prompt->SizeBytes());
+  Require(at_prompt->CopyTo(bytes), "snapshot copy");
+  auto persisted = model->CreateSession(
+      model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                      : gufo::core::SessionMode::kAutoregressive,
+      kContext, &error);
+  Require(persisted != nullptr, error);
+  Require(persisted->RestoreSnapshot(bytes, &error), error);
+  RequireSame(expected, Decode(*persisted, kTokens, config, 8),
+              "persistent restore");
+
+  // Restoring over a session that already decoded discards its state.
+  Require(origin->RestoreSnapshot(*at_prompt, &error), error);
+  RequireSame(expected, Decode(*origin, kTokens, config, 8),
+              "restore over a used session");
+
+  // Single-token decoding from a restored session also matches.
+  Require(origin->RestoreSnapshot(*at_prompt, &error), error);
+  const Decoded single = Decode(*origin, 16, config, 1);
+  Require(restored->RestoreSnapshot(*at_prompt, &error), error);
+  Require(single.tokens == Decode(*restored, 16, config, 1).tokens,
+          "single-token decode differs after restore");
+
+  // A mid-decode snapshot carries the draft block's caught-up state and
+  // the partial batch of kept trunk rows.
+  Require(origin->RestoreSnapshot(*at_prompt, &error), error);
+  const Decoded first_half = Decode(*origin, 16, config, 8);
+  auto mid = origin->SaveSnapshot(&error);
+  Require(mid != nullptr, error);
+  const Decoded second_half = Decode(*origin, kTokens, config, 8);
+  Require(restored->RestoreSnapshot(*mid, &error), error);
+  Require(restored->Position() == prompt.size() + first_half.tokens.size(),
+          "mid-decode position");
+  // Controller state is part of a stochastic continuation's replay.
+  RequireSame(second_half, Decode(*restored, kTokens, config, 8),
+              "mid-decode restore");
+
+  // Capture a rejected proposal before its residual has been evaluated.
+  // The context snapshot and the request-owned sampler must replay together.
+  auto pending = model->CreateSession(
+      model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                      : gufo::core::SessionMode::kAutoregressive,
+      kContext, &error);
+  const auto short_prompt = std::span(prompt).first(16);
+  Require(pending && pending->Sync(short_prompt, &error), error);
+  const std::vector<sampling::TokenId> short_history(short_prompt.begin(),
+                                                     short_prompt.end());
+  sampling::SamplerState sampler({.temperature = 2.0F, .seed = 73},
+                                 short_history);
+  bool rejected = false;
+  for (unsigned attempt = 0; attempt < 32 && !rejected; ++attempt) {
+    qfn::Session::DecodeResult step;
+    Require(pending->DecodeStep(2, sampler, &step, &error, false), error);
+    rejected = step.tokens.size() == 1;
+  }
+  Require(rejected, "snapshot test did not exercise a deferred residual");
+  auto residual_snapshot = pending->SaveSnapshot(&error);
+  Require(residual_snapshot != nullptr, error);
+  auto replay_sampler = sampler;
+  const auto residual_expected = Decode(*pending, 16, sampler, 8);
+  Require(restored->RestoreSnapshot(*residual_snapshot, &error), error);
+  RequireSame(residual_expected, Decode(*restored, 16, replay_sampler, 8),
+              "deferred residual restore");
+  Require(sampler.rng_state() == replay_sampler.rng_state(),
+          "deferred residual restore changed RNG");
+
+  // Extending the restored context keeps the prefix.
+  Require(restored->RestoreSnapshot(*at_prompt, &error), error);
+  std::vector<std::int32_t> extended = prompt;
+  extended.insert(extended.end(), expected.tokens.begin(),
+                  expected.tokens.end());
+  Require(restored->Sync(extended, &error), error);
+  Require(origin->RestoreSnapshot(*at_prompt, &error), error);
+  Require(origin->Sync(extended, &error), error);
+  Require(std::memcmp(origin->Logits().data(), restored->Logits().data(),
+                      prompt_logits.size() * sizeof(float)) == 0,
+          "extension after restore differs");
+
+  // Cached state from older prefill arithmetic must be rebuilt.
+  auto incompatible = bytes;
+  const std::uint32_t old_version = qfn::Session::kSnapshotPayloadVersion - 1;
+  std::memcpy(incompatible.data() + 8, &old_version, sizeof(old_version));
+  Require(!restored->RestoreSnapshot(incompatible, &error),
+          "incompatible snapshot version accepted");
+  Require(restored->Position() == extended.size(),
+          "incompatible snapshot disturbed the session");
+
+  // Rejections: truncated payload, and a context too small to hold it.
+  Require(
+      !restored->RestoreSnapshot(
+          std::span<const std::uint8_t>(bytes).first(bytes.size() / 2), &error),
+      "truncated payload accepted");
+  Require(restored->Position() == extended.size(),
+          "rejected payload disturbed the session");
+  auto small = model->CreateSession(
+      model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                      : gufo::core::SessionMode::kAutoregressive,
+      2048, &error);
+  Require(small != nullptr, error);
+  Require(!small->RestoreSnapshot(*at_prompt, &error),
+          "oversized snapshot accepted");
+  std::cout << "snapshot round trips exact=1\n";
+  return 0;
+} catch (const std::exception& e) {
+  std::cerr << "FAIL: " << e.what() << "\n";
+  return 1;
+}
 }

@@ -2590,13 +2590,41 @@ __device__ __forceinline__ void LoadQ4K8(const unsigned char* sb_codes,
   }
 }
 
+// YarnRope travels to the kernels by value as a plain 20-byte argument.
+// Every rope kernel is instantiated with and without YaRN (`kYarn`) and the
+// launcher picks one on the host: a runtime branch in the default kernel let
+// fast-math contract its rotation differently, so the default instantiation
+// keeps the original code and only the YaRN one carries the extra work.
+static_assert(std::is_trivially_copyable_v<YarnRope> && sizeof(YarnRope) == 20);
+
+// YaRN frequency. The product is kept opaque so every rope site rounds the
+// angle identically: fast-math may otherwise reassociate position * freq *
+// multiplier differently per kernel and break cross-site byte identity.
+__device__ __forceinline__ float YarnFrequency(float freq, std::uint32_t pair,
+                                               const YarnRope& yarn) {
+  float scaled = freq * YarnPairMultiplier(yarn, pair);
+  asm volatile("" : "+v"(scaled));
+  return scaled;
+}
+
+// YaRN attention factor on cos and sin, opaque for the same reason: the
+// sites rotate with different expressions (explicit FMA or fast-math
+// contraction), which must all see the same rounded scaled values.
+__device__ __forceinline__ void YarnScale(float& sine, float& cosine,
+                                          const YarnRope& yarn) {
+  sine *= yarn.mscale;
+  cosine *= yarn.mscale;
+  asm volatile("" : "+v"(sine), "+v"(cosine));
+}
+
 // Keep each head's original eight-wave reduction. Heads in a block share
 // rotary angles; normalization statistics remain independent.
 // The Q8_0 cache quantizes each 32-element block from the pre-store F32
 // value: F16 scale = amax/127, codes rounded to nearest even. Blocks follow
 // element indices, so with d a multiple of 32 a warp covers whole blocks;
 // the RoPE'd key halves must stay inside the first warp, i.e. rotary 64.
-template<std::uint32_t kHeadsPerBlock, bool kKvQ8, bool kVQ4K = false>
+template<std::uint32_t kHeadsPerBlock, bool kKvQ8, bool kVQ4K = false,
+         bool kYarn = false>
 __global__ void PrepareAttentionKernel(
     const float* __restrict__ packed, std::uint32_t stride,
     const float* __restrict__ q_gamma, const float* __restrict__ k_gamma,
@@ -2604,7 +2632,8 @@ __global__ void PrepareAttentionKernel(
     unsigned char* __restrict__ k_cache, unsigned char* __restrict__ v_cache,
     std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t d,
     std::uint32_t rotary, const std::uint32_t* start_pos, float theta,
-    float eps, const qwen::vision::DeviceRope* rope) {
+    float eps, const qwen::vision::DeviceRope* rope,
+    [[maybe_unused]] YarnRope yarn) {
   __shared__ float partial[kHeadsPerBlock][8];
   __shared__ float norm[kHeadsPerBlock][256];
   __shared__ float q4k_scratch[16];
@@ -2700,10 +2729,14 @@ __global__ void PrepareAttentionKernel(
   const std::uint32_t half = rotary / 2;
   float sine = 0.0f, cosine = 0.0f;
   if (tid < half) {
-    const float freq = powf(
+    float freq = powf(
         theta, -2.0f * static_cast<float>(tid) / static_cast<float>(rotary));
+    if constexpr (kYarn)
+      freq = YarnFrequency(freq, tid, yarn);
     sincosf(qwen::vision::RopePosition(rope, *start_pos + t, tid) * freq, &sine,
             &cosine);
+    if constexpr (kYarn)
+      YarnScale(sine, cosine, yarn);
   }
 #pragma unroll
   for (std::uint32_t j = 0; j < kHeadsPerBlock; ++j) {
@@ -2746,25 +2779,38 @@ __global__ void PrepareAttentionKernel(
   }
 }
 
+template<bool kYarn>
 __global__ void RopeKernel(float* x, std::uint32_t heads, std::uint32_t d,
                            std::uint32_t rotary_dim,
                            const std::uint32_t* start_pos, float theta,
-                           const qwen::vision::DeviceRope* rope) {
+                           const qwen::vision::DeviceRope* rope,
+                           [[maybe_unused]] YarnRope yarn) {
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t half = rotary_dim / 2;
   for (std::uint32_t idx = threadIdx.x; idx < heads * half; idx += blockDim.x) {
     const std::uint32_t h = idx / half;
     const std::uint32_t i = idx % half;
     float* v = x + (static_cast<std::size_t>(t) * heads + h) * d;
-    const float freq = powf(
+    float freq = powf(
         theta, -2.0f * static_cast<float>(i) / static_cast<float>(rotary_dim));
+    if constexpr (kYarn)
+      freq = YarnFrequency(freq, i, yarn);
     float s = 0.0f;
     float c = 0.0f;
     sincosf(qwen::vision::RopePosition(rope, *start_pos + t, i) * freq, &s, &c);
+    if constexpr (kYarn)
+      YarnScale(s, c, yarn);
     const float a = v[i];
     const float b = v[i + half];
-    v[i] = a * c - b * s;
-    v[i + half] = a * s + b * c;
+    if constexpr (kYarn) {
+      // Explicit rounding, as in PrepareAttention and the GEMM epilogue:
+      // fast-math may otherwise contract a * s + b * c either way round.
+      v[i] = __fmaf_rn(a, c, -__fmul_rn(b, s));
+      v[i + half] = __fmaf_rn(a, s, __fmul_rn(b, c));
+    } else {
+      v[i] = a * c - b * s;
+      v[i + half] = a * s + b * c;
+    }
   }
 }
 
@@ -2835,14 +2881,13 @@ __global__ void StoreRowsKernel(const float* src, float* dst,
 /// grid: the most blocks a batch can complete. Block b pools raw keys
 /// [b*ratio, (b+1)*ratio) once every one of them is stored, i.e. for
 /// b in [*first_block, (*start_pos + n_tokens) / ratio).
-__global__ void PoolBlocksKernel(const float* raw, const float* gamma,
-                                 __half* blocks,
-                                 const std::uint32_t* first_block,
-                                 const std::uint32_t* start_pos,
-                                 std::uint32_t n_tokens, std::uint32_t ratio,
-                                 std::uint32_t dim, std::uint32_t rotary_dim,
-                                 float theta, float eps, std::uint32_t capacity,
-                                 const qwen::vision::DeviceRope* rope) {
+template<bool kYarn>
+__global__ void PoolBlocksKernel(
+    const float* raw, const float* gamma, __half* blocks,
+    const std::uint32_t* first_block, const std::uint32_t* start_pos,
+    std::uint32_t n_tokens, std::uint32_t ratio, std::uint32_t dim,
+    std::uint32_t rotary_dim, float theta, float eps, std::uint32_t capacity,
+    const qwen::vision::DeviceRope* rope, [[maybe_unused]] YarnRope yarn) {
   __shared__ float v[256];
   __shared__ float shared[32];
   const std::uint32_t b = *first_block + blockIdx.x;
@@ -2868,11 +2913,15 @@ __global__ void PoolBlocksKernel(const float* raw, const float* gamma,
   float outv = i < dim ? v[i] : 0.0f;
   if (i < rotary_dim) {
     const std::uint32_t p = i < half ? i : i - half;
-    const float freq = powf(
+    float freq = powf(
         theta, -2.0f * static_cast<float>(p) / static_cast<float>(rotary_dim));
+    if constexpr (kYarn)
+      freq = YarnFrequency(freq, p, yarn);
     float s = 0.0f;
     float c = 0.0f;
     sincosf(qwen::vision::RopePosition(rope, b * ratio, p) * freq, &s, &c);
+    if constexpr (kYarn)
+      YarnScale(s, c, yarn);
     const float a = v[p];
     const float bb = v[p + half];
     outv = i < half ? a * c - bb * s : a * s + bb * c;
@@ -3304,8 +3353,8 @@ __global__ void CompactSelectionKernel(
 /// combines them, otherwise the normalized row goes straight to `out`.
 /// With `lists`/`counts` (CompactSelectionKernel's output, ratio 4 only) the
 /// selected blocks are read from the ready-made list instead of being
-/// compacted from the mask. The tiles are the same 64-block tiles dealt to the
-/// splits in the same order, so the output is bitwise identical.
+/// compacted from the mask. The tiles are the same 64-block tiles dealt to
+/// the splits in the same order, so the output is bitwise identical.
 template<std::uint32_t kGroup, bool kKvQ8, bool kVQ4K = false>
 __global__ void AttentionKernel(
     const float* q, const unsigned char* k_cache, const unsigned char* v_cache,
@@ -4417,14 +4466,15 @@ constexpr std::uint32_t kWmmaRatio = 4;
 constexpr std::uint32_t kWmmaKSteps = kWmmaHeadDim / 16;
 // Row padding keeps a 16-byte-per-lane fragment read off a single bank group.
 constexpr std::uint32_t kWmmaKStride = kWmmaHeadDim + 8;
-// Union-mask capacity: one bit per 4-token block, 262,144 tokens of context.
+// Union-mask capacity of the live visible extent: one bit per 4-token block,
+// 262,144 visible tokens. Rows may be strided wider.
 constexpr std::uint32_t kWmmaMaxMaskWords = 2048;
 
 /// Two row layouts share the kernel. The dense window packs 16 queries x 2
 /// heads (a row block is 16 queries of one head, grid.y over head pairs).
 /// The sparse window packs four queries x twelve heads into three row
-/// blocks without padding, with adjacent blocks covering both KV heads: the key
-/// tiles are gathered from the union of the block's query selections and
+/// blocks without padding, with adjacent blocks covering both KV heads: the
+/// key tiles are gathered from the union of the block's query selections and
 /// four selections overlap far less than 32 (measured at 16k depth: 846
 /// versus 2,478 selected blocks against 512 per query).
 template<std::uint32_t kQueryRows, std::uint32_t kKeys, bool kPackHeads,
@@ -5293,8 +5343,9 @@ __global__ void QuantizeQ8TiledKernel(const float* __restrict__ x,
   }
 }
 
-// Preserve the separate scale/SiLU kernel's F32 intermediates before narrowing.
-// Without these compiler boundaries, fused F16 output can round differently.
+// Preserve the separate scale/SiLU kernel's F32 intermediates before
+// narrowing. Without these compiler boundaries, fused F16 output can round
+// differently.
 __device__ __forceinline__ float HcScaledSilu(float value) {
   float scaled = value * 0.25F;
   asm volatile("" : "+v"(scaled));
@@ -5304,9 +5355,9 @@ __device__ __forceinline__ float HcScaledSilu(float value) {
 }
 
 /// Two-dimensionally blocked W8A8 WMMA GEMM: block = BM rows x BN tokens, BK
-/// 32-element K blocks per LDS stage, waves = WM row groups x WN token groups.
-/// Out-of-range rows and K blocks are clamped and their scale zeroed, so
-/// they contribute exactly zero without divergence. y is [batch][m].
+/// 32-element K blocks per LDS stage, waves = WM row groups x WN token
+/// groups. Out-of-range rows and K blocks are clamped and their scale zeroed,
+/// so they contribute exactly zero without divergence. y is [batch][m].
 template<int BM, int BN, int BK, int WM, int WN, bool kHcDown = false>
 __launch_bounds__(256) __global__ void W8A8BlockedWmmaGEMMKernel(
     const void* __restrict__ w, const void* __restrict__ x_blocks,
@@ -6688,8 +6739,8 @@ __launch_bounds__(256) __global__
   }
 
   // One wave writes a complete 128-byte line of F16 output. Padding the
-  // shared row by two floats also makes the accumulator scatter conflict-free.
-  // Narrow buckets keep the lighter wave-local epilogue below.
+  // shared row by two floats also makes the accumulator scatter
+  // conflict-free. Narrow buckets keep the lighter wave-local epilogue below.
   if constexpr (BN >= 48) {
     static_assert(kLdsBytes >= 16 * (BM + 2) * sizeof(float));
     if (out_half != nullptr) {
@@ -7511,6 +7562,7 @@ struct AttentionProjectionOutput {
   float theta;
   float eps;
   const qwen::vision::DeviceRope* rope;
+  YarnRope yarn;
 };
 
 /// Dense F16 WMMA GEMM over Q8_0 or F16 weights: block = BM rows x BN tokens,
@@ -7524,7 +7576,7 @@ struct AttentionProjectionOutput {
 template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1,
          bool kHcMix = false, bool kSsmConv = false, bool kAttention = false,
          bool kHalfWeights = false, bool kBf16 = false, bool kStrided = false,
-         bool kKvQ8 = false, bool kVQ4K = false>
+         bool kKvQ8 = false, bool kVQ4K = false, bool kYarn = false>
 __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     const void* __restrict__ w, const __half* __restrict__ x,
     float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k,
@@ -7922,13 +7974,17 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
               v[c] = v[c] * gamma[c * 32 + lane_id];
               asm volatile("" : "+v"(v[c]));
             }
-            const float freq = powf(
-                attention.theta, -2.0F * static_cast<float>(lane_id) / 64.0F);
+            float freq = powf(attention.theta,
+                              -2.0F * static_cast<float>(lane_id) / 64.0F);
+            if constexpr (kYarn)
+              freq = YarnFrequency(freq, lane_id, attention.yarn);
             float sn = 0.0F, cs = 0.0F;
             sincosf(qwen::vision::RopePosition(
                         attention.rope, *attention.position + tok, lane_id) *
                         freq,
                     &sn, &cs);
+            if constexpr (kYarn)
+              YarnScale(sn, cs, attention.yarn);
             const float lo = __fmaf_rn(v[0], cs, -__fmul_rn(v[1], sn));
             const float hi = __fmaf_rn(v[0], sn, __fmul_rn(v[1], cs));
             v[0] = lo;
@@ -8236,8 +8292,10 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       float* gate, void* keys, void* values,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
-                      const qwen::vision::DeviceRope* rope,
-                      KvDtypes kv_dtypes) {
+                      const qwen::vision::DeviceRope* rope, KvDtypes kv_dtypes,
+                      const YarnRope& yarn) {
+  // Any prefill batch takes the fused path (decode keeps the separate
+  // route): the KV quantization must not depend on the prefill chunk size.
   if (n_tokens < 1 || weights == nullptr || input == nullptr ||
       q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
       gate == nullptr || keys == nullptr || values == nullptr ||
@@ -8248,8 +8306,11 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
   // Q4_K values ride the Q8_0 key path; F16 keys require F16 values.
   if (kv_q8 != (kv_dtypes.value != KvCacheDtype::kF16))
     return false;
-  const AttentionProjectionOutput output{q_gamma, k_gamma,  query, gate, keys,
-                                         values,  position, theta, eps,  rope};
+  if (kv_q8 && yarn.enabled != 0)
+    return false;  // YaRN has no quantized-cache path yet.
+  const AttentionProjectionOutput output{q_gamma, k_gamma, query,    gate,
+                                         keys,    values,  position, theta,
+                                         eps,     rope,    yarn};
   if (kv_q8) {
     // The q8 attention cache keeps the pre-#421 tile geometry: its weight
     // staging path was tuned at BK=2 and upstream's change never measured it.
@@ -8267,18 +8328,27 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                          stream, weights, input, nullptr, n_tokens, 13312, 2560,
                          nullptr, nullptr, nullptr, nullptr, nullptr, output);
     }
-  } else {
-    // One 256-row tile per query, gate, key or value head (52). Four row
-    // tiles per token tile in launch order share each activation tile's read
-    // (8.8 to 7.9 ms at 4,096 tokens). One K block per LDS stage halves the
-    // stage to 24 KB, so three blocks share a WGP instead of two (7.8 to
-    // 7.3 ms); the K order is unchanged.
+    return true;
+  }
+  if (yarn.enabled != 0) {
     hipLaunchKernelGGL(
-        (DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false, true>),
+        (DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false, true, false,
+                            false, false, false, false, true>),
         dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
         input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr,
         nullptr, nullptr, output);
+    return true;
   }
+  // One 256-row tile per query, gate, key or value head (52). Four row
+  // tiles per token tile in launch order share each activation tile's read
+  // (8.8 to 7.9 ms at 4,096 tokens). One K block per LDS stage halves the
+  // stage to 24 KB, so three blocks share a WGP instead of two (7.8 to
+  // 7.3 ms); the K order is unchanged.
+  hipLaunchKernelGGL(
+      (DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false, true>),
+      dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
+      input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr, nullptr,
+      nullptr, output);
   return true;
 }
 
@@ -8714,7 +8784,7 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope, bool prefill,
-                      KvDtypes kv_dtypes) {
+                      KvDtypes kv_dtypes, const YarnRope& yarn) {
   const bool kv_q8 = kv_dtypes.key == KvCacheDtype::kQ8_0;
   const bool v_q4k = kv_dtypes.value == KvCacheDtype::kQ4_K;
   if (d == 0 || d > 256 || rotary_dim == 0 || rotary_dim > d ||
@@ -8728,27 +8798,22 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
     return true;
   auto* k_bytes = static_cast<unsigned char*>(k_cache);
   auto* v_bytes = static_cast<unsigned char*>(v_cache);
-  if (!prefill && n_tokens < 32) {
-    if (kv_q8) {
-      if (v_q4k) {
-        hipLaunchKernelGGL((PrepareAttentionKernel<1, true, true>),
-                           dim3(n_tokens, heads + kv_heads), dim3(kThreads), 0,
-                           stream, packed, stride, q_gamma, k_gamma, q, gate,
-                           k_bytes, v_bytes, heads, kv_heads, d, rotary_dim,
-                           start_pos, theta, eps, rope);
-      } else {
-        hipLaunchKernelGGL((PrepareAttentionKernel<1, true, false>),
-                           dim3(n_tokens, heads + kv_heads), dim3(kThreads), 0,
-                           stream, packed, stride, q_gamma, k_gamma, q, gate,
-                           k_bytes, v_bytes, heads, kv_heads, d, rotary_dim,
-                           start_pos, theta, eps, rope);
-      }
-    } else {
-      hipLaunchKernelGGL((PrepareAttentionKernel<1, false, false>),
+  if (kv_q8 && yarn.enabled != 0)
+    return false;  // YaRN has no quantized-cache path yet.
+  if (yarn.enabled != 0) {
+    // YaRN rotates through the F16 cache path only.
+    if (!prefill && n_tokens < 32) {
+      hipLaunchKernelGGL((PrepareAttentionKernel<1, false, false, true>),
                          dim3(n_tokens, heads + kv_heads), dim3(kThreads), 0,
                          stream, packed, stride, q_gamma, k_gamma, q, gate,
                          k_bytes, v_bytes, heads, kv_heads, d, rotary_dim,
-                         start_pos, theta, eps, rope);
+                         start_pos, theta, eps, rope, yarn);
+    } else {
+      hipLaunchKernelGGL((PrepareAttentionKernel<4, false, false, true>),
+                         dim3(n_tokens, (heads + kv_heads + 3) / 4),
+                         dim3(kThreads), 0, stream, packed, stride, q_gamma,
+                         k_gamma, q, gate, k_bytes, v_bytes, heads, kv_heads, d,
+                         rotary_dim, start_pos, theta, eps, rope, yarn);
     }
   } else if (kv_q8) {
     if (v_q4k) {
@@ -8756,20 +8821,26 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                          dim3(n_tokens, (heads + kv_heads + 3) / 4),
                          dim3(kThreads), 0, stream, packed, stride, q_gamma,
                          k_gamma, q, gate, k_bytes, v_bytes, heads, kv_heads, d,
-                         rotary_dim, start_pos, theta, eps, rope);
+                         rotary_dim, start_pos, theta, eps, rope, yarn);
     } else {
       hipLaunchKernelGGL((PrepareAttentionKernel<4, true, false>),
                          dim3(n_tokens, (heads + kv_heads + 3) / 4),
                          dim3(kThreads), 0, stream, packed, stride, q_gamma,
                          k_gamma, q, gate, k_bytes, v_bytes, heads, kv_heads, d,
-                         rotary_dim, start_pos, theta, eps, rope);
+                         rotary_dim, start_pos, theta, eps, rope, yarn);
     }
+  } else if (!prefill && n_tokens < 32) {
+    hipLaunchKernelGGL((PrepareAttentionKernel<1, false, false>),
+                       dim3(n_tokens, heads + kv_heads), dim3(kThreads), 0,
+                       stream, packed, stride, q_gamma, k_gamma, q, gate,
+                       k_bytes, v_bytes, heads, kv_heads, d, rotary_dim,
+                       start_pos, theta, eps, rope, yarn);
   } else {
     hipLaunchKernelGGL((PrepareAttentionKernel<4, false, false>),
                        dim3(n_tokens, (heads + kv_heads + 3) / 4),
                        dim3(kThreads), 0, stream, packed, stride, q_gamma,
                        k_gamma, q, gate, k_bytes, v_bytes, heads, kv_heads, d,
-                       rotary_dim, start_pos, theta, eps, rope);
+                       rotary_dim, start_pos, theta, eps, rope, yarn);
   }
   return true;
 }
@@ -8777,9 +8848,15 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
 void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
           std::uint32_t d, std::uint32_t rotary_dim,
           const std::uint32_t* start_pos, float theta, hipStream_t stream,
-          const qwen::vision::DeviceRope* rope) {
-  hipLaunchKernelGGL(RopeKernel, dim3(n_tokens), dim3(kThreads), 0, stream, x,
-                     heads, d, rotary_dim, start_pos, theta, rope);
+          const qwen::vision::DeviceRope* rope, const YarnRope& yarn) {
+  if (yarn.enabled != 0)
+    hipLaunchKernelGGL(RopeKernel<true>, dim3(n_tokens), dim3(kThreads), 0,
+                       stream, x, heads, d, rotary_dim, start_pos, theta, rope,
+                       yarn);
+  else
+    hipLaunchKernelGGL(RopeKernel<false>, dim3(n_tokens), dim3(kThreads), 0,
+                       stream, x, heads, d, rotary_dim, start_pos, theta, rope,
+                       yarn);
 }
 
 void StoreKv(const float* src, void* cache, std::uint32_t n_tokens,
@@ -8817,14 +8894,21 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        std::uint32_t grid_blocks, std::uint32_t ratio,
                        std::uint32_t dim, std::uint32_t rotary_dim, float theta,
                        float eps, std::uint32_t capacity, hipStream_t stream,
-                       const qwen::vision::DeviceRope* rope) {
+                       const qwen::vision::DeviceRope* rope,
+                       const YarnRope& yarn) {
   if (grid_blocks == 0) {
     return;
   }
-  hipLaunchKernelGGL(PoolBlocksKernel, dim3(grid_blocks), dim3(kThreads), 0,
-                     stream, raw_keys, gamma, blocks, first_block, start_pos,
-                     n_tokens, ratio, dim, rotary_dim, theta, eps, capacity,
-                     rope);
+  if (yarn.enabled != 0)
+    hipLaunchKernelGGL(PoolBlocksKernel<true>, dim3(grid_blocks),
+                       dim3(kThreads), 0, stream, raw_keys, gamma, blocks,
+                       first_block, start_pos, n_tokens, ratio, dim, rotary_dim,
+                       theta, eps, capacity, rope, yarn);
+  else
+    hipLaunchKernelGGL(PoolBlocksKernel<false>, dim3(grid_blocks),
+                       dim3(kThreads), 0, stream, raw_keys, gamma, blocks,
+                       first_block, start_pos, n_tokens, ratio, dim, rotary_dim,
+                       theta, eps, capacity, rope, yarn);
 }
 
 void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
@@ -8922,550 +9006,464 @@ void Attention(const float* q, const void* k_cache, const void* v_cache,
   }
 }
 
-bool WmmaCausalAttention(const float* q, const float* gate, const void* k_cache,
-                         const void* v_cache, const std::uint32_t* mask,
-                         std::uint32_t mask_words, float* out,
-                         std::uint32_t n_tokens, std::uint32_t start_pos,
-                         std::uint32_t heads, std::uint32_t kv_heads,
-                         std::uint32_t d, std::uint32_t ratio,
-                         hipStream_t stream, bool last_only, KvDtypes kv_dtypes,
-                         const std::uint32_t* lead_mask, std::uint32_t lead) {
+std::uint32_t WmmaCausalAttentionContextLimit(std::uint32_t heads,
+                                              std::uint32_t kv_heads,
+                                              std::uint32_t d,
+                                              std::uint32_t ratio) {
   if (heads != kWmmaQueryHeads || kv_heads != kWmmaKvHeads ||
-      d != kWmmaHeadDim || ratio != kWmmaRatio || n_tokens == 0 ||
-      (mask != nullptr && mask_words > kWmmaMaxMaskWords) ||
-      (lead != 0 && (lead >= kWmmaRatio || lead_mask == nullptr))) {
-    return false;
-  }
-  const auto* k_bytes = static_cast<const unsigned char*>(k_cache);
-  const auto* v_bytes = static_cast<const unsigned char*>(v_cache);
-  const bool kv_q8 = kv_dtypes.key == KvCacheDtype::kQ8_0;
-  const bool v_q4k = kv_dtypes.value == KvCacheDtype::kQ4_K;
-  if (mask != nullptr) {
-    constexpr std::uint32_t kPackedQueries = 4;
-    // last_only computes the absolute-aligned group containing the batch's
-    // final row: with lead rows prepended it starts up to three rows before
-    // the launch-relative tile (the same tile when lead is zero).
-    const std::uint32_t last_row = n_tokens - 1;
-    const std::uint32_t first_group =
-        last_only ? (last_row + lead - ((lead + last_row) % kPackedQueries)) /
-                        kPackedQueries
-                  : 0;
-    // The lead rows extend the first group to the full pass's absolute
-    // query alignment, so its grid carries one extra group at most.
-    const dim3 grid(
-        (lead + n_tokens + kPackedQueries - 1) / kPackedQueries - first_group,
-        kWmmaKvHeads);
-    // At deep sparse windows, staging the current V before fetching the
-    // next one shortens their overlapping register lifetimes.
-    const bool late_v = start_pos >= 65536;
-    if (kv_q8) {
-      if (v_q4k) {
-        if (late_v) {
-          hipLaunchKernelGGL(
-              (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true,
-                                         true, true>),
-              grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-              mask_words, out, start_pos, n_tokens, first_group, lead_mask,
-              lead);
+      d != kWmmaHeadDim || ratio != kWmmaRatio)
+    return 0;
+  return kWmmaMaxMaskWords * kWmmaRatio * 32;
+}
+
+    bool WmmaCausalAttention(
+        const float* q, const float* gate, const void* k_cache,
+        const void* v_cache, const std::uint32_t* mask,
+        std::uint32_t mask_words, float* out, std::uint32_t n_tokens,
+        std::uint32_t start_pos, std::uint32_t heads, std::uint32_t kv_heads,
+        std::uint32_t d, std::uint32_t ratio, hipStream_t stream,
+        bool last_only, KvDtypes kv_dtypes, const std::uint32_t* lead_mask,
+        std::uint32_t lead) {
+      if (heads != kWmmaQueryHeads || kv_heads != kWmmaKvHeads ||
+          d != kWmmaHeadDim || ratio != kWmmaRatio || n_tokens == 0 ||
+          (mask != nullptr && mask_words > kWmmaMaxMaskWords) ||
+          (lead != 0 && (lead >= kWmmaRatio || lead_mask == nullptr))) {
+        return false;
+      }
+      const auto* k_bytes = static_cast<const unsigned char*>(k_cache);
+      const auto* v_bytes = static_cast<const unsigned char*>(v_cache);
+      const bool kv_q8 = kv_dtypes.key == KvCacheDtype::kQ8_0;
+      const bool v_q4k = kv_dtypes.value == KvCacheDtype::kQ4_K;
+      if (mask != nullptr) {
+        // The kernel's union mask covers the LIVE visible extent; mask_words is
+        // only the row stride and may be wider when the session capacity
+        // exceeds 262,144 tokens.
+        const std::uint64_t live_blocks =
+            (std::uint64_t{start_pos} + n_tokens + kWmmaRatio - 1) / kWmmaRatio;
+        const std::uint64_t live_words = (live_blocks + 31) / 32;
+        if (live_words > kWmmaMaxMaskWords || live_words > mask_words)
+          return false;
+      }
+      if (mask != nullptr) {
+        constexpr std::uint32_t kPackedQueries = 4;
+        // last_only computes the absolute-aligned group containing the batch's
+        // final row: with lead rows prepended it starts up to three rows before
+        // the launch-relative tile (the same tile when lead is zero).
+        const std::uint32_t last_row = n_tokens - 1;
+        const std::uint32_t first_group =
+            last_only
+                ? (last_row + lead - ((lead + last_row) % kPackedQueries)) /
+                      kPackedQueries
+                : 0;
+        // The lead rows extend the first group to the full pass's absolute
+        // query alignment, so its grid carries one extra group at most.
+        const dim3 grid(
+            (lead + n_tokens + kPackedQueries - 1) / kPackedQueries -
+                first_group,
+            kWmmaKvHeads);
+        // At deep sparse windows, staging the current V before fetching the
+        // next one shortens their overlapping register lifetimes.
+        const bool late_v = start_pos >= 65536;
+        if (kv_q8) {
+          if (v_q4k) {
+            if (late_v) {
+              hipLaunchKernelGGL(
+                  (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true,
+                                             true, true, true>),
+                  grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes,
+                  mask, mask_words, out, start_pos, n_tokens, first_group,
+                  lead_mask, lead);
+            } else {
+              hipLaunchKernelGGL(
+                  (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true,
+                                             false, true, true>),
+                  grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes,
+                  mask, mask_words, out, start_pos, n_tokens, first_group,
+                  lead_mask, lead);
+            }
+          } else if (late_v) {
+            hipLaunchKernelGGL(
+                (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true,
+                                           true, true>),
+                grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes,
+                mask, mask_words, out, start_pos, n_tokens, first_group,
+                lead_mask, lead);
+          } else {
+            hipLaunchKernelGGL(
+                (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true,
+                                           false, true>),
+                grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes,
+                mask, mask_words, out, start_pos, n_tokens, first_group,
+                lead_mask, lead);
+          }
+        } else if (late_v) {
+          hipLaunchKernelGGL((WmmaCausalAttentionKernel<kPackedQueries,
+                                                        kWmmaKeys, true, true>),
+                             grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
+                             v_bytes, mask, mask_words, out, start_pos,
+                             n_tokens, first_group, lead_mask, lead);
         } else {
           hipLaunchKernelGGL(
-              (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, false,
-                                         true, true>),
+              (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>),
               grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
               mask_words, out, start_pos, n_tokens, first_group, lead_mask,
               lead);
         }
-      } else if (late_v) {
-        hipLaunchKernelGGL((WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys,
-                                                      true, true, true>),
-                           grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
-                           v_bytes, mask, mask_words, out, start_pos, n_tokens,
-                           first_group, lead_mask, lead);
-      } else {
-        hipLaunchKernelGGL((WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys,
-                                                      true, false, true>),
-                           grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
-                           v_bytes, mask, mask_words, out, start_pos, n_tokens,
-                           first_group, lead_mask, lead);
+        return true;
       }
-    } else if (late_v) {
-      hipLaunchKernelGGL(
-          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true>),
-          grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-          mask_words, out, start_pos, n_tokens, first_group, lead_mask, lead);
-    } else {
-      hipLaunchKernelGGL(
-          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
-          dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
-          mask_words, out, start_pos, n_tokens, first_group, lead_mask, lead);
+      const std::uint32_t first_group =
+          last_only ? (n_tokens - 1) / kWmmaQueryRows : 0;
+      const dim3 grid(
+          (n_tokens + kWmmaQueryRows - 1) / kWmmaQueryRows - first_group,
+          kWmmaKvHeads * (kWmmaGqa / kWmmaHeads));
+      if (kv_q8) {
+        if (v_q4k) {
+          hipLaunchKernelGGL(
+              (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false,
+                                         false, true, true>),
+              grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
+              mask_words, out, start_pos, n_tokens, first_group);
+        } else {
+          hipLaunchKernelGGL(
+              (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false,
+                                         false, true>),
+              grid, dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
+              mask_words, out, start_pos, n_tokens, first_group);
+        }
+      } else {
+        hipLaunchKernelGGL(
+            (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false>), grid,
+            dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask,
+            mask_words, out, start_pos, n_tokens, first_group);
+      }
+      return true;
     }
-    return true;
-  }
-  const std::uint32_t first_group =
-      last_only ? (n_tokens - 1) / kWmmaQueryRows : 0;
-  const dim3 grid(
-      (n_tokens + kWmmaQueryRows - 1) / kWmmaQueryRows - first_group,
-      kWmmaKvHeads * (kWmmaGqa / kWmmaHeads));
-  if (kv_q8) {
-    if (v_q4k) {
-      hipLaunchKernelGGL((WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys,
-                                                    false, false, true, true>),
-                         grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
-                         v_bytes, mask, mask_words, out, start_pos, n_tokens,
-                         first_group);
-    } else {
-      hipLaunchKernelGGL((WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys,
-                                                    false, false, true>),
-                         grid, dim3(kThreads), 0, stream, q, gate, k_bytes,
-                         v_bytes, mask, mask_words, out, start_pos, n_tokens,
-                         first_group);
+
+    __global__ void ExpertCountsKernel(
+        const std::int32_t* ids, std::uint32_t* counts, std::size_t slots) {
+      const std::size_t i =
+          blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+      if (i < slots && ids[i] >= 0) {
+        atomicAdd(counts + ids[i], 1u);
+      }
     }
-  } else {
-    hipLaunchKernelGGL(
-        (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false>), grid,
-        dim3(kThreads), 0, stream, q, gate, k_bytes, v_bytes, mask, mask_words,
-        out, start_pos, n_tokens, first_group);
-  }
-  return true;
-}
 
-__global__ void ExpertCountsKernel(const std::int32_t* ids,
-                                   std::uint32_t* counts, std::size_t slots) {
-  const std::size_t i =
-      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
-  if (i < slots && ids[i] >= 0) {
-    atomicAdd(counts + ids[i], 1u);
-  }
-}
+    void RouterTopK(const float* logits, std::uint32_t stride,
+                    std::int32_t* ids, float* weights, std::uint32_t n_tokens,
+                    std::uint32_t n_experts, std::uint32_t k,
+                    hipStream_t stream) {
+      if (n_experts <= 512) {
+        hipLaunchKernelGGL((RouterTopKKernel<512>), dim3(n_tokens),
+                           dim3(kThreads), 0, stream, logits, stride, ids,
+                           weights, n_experts, k);
+      } else {
+        hipLaunchKernelGGL((RouterTopKKernel<1024>), dim3(n_tokens),
+                           dim3(kThreads), 0, stream, logits, stride, ids,
+                           weights, n_experts, k);
+      }
+    }
 
-void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
-                float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
-                std::uint32_t k, hipStream_t stream) {
-  if (n_experts <= 512) {
-    hipLaunchKernelGGL((RouterTopKKernel<512>), dim3(n_tokens), dim3(kThreads),
-                       0, stream, logits, stride, ids, weights, n_experts, k);
-  } else {
-    hipLaunchKernelGGL((RouterTopKKernel<1024>), dim3(n_tokens), dim3(kThreads),
-                       0, stream, logits, stride, ids, weights, n_experts, k);
-  }
-}
+    void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
+                      std::uint32_t n_tokens, std::uint32_t n_experts,
+                      std::uint32_t k, hipStream_t stream) {
+      (void)hipMemsetAsync(counts, 0, n_experts * sizeof(std::uint32_t),
+                           stream);
+      const std::size_t slots = static_cast<std::size_t>(n_tokens) * k;
+      hipLaunchKernelGGL(ExpertCountsKernel, dim3(Blocks(slots)),
+                         dim3(kThreads), 0, stream, ids, counts, slots);
+    }
 
-void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
-                  std::uint32_t n_tokens, std::uint32_t n_experts,
-                  std::uint32_t k, hipStream_t stream) {
-  (void)hipMemsetAsync(counts, 0, n_experts * sizeof(std::uint32_t), stream);
-  const std::size_t slots = static_cast<std::size_t>(n_tokens) * k;
-  hipLaunchKernelGGL(ExpertCountsKernel, dim3(Blocks(slots)), dim3(kThreads), 0,
-                     stream, ids, counts, slots);
-}
-
-void MoeEpilogue(const float* expert_out, const float* weights,
-                 const float* shared, const float* gate,
-                 std::uint32_t gate_stride, float* out, std::uint32_t n_tokens,
-                 std::uint32_t k, std::uint32_t dim, hipStream_t stream) {
-  hipLaunchKernelGGL(MoeEpilogueKernel, dim3(n_tokens, Blocks(dim)),
-                     dim3(kThreads), 0, stream, expert_out, weights, shared,
-                     gate, gate_stride, out, k, dim);
-}
-
-void MoeEpilogueVec4(const float* expert_out, const float* weights,
+    void MoeEpilogue(const float* expert_out, const float* weights,
                      const float* shared, const float* gate,
                      std::uint32_t gate_stride, float* out,
                      std::uint32_t n_tokens, std::uint32_t k, std::uint32_t dim,
                      hipStream_t stream) {
-  if (dim % 4 != 0) {
-    MoeEpilogue(expert_out, weights, shared, gate, gate_stride, out, n_tokens,
-                k, dim, stream);
-    return;
-  }
-  hipLaunchKernelGGL(MoeEpilogueVec4Kernel<float>,
-                     dim3(n_tokens, Blocks(dim / 4)), dim3(kThreads), 0, stream,
-                     expert_out, weights, shared, gate, gate_stride, out, k,
-                     dim);
-}
-
-void MoeEpilogueVec4F16(const __half* expert_out, const float* weights,
-                        const float* shared, const float* gate,
-                        std::uint32_t gate_stride, float* out,
-                        std::uint32_t n_tokens, std::uint32_t k,
-                        std::uint32_t dim, hipStream_t stream) {
-  hipLaunchKernelGGL(MoeEpilogueVec4Kernel<__half>,
-                     dim3(n_tokens, Blocks(dim / 4)), dim3(kThreads), 0, stream,
-                     expert_out, weights, shared, gate, gate_stride, out, k,
-                     dim);
-}
-
-void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
-               float* dst, std::uint32_t n_tokens, std::uint32_t width,
-               hipStream_t stream) {
-  const bool aligned = (reinterpret_cast<std::uintptr_t>(base) |
-                        reinterpret_cast<std::uintptr_t>(alt) |
-                        reinterpret_cast<std::uintptr_t>(dst)) %
-                           16 ==
-                       0;
-  if (aligned && width % 4 == 0) {
-    hipLaunchKernelGGL(MtpHiddenVec4Kernel, dim3(n_tokens, Blocks(width / 4)),
-                       dim3(kThreads), 0, stream,
-                       reinterpret_cast<const float4*>(base),
-                       reinterpret_cast<const float4*>(alt), row,
-                       reinterpret_cast<float4*>(dst), width / 4);
-    return;
-  }
-  hipLaunchKernelGGL(MtpHiddenKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
-                     base, alt, row, dst, width);
-}
-
-__global__ void MtpAdvanceControlKernel(std::uint32_t* mtp_position,
-                                        std::uint32_t* mtp_blocks,
-                                        std::int32_t* hidden_row,
-                                        std::uint32_t count,
-                                        std::uint32_t top_k,
-                                        std::uint32_t compress_ratio) {
-  *mtp_position += count;
-  if (*mtp_position > top_k) {
-    *mtp_blocks = *mtp_position / compress_ratio;
-  }
-  *hidden_row = -1;
-}
-
-void MtpAdvanceControl(std::uint32_t* mtp_position, std::uint32_t* mtp_blocks,
-                       std::int32_t* hidden_row, std::uint32_t count,
-                       std::uint32_t top_k, std::uint32_t compress_ratio,
-                       hipStream_t stream) {
-  hipLaunchKernelGGL(MtpAdvanceControlKernel, dim3(1), dim3(1), 0, stream,
-                     mtp_position, mtp_blocks, hidden_row, count, top_k,
-                     compress_ratio);
-}
-
-void MtpAddEmbedding(const float* embedding, float* residual,
-                     std::uint32_t n_tokens, std::uint32_t hidden,
-                     std::uint32_t streams, hipStream_t stream) {
-  const bool aligned = (reinterpret_cast<std::uintptr_t>(embedding) |
-                        reinterpret_cast<std::uintptr_t>(residual)) %
-                           16 ==
-                       0;
-  if (aligned && hidden % 4 == 0) {
-    hipLaunchKernelGGL(
-        MtpAddEmbeddingVec4Kernel, dim3(n_tokens, Blocks(streams * hidden / 4)),
-        dim3(kThreads), 0, stream, reinterpret_cast<const float4*>(embedding),
-        reinterpret_cast<float4*>(residual), hidden / 4, streams);
-    return;
-  }
-  hipLaunchKernelGGL(MtpAddEmbeddingKernel, dim3(n_tokens), dim3(kThreads), 0,
-                     stream, embedding, residual, hidden, streams);
-}
-
-void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
-            std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream) {
-  hipLaunchKernelGGL(ArgmaxPartialKernel, dim3(kArgmaxParts, n_tokens),
-                     dim3(kThreads), 0, stream, logits, scratch, vocab);
-  hipLaunchKernelGGL(ArgmaxFinishKernel, dim3(n_tokens), dim3(kThreads), 0,
-                     stream, logits, scratch, out, vocab);
-}
-
-void PenalizedArgmax(const float* logits, GreedyPenaltyRows penalties,
-                     float repeat, float frequency, float presence,
-                     PenaltyArgmaxCandidate* partial, ArgmaxCandidate* out,
-                     std::uint32_t rows, std::uint32_t vocab,
-                     hipStream_t stream) {
-  if (rows == 0 || rows > 7 || vocab == 0)
-    throw std::invalid_argument("invalid penalty argmax shape");
-  PenaltyArgmaxPartialKernel<<<dim3(kArgmaxParts, rows), kThreads, 0, stream>>>(
-      logits, penalties, repeat, frequency, presence, partial, vocab);
-  PenaltyArgmaxFinishKernel<<<rows, kThreads, 0, stream>>>(logits, partial, out,
-                                                           vocab);
-}
-
-__global__ void MaskDraftLogitsKernel(float* logits, const std::int32_t* table,
-                                      std::uint32_t n) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n && table[i] < 0)
-    logits[i] = -INFINITY;
-}
-
-void MaskDraftLogits(float* logits, const std::int32_t* table, std::uint32_t n,
-                     hipStream_t stream) {
-  hipLaunchKernelGGL(MaskDraftLogitsKernel, dim3(Blocks(n)), dim3(kThreads), 0,
-                     stream, logits, table, n);
-}
-
-__global__ void GatherDraftLogitsKernel(float* logits,
-                                        const std::int32_t* table,
-                                        std::uint32_t prefix, std::uint32_t n) {
-  // One block: every read finishes before any write, so the table rows can
-  // overwrite the logits they are gathered from.
-  const std::uint32_t i = threadIdx.x;
-  float value = -INFINITY;
-  if (i < n && table[i] >= 0)
-    value = logits[table[i]];
-  __syncthreads();
-  if (i < n)
-    logits[prefix + i] = value;
-}
-
-void GatherDraftLogits(float* logits, const std::int32_t* table,
-                       std::uint32_t prefix, std::uint32_t n,
-                       hipStream_t stream) {
-  hipLaunchKernelGGL(GatherDraftLogitsKernel, dim3(1), dim3(n), 0, stream,
-                     logits, table, prefix, n);
-}
-
-__global__ void RemapDraftIdsKernel(std::uint32_t* ids, std::uint32_t n,
-                                    std::uint32_t prefix,
-                                    const std::int32_t* table) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n && ids[i] >= prefix)
-    ids[i] = static_cast<std::uint32_t>(table[ids[i] - prefix]);
-}
-
-void RemapDraftIds(std::uint32_t* ids, std::uint32_t n, std::uint32_t prefix,
-                   const std::int32_t* table, hipStream_t stream) {
-  hipLaunchKernelGGL(RemapDraftIdsKernel, dim3(Blocks(n)), dim3(kThreads), 0,
-                     stream, ids, n, prefix, table);
-}
-
-void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
-                            ArgmaxCandidate* out, std::uint32_t rows,
-                            std::uint32_t vocab, hipStream_t stream) {
-  hipLaunchKernelGGL(GatherArgmaxCandidatesKernel, dim3(Blocks(rows)),
-                     dim3(kThreads), 0, stream, logits, ids, out, rows, vocab);
-}
-
-template<unsigned Keep>
-void SelectMtpCandidates(const float* logits, std::uint32_t* ids,
-                         std::uint32_t* scratch_ids, float* scores,
-                         std::uint32_t vocab, hipStream_t stream) {
-  if (logits == nullptr || ids == nullptr || scratch_ids == nullptr ||
-      vocab == 0) {
-    throw std::invalid_argument("invalid MTP candidate selection");
-  }
-  const auto tiles = [](std::uint32_t n) {
-    return 1U + (n - 1U) / kMtpCandidateTile;
-  };
-  unsigned passes = 1;
-  for (auto size = vocab; size > kMtpCandidateTile; size = tiles(size) * Keep) {
-    ++passes;
-  }
-  // Choose the first buffer so the final pass always lands in `ids`.
-  auto* destination = passes % 2 != 0 ? ids : scratch_ids;
-  const std::uint32_t* source = nullptr;
-  auto size = vocab;
-  for (;;) {
-    const auto blocks = tiles(size);
-    hipLaunchKernelGGL((MtpCandidateTileKernel<Keep>), dim3(blocks),
-                       dim3(kThreads), 0, stream, logits, source, destination,
-                       blocks == 1 ? scores : nullptr, size, vocab);
-    if (blocks == 1) {
-      break;
+      hipLaunchKernelGGL(MoeEpilogueKernel, dim3(n_tokens, Blocks(dim)),
+                         dim3(kThreads), 0, stream, expert_out, weights, shared,
+                         gate, gate_stride, out, k, dim);
     }
-    size = blocks * Keep;
-    source = destination;
-    destination = destination == ids ? scratch_ids : ids;
-  }
-}
 
-std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab) {
-  const auto tiles = (vocab + 1023) / 1024;
-  return (tiles > 2 ? tiles : 2) * kMtpCandidates;
-}
+    void MoeEpilogueVec4(const float* expert_out, const float* weights,
+                         const float* shared, const float* gate,
+                         std::uint32_t gate_stride, float* out,
+                         std::uint32_t n_tokens, std::uint32_t k,
+                         std::uint32_t dim, hipStream_t stream) {
+      if (dim % 4 != 0) {
+        MoeEpilogue(expert_out, weights, shared, gate, gate_stride, out,
+                    n_tokens, k, dim, stream);
+        return;
+      }
+      hipLaunchKernelGGL(MoeEpilogueVec4Kernel<float>,
+                         dim3(n_tokens, Blocks(dim / 4)), dim3(kThreads), 0,
+                         stream, expert_out, weights, shared, gate, gate_stride,
+                         out, k, dim);
+    }
 
-void VerificationCandidates(const float* logits, GreedyPenaltyRows penalties,
-                            std::uint32_t* ids, std::uint32_t* scratch_ids,
-                            sampling::LogitCandidate* out, std::uint32_t rows,
-                            std::uint32_t vocab, hipStream_t stream) {
-  if (!logits || !ids || !scratch_ids || !out || !vocab || !rows || rows > 7)
-    throw std::invalid_argument("invalid verification candidate shape");
-  const auto stride = MtpCandidateWorkspaceSize(vocab);
-  const auto tiles = [](std::uint32_t n) { return 1U + (n - 1U) / 1024; };
-  auto size = vocab;
-  auto blocks = tiles(size);
-  VerificationCandidateTileKernel<true>
-      <<<dim3(blocks, rows), kThreads, 0, stream>>>(logits, penalties, nullptr,
-                                                    ids, size, vocab, stride);
-  auto* source = ids;
-  auto* destination = scratch_ids;
-  while (blocks > 1) {
-    size = blocks * kMtpCandidates;
-    blocks = tiles(size);
-    VerificationCandidateTileKernel<false>
-        <<<dim3(blocks, rows), kThreads, 0, stream>>>(
-            logits, penalties, source, destination, size, vocab, stride);
-    std::swap(source, destination);
-  }
-  GatherVerificationCandidatesKernel<<<rows, kThreads, 0, stream>>>(
-      logits, penalties, source, out, vocab, stride);
-}
+    void MoeEpilogueVec4F16(const __half* expert_out, const float* weights,
+                            const float* shared, const float* gate,
+                            std::uint32_t gate_stride, float* out,
+                            std::uint32_t n_tokens, std::uint32_t k,
+                            std::uint32_t dim, hipStream_t stream) {
+      hipLaunchKernelGGL(MoeEpilogueVec4Kernel<__half>,
+                         dim3(n_tokens, Blocks(dim / 4)), dim3(kThreads), 0,
+                         stream, expert_out, weights, shared, gate, gate_stride,
+                         out, k, dim);
+    }
 
-void MtpTopCandidates(const float* logits, std::uint32_t* ids,
-                      std::uint32_t* scratch_ids, float* scores,
-                      std::uint32_t vocab, hipStream_t stream) {
-  if (scores == nullptr)
-    throw std::invalid_argument("invalid MTP candidate scores");
-  SelectMtpCandidates<kMtpCandidates>(logits, ids, scratch_ids, scores, vocab,
-                                      stream);
-}
+    void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
+                   float* dst, std::uint32_t n_tokens, std::uint32_t width,
+                   hipStream_t stream) {
+      const bool aligned = (reinterpret_cast<std::uintptr_t>(base) |
+                            reinterpret_cast<std::uintptr_t>(alt) |
+                            reinterpret_cast<std::uintptr_t>(dst)) %
+                               16 ==
+                           0;
+      if (aligned && width % 4 == 0) {
+        hipLaunchKernelGGL(MtpHiddenVec4Kernel,
+                           dim3(n_tokens, Blocks(width / 4)), dim3(kThreads), 0,
+                           stream, reinterpret_cast<const float4*>(base),
+                           reinterpret_cast<const float4*>(alt), row,
+                           reinterpret_cast<float4*>(dst), width / 4);
+        return;
+      }
+      hipLaunchKernelGGL(MtpHiddenKernel, dim3(n_tokens), dim3(kThreads), 0,
+                         stream, base, alt, row, dst, width);
+    }
 
-std::uint32_t MtpDraftShortlistWorkspaceSize(std::uint32_t vocab) {
-  const auto tiles = (vocab + kMtpCandidateTile - 1) / kMtpCandidateTile;
-  return (tiles > 2 ? tiles : 2) * kMtpDraftShortlist;
-}
+    __global__ void MtpAdvanceControlKernel(
+        std::uint32_t* mtp_position, std::uint32_t* mtp_blocks,
+        std::int32_t* hidden_row, std::uint32_t count, std::uint32_t top_k,
+        std::uint32_t compress_ratio) {
+      *mtp_position += count;
+      if (*mtp_position > top_k) {
+        *mtp_blocks = *mtp_position / compress_ratio;
+      }
+      *hidden_row = -1;
+    }
 
-void MtpDraftShortlist(const float* logits, std::uint32_t* ids,
-                       std::uint32_t* scratch_ids, float* scores,
-                       std::uint32_t vocab, hipStream_t stream) {
-  if (scores == nullptr)
-    throw std::invalid_argument("invalid MTP draft shortlist scores");
-  SelectMtpCandidates<kMtpDraftShortlist>(logits, ids, scratch_ids, scores,
+    void MtpAdvanceControl(std::uint32_t* mtp_position,
+                           std::uint32_t* mtp_blocks, std::int32_t* hidden_row,
+                           std::uint32_t count, std::uint32_t top_k,
+                           std::uint32_t compress_ratio, hipStream_t stream) {
+      hipLaunchKernelGGL(MtpAdvanceControlKernel, dim3(1), dim3(1), 0, stream,
+                         mtp_position, mtp_blocks, hidden_row, count, top_k,
+                         compress_ratio);
+    }
+
+    void MtpAddEmbedding(const float* embedding, float* residual,
+                         std::uint32_t n_tokens, std::uint32_t hidden,
+                         std::uint32_t streams, hipStream_t stream) {
+      const bool aligned = (reinterpret_cast<std::uintptr_t>(embedding) |
+                            reinterpret_cast<std::uintptr_t>(residual)) %
+                               16 ==
+                           0;
+      if (aligned && hidden % 4 == 0) {
+        hipLaunchKernelGGL(
+            MtpAddEmbeddingVec4Kernel,
+            dim3(n_tokens, Blocks(streams * hidden / 4)), dim3(kThreads), 0,
+            stream, reinterpret_cast<const float4*>(embedding),
+            reinterpret_cast<float4*>(residual), hidden / 4, streams);
+        return;
+      }
+      hipLaunchKernelGGL(MtpAddEmbeddingKernel, dim3(n_tokens), dim3(kThreads),
+                         0, stream, embedding, residual, hidden, streams);
+    }
+
+    void Argmax(const float* logits, ArgmaxCandidate* scratch,
+                std::int32_t* out, std::uint32_t n_tokens, std::uint32_t vocab,
+                hipStream_t stream) {
+      hipLaunchKernelGGL(ArgmaxPartialKernel, dim3(kArgmaxParts, n_tokens),
+                         dim3(kThreads), 0, stream, logits, scratch, vocab);
+      hipLaunchKernelGGL(ArgmaxFinishKernel, dim3(n_tokens), dim3(kThreads), 0,
+                         stream, logits, scratch, out, vocab);
+    }
+
+    void PenalizedArgmax(const float* logits, GreedyPenaltyRows penalties,
+                         float repeat, float frequency, float presence,
+                         PenaltyArgmaxCandidate* partial, ArgmaxCandidate* out,
+                         std::uint32_t rows, std::uint32_t vocab,
+                         hipStream_t stream) {
+      if (rows == 0 || rows > 7 || vocab == 0)
+        throw std::invalid_argument("invalid penalty argmax shape");
+      PenaltyArgmaxPartialKernel<<<dim3(kArgmaxParts, rows), kThreads, 0,
+                                   stream>>>(
+          logits, penalties, repeat, frequency, presence, partial, vocab);
+      PenaltyArgmaxFinishKernel<<<rows, kThreads, 0, stream>>>(logits, partial,
+                                                               out, vocab);
+    }
+
+    __global__ void MaskDraftLogitsKernel(
+        float* logits, const std::int32_t* table, std::uint32_t n) {
+      const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+      if (i < n && table[i] < 0)
+        logits[i] = -INFINITY;
+    }
+
+    void MaskDraftLogits(float* logits, const std::int32_t* table,
+                         std::uint32_t n, hipStream_t stream) {
+      hipLaunchKernelGGL(MaskDraftLogitsKernel, dim3(Blocks(n)), dim3(kThreads),
+                         0, stream, logits, table, n);
+    }
+
+    __global__ void GatherDraftLogitsKernel(
+        float* logits, const std::int32_t* table, std::uint32_t prefix,
+        std::uint32_t n) {
+      // One block: every read finishes before any write, so the table rows can
+      // overwrite the logits they are gathered from.
+      const std::uint32_t i = threadIdx.x;
+      float value = -INFINITY;
+      if (i < n && table[i] >= 0)
+        value = logits[table[i]];
+      __syncthreads();
+      if (i < n)
+        logits[prefix + i] = value;
+    }
+
+    void GatherDraftLogits(float* logits, const std::int32_t* table,
+                           std::uint32_t prefix, std::uint32_t n,
+                           hipStream_t stream) {
+      hipLaunchKernelGGL(GatherDraftLogitsKernel, dim3(1), dim3(n), 0, stream,
+                         logits, table, prefix, n);
+    }
+
+    __global__ void RemapDraftIdsKernel(std::uint32_t* ids, std::uint32_t n,
+                                        std::uint32_t prefix,
+                                        const std::int32_t* table) {
+      const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+      if (i < n && ids[i] >= prefix)
+        ids[i] = static_cast<std::uint32_t>(table[ids[i] - prefix]);
+    }
+
+    void RemapDraftIds(std::uint32_t* ids, std::uint32_t n,
+                       std::uint32_t prefix, const std::int32_t* table,
+                       hipStream_t stream) {
+      hipLaunchKernelGGL(RemapDraftIdsKernel, dim3(Blocks(n)), dim3(kThreads),
+                         0, stream, ids, n, prefix, table);
+    }
+
+    void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
+                                ArgmaxCandidate* out, std::uint32_t rows,
+                                std::uint32_t vocab, hipStream_t stream) {
+      hipLaunchKernelGGL(GatherArgmaxCandidatesKernel, dim3(Blocks(rows)),
+                         dim3(kThreads), 0, stream, logits, ids, out, rows,
+                         vocab);
+    }
+
+    template<unsigned Keep>
+    void SelectMtpCandidates(const float* logits, std::uint32_t* ids,
+                             std::uint32_t* scratch_ids, float* scores,
+                             std::uint32_t vocab, hipStream_t stream) {
+      if (logits == nullptr || ids == nullptr || scratch_ids == nullptr ||
+          vocab == 0) {
+        throw std::invalid_argument("invalid MTP candidate selection");
+      }
+      const auto tiles = [](std::uint32_t n) {
+        return 1U + (n - 1U) / kMtpCandidateTile;
+      };
+      unsigned passes = 1;
+      for (auto size = vocab; size > kMtpCandidateTile;
+           size = tiles(size) * Keep) {
+        ++passes;
+      }
+      // Choose the first buffer so the final pass always lands in `ids`.
+      auto* destination = passes % 2 != 0 ? ids : scratch_ids;
+      const std::uint32_t* source = nullptr;
+      auto size = vocab;
+      for (;;) {
+        const auto blocks = tiles(size);
+        hipLaunchKernelGGL((MtpCandidateTileKernel<Keep>), dim3(blocks),
+                           dim3(kThreads), 0, stream, logits, source,
+                           destination, blocks == 1 ? scores : nullptr, size,
+                           vocab);
+        if (blocks == 1) {
+          break;
+        }
+        size = blocks * Keep;
+        source = destination;
+        destination = destination == ids ? scratch_ids : ids;
+      }
+    }
+
+    std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab) {
+      const auto tiles = (vocab + 1023) / 1024;
+      return (tiles > 2 ? tiles : 2) * kMtpCandidates;
+    }
+
+    void VerificationCandidates(
+        const float* logits, GreedyPenaltyRows penalties, std::uint32_t* ids,
+        std::uint32_t* scratch_ids, sampling::LogitCandidate* out,
+        std::uint32_t rows, std::uint32_t vocab, hipStream_t stream) {
+      if (!logits || !ids || !scratch_ids || !out || !vocab || !rows ||
+          rows > 7)
+        throw std::invalid_argument("invalid verification candidate shape");
+      const auto stride = MtpCandidateWorkspaceSize(vocab);
+      const auto tiles = [](std::uint32_t n) { return 1U + (n - 1U) / 1024; };
+      auto size = vocab;
+      auto blocks = tiles(size);
+      VerificationCandidateTileKernel<true>
+          <<<dim3(blocks, rows), kThreads, 0, stream>>>(
+              logits, penalties, nullptr, ids, size, vocab, stride);
+      auto* source = ids;
+      auto* destination = scratch_ids;
+      while (blocks > 1) {
+        size = blocks * kMtpCandidates;
+        blocks = tiles(size);
+        VerificationCandidateTileKernel<false>
+            <<<dim3(blocks, rows), kThreads, 0, stream>>>(
+                logits, penalties, source, destination, size, vocab, stride);
+        std::swap(source, destination);
+      }
+      GatherVerificationCandidatesKernel<<<rows, kThreads, 0, stream>>>(
+          logits, penalties, source, out, vocab, stride);
+    }
+
+    void MtpTopCandidates(const float* logits, std::uint32_t* ids,
+                          std::uint32_t* scratch_ids, float* scores,
+                          std::uint32_t vocab, hipStream_t stream) {
+      if (scores == nullptr)
+        throw std::invalid_argument("invalid MTP candidate scores");
+      SelectMtpCandidates<kMtpCandidates>(logits, ids, scratch_ids, scores,
                                           vocab, stream);
-}
+    }
 
-__global__ void GatherDraftHeadRowsKernel(const std::uint8_t* weights,
-                                          const std::uint32_t* ids,
-                                          uint4* gathered, std::uint32_t chunks,
-                                          std::uint32_t rows) {
-  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= rows * chunks) {
-    return;
-  }
-  const std::uint32_t row = i / chunks;
-  const std::uint32_t chunk = i % chunks;
-  const auto* src = reinterpret_cast<const uint4*>(
-      weights + static_cast<std::size_t>(ids[row]) * chunks * 16);
-  gathered[i] = src[chunk];
-}
+    std::uint32_t MtpDraftShortlistWorkspaceSize(std::uint32_t vocab) {
+      const auto tiles = (vocab + kMtpCandidateTile - 1) / kMtpCandidateTile;
+      return (tiles > 2 ? tiles : 2) * kMtpDraftShortlist;
+    }
 
-void GatherDraftHeadRows(const void* weights, const std::uint32_t* ids,
-                         void* gathered, std::uint32_t row_bytes,
-                         std::uint32_t rows, hipStream_t stream) {
-  const auto chunks = row_bytes / 16;
-  const std::size_t count = std::size_t{rows} * chunks;
-  hipLaunchKernelGGL(
-      GatherDraftHeadRowsKernel, dim3(Blocks(count)), dim3(kThreads), 0, stream,
-      static_cast<const std::uint8_t*>(weights), ids,
-      static_cast<uint4*>(gathered), static_cast<std::uint32_t>(chunks), rows);
-}
+    void MtpDraftShortlist(const float* logits, std::uint32_t* ids,
+                           std::uint32_t* scratch_ids, float* scores,
+                           std::uint32_t vocab, hipStream_t stream) {
+      if (scores == nullptr)
+        throw std::invalid_argument("invalid MTP draft shortlist scores");
+      SelectMtpCandidates<kMtpDraftShortlist>(logits, ids, scratch_ids, scores,
+                                              vocab, stream);
+    }
 
-void CopyDevice(const float* src, float* dst, std::size_t count,
-                hipStream_t stream) {
-  hipLaunchKernelGGL(CopyKernel, dim3(Blocks(count)), dim3(kThreads), 0, stream,
-                     src, dst, count);
-}
+    __global__ void GatherDraftHeadRowsKernel(
+        const std::uint8_t* weights, const std::uint32_t* ids, uint4* gathered,
+        std::uint32_t chunks, std::uint32_t rows) {
+      const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+      if (i >= rows * chunks) {
+        return;
+      }
+      const std::uint32_t row = i / chunks;
+      const std::uint32_t chunk = i % chunks;
+      const auto* src = reinterpret_cast<const uint4*>(
+          weights + static_cast<std::size_t>(ids[row]) * chunks * 16);
+      gathered[i] = src[chunk];
+    }
 
-namespace {
-__global__ void CopyWordsKernel(const std::uint32_t* src, std::uint32_t* dst,
-                                std::size_t count) {
-  const std::size_t i =
-      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
-  if (i < count) {
-    dst[i] = src[i];
-  }
-}
-__global__ void CopyBytesKernel(const std::uint8_t* src, std::uint8_t* dst,
-                                std::size_t count) {
-  const std::size_t i =
-      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
-  if (i < count) {
-    dst[i] = src[i];
-  }
-}
+    void GatherDraftHeadRows(const void* weights, const std::uint32_t* ids,
+                             void* gathered, std::uint32_t row_bytes,
+                             std::uint32_t rows, hipStream_t stream) {
+      const auto chunks = row_bytes / 16;
+      const std::size_t count = std::size_t{rows} * chunks;
+      hipLaunchKernelGGL(GatherDraftHeadRowsKernel, dim3(Blocks(count)),
+                         dim3(kThreads), 0, stream,
+                         static_cast<const std::uint8_t*>(weights), ids,
+                         static_cast<uint4*>(gathered),
+                         static_cast<std::uint32_t>(chunks), rows);
+    }
 
-__global__ void SignalDoneKernel(volatile std::uint32_t* flag,
-                                 std::uint32_t value) {
-  __threadfence_system();
-  *flag = value;
-  __threadfence_system();
-}
-
-__global__ void BumpDoneKernel(volatile std::uint32_t* flag) {
-  __threadfence_system();
-  *flag = *flag + 1;
-  __threadfence_system();
-}
-
-__global__ void WaitHostKernel(volatile std::uint32_t* flag,
-                               std::uint32_t want) {
-  while (*flag != want) {
-    __builtin_amdgcn_s_sleep(2);
-  }
-  __threadfence_system();
-}
-
-__global__ void GpuStampKernel(std::uint64_t* slot) {
-  *slot = wall_clock64();
-}
-
-__global__ void GatherRowsKernel(const std::uint32_t* __restrict__ src,
-                                 std::uint32_t* __restrict__ dst,
-                                 const std::int32_t* __restrict__ ids,
-                                 std::size_t words) {
-  const std::size_t row = blockIdx.x;
-  const std::uint32_t* from = src + static_cast<std::size_t>(ids[row]) * words;
-  std::uint32_t* to = dst + row * words;
-  for (std::size_t w = threadIdx.x; w < words; w += blockDim.x) {
-    to[w] = from[w];
-  }
-}
-
-__global__ void RemapIdsKernel(std::uint32_t* ids, std::uint32_t count,
-                               const std::int32_t* map) {
-  const std::uint32_t i = threadIdx.x;
-  if (i < count) {
-    ids[i] = static_cast<std::uint32_t>(map[ids[i]]);
-  }
-}
-}  // namespace
-
-void SignalDone(std::uint32_t* flag, std::uint32_t value, hipStream_t stream) {
-  hipLaunchKernelGGL(SignalDoneKernel, dim3(1), dim3(1), 0, stream, flag,
-                     value);
-}
-
-void BumpDone(std::uint32_t* flag, hipStream_t stream) {
-  hipLaunchKernelGGL(BumpDoneKernel, dim3(1), dim3(1), 0, stream, flag);
-}
-
-void WaitHost(std::uint32_t* flag, std::uint32_t want, hipStream_t stream) {
-  hipLaunchKernelGGL(WaitHostKernel, dim3(1), dim3(1), 0, stream, flag, want);
-}
-
-void GpuStamp(std::uint64_t* slot, hipStream_t stream) {
-  hipLaunchKernelGGL(GpuStampKernel, dim3(1), dim3(1), 0, stream, slot);
-}
-
-void GatherRows(const void* src, void* dst, const std::int32_t* ids,
-                std::uint32_t rows, std::size_t row_bytes, hipStream_t stream) {
-  if (rows == 0) {
-    return;
-  }
-  hipLaunchKernelGGL(GatherRowsKernel, dim3(rows), dim3(256), 0, stream,
-                     static_cast<const std::uint32_t*>(src),
-                     static_cast<std::uint32_t*>(dst), ids, row_bytes / 4);
-}
-
-void RemapIds(std::uint32_t* ids, std::uint32_t count, const std::int32_t* map,
-              hipStream_t stream) {
-  hipLaunchKernelGGL(RemapIdsKernel, dim3(1), dim3(64), 0, stream, ids, count,
-                     map);
-}
-
-void CopyMapped(const void* src, void* dst, std::size_t bytes,
-                hipStream_t stream) {
-  if (bytes == 0) {
-    return;
-  }
-  const bool words = bytes % 4 == 0 &&
-                     reinterpret_cast<std::uintptr_t>(src) % 4 == 0 &&
-                     reinterpret_cast<std::uintptr_t>(dst) % 4 == 0;
-  if (words) {
-    hipLaunchKernelGGL(CopyWordsKernel, dim3(Blocks(bytes / 4)), dim3(kThreads),
-                       0, stream, static_cast<const std::uint32_t*>(src),
-                       static_cast<std::uint32_t*>(dst), bytes / 4);
-  } else {
-    hipLaunchKernelGGL(CopyBytesKernel, dim3(Blocks(bytes)), dim3(kThreads), 0,
-                       stream, static_cast<const std::uint8_t*>(src),
-                       static_cast<std::uint8_t*>(dst), bytes);
-  }
-}
-
-}  // namespace gufo::models::qwen38_flash_next::rocm
-
+  }  // namespace gufo::models::qwen38_flash_next::rocm

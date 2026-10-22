@@ -2,7 +2,7 @@
 // Use the production CLI for generation and the session test for replay.
 //
 // gpu_probe --model FIRST_SHARD.gguf --prompt TEXT [--reference]
-//           [--batch T] [--context N] [--dump logits.bin]
+//           [--batch T] [--context N] [--yarn-factor F] [--dump logits.bin]
 // Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
 // MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
 //                      [--depth N] (default: 0, 4096, 32768)
@@ -37,6 +37,9 @@ void AuditMtp(q::rocm::Executor& executor, const q::rocm::DeviceModel& device,
               const q::ModelWeights& weights, const q::MtpWeights& mtp,
               const gufo::tokenization::QwenTokenizer& tokenizer,
               const std::filesystem::path& path);
+void AuditChainCosts(q::rocm::Executor& executor,
+                     const gufo::tokenization::QwenTokenizer& tokenizer,
+                     std::uint32_t depth);
 void AuditMtpCosts(q::rocm::Executor& executor,
                    const gufo::tokenization::QwenTokenizer& tokenizer,
                    std::span<const std::uint32_t> depths,
@@ -91,11 +94,13 @@ int main(int argc, char** argv) {
   bool mtp_audit = false;
   bool reference = false;
   bool cost_audit = false;
+  bool chain_audit = false;
   bool sampled_head = false;
   std::vector<std::uint32_t> cost_concurrencies;
   std::optional<std::uint32_t> cost_depth;
   std::uint32_t batch = 512;
   std::uint32_t context = 4096;
+  float yarn_factor = 1.0F;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     auto next = [&]() -> std::string {
@@ -107,6 +112,8 @@ int main(int argc, char** argv) {
       mtp_path = next();
     } else if (arg == "--mtp-audit") {
       mtp_audit = true;
+    } else if (arg == "--chain-audit") {
+      chain_audit = true;
     } else if (arg == "--sampled-head") {
       sampled_head = true;
     } else if (arg == "--cost-audit") {
@@ -172,6 +179,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s requires a positive integer\n", arg.c_str());
         return 2;
       }
+    } else if (arg == "--yarn-factor") {
+      const auto value = next();
+      const auto [end, ec] = std::from_chars(
+          value.data(), value.data() + value.size(), yarn_factor);
+      if (ec != std::errc{} || end != value.data() + value.size() ||
+          !(yarn_factor >= 1.0F)) {
+        std::fprintf(stderr, "--yarn-factor requires a number >= 1\n");
+        return 2;
+      }
     } else if (arg == "--dump") {
       dump_path = next();
     } else {
@@ -191,7 +207,7 @@ int main(int argc, char** argv) {
                  "be combined with other probes; --decode-ids requires it\n");
     return 2;
   }
-  if ((mtp_audit || cost_audit) && mtp_path.empty()) {
+  if ((mtp_audit || cost_audit || chain_audit) && mtp_path.empty()) {
     std::fprintf(stderr, "MTP audits require --mtp-model\n");
     return 2;
   }
@@ -199,7 +215,13 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--cost-audit cannot be combined with other probes\n");
     return 2;
   }
-  if ((cost_depth || sampled_head) && !cost_audit) {
+  if (chain_audit &&
+      (mtp_audit || reference || cost_audit || decode || !dump_path.empty())) {
+    std::fprintf(stderr,
+                 "--chain-audit cannot be combined with other probes\n");
+    return 2;
+  }
+  if ((cost_depth || sampled_head) && !cost_audit && !chain_audit) {
     std::fprintf(stderr, "--depth and --sampled-head require --cost-audit\n");
     return 2;
   }
@@ -220,6 +242,17 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "tokenizer failed: %s\n", error.c_str());
     return 1;
   }
+  if (yarn_factor != 1.0F) {
+    const q::RopeScaling scaling{
+        .factor = yarn_factor,
+        .original_context = weights->config.context_length};
+    if (!q::ValidateRopeScaling(scaling, weights->config.context_length,
+                                &error)) {
+      std::fprintf(stderr, "invalid YaRN factor: %s\n", error.c_str());
+      return 2;
+    }
+    weights->config.rope_scaling = scaling;
+  }
   const auto& c = weights->config;
   if (cost_depth &&
       (c.context_length < 96 || *cost_depth > c.context_length - 96)) {
@@ -230,8 +263,9 @@ int main(int argc, char** argv) {
   if (c.ple_layer >= 0) {
     const auto& t = weights->ple_table;
     ngram = q::NgramTable::Open(
-        reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
-        t.rows, c.ple_head_dim, t.type, &error);
+        reader->GetMappedRegions()[t.shard].file_descriptor,
+        reader->GetMappedRegions()[t.shard].source_path, t.file_offset, t.rows,
+        c.ple_head_dim, t.type, &error);
     if (!ngram) {
       std::fprintf(stderr, "n-gram table failed: %s\n", error.c_str());
       return 1;
@@ -269,8 +303,9 @@ int main(int argc, char** argv) {
   }
   q::rocm::Executor::Options options;
   options.max_batch = batch;
+  options.max_context = context;
   options.max_logit_rows = std::min<std::uint32_t>(batch, 64);
-  if (mtp_audit || cost_audit)
+  if (mtp_audit || cost_audit || chain_audit)
     options.max_speculative = 8;
 
   if (cost_audit) {
@@ -282,6 +317,15 @@ int main(int argc, char** argv) {
   if (!executor) {
     std::fprintf(stderr, "executor failed: %s\n", error.c_str());
     return 1;
+  }
+  if (chain_audit) {
+    try {
+      AuditChainCosts(*executor, *tokenizer, cost_depth.value_or(0));
+      return 0;
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "chain audit failed: %s\n", e.what());
+      return 1;
+    }
   }
   if (cost_audit) {
     try {

@@ -359,7 +359,6 @@ void NgramTable::Worker() {
         continue;
       }
       Pending& p = slots[live];
-      p.owner = batch[i].owner;
       const std::uint64_t offset =
           base_offset_ + std::uint64_t{batch[i].row} * row_bytes_;
       p.offset = offset;
@@ -371,6 +370,7 @@ void NgramTable::Worker() {
       p.needed = static_cast<std::size_t>(offset - p.begin) + row_bytes_;
       p.row = batch[i].row;
       p.dst = batch[i].dst;
+      p.owner = batch[i].owner;
       p.base = aligned_base(p.buf, p.length);
       std::memset(&p.overlapped, 0, sizeof(p.overlapped));
       p.overlapped.Offset = static_cast<DWORD>(p.begin);
@@ -397,6 +397,8 @@ void NgramTable::Worker() {
         ok = ReadOne(p.row, p.dst, p.buf, p.owner, p.event) && ok;
         continue;
       }
+      if (p.owner != nullptr)
+        p.owner->disk_reads_.fetch_add(1, std::memory_order_relaxed);
       StoreRow(p.row, p.base + (p.offset - p.begin), p.dst);
     }
     lock.lock();
@@ -425,7 +427,8 @@ void NgramTable::Worker() {
     lock.unlock();
     bool ok = true;
     for (std::size_t i = 0; i < count; ++i) {
-      ok = ReadOne(batch[i].row, batch[i].dst, buf, batch[i].owner) && ok;
+      ok = ReadOne(batch[i].row, batch[i].dst, buf, batch[i].owner, nullptr) &&
+           ok;
     }
     lock.lock();
     failed_ = failed_ || !ok;

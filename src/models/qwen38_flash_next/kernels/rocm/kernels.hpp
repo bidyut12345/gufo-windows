@@ -11,6 +11,7 @@
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/vision/rope.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kv_layout.hpp"
+#include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 /// Model-private HIP launchers for everything outside the quantized GEMM
 /// tier. Activations are row-major float32 [tokens][dim] unless noted; every
@@ -36,35 +37,6 @@ constexpr std::size_t GdnRollbackRowFloats(std::uint32_t row,
 void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
                      std::uint32_t k_heads, std::uint32_t v_heads,
                      hipStream_t stream);
-/// Device-to-device float copy as a kernel on `stream`. A hipMemcpyAsync
-/// between device buffers runs on the copy engine, and every switch between
-/// it and the compute queue costs a cross-engine wait.
-void CopyDevice(const float* src, float* dst, std::size_t count,
-                hipStream_t stream);
-/// Copies `bytes` between device memory and pinned host memory
-/// (hipHostMalloc) with a kernel: on this APU the GPU reads and writes the
-/// pinned pages directly, while a host<->device hipMemcpyAsync costs a copy
-/// engine hand-off (~30 us per graph node).
-void CopyMapped(const void* src, void* dst, std::size_t bytes,
-                hipStream_t stream);
-/// Writes `value` to `flag` (coherent pinned memory) with system-scope
-/// fences once the stream reaches this point: a completion signal the host
-/// can spin on instead of hipStreamSynchronize.
-void SignalDone(std::uint32_t* flag, std::uint32_t value, hipStream_t stream);
-/// Increments the completion flag; captured as a graph's last node, it
-/// signals the graph's end without a separate launch after it.
-void BumpDone(std::uint32_t* flag, hipStream_t stream);
-/// Holds the stream until the host writes `want` into coherent `flag`.
-void WaitHost(std::uint32_t* flag, std::uint32_t want, hipStream_t stream);
-/// Diagnostics: writes the GPU wall clock to `slot` when the stream gets here.
-void GpuStamp(std::uint64_t* slot, hipStream_t stream);
-/// Copies rows `ids[0..rows)` of `src` (row_bytes each, a multiple of 4)
-/// into consecutive rows of `dst`.
-void GatherRows(const void* src, void* dst, const std::int32_t* ids,
-                std::uint32_t rows, std::size_t row_bytes, hipStream_t stream);
-/// ids[i] = map[ids[i]] for i < count (subset index -> token id).
-void RemapIds(std::uint32_t* ids, std::uint32_t count, const std::int32_t* map,
-              hipStream_t stream);
 
 /// GGUF type ids the runtime accepts for the small-matrix and lookup paths.
 enum class WeightType : std::uint32_t {
@@ -242,13 +214,14 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
 /// Fixed geometry: 24 query heads, two KV heads, 256 dimensions, 64 rotary.
 /// Requires at least 1024 tokens; cache capacity must include position +
 /// tokens.
+/// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
 bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
                       float* gate, void* keys, void* values,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      KvDtypes kv_dtypes = {});
+                      KvDtypes kv_dtypes = {}, const YarnRope& yarn = {});
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -448,6 +421,7 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
 /// and writes the caches (F16 values, or Q8_0 blocks with `kv_dtype`).
 /// Returns false for heads wider than 256.
 /// With zero query heads, packed contains only K/V and q/gate may be null.
+/// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
 bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const float* q_gamma, const float* k_gamma, float* q,
                       float* gate, void* k_cache, void* v_cache,
@@ -456,16 +430,19 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false, KvDtypes kv_dtypes = {});
+                      bool prefill = false, KvDtypes kv_dtypes = {},
+                      const YarnRope& yarn = {});
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
 /// session's control block) so a captured decode graph replays at any
 /// position.
+/// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
 void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
           std::uint32_t d, std::uint32_t rotary_dim,
           const std::uint32_t* start_pos, float theta, hipStream_t stream,
-          const qwen::vision::DeviceRope* rope = nullptr);
+          const qwen::vision::DeviceRope* rope = nullptr,
+          const YarnRope& yarn = {});
 
 /// Stores f32 rows into the cache at positions start_pos + t:
 /// cache[(start_pos + t)][row_dim], rounded to F16 or quantized to Q8_0/Q4_K
@@ -484,13 +461,15 @@ void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
 /// block start position, then round once to F16 for scoring.
 /// `grid_blocks` bounds how many blocks one launch
 /// can pool (a device-side bound is not available at launch time).
+/// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
 void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        __half* blocks, const std::uint32_t* first_block,
                        const std::uint32_t* start_pos, std::uint32_t n_tokens,
                        std::uint32_t grid_blocks, std::uint32_t ratio,
                        std::uint32_t dim, std::uint32_t rotary_dim, float theta,
                        float eps, std::uint32_t capacity, hipStream_t stream,
-                       const qwen::vision::DeviceRope* rope = nullptr);
+                       const qwen::vision::DeviceRope* rope = nullptr,
+                       const YarnRope& yarn = {});
 
 /// Per query t (position *start_pos + first_token + t): scores every
 /// complete block below its own tail, keeps the `budget` highest, and
@@ -521,8 +500,14 @@ void Attention(const float* q, const void* k_cache, const void* v_cache,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
                hipStream_t stream, std::uint32_t* lists = nullptr,
-               std::uint32_t* counts = nullptr,
-               std::uint32_t list_capacity = 0, KvDtypes kv_dtypes = {});
+               std::uint32_t* counts = nullptr, std::uint32_t list_capacity = 0,
+               KvDtypes kv_dtypes = {});
+
+/// Maximum visible sparse context for this WMMA geometry, or zero when the
+/// geometry is unsupported. Checkpoint planning uses the same dispatch limit.
+[[nodiscard]] std::uint32_t WmmaCausalAttentionContextLimit(
+    std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t d,
+    std::uint32_t ratio);
 
 /// Fused causal attention on the WMMA cores for wide batches: scores, online
 /// softmax, PV and the sigmoid output gate in one launch. `mask` follows

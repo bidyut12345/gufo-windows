@@ -16,7 +16,6 @@
 #include "src/core/speculative/prompt_lookup.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
-#include "src/models/qwen/hip/dflash/prompt_lookup_27b.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
@@ -89,6 +88,12 @@ private:
   friend class QwenDFlashGpuExecutor;
 };
 
+struct QwenDFlashBlockCandidates {
+  std::uint32_t top_k{0};
+  std::vector<tokenization::TokenId> ids;
+  std::vector<float> logits;
+};
+
 /// Immutable GPU-visible DFlash / DFlash-2 model weights and topology.
 class QwenDFlashGpuModel final {
 public:
@@ -99,9 +104,21 @@ public:
   QwenDFlashGpuModel(QwenDFlashGpuModel&&) = delete;
   QwenDFlashGpuModel& operator=(QwenDFlashGpuModel&&) = delete;
 
+  struct TiedTarget {
+    core::ModelConfig config;
+    models::QwenTensorRef token_embedding;
+    models::QwenTensorRef output;
+  };
+
   [[nodiscard]] static std::shared_ptr<const QwenDFlashGpuModel> Create(
       std::shared_ptr<const core::GgufReader> dflash_reader,
       std::shared_ptr<const QwenGpuModel> target_model,
+      std::string* error_msg = nullptr);
+
+  [[nodiscard]] static std::shared_ptr<const QwenDFlashGpuModel> Create(
+      std::shared_ptr<const core::GgufReader> dflash_reader,
+      const TiedTarget& target,
+      std::shared_ptr<const void> target_lifetime = nullptr,
       std::string* error_msg = nullptr);
 
   [[nodiscard]] const speculative::QwenDFlashWeights& GetWeights()
@@ -126,12 +143,14 @@ public:
 private:
   QwenDFlashGpuModel(std::shared_ptr<const core::GgufReader> dflash_reader,
                      std::shared_ptr<const QwenGpuModel> target_model,
+                     std::shared_ptr<const void> target_lifetime,
                      speculative::QwenDFlashWeights weights,
                      std::vector<void*> allocations,
                      std::size_t packed_weight_bytes);
 
   std::shared_ptr<const core::GgufReader> dflash_reader_;
   std::shared_ptr<const QwenGpuModel> target_model_;
+  std::shared_ptr<const void> target_lifetime_;
   speculative::QwenDFlashWeights weights_;
   std::vector<void*> allocations_;
   std::size_t packed_weight_bytes_{0};
@@ -173,7 +192,8 @@ public:
       std::vector<tokenization::TokenId>* out_candidate_ids = nullptr,
       std::vector<float>* out_candidate_probabilities = nullptr,
       const DFlashTrace& trace = {},
-      const sampling::SamplerState* sampler = nullptr);
+      const sampling::SamplerState* sampler = nullptr,
+      QwenDFlashBlockCandidates* out_candidates = nullptr);
 
   /// Shared projections with independent attention, convolution and selector
   /// boundaries. A single request retains the ordinary block execution.
@@ -394,13 +414,6 @@ private:
   std::vector<tokenization::TokenId> proposed_tokens_;
   // Diagnostics only (GUFO_QWEN27_DRAFTLOG): the pending proposal's draft
   // probabilities and position.
-  std::vector<float> proposed_probabilities_;
-  std::uint32_t proposed_position_{0};
-  // Opt-in prompt lookup (GUFO_QWEN27_LOOKUP): proposals of up to
-  // lookup_limit_ tokens copied from the context replace a DFlash2 block.
-  qwen27::PromptLookup lookup_;
-  std::uint32_t lookup_limit_{0};
-  std::uint32_t lookup_tokens_{0};  // trailing lookup tokens of the proposal
   bool primed_{false};
   bool proposal_active_{false};
 };

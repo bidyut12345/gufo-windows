@@ -2,6 +2,8 @@
 
 #include <cassert>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -58,6 +60,10 @@ void CheckSidecarCompatibility() {
   trunk.ple_layer = 1;
   Require(sidecar.MtpMatches(trunk),
           "trunk-only PLE incorrectly required in MTP");
+
+  // The MTP sidecar never carries rope scaling; the trunk's governs both.
+  trunk.rope_scaling = {.factor = 2.5F, .original_context = 262144};
+  Require(sidecar.MtpMatches(trunk), "YaRN trunk rejected an unscaled sidecar");
 }
 
 using Value =
@@ -239,10 +245,69 @@ void CheckMalformedMetadata() {
   assert(draft && trunk && draft->MtpMatches(*trunk));
 }
 
+void CheckMtpSidecarDiscovery(const std::filesystem::path& root) {
+  const auto create = [](const std::filesystem::path& path) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream file(path, std::ios::binary);
+    Require(file.good(), "sidecar discovery fixture file created");
+  };
+  const auto target = root / "UD-Q4_K_XL" / "target.gguf";
+  create(target);
+  Require(qfn::DiscoverMtpSidecar(target.string()).empty(),
+          "discovery found a sidecar with none present");
+
+  // Unsloth snapshot layout: draft in a sibling MTP/ directory.
+  const auto snapshot_draft = root / "MTP" / "mtp-X-shared-Q8_0.gguf";
+  create(snapshot_draft);
+  Require(qfn::DiscoverMtpSidecar(target.string()) == snapshot_draft.string(),
+          "discovery missed the snapshot MTP/ sidecar");
+
+  // Non-shared drafts and wrong extensions never qualify.
+  create(root / "MTP" / "mtp-X-Q8_0.gguf");
+  create(root / "MTP" / "mtp-X-shared-Q8_0.gguf.txt");
+  Require(qfn::DiscoverMtpSidecar(target.string()) == snapshot_draft.string(),
+          "discovery accepted a non-shared or non-GGUF draft");
+
+  // Quant preference overrides distance; flat layout still discovered.
+  const auto flat_draft = root / "mtp-Y-shared-Q8_0.gguf";
+  const auto flat_bf16 = root / "mtp-Y-shared-BF16.gguf";
+  create(flat_draft);
+  create(flat_bf16);
+  Require(qfn::DiscoverMtpSidecar(target.string()) == flat_draft.string(),
+          "discovery did not prefer the Q8_0 sidecar");
+  Require(qfn::DiscoverMtpSidecar((root / "flat.gguf").string()) ==
+              flat_draft.string(),
+          "discovery missed a sidecar beside the target");
+
+  std::filesystem::remove_all(root);
+}
+
+void CheckScaledContext() {
+  qfn::Config c;
+  c.context_length = 262144;
+  c.compress_ratio = 4;
+  Require(c.MaxContextLength() == 262144, "scaling off must keep native");
+  Require(c.SparseMaskWords(c.context_length) == 2048,
+          "native mask row width changed");
+  c.rope_scaling = {.factor = 1.5625F, .original_context = 262144};
+  Require(c.MaxContextLength() == 409600, "YaRN 1.5625 must reach 409600");
+  Require(c.SparseMaskWords(409600) == 3200, "mask rows must cover 409600");
+  c.rope_scaling.factor = 2.5F;
+  Require(c.MaxContextLength() == 655360, "YaRN 2.5 must reach 655360");
+  Require(c.SparseMaskWords(655360) == 5120, "mask rows must cover 655360");
+  const auto parsed = Parse(ValidMetadata());
+  Require(parsed && parsed->rope_scaling == qfn::RopeScaling{},
+          "the GGUF loader must default rope scaling off (it sets no such "
+          "keys today)");
+}
+
 }  // namespace
 
 int main() {
   CheckSidecarCompatibility();
   CheckMalformedMetadata();
+  CheckMtpSidecarDiscovery(std::filesystem::temp_directory_path() /
+                           "gufo_qfn_discovery_test");
+  CheckScaledContext();
   std::cout << "Flash-Next metadata checks passed.\n";
 }

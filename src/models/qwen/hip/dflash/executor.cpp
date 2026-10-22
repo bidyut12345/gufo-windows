@@ -985,11 +985,17 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     std::span<const float> sample_uniforms, std::vector<float>* out_confidences,
     std::vector<tokenization::TokenId>* out_candidate_ids,
     std::vector<float>* out_candidate_probabilities, const DFlashTrace& trace,
-    const sampling::SamplerState* sampler) {
+    const sampling::SamplerState* sampler,
+    QwenDFlashBlockCandidates* out_candidates) {
   CheckContinuation();
   const auto& weights = model_->GetWeights();
   const auto& cfg = model_->GetConfig();
   const auto& df_cfg = model_->GetDFlashConfig();
+  if (out_candidates != nullptr) {
+    out_candidates->top_k = df_cfg.selector_top_k;
+    out_candidate_ids = &out_candidates->ids;
+    out_candidate_probabilities = &out_candidates->logits;
+  }
   const std::size_t hidden_size = cfg.hidden_size;
   const std::size_t intermediate_size = cfg.intermediate_size;
   const std::size_t num_q_heads = cfg.num_attention_heads;

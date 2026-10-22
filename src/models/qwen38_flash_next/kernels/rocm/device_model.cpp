@@ -124,7 +124,6 @@ struct Uploader {
   bool ok{true};
   std::uint32_t shard_base{0};
   std::uint64_t requested{0};
-  bool managed_experts{false};
 
   [[nodiscard]] bool Measuring() const noexcept { return weights == nullptr; }
 
@@ -135,14 +134,7 @@ struct Uploader {
     ok = false;
   }
 
-  [[nodiscard]] hipError_t Allocate(void** pointer, std::size_t size,
-                                    bool is_expert = false) {
-    if (managed_experts && is_expert) {
-      if (Measuring()) {
-        return hipSuccess;
-      }
-      return hip::AllocateManaged(pointer, size);
-    }
+  [[nodiscard]] hipError_t Allocate(void** pointer, std::size_t size) {
     requested += size;
     if (Measuring()) {
       return hipSuccess;
@@ -187,15 +179,17 @@ struct Uploader {
         static_cast<const std::uint8_t*>(region.data) + t.file_offset;
     const std::size_t row_src_bytes = t.cols / 256 * 210;
     const std::size_t row_dst_bytes = t.cols / 32 * sizeof(quant::block_q8_0);
-    constexpr std::uint32_t kChunkRows = 4096;
+    constexpr std::size_t kChunkRows = 4096;
+    const std::size_t chunk_dst_bytes = kChunkRows * row_dst_bytes;
+    std::vector<std::uint8_t> staged(chunk_dst_bytes);
     const std::uint32_t workers =
         std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
-    std::vector<std::uint8_t> staged(kChunkRows * row_dst_bytes);
-    for (std::uint32_t row_start = 0; row_start < t.rows;
-         row_start += kChunkRows) {
-      const std::uint32_t chunk_rows = std::min<std::uint32_t>(
-          kChunkRows, static_cast<std::uint32_t>(t.rows) - row_start);
-      const std::size_t chunk_dst_bytes = chunk_rows * row_dst_bytes;
+
+    for (std::uint32_t chunk_start = 0; chunk_start < t.rows;
+         chunk_start += kChunkRows) {
+      const std::uint32_t chunk_rows = static_cast<std::uint32_t>(
+          std::min<std::size_t>(kChunkRows, t.rows - chunk_start));
+      const std::size_t current_chunk_bytes = chunk_rows * row_dst_bytes;
       std::vector<std::thread> threads;
       for (std::uint32_t w = 0; w < workers; ++w) {
         threads.emplace_back([&, w] {
@@ -205,10 +199,9 @@ struct Uploader {
           const std::uint32_t end = static_cast<std::uint32_t>(
               static_cast<std::uint64_t>(chunk_rows) * (w + 1) / workers);
           for (std::uint32_t r = begin; r < end; ++r) {
-            const std::uint32_t row = row_start + r;
-            quant::DequantizeQ6_K(
-                src + static_cast<std::size_t>(row) * row_src_bytes,
-                chunk.data(), t.cols);
+            const std::uint32_t row = chunk_start + r;
+            quant::DequantizeQ6_K(src + row * row_src_bytes, chunk.data(),
+                                  t.cols);
             auto* out = reinterpret_cast<quant::block_q8_0*>(
                 staged.data() + static_cast<std::size_t>(r) * row_dst_bytes);
             for (std::size_t b = 0; b < t.cols / 32; ++b) {
@@ -231,9 +224,9 @@ struct Uploader {
         thread.join();
       }
       if (hipMemcpy(static_cast<std::uint8_t*>(ptr) +
-                        static_cast<std::size_t>(row_start) * row_dst_bytes,
-                    staged.data(), chunk_dst_bytes, hipMemcpyHostToDevice) !=
-          hipSuccess) {
+                        static_cast<std::size_t>(chunk_start) * row_dst_bytes,
+                    staged.data(), current_chunk_bytes,
+                    hipMemcpyHostToDevice) != hipSuccess) {
         Fail("Q8_0 upload failed for " + std::string(t.name));
         return d;
       }
@@ -282,15 +275,17 @@ struct Uploader {
     }
     allocations.push_back(ptr);
     bytes += dst_bytes + kTailMargin;
-    constexpr std::uint32_t kChunkRows = 4096;
+    constexpr std::size_t kChunkRows = 4096;
+    const std::size_t chunk_dst_bytes = kChunkRows * row_dst_bytes;
+    std::vector<std::uint8_t> staged(chunk_dst_bytes);
     const std::uint32_t workers =
         std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
-    std::vector<std::uint8_t> staged(kChunkRows * row_dst_bytes);
-    for (std::uint32_t row_start = 0; row_start < t.rows;
-         row_start += kChunkRows) {
-      const std::uint32_t chunk_rows = std::min<std::uint32_t>(
-          kChunkRows, static_cast<std::uint32_t>(t.rows) - row_start);
-      const std::size_t chunk_dst_bytes = chunk_rows * row_dst_bytes;
+
+    for (std::uint32_t chunk_start = 0; chunk_start < t.rows;
+         chunk_start += kChunkRows) {
+      const std::uint32_t chunk_rows = static_cast<std::uint32_t>(
+          std::min<std::size_t>(kChunkRows, t.rows - chunk_start));
+      const std::size_t current_chunk_bytes = chunk_rows * row_dst_bytes;
       std::vector<std::thread> threads;
       for (std::uint32_t w = 0; w < workers; ++w) {
         threads.emplace_back([&, w] {
@@ -299,7 +294,7 @@ struct Uploader {
           const std::uint32_t end = static_cast<std::uint32_t>(
               static_cast<std::uint64_t>(chunk_rows) * (w + 1) / workers);
           for (std::uint32_t r = begin; r < end; ++r) {
-            const std::uint32_t row = row_start + r;
+            const std::uint32_t row = chunk_start + r;
             const auto* in = reinterpret_cast<const quant::block_q8_0*>(
                 src + static_cast<std::size_t>(row) * row_src_bytes);
             auto* out = reinterpret_cast<BlockQ4_0*>(
@@ -332,9 +327,9 @@ struct Uploader {
         thread.join();
       }
       if (hipMemcpy(static_cast<std::uint8_t*>(ptr) +
-                        static_cast<std::size_t>(row_start) * row_dst_bytes,
-                    staged.data(), chunk_dst_bytes, hipMemcpyHostToDevice) !=
-          hipSuccess) {
+                        static_cast<std::size_t>(chunk_start) * row_dst_bytes,
+                    staged.data(), current_chunk_bytes,
+                    hipMemcpyHostToDevice) != hipSuccess) {
         Fail("Q4_0 upload failed for " + std::string(t.name));
         return d;
       }
@@ -356,8 +351,7 @@ struct Uploader {
     }
     const std::size_t size = t.SizeBytes();
     void* ptr = nullptr;
-    const bool is_expert = (t.experts > 1);
-    if (Allocate(&ptr, size + kTailMargin, is_expert) != hipSuccess) {
+    if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
       Fail("device allocation failed for " + std::string(t.name) + " (" +
            std::to_string(size) + " bytes)");
       return d;
@@ -646,11 +640,7 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
 std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
-    std::string* error_msg, bool managed_experts) {
-  const char* env_me = std::getenv("GUFO_MANAGED_EXPERTS");
-  if (env_me != nullptr && std::string_view(env_me) != "0") {
-    managed_experts = true;
-  }
+    std::string* error_msg) {
   // The routed expert kernels cover Q4_K, Q5_K, Q5_1, Q8_0, IQ3_S and
   // IQ4_XS. The LM head may be Q6_K: it is host-dequantized to Q8_0 instead,
   // which keeps it on the fast dense-GEMM tiers.
@@ -703,8 +693,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::size_t max_q8_cols = 32;
     Uploader measure{*stager, nullptr,       conversions, allocations,
                      bytes,   max_half_cols, max_q8_cols, shards,
-                     error_msg, /*ok=*/true, /*shard_base=*/0, /*requested=*/0,
-                     managed_experts};
+                     error_msg};
     (void)measure.Model(w, mtp, shard_count);
     if (!measure.ok) {
       return nullptr;
@@ -715,8 +704,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   std::vector<Conversion> conversions;
   Uploader up{*stager,   &weights,          conversions,     m->allocations_,
               m->bytes_, m->max_half_cols_, m->max_q8_cols_, shards,
-              error_msg, /*ok=*/true, /*shard_base=*/0, /*requested=*/0,
-              managed_experts};
+              error_msg};
   Uploaded uploaded = up.Model(w, mtp, shard_count);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;

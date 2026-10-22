@@ -128,7 +128,7 @@ private:
   void StoreRow(std::uint32_t row, const std::uint8_t* src, float* dst);
   bool ReadCached(std::uint32_t row, float* dst);
   bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf,
-               NgramCounters* owner = nullptr, void* io_event = nullptr);
+               NgramCounters* owner, void* io_event);
   void Worker();
 
   struct CacheEntry {

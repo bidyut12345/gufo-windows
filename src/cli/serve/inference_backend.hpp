@@ -94,7 +94,8 @@ public:
             TextRunnerRamCacheOptions ram_cache_config = {},
             models::qwen38_flash_next::KvCacheMode kv_cache_mode =
                 models::qwen38_flash_next::KvCacheMode::kF16,
-            bool managed_experts = false);
+            bool managed_experts = false,
+            bool enable_yarn = false);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.

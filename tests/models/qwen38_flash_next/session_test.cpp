@@ -1834,6 +1834,41 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
         const auto& saved = references[(offset + row) % references.size()];
         const auto& expected = use_mtp ? saved.mtp : saved.ar;
         const auto actual = pending[row].get();
+        if (actual.tokens != expected.tokens ||
+            (saved.test.config.uses_random_sampling() &&
+             (actual.draft_tokens != expected.draft_tokens ||
+              actual.draft_accepted_tokens !=
+                  expected.draft_accepted_tokens))) {
+          std::size_t first_diff = actual.tokens.size();
+          for (std::size_t t = 0;
+               t < std::min(actual.tokens.size(), expected.tokens.size());
+               ++t) {
+            if (actual.tokens[t] != expected.tokens[t]) {
+              first_diff = t;
+              break;
+            }
+          }
+          std::cout << "interleave mismatch: backend="
+                    << (use_mtp ? "mtp" : "ar") << " case=" << saved.test.name
+                    << " actual_tokens=" << actual.tokens.size()
+                    << " expected=" << expected.tokens.size()
+                    << " first_diff=" << first_diff << " drafts "
+                    << actual.draft_tokens << '/' << expected.draft_tokens
+                    << " accepted " << actual.draft_accepted_tokens << '/'
+                    << expected.draft_accepted_tokens << '\n';
+          for (std::size_t t = 0; t < expected.tokens.size(); ++t) {
+            std::cout << "  token " << t << ": expected "
+                      << (t < expected.tokens.size()
+                              ? std::to_string(expected.tokens[t])
+                              : "<none>")
+                      << " actual "
+                      << (t < actual.tokens.size()
+                              ? std::to_string(actual.tokens[t])
+                              : "<none>")
+                      << '\n';
+          }
+          std::cout << std::flush;
+        }
         Require(actual.tokens == expected.tokens &&
                     (!saved.test.config.uses_random_sampling() ||
                      (actual.draft_tokens == expected.draft_tokens &&
