@@ -56,46 +56,44 @@ if (-not (Test-Path $zipPath)) { throw "Expected package not found at: $zipPath"
 # 4. Generate comprehensive release notes
 Write-Host "`n[3/4] Generating release notes..." -ForegroundColor Yellow
 $releaseNotesPath = Join-Path $distDir "RELEASE_NOTES.md"
-$notesContent = @"
-# Gufo for Windows $Tag (AMD Strix Halo gfx1151)
+$notesTemplate = @'
+# Gufo for Windows {0} (AMD Strix Halo gfx1151)
 
-High-performance native local LLM inference engine optimized for AMD Ryzen AI MAX+ 395 with Radeon 8060S (\`gfx1151\`) on Windows 11.
+High-performance native local LLM inference engine optimized for AMD Ryzen AI MAX+ 395 with Radeon 8060S (`gfx1151`) on Windows 11.
 
 ## What's New in this Release
 
 ### 🔄 Upstream Merged
-- Fully merged upstream \`gufo-org/gufo\` **v0.20.0** release for AMD Strix Halo gfx1151.
+- Fully merged upstream `gufo-org/gufo` **v0.20.0** release for AMD Strix Halo gfx1151.
 
 ### 📊 Console Logger & Real-Time Monitoring
 - **Tabular Request Summaries**: Request completion log displays in a clean tabular box format in console.
 - **5-Second Interval Progress Updates**: Real-time console progress logged every 5 seconds during long prompt processing and decoding with instantaneous speed (t/s), average speed, and token counters.
-- **OpenAI API Speed Exposure**: \`prompt_tokens_per_second\`, \`completion_tokens_per_second\`, and \`total_tokens_per_second\` included in \`usage\` and \`timings\` for \`/v1/chat/completions\`, \`/v1/completions\`, and streaming terminal chunks.
+- **OpenAI API Speed Exposure**: `prompt_tokens_per_second`, `completion_tokens_per_second`, and `total_tokens_per_second` included in `usage` and `timings` for `/v1/chat/completions`, `/v1/completions`, and streaming terminal chunks.
 
 ### 🚀 Web Portal & UI Enhancements
-- **Live Generation Speed**: Real-time \`eval: X.X t/s | Y tokens\` live tracking in the message footer and status bar.
-- **Scroll Intent & Stickiness**: Replaced threshold heuristic with user scroll intent detection (\`wheel\` / \`touchmove\`) and programmatic scroll guards to prevent autoscroll jumping during fast streaming.
+- **Live Generation Speed**: Real-time `eval: X.X t/s | Y tokens` live tracking in the message footer and status bar.
+- **Scroll Intent & Stickiness**: Replaced threshold heuristic with user scroll intent detection (`wheel` / `touchmove`) and programmatic scroll guards to prevent autoscroll jumping during fast streaming.
 - **New Chat Attachment Landing View & Popover Menu**: Multi-modal image attachments, document uploads, workspace selector, system prompt personas, and 6 thinking levels.
-- **Feature Flags**: Supported \`--no-webui\` and \`--no-tools\`.
+- **Feature Flags**: Supported `--no-webui` and `--no-tools`.
 
 ### ⚡ Strix Halo Engine & Memory Optimizations
-- **KV Cache Quantization for Qwen 3.8 Flash-Next**:
-  - \`f16\` (default reference)
-  - \`q8\` (blocked 8-bit symmetric quantization with f16 scales)
-  - \`fp8\` (E4M3 format with per-32 f16 scales)
-  - \`GUFO_KV_V4=1\` (K8V4: 4-bit values, saves 23.5% KV cache VRAM)
-  - \`GUFO_KV_Q4=1\` (K4V8: 4-bit keys)
-  - \`K4V4\`: Cuts KV footprint down to 1.81 GB at 262,144 context!
+- **KV Cache Quantization for Qwen 3.8 Flash-Next (`--kv-cache`)**:
+  - `--kv-cache f16`: Standard 16-bit float KV cache (default reference, full fidelity).
+  - `--kv-cache q8_0` (or `q8`): 8-bit quantized KV cache on both K and V planes (~47% memory reduction).
+  - `--kv-cache q8_0-q4_k` (or `K8V4`): Mixed quantization with Q8_0 keys and Q4_K values (~59% memory reduction, cutting KV footprint down to ~1.81 GB at 262k context).
 - **Unsloth UD-IQ4_XS Quantization Support**:
-  - Full support for \`UD-IQ4_XS\` models mixing IQ3_S/IQ4_XS experts and Q6_K heads.
+  - Full support for `UD-IQ4_XS` models mixing IQ3_S/IQ4_XS experts and Q6_K heads.
 - **Reduced VRAM and RAM Footprint**:
   - Zero-copy unified memory allocations on Windows 11.
 
 ## Quickstart (Windows 11)
 
-1. Extract \`gufo-windows-$Version.zip\`.
-2. Double-click \`start.cmd\` to launch the interactive model manager.
-3. Open \`http://localhost:8080/\` in your web browser.
-"@
+1. Extract `gufo-windows-{1}.zip`.
+2. Double-click `start.cmd` to launch the interactive model manager.
+3. Open `http://localhost:8080/` in your web browser.
+'@
+$notesContent = $notesTemplate -f $Tag, $Version
 
 [System.IO.File]::WriteAllText($releaseNotesPath, $notesContent, [System.Text.Encoding]::UTF8)
 Write-Host "Wrote release notes to $releaseNotesPath" -ForegroundColor Green

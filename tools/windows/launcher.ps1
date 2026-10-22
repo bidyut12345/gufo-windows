@@ -233,11 +233,10 @@ function New-Plan($o, $f) {
   $vars = [ordered]@{}
   $labels = @()
   if ($f.KvQuant -in @("q8", "fp8")) {
-    $llm += @("--kv-quant", $f.KvQuant)
+    $llm += @("--kv-cache", $f.KvQuant)
     $labels += "kv-$($f.KvQuant)"
   } elseif ($f.KvQuant -eq "K8V4") {
-    $llm += @("--kv-quant", "q8")
-    $vars["GUFO_KV_V4"] = "1"
+    $llm += @("--kv-cache", "K8V4")
     $labels += "kv-K8V4"
   }
   if ($f.Spec -and $o.DraftKind) {

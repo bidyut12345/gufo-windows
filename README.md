@@ -39,11 +39,10 @@ for user-facing changes and release history.
 - **Cleaned Navigation**: Removed redundant "Tools & MCP" button from the top header since the Settings drawer already manages tools.
 
 ### ⚡ KV Cache Quantization & UD-IQ4_XS Support (VRAM/RAM Optimization)
-- **KV Cache Quantization for Qwen 3.8 Flash-Next**: Referencing optimizations from [dardeaw/MBufo](https://github.com/dardeaw/MBufo) and [endyjasmi/gufo](https://github.com/endyjasmi/gufo), Gufo supports:
-  - `--kv-quant f16`: Standard 16-bit float KV cache.
-  - `--kv-quant q8`: 8-bit quantized KV cache (~50% memory reduction).
-  - `--kv-quant fp8`: 8-bit floating point KV cache for fast tensor cores.
-  - `GUFO_KV_V4=1` (K8V4 / K4V4): 4-bit / 8-bit compressed KV cache, reducing 262k context KV memory footprint from ~64 GiB down to under 16 GiB!
+- **KV Cache Quantization for Qwen 3.8 Flash-Next (`--kv-cache`)**:
+  - `--kv-cache f16`: Standard 16-bit float KV cache (default reference, full fidelity).
+  - `--kv-cache q8_0` (or `q8`): 8-bit quantized KV cache on both K and V planes (~47% memory reduction).
+  - `--kv-cache q8_0-q4_k` (or `K8V4`): Mixed quantization with Q8_0 keys and Q4_K values (~59% memory reduction, cutting KV footprint down to ~1.81 GB at 262k context).
 - **Unsloth `UD-IQ4_XS` Support**: Full support for Unsloth's ultra-compact `UD-IQ4_XS` quantized weights alongside `UD-Q4_K_XL` and `UD-Q8_K_XL`, minimizing VRAM and system memory bandwidth contention.
 - **Quantization-Aware Memory Estimation**: `inventory.ps1` and `launcher.ps1` automatically compute KV cache memory requirements based on selected quantization and total context.
 
