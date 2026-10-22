@@ -63,6 +63,12 @@ High-performance native local LLM inference engine optimized for AMD Ryzen AI MA
 
 ## What's New in this Release
 
+### 🧩 New in v0.20.1
+- **Ask-User / Ask-Question Interactive Prompts**: The chat portal now renders interactive question cards (selectable choices + freeform text) when the model calls `ask_user`/`ask_question`, including support for `questions[]`-style arguments.
+- **Inline Tool-Call Recovery**: Tool calls emitted as `<tool_call>` / `<function=...>` text in model output are parsed and executed instead of being shown as raw text.
+- **Windows Memory Allocation**: Weights allocate via `hipMalloc` against the combined WDDM video-memory pool on Windows 11, with a retry on transient out-of-memory, improving large-model loading stability.
+- **Faster Qwen 3.8 Flash-Next Weight Upload**: Q6_K→Q8_6 re-quantization during model load now stages in 4096-row chunks, cutting peak host RAM during upload.
+
 ### 🔄 Upstream Merged
 - Fully merged upstream `gufo-org/gufo` **v0.20.0** release for AMD Strix Halo gfx1151.
 
