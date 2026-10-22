@@ -115,16 +115,13 @@ bool WebSocket::Read(char* data, std::size_t size) {
       size -= count;
       continue;
     }
-#ifdef _WIN32
-    // See platform::StopSocketReads: wake periodically to observe closed_.
-    if (!platform::WaitReadable(fd_, std::chrono::milliseconds(50)))
+#if defined(_WIN32)
+    const int chunk = static_cast<int>(std::min<std::size_t>(size, 65536));
+    const auto count = ::recv(fd_, data, chunk, 0);
+    const int err = count < 0 ? WSAGetLastError() : 0;
+    if (count < 0 && err == WSAEINTR)
       continue;
-#endif
-    const auto count = platform::SocketRecv(fd_, data, size, 0);
-    if (count < 0 && errno == EINTR)
-      continue;
-    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      // A client that only listens to streamed output is not idle.
+    if (count < 0 && (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT)) {
       const std::chrono::steady_clock::duration since_send(
           std::chrono::steady_clock::now().time_since_epoch().count() -
           last_send_.load());
@@ -133,6 +130,20 @@ bool WebSocket::Read(char* data, std::size_t size) {
       Close(1001);
       return false;
     }
+#else
+    const auto count = ::recv(fd_, data, size, 0);
+    if (count < 0 && errno == EINTR)
+      continue;
+    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      const std::chrono::steady_clock::duration since_send(
+          std::chrono::steady_clock::now().time_since_epoch().count() -
+          last_send_.load());
+      if (since_send < idle_)
+        continue;
+      Close(1001);
+      return false;
+    }
+#endif
     if (count <= 0)
       return false;
     data += count;
@@ -186,7 +197,7 @@ void WebSocket::Close(std::uint16_t code) {
   const std::array<char, 2> payload{static_cast<char>(code >> 8),
                                     static_cast<char>(code & 255)};
   (void)Send(8, std::string_view(payload.data(), payload.size()));
-  platform::StopSocketReads(fd_);
+  (void)::shutdown(fd_, SHUT_RD);
 }
 
 bool WebSocket::MarkClosed() {
