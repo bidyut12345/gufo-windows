@@ -6474,8 +6474,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
 
         const btnRetry = document.createElement('button');
         btnRetry.className = 'btn-msg-action';
-        btnRetry.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> Regnerate';
-        btnRetry.title = 'Regnerate message';
+        btnRetry.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> Re-Generate';
+        btnRetry.title = 'Re-generate message';
         btnRetry.onclick = () => {
           const target = findMessageIndex(m, msgIdx);
           retryUserMessage(target);
