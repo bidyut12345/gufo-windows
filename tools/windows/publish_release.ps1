@@ -63,6 +63,10 @@ High-performance native local LLM inference engine optimized for AMD Ryzen AI MA
 
 ## What's New in this Release
 
+### 🧩 New in v0.20.2
+- **Chat Portal Fix**: Corrected action button label typo and tooltip for message re-generation (`Re-Generate`).
+- Includes interactive tool prompts (`ask_question`/`ask_user`), inline tool-call recovery, unified WDDM memory allocation, and fast Qwen 3.8 Flash-Next weight upload optimizations from v0.20.1.
+
 ### 🧩 New in v0.20.1
 - **Ask-User / Ask-Question Interactive Prompts**: The chat portal now renders interactive question cards (selectable choices + freeform text) when the model calls `ask_user`/`ask_question`, including support for `questions[]`-style arguments.
 - **Inline Tool-Call Recovery**: Tool calls emitted as `<tool_call>` / `<function=...>` text in model output are parsed and executed instead of being shown as raw text.
