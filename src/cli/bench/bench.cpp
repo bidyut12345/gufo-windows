@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -25,7 +26,9 @@
 #include "src/core/sampling.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/qwen35moe/engine.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -173,21 +176,28 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
         opt.validate_prefill_tokens = num;
         return true;
       });
-
+  parser.AddOption("", "--logit-eval", "TEXT",
+                   "Teacher-forced logit dump of a UTF-8 text file "
+                   "(Flash-Next)",
+                   "Validation", &opt.logit_eval_path);
   parser.AddOption(
-      "", "--logit-eval", "TEXT",
-      "Flash-Next: teacher-force this text file through the decode and "
-      "verify arithmetic and dump per-position log-probabilities",
-      "Validation", &opt.logit_eval_path);
-  parser.AddOption("", "--logit-out", "PREFIX",
-                   "Output prefix for --logit-eval (PREFIX-s<i>.bin)",
-                   "Validation", &opt.logit_out);
+      "", "--logit-out", "PREFIX",
+      "Output prefix for --logit-eval (PREFIX-s<i>.bin, default: logit-eval)",
+      "Validation", &opt.logit_out);
+  parser.AddOption("", "--logit-schedules", "SCHEDULES",
+                   "Colon-separated verify-width schedules for --logit-eval, "
+                   "comma-separated widths per schedule, p-prefixed for "
+                   "prompt arithmetic (default: 1)",
+                   "Validation", &opt.logit_schedules);
   parser.AddOption(
-      "", "--logit-schedules", "W:W,...",
-      "Verify-width cycles for --logit-eval, one output per schedule "
-      "(default: 1:1,2,3,4,5,6,7,8); a 'p' prefix (p8) uses the prefill "
-      "arithmetic",
-      "Validation", &opt.logit_schedules);
+      "", "--checkpoint-eval", "TEXT",
+      "Compare the next-token row after TEXT between a fresh prefill, a "
+      "prefix+suffix split and a restored prefix checkpoint (Flash-Next)",
+      "Validation", &opt.checkpoint_eval_path);
+  parser.AddOption(
+      "", "--checkpoint-boundaries", "LIST",
+      "Comma-separated prefix depths for --checkpoint-eval (default: 600)",
+      "Validation", &opt.checkpoint_boundaries);
 
   const auto parse_speculative_backend =
       [&opt, &speculative_explicit](std::string_view, std::string_view value,
@@ -220,6 +230,26 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
+  parser.AddCustomOption(
+      "", "--kv-cache", "MODE",
+      "KV cache storage for Flash-Next: f16 (default), q8_0 (both planes, "
+      "~47% fewer bytes), q8_0-q4_k (Q8_0 keys, Q4_K values, ~59% fewer "
+      "bytes); lossy except f16",
+      "Cache",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
+                                                         &opt.kv_cache_mode)) {
+          if (error != nullptr) {
+            *error = "Invalid mode for --kv-cache: '" + std::string(value) +
+                     "' (want " +
+                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
+                     ")";
+          }
+          return false;
+        }
+        return true;
+      });
   parser.AddCustomOption(
       "", "--draft-tokens", "N",
       "Maximum speculative draft tokens per verification step (default: 7)",
@@ -258,47 +288,11 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
         opt.min_draft_tokens = count;
         return true;
       });
-
-  parser.AddCustomOption(
-      "", "--kv-cache", "MODE",
-      "KV cache storage for Flash-Next: f16 (default), q8 / q8_0 (both "
-      "planes, ~47% fewer bytes), q8_0-q4_k / K8V4 (Q8_0 keys, Q4_K values, "
-      "~59% fewer bytes); lossy except f16",
-      "Cache",
-      [&opt](std::string_view, std::string_view value,
-             std::string* error) -> bool {
-        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
-                                                         &opt.kv_cache_mode)) {
-          if (error != nullptr) {
-            *error = "Invalid mode for --kv-cache: '" + std::string(value) +
-                     "' (want " +
-                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
-                     ")";
-          }
-          return false;
-        }
-        return true;
-      });
-  parser.AddCustomOption(
-      "", "--kv-quant", "MODE",
-      "Alias for --kv-cache: f16, q8, q8_0, fp8, q8_0-q4_k, K8V4",
-      "Cache",
-      [&opt](std::string_view, std::string_view value,
-             std::string* error) -> bool {
-        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
-                                                         &opt.kv_cache_mode)) {
-          if (error != nullptr) {
-            *error = "Invalid mode for --kv-quant: '" + std::string(value) +
-                     "' (want " +
-                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
-                     ")";
-          }
-          return false;
-        }
-        return true;
-      });
-
   RegisterSamplingOptions(parser, &opt.sampling, "Sampling", false);
+  parser.AddFlag("", "--enable-yarn",
+                 "Flash-Next: static YaRN, required when depth + prompt or "
+                 "generation exceeds the native 262144",
+                 "Model", &opt.enable_yarn);
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
                  "General", &opt.verbose);
@@ -454,6 +448,11 @@ int RunDeepSeekBenchmark(
   if (dspark && options.min_draft_tokens != 1) {
     std::cerr << "Error: DSpark uses model-owned adaptive drafting; custom "
                  "draft floors are unsupported\n";
+    return 1;
+  }
+  if (options.kv_cache_mode != models::qwen38_flash_next::KvCacheMode::kF16) {
+    std::cerr << "Error: --kv-cache applies only to Qwen3.8-Flash-Next "
+                 "models\n";
     return 1;
   }
 
@@ -931,9 +930,11 @@ bool IsQwen38FlashNext(const core::GgufReader& reader) {
 // feeds the same tokens in chunks of its cycling widths (1 = decode step,
 // 2+ = fully accepted verify pass) and records, per position, the target
 // token's log-probability and the top-64 log-probabilities. Two dumps are
-// compared by logit-eval.py (perplexity, KL, top-1 agreement).
+// compared by tools/bench/logit_eval.py (perplexity, deltas, top-1
+// agreement) — across schedules on one build for row-count parity, and
+// across builds at equal schedules for kernel parity.
 int RunFlashNextLogitEval(models::qwen38_flash_next::Model& model,
-                          const BenchOptions& options, std::uint32_t context) {
+                          const BenchOptions& options) {
   constexpr std::uint32_t kTop = 64;
   std::ifstream in(options.logit_eval_path, std::ios::binary);
   if (!in) {
@@ -943,9 +944,9 @@ int RunFlashNextLogitEval(models::qwen38_flash_next::Model& model,
   const std::string text((std::istreambuf_iterator<char>(in)),
                          std::istreambuf_iterator<char>());
   const auto tokens = model.Tokenize(text);
-  if (tokens.size() < 2 || tokens.size() >= context) {
+  if (tokens.size() < 2) {
     std::cerr << "Error: logit-eval text is " << tokens.size()
-              << " tokens; it needs 2.." << context - 1 << '\n';
+              << " tokens; it needs at least 2\n";
     return 1;
   }
   // A schedule prefixed with 'p' uses the prompt (prefill) arithmetic.
@@ -978,6 +979,7 @@ int RunFlashNextLogitEval(models::qwen38_flash_next::Model& model,
   std::vector<std::int32_t> order(vocab);
   for (std::size_t s = 0; s < schedules.size(); ++s) {
     std::string error;
+    const std::uint32_t context = static_cast<std::uint32_t>(tokens.size() + 1);
     auto session =
         model.CreateSession(model.HasMtp() && !prefill[s]
                                 ? gufo::core::SessionMode::kSpeculative
@@ -1056,6 +1058,120 @@ int RunFlashNextLogitEval(models::qwen38_flash_next::Model& model,
   return 0;
 }
 
+/// The next-token row of a session that just finished a prompt: the logits,
+/// their argmax and the top-1 margin over the runner-up.
+struct BoundaryRow {
+  std::vector<float> logits;
+  std::size_t top1{0};
+  float margin{0};
+};
+
+BoundaryRow CaptureBoundaryRow(
+    const models::qwen38_flash_next::Session& session) {
+  const auto logits = session.Logits();
+  BoundaryRow row;
+  row.logits.assign(logits.begin(), logits.end());
+  std::vector<std::size_t> order(row.logits.size());
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  std::partial_sort(order.begin(), order.begin() + 2, order.end(),
+                    [&row](std::size_t a, std::size_t b) {
+                      return row.logits[a] > row.logits[b];
+                    });
+  row.top1 = order[0];
+  row.margin = row.logits[order[0]] - row.logits[order[1]];
+  return row;
+}
+
+float MaxAbsDelta(std::span<const float> a, std::span<const float> b) {
+  float max_delta = 0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    max_delta = std::max(max_delta, std::abs(a[i] - b[i]));
+  return max_delta;
+}
+
+// Continuation-cache boundary exactness: the serving cache restores a
+// checkpoint of the previous turn's prefix and prefills only the suffix,
+// so a reused turn's next-token row is computed over a different prefill
+// split than a fresh full prefill. For every boundary depth this feeds the
+// same prompt three ways — a fresh full Sync, a prefix-then-whole Sync in
+// one session, and a prefix checkpoint restored into a second session —
+// and compares the resulting next-token rows.
+int RunFlashNextCheckpointEval(models::qwen38_flash_next::Model& model,
+                               const BenchOptions& options) {
+  std::ifstream in(options.checkpoint_eval_path, std::ios::binary);
+  if (!in) {
+    std::cerr << "Error: cannot read " << options.checkpoint_eval_path << '\n';
+    return 1;
+  }
+  const std::string text((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+  const auto tokens = model.Tokenize(text);
+  const auto boundaries =
+      ParseCommaSeparatedSizes(options.checkpoint_boundaries);
+  if (tokens.size() < 4 || !boundaries || boundaries->empty()) {
+    std::cerr << "Error: checkpoint-eval needs a longer text and at least "
+                 "one boundary\n";
+    return 1;
+  }
+  for (const auto boundary : *boundaries) {
+    if (boundary <= 1 || boundary + 1 >= tokens.size()) {
+      std::cerr << "Error: boundary " << boundary << " is outside the text ("
+                << tokens.size() << " tokens)\n";
+      return 1;
+    }
+  }
+  const std::uint32_t context = static_cast<std::uint32_t>(tokens.size() + 1);
+  std::string error;
+  std::cout << "[Checkpoint Eval] " << tokens.size() << " tokens, "
+            << boundaries->size() << " boundary depth(s)\n";
+  auto fresh = model.CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                   context, &error);
+  if (!fresh || !fresh->Sync(tokens, &error)) {
+    std::cerr << "Error: checkpoint-eval fresh prefill: " << error << '\n';
+    return 1;
+  }
+  const BoundaryRow fresh_row = CaptureBoundaryRow(*fresh);
+  for (const auto boundary : *boundaries) {
+    auto chunked = model.CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                       context, &error);
+    if (!chunked || !chunked->Sync(std::span(tokens).first(boundary), &error)) {
+      std::cerr << "Error: checkpoint-eval prefix prefill: " << error << '\n';
+      return 1;
+    }
+    auto snapshot = chunked->SaveAlignedSnapshot(&error);
+    if (!snapshot) {
+      std::cerr << "Error: checkpoint-eval capture: " << error << '\n';
+      return 1;
+    }
+    if (!chunked->Sync(tokens, &error)) {
+      std::cerr << "Error: checkpoint-eval suffix prefill: " << error << '\n';
+      return 1;
+    }
+    const BoundaryRow chunked_row = CaptureBoundaryRow(*chunked);
+    auto restored = model.CreateSession(
+        gufo::core::SessionMode::kAutoregressive, context, &error);
+    if (!restored || !restored->RestoreSnapshot(*snapshot, &error) ||
+        !restored->Sync(tokens, &error)) {
+      std::cerr << "Error: checkpoint-eval restore: " << error << '\n';
+      return 1;
+    }
+    const BoundaryRow restored_row = CaptureBoundaryRow(*restored);
+    const bool restore_exact =
+        chunked_row.logits.size() == restored_row.logits.size() &&
+        std::memcmp(chunked_row.logits.data(), restored_row.logits.data(),
+                    chunked_row.logits.size() * sizeof(float)) == 0;
+    const float split_delta = MaxAbsDelta(fresh_row.logits, chunked_row.logits);
+    std::cout << "[Checkpoint Eval] boundary " << boundary << ": top1 "
+              << fresh_row.top1 << " (margin " << fresh_row.margin << ") vs "
+              << chunked_row.top1 << " (margin " << chunked_row.margin
+              << "), split max|d| " << std::scientific << std::setprecision(3)
+              << split_delta << std::defaultfloat << std::setprecision(6)
+              << ", restored "
+              << (restore_exact ? "bit-identical to split" : "DIFFERS") << '\n';
+  }
+  return 0;
+}
+
 int RunQwen38FlashNextBenchmark(
     const BenchOptions& options,
     const std::shared_ptr<const core::GgufReader>& reader,
@@ -1071,32 +1187,26 @@ int RunQwen38FlashNextBenchmark(
     return values.empty() ? std::size_t{0}
                           : *std::max_element(values.begin(), values.end());
   };
-  const std::size_t max_depth = max_or_zero(options.n_depths);
-  const std::size_t max_prompt = max_or_zero(options.n_prompts);
-  const std::size_t max_generation = max_or_zero(options.n_gens);
-  if (std::max({max_depth, max_prompt, max_generation,
-                options.validate_prefill_tokens}) >
+  if (std::max({max_or_zero(options.n_depths), max_or_zero(options.n_prompts),
+                max_or_zero(options.n_gens), options.validate_prefill_tokens}) >
       std::numeric_limits<std::uint32_t>::max()) {
     std::cerr << "Error: benchmark workload exceeds the context range\n";
     return 1;
   }
-  const std::size_t base_context =
-      std::max({std::size_t{4096}, max_depth + max_prompt + 1,
-                std::max<std::size_t>(max_depth, 16) + max_generation + 1,
-                options.validate_prefill_tokens + 1});
-  // Logit-eval texts are short; 32K covers any sensible corpus.
-  const std::size_t required_context =
-      options.logit_eval_path.empty()
-          ? base_context
-          : std::max<std::size_t>(base_context, 32768);
+  const std::size_t required_context = FlashNextBenchContext(options);
   const bool mtp = options.speculative_backend == "mtp";
   if (!options.speculative_backend.empty() && !mtp) {
     std::cerr << "Error: Qwen3.8-Flash-Next supports only --speculative mtp "
                  "or off\n";
     return 1;
   }
-  if (mtp && options.mtp_model_path.empty()) {
-    std::cerr << "Error: --speculative mtp requires --mtp-model\n";
+  const std::string mtp_model_path =
+      mtp && options.mtp_model_path.empty()
+          ? qfn::DiscoverMtpSidecar(options.model_path)
+          : options.mtp_model_path;
+  if (mtp && mtp_model_path.empty()) {
+    std::cerr << "Error: --speculative mtp requires --mtp-model or a "
+                 "shared MTP sidecar beside the model\n";
     return 1;
   }
   if (options.concurrency != std::vector<std::size_t>{1}) {
@@ -1113,14 +1223,27 @@ int RunQwen38FlashNextBenchmark(
     return 1;
   }
 
+  // The same --enable-yarn rule as serve, applied to the context that sizes
+  // the benchmark's own requests.
+  const std::uint32_t qwen4exp_native_context =
+      reader->GetMetadataUint32("qwen4exp.context_length").value_or(0);
+  std::optional<qfn::RopeScaling> rope_scaling;
+  std::string yarn_error;
+  if (!ResolveFlashNextBenchYarn(options, qwen4exp_native_context,
+                                 &rope_scaling, &yarn_error)) {
+    std::cerr << "Error: Flash-Next benchmark: " << yarn_error << '\n';
+    return 1;
+  }
+
   std::string error;
   auto model = qfn::Model::Load(
       options.model_path,
       qfn::ModelOptions{
           .max_context = static_cast<std::uint32_t>(required_context),
-          .mtp_model_path = mtp ? options.mtp_model_path : "",
+          .mtp_model_path = mtp ? mtp_model_path : "",
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
           .kv_cache_mode = options.kv_cache_mode,
+          .rope_scaling = rope_scaling,
       },
       &error);
   if (model == nullptr) {
@@ -1129,9 +1252,17 @@ int RunQwen38FlashNextBenchmark(
     return 1;
   }
   PrintModelLoadTime(model_load_start);
+  if (rope_scaling) {
+    std::cout << "[YaRN]: factor=" << rope_scaling->factor
+              << " original_context=" << qwen4exp_native_context
+              << " context=" << required_context << '\n';
+  }
+
   if (!options.logit_eval_path.empty()) {
-    return RunFlashNextLogitEval(*model, options,
-                                 static_cast<std::uint32_t>(required_context));
+    return RunFlashNextLogitEval(*model, options);
+  }
+  if (!options.checkpoint_eval_path.empty()) {
+    return RunFlashNextCheckpointEval(*model, options);
   }
 
   // Repeat a fixed token pattern for reproducible timing. It uses far fewer
@@ -1336,9 +1467,321 @@ int RunQwen38FlashNextBenchmark(
   return 0;
 }
 
+int RunOrnithBenchmark(const BenchOptions& options,
+                       const std::shared_ptr<const core::GgufReader>& reader,
+                       std::chrono::steady_clock::time_point model_load_start) {
+  namespace q35 = models::qwen35moe;
+  int device_count = 0;
+  if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
+    std::cerr << "Error: no HIP GPU is available for Ornith-1.5-35B\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  const auto max_or_zero = [](const std::vector<std::size_t>& values) {
+    return values.empty() ? std::size_t{0}
+                          : *std::max_element(values.begin(), values.end());
+  };
+  const std::size_t max_depth = max_or_zero(options.n_depths);
+  const std::size_t max_prompt = max_or_zero(options.n_prompts);
+  const std::size_t max_generation = max_or_zero(options.n_gens);
+  if (std::max({max_depth, max_prompt, max_generation,
+                options.validate_prefill_tokens}) >
+      std::numeric_limits<std::uint32_t>::max()) {
+    std::cerr << "Error: benchmark workload exceeds the context range\n";
+    return 1;
+  }
+  const std::size_t required_context =
+      std::max({std::size_t{4096}, max_depth + max_prompt + 1,
+                std::max<std::size_t>(max_depth, 16) + max_generation + 1,
+                options.validate_prefill_tokens + 1});
+  const bool mtp = options.speculative_backend == "mtp";
+  const bool dflash = options.speculative_backend == "dflash2";
+  if (!options.speculative_backend.empty() && !mtp && !dflash) {
+    std::cerr << "Error: Ornith-1.5-35B supports --speculative mtp, dflash2, "
+                 "or off\n";
+    return 1;
+  }
+  if (mtp && !options.mtp_model_path.empty()) {
+    std::cerr << "Error: Ornith MTP is built into the model file; do not "
+                 "pass --mtp-model\n";
+    return 1;
+  }
+  if (dflash && options.dflash_model_path.empty()) {
+    std::cerr << "Error: Ornith DFlash requires --dflash-model\n";
+    return 1;
+  }
+  if (options.concurrency != std::vector<std::size_t>{1}) {
+    std::cerr << "Error: Ornith bench supports C1; use the serving "
+                 "benchmark for concurrent requests\n";
+    return 1;
+  }
+  if ((mtp || dflash) && options.min_draft_tokens != 1) {
+    std::cerr << "Error: Ornith speculation requires --min-draft-tokens 1\n";
+    return 1;
+  }
+  if (required_context > std::numeric_limits<std::uint32_t>::max()) {
+    std::cerr << "Error: Ornith context is out of range\n";
+    return 1;
+  }
+
+  std::string error;
+  auto model = q35::Model::Load(
+      options.model_path,
+      q35::ModelOptions{
+          .max_context = static_cast<std::uint32_t>(required_context),
+          .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
+          .dflash_model_path =
+              dflash ? options.dflash_model_path : std::string{},
+          .kv_cache_mode =
+              static_cast<q35::KvCacheMode>(options.kv_cache_mode),
+      },
+      &error);
+  if (model == nullptr) {
+    std::cerr << "Error creating Ornith-1.5-35B model: " << error << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(model_load_start);
+
+  // Repeat a fixed token pattern for reproducible timing. It uses far fewer
+  // distinct PLE rows than varied requests.
+  std::vector<std::int32_t> tokens;
+  {
+    const auto pattern = model->Tokenize(
+        "The quick brown fox jumps over the lazy dog. "
+        "Strix Halo executes this deterministic benchmark sequence. ");
+    if (pattern.empty()) {
+      std::cerr << "Error: benchmark token pattern is empty\n";
+      return 1;
+    }
+    tokens.resize(required_context);
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      tokens[i] = pattern[i % pattern.size()];
+    }
+  }
+
+  if (options.validate_prefill_tokens != 0) {
+    // Batched prefill against one-token-at-a-time evaluation of the same
+    // prefix; both run on the GPU, so this checks the batched kernels. The
+    // validation only exercises trunk prefill, so DFlash sessions stay out
+    // of it (the draft allows one session at a time).
+    const auto validation_mode =
+        dflash ? std::optional{gufo::core::SessionMode::kAutoregressive}
+               : std::nullopt;
+    auto sequential = model->CreateSession(
+        validation_mode.value_or(options.speculative_backend.empty()
+                                     ? gufo::core::SessionMode::kAutoregressive
+                                     : gufo::core::SessionMode::kSpeculative),
+        static_cast<std::uint32_t>(required_context), &error);
+    auto batched = model->CreateSession(
+        validation_mode.value_or(options.speculative_backend.empty()
+                                     ? gufo::core::SessionMode::kAutoregressive
+                                     : gufo::core::SessionMode::kSpeculative),
+        static_cast<std::uint32_t>(required_context), &error);
+    const auto prefix =
+        std::span(tokens).first(options.validate_prefill_tokens);
+    if (!sequential || !batched || !sequential->Sync(prefix.first(1), &error) ||
+        !batched->Sync(prefix, &error)) {
+      std::cerr << "Ornith-1.5-35B prefill validation failed: " << error
+                << '\n';
+      return 1;
+    }
+    for (const std::int32_t token : prefix.subspan(1)) {
+      if (!sequential->Evaluate(token, &error)) {
+        std::cerr << "Ornith-1.5-35B sequential reference failed: " << error
+                  << '\n';
+        return 1;
+      }
+    }
+    const auto reference = sequential->Logits();
+    const auto candidate = batched->Logits();
+    const auto comparison = testing::CompareLogits(reference, candidate);
+    const std::size_t rank =
+        1 + std::count_if(candidate.begin(), candidate.end(), [&](float value) {
+          return value > candidate[comparison.reference_argmax];
+        });
+    std::cout << "[Prefill Validation] tokens=" << prefix.size()
+              << " finite=" << comparison.finite
+              << " scalar_winner_rank=" << rank
+              << " rmse=" << comparison.root_mean_square_error
+              << " cosine=" << comparison.cosine_similarity
+              << " max_error=" << comparison.max_abs_diff << '\n';
+    if (!comparison.finite || rank > 3 ||
+        comparison.root_mean_square_error > 1.12F ||
+        comparison.cosine_similarity < 0.979F ||
+        comparison.max_abs_diff > 5.0F) {
+      return 1;
+    }
+  }
+
+  const double size_gib =
+      static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0);
+  const auto model_name = model->ModelName();
+  std::cout << "| " << std::left << std::setw(32) << "model"
+            << " | " << std::right << std::setw(10) << "size"
+            << " | " << std::left << std::setw(10) << "backend"
+            << " | " << std::right << std::setw(18) << "test"
+            << " | " << std::right << std::setw(21) << "t/s"
+            << " |\n"
+            << "| " << std::string(32, '-') << " | " << std::string(10, '-')
+            << " | " << std::string(10, '-') << " | " << std::string(18, '-')
+            << " | " << std::string(21, '-') << " |\n";
+  std::ostringstream size_text;
+  size_text << std::fixed << std::setprecision(2) << size_gib << " GiB";
+  const auto print_result = [&](std::string_view test_name,
+                                const BenchStats& stats) {
+    std::ostringstream throughput;
+    throughput << std::fixed << std::setprecision(2) << stats.mean << " ± "
+               << stats.stddev;
+    std::cout << "| " << std::left << std::setw(32) << model_name << " | "
+              << std::right << std::setw(10) << size_text.str() << " | "
+              << std::left << std::setw(10) << "ROCm (HIP)"
+              << " | " << std::right << std::setw(18) << test_name << " | "
+              << std::right << std::setw(21) << throughput.str() << " |\n"
+              << std::flush;
+  };
+
+  for (const std::size_t depth : options.n_depths) {
+    for (const std::size_t prompt_length : options.n_prompts) {
+      if (depth + prompt_length >= required_context) {
+        std::cerr << "Error: prompt benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      // A full aligned prefix already warms the same chunk shapes and GEMM
+      // plans. Other shapes still need an untimed pass before measurement.
+      const auto chunk = model->PrefillCapacity();
+      const bool warm_prefix = chunk > 0 && depth >= chunk &&
+                               depth % chunk == 0 && prompt_length > 0 &&
+                               prompt_length % chunk == 0;
+      for (std::size_t repetition = warm_prefix ? 1 : 0;
+           repetition <= options.repetitions; ++repetition) {
+        auto session = model->CreateSession(
+            options.speculative_backend.empty()
+                ? gufo::core::SessionMode::kAutoregressive
+                : gufo::core::SessionMode::kSpeculative,
+            static_cast<std::uint32_t>(required_context), &error);
+        if (!session ||
+            (depth > 0 &&
+             !session->Sync(std::span(tokens).first(depth), &error))) {
+          std::cerr << "Error preparing depth: " << error << '\n';
+          return 1;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (!session->Sync(std::span(tokens).first(depth + prompt_length),
+                           &error)) {
+          std::cerr << "Error running prefill: " << error << '\n';
+          return 1;
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        if (repetition > 0) {
+          runs.push_back(static_cast<double>(prompt_length) / seconds);
+        }
+      }
+      print_result(MakeTestName("pp", prompt_length, depth),
+                   ComputeStats(runs));
+    }
+
+    for (const std::size_t generation_length : options.n_gens) {
+      const std::size_t prefix_length = depth > 0 ? depth : 16;
+      if (prefix_length + generation_length >= required_context) {
+        std::cerr << "Error: generation benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      for (std::size_t repetition = 0; repetition < options.repetitions;
+           ++repetition) {
+        auto session = model->CreateSession(
+            options.speculative_backend.empty()
+                ? gufo::core::SessionMode::kAutoregressive
+                : gufo::core::SessionMode::kSpeculative,
+            static_cast<std::uint32_t>(required_context), &error);
+        if (!session ||
+            !session->Sync(std::span(tokens).first(prefix_length), &error)) {
+          std::cerr << "Error preparing generation: " << error << '\n';
+          return 1;
+        }
+        std::vector<std::int32_t> generated;
+        const std::vector<sampling::TokenId> history(
+            tokens.begin(), tokens.begin() + prefix_length);
+        sampling::SamplerState sampler(options.sampling, history);
+        const auto start = std::chrono::steady_clock::now();
+        while (generated.size() < generation_length) {
+          q35::Session::DecodeResult decoded;
+          if (!session->DecodeStep(generation_length - generated.size(),
+                                   sampler, &decoded, &error, false) ||
+              decoded.tokens.empty()) {
+            std::cerr << "Error running Ornith decode: " << error << '\n';
+            return 1;
+          }
+          generated.insert(generated.end(), decoded.tokens.begin(),
+                           decoded.tokens.end());
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        runs.push_back(static_cast<double>(generation_length) / seconds);
+        if (options.verbose) {
+          const auto stats = session->Statistics();
+          std::cerr << "Ornith-1.5-35B tg depth=" << depth
+                    << " cycles=" << stats.cycles
+                    << " drafted=" << stats.drafted
+                    << " accepted=" << stats.accepted << " output_sha256="
+                    << crypto::Sha256Hex(
+                           std::span(reinterpret_cast<const std::uint8_t*>(
+                                         generated.data()),
+                                     generated.size() * sizeof(std::int32_t)))
+                    << " text="
+                    << model->Decode(std::span(generated).first(
+                           std::min<std::size_t>(generated.size(), 48)))
+                    << '\n';
+        }
+      }
+      print_result(MakeTestName("tg", generation_length, depth),
+                   ComputeStats(runs));
+    }
+  }
+  std::cout << '\n';
+  return 0;
+}
+
 #endif
 
 }  // namespace
+
+std::size_t FlashNextBenchContext(const BenchOptions& options) {
+  const auto max_or_zero = [](const std::vector<std::size_t>& values) {
+    return values.empty() ? std::size_t{0}
+                          : *std::max_element(values.begin(), values.end());
+  };
+  const std::size_t max_depth = max_or_zero(options.n_depths);
+  return std::max(
+      {std::size_t{4096}, max_depth + max_or_zero(options.n_prompts) + 1,
+       std::max<std::size_t>(max_depth, 16) + max_or_zero(options.n_gens) + 1,
+       options.validate_prefill_tokens + 1,
+       // Logit-eval texts are short; 32K covers any sensible corpus.
+       options.logit_eval_path.empty() ? std::size_t{0} : std::size_t{32768},
+       options.checkpoint_eval_path.empty() ? std::size_t{0}
+                                            : std::size_t{32768}});
+}
+
+bool ResolveFlashNextBenchYarn(
+    const BenchOptions& options, std::uint32_t native,
+    std::optional<models::qwen38_flash_next::RopeScaling>* scaling,
+    std::string* error) {
+  const std::size_t context = FlashNextBenchContext(options);
+  if (context > std::numeric_limits<std::uint32_t>::max()) {
+    *scaling = std::nullopt;
+    if (error != nullptr)
+      *error = "benchmark workload exceeds the context range";
+    return false;
+  }
+  return models::qwen38_flash_next::ResolveRopeScaling(
+      static_cast<std::uint32_t>(context), native, options.enable_yarn, scaling,
+      error);
+}
 
 void PrintBenchHelp(std::string_view program_name) {
   BenchOptions opt;
@@ -1459,11 +1902,18 @@ int RunBench(std::span<const char* const> args) {
       std::move(reader_owner));
 
 #if defined(ENGINE_ENABLE_HIP)
+  if (opt.enable_yarn && !IsQwen38FlashNext(*reader)) {
+    std::cerr << "Error: --enable-yarn applies only to Qwen3.8-Flash-Next\n";
+    return 1;
+  }
   if (IsDeepSeekV4Flash(*reader)) {
     return RunDeepSeekBenchmark(opt, reader, model_load_start);
   }
   if (IsQwen38FlashNext(*reader)) {
     return RunQwen38FlashNextBenchmark(opt, reader, model_load_start);
+  }
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    return RunOrnithBenchmark(opt, reader, model_load_start);
   }
 
   if (opt.concurrency != std::vector<std::size_t>{1}) {

@@ -114,6 +114,10 @@ endif()
 # Qwen3.8-Flash-Next — model-private CPU reference plus ROCm runtime.
 add_subdirectory(src/models/qwen38_flash_next)
 
+# Ornith-1.5-35B (qwen35moe) — Flash-Next-lineage hybrid MoE; shares the
+# vendored qfn_mmq kernel build.
+add_subdirectory(src/models/qwen35moe)
+
 # Qwen3-TTS — CPU reference + HIP kernels (CustomVoice 12Hz).
 add_subdirectory(src/models/qwen3_tts)
 
@@ -267,7 +271,8 @@ add_library(gufo_llm_cli STATIC
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
-    gufo_qwen38_flash_next)
+    gufo_qwen38_flash_next
+    gufo_qwen35moe)
 endif()
 
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
@@ -580,6 +585,7 @@ if (BUILD_TESTING)
 
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)
+  add_subdirectory(tests/models/qwen35moe)
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test
@@ -1166,12 +1172,3 @@ if (BUILD_TESTING)
   include(cmake/Checks.cmake)
 endif()
 
-# Qwen3.6-35B-A3B (qwen35moe): its runtime library and the gufo-a3b driver.
-add_subdirectory(src/models/qwen36_a3b)
-# `gufo serve` runs qwen35moe GGUFs through its text runner
-# (src/cli/serve/inference_backend.cpp); OFF builds gufo.exe without it.
-option(GUFO_WITH_A3B "gufo serve for Qwen3.6-35B-A3B (qwen35moe) GGUFs" ON)
-if(GUFO_WITH_A3B AND TARGET gufo_qwen36_a3b)
-  target_link_libraries(gufo PRIVATE gufo_qwen36_a3b)
-  target_compile_definitions(gufo PRIVATE GUFO_WITH_A3B=1)
-endif()

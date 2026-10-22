@@ -1,0 +1,10 @@
+{
+  "multi-mixed": {
+    "6": "greedy completions diverge from the isolated AR reference at this width: batched speculative verification co-batches sessions beyond the 8-row vector-kernel contract, whose tiled fallback does not reproduce the vector path's arithmetic; the measurements are withheld rather than published",
+    "8": "same consistency-gate failure as C6"
+  },
+  "multi-repetition": {
+    "6": "same consistency-gate failure as multi-mixed C6 (the Q8_0 draft accepts less per cycle, so co-batched verify rows stay under the contract through C4 and trip at the same level as mixed text)",
+    "8": "same consistency-gate failure as multi-mixed C6"
+  }
+}

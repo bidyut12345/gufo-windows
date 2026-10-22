@@ -23,6 +23,7 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
+#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -31,8 +32,8 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
+#include "src/models/qwen35moe/engine.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
-#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 #endif
 
 namespace gufo::cli {
@@ -162,6 +163,26 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
   parser.AddCustomOption(
+      "", "--kv-cache", "MODE",
+      "KV cache storage for Flash-Next: f16 (default), q8_0 (both planes, "
+      "~47% fewer bytes), q8_0-q4_k (Q8_0 keys, Q4_K values, ~59% fewer "
+      "bytes); lossy except f16",
+      "Cache",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
+                                                         &opt.kv_cache_mode)) {
+          if (error != nullptr) {
+            *error = "Invalid mode for --kv-cache: '" + std::string(value) +
+                     "' (want " +
+                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
+                     ")";
+          }
+          return false;
+        }
+        return true;
+      });
+  parser.AddCustomOption(
       "-d", "--draft-tokens", "N",
       "Maximum speculative draft tokens evaluated per step (default: 7)",
       "Speculative",
@@ -198,45 +219,6 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
           return false;
         }
         opt.min_draft_tokens = count;
-        return true;
-      });
-
-  parser.AddCustomOption(
-      "", "--kv-cache", "MODE",
-      "KV cache storage for Flash-Next: f16 (default), q8 / q8_0 (both "
-      "planes, ~47% fewer bytes), q8_0-q4_k / K8V4 (Q8_0 keys, Q4_K values, "
-      "~59% fewer bytes); lossy except f16",
-      "Cache",
-      [&opt](std::string_view, std::string_view value,
-             std::string* error) -> bool {
-        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
-                                                         &opt.kv_cache_mode)) {
-          if (error != nullptr) {
-            *error = "Invalid mode for --kv-cache: '" + std::string(value) +
-                     "' (want " +
-                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
-                     ")";
-          }
-          return false;
-        }
-        return true;
-      });
-  parser.AddCustomOption(
-      "", "--kv-quant", "MODE",
-      "Alias for --kv-cache: f16, q8, q8_0, fp8, q8_0-q4_k, K8V4",
-      "Cache",
-      [&opt](std::string_view, std::string_view value,
-             std::string* error) -> bool {
-        if (!models::qwen38_flash_next::ParseKvCacheMode(value,
-                                                         &opt.kv_cache_mode)) {
-          if (error != nullptr) {
-            *error = "Invalid mode for --kv-quant: '" + std::string(value) +
-                     "' (want " +
-                     std::string(models::qwen38_flash_next::kKvCacheModeList) +
-                     ")";
-          }
-          return false;
-        }
         return true;
       });
 
@@ -353,6 +335,12 @@ constexpr std::uint32_t kDefaultContext = 4096;
 std::shared_ptr<models::deepseek_v4_flash::Model> LoadDeepSeekModel(
     const PromptOptions& opt, const core::GgufReader& reader,
     std::chrono::steady_clock::time_point load_start) {
+  if (opt.kv_cache_mode != models::qwen38_flash_next::KvCacheMode::kF16) {
+    std::cerr << "Error: --kv-cache applies only to Qwen3.8-Flash-Next "
+                 "models\n";
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
   if (opt.force_cpu) {
     std::cerr << "DeepSeek V4 Flash is supported only by the ROCm backend\n";
     PrintModelLoadTime(load_start, false);
@@ -704,11 +692,22 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
     std::cerr << "Unsupported Flash-Next chat template: " << error << '\n';
     return nullptr;
   }
+  std::string mtp_model_path;
+  if (opt.speculative_backend == "mtp") {
+    mtp_model_path =
+        opt.mtp_model_path.empty()
+            ? models::qwen38_flash_next::DiscoverMtpSidecar(opt.model_path)
+            : opt.mtp_model_path;
+    if (mtp_model_path.empty()) {
+      std::cerr << "Flash-Next MTP requires --mtp-model or a shared MTP "
+                   "sidecar beside the model\n";
+      return nullptr;
+    }
+  }
   auto model = models::qwen38_flash_next::Model::Load(
       opt.model_path,
       {.max_context = kDefaultContext,
-       .mtp_model_path =
-           opt.speculative_backend == "mtp" ? opt.mtp_model_path : "",
+       .mtp_model_path = mtp_model_path,
        .max_draft_tokens = opt.draft_tokens,
        .vision_model_path = opt.vision_model_path,
        .kv_cache_mode = opt.kv_cache_mode},
@@ -716,6 +715,53 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)
     std::cerr << "Flash-Next load failed: " << error << '\n';
+  return model;
+}
+
+std::shared_ptr<models::qwen35moe::Model> LoadOrnithModel(
+    const PromptOptions& opt, const core::GgufReader& reader,
+    std::chrono::steady_clock::time_point load_start) {
+  std::string error;
+  const bool dflash = opt.speculative_backend == "dflash2";
+  if (opt.force_cpu ||
+      (!opt.speculative_backend.empty() && opt.speculative_backend != "mtp" &&
+       !dflash) ||
+      ((opt.speculative_backend == "mtp" || dflash) &&
+       opt.min_draft_tokens != 1)) {
+    std::cerr << "Ornith requires ROCm and supports --speculative mtp or "
+                 "dflash2 with --min-draft-tokens 1\n";
+    return nullptr;
+  }
+  if (dflash && opt.dflash_model_path.empty()) {
+    std::cerr << "Ornith DFlash requires --dflash-model\n";
+    return nullptr;
+  }
+  if (opt.use_chat_template &&
+      !tokenization::QwenChatTemplate::ValidateGgufTemplate(reader, &error)) {
+    std::cerr << "Unsupported Ornith chat template: " << error << '\n';
+    return nullptr;
+  }
+  models::qwen35moe::ModelOptions options{
+      .max_context = kDefaultContext,
+      .max_draft_tokens = opt.draft_tokens,
+      .vision_model_path = opt.vision_model_path,
+      .dflash_model_path = dflash ? opt.dflash_model_path : std::string{},
+      .kv_cache_mode =
+          static_cast<models::qwen35moe::KvCacheMode>(opt.kv_cache_mode),
+  };
+  if (dflash && !opt.draft_policy.empty()) {
+    try {
+      options.dflash_policy =
+          speculative::ParseDFlashDraftPolicy(opt.draft_policy);
+    } catch (const std::exception& ex) {
+      std::cerr << ex.what() << '\n';
+      return nullptr;
+    }
+  }
+  auto model = models::qwen35moe::Model::Load(opt.model_path, options, &error);
+  PrintModelLoadTime(load_start, model != nullptr);
+  if (!model)
+    std::cerr << "Ornith load failed: " << error << '\n';
   return model;
 }
 
@@ -774,6 +820,54 @@ int GenerateFlashNextResponse(const PromptOptions& opt,
                 << " lookup_accepted="
                 << stats.lookup_accepted - stats_before.lookup_accepted << '\n';
     }
+    PrintTokenTrace(generated);
+  }
+  return 0;
+}
+
+int GenerateOrnithResponse(const PromptOptions& opt,
+                           const models::qwen35moe::Model& model,
+                           models::qwen35moe::Session& session,
+                           std::span<const tokenization::TokenId> prompt,
+                           std::string* reply = nullptr) {
+  if (prompt.empty() || prompt.size() >= session.ContextSize() ||
+      opt.max_tokens > session.ContextSize() - prompt.size()) {
+    std::cerr << "Ornith prompt and output exceed the 4096-token CLI context\n";
+    return 1;
+  }
+  const std::vector<std::int32_t> input(prompt.begin(), prompt.end());
+  std::string error;
+  if (!session.Sync(input, &error)) {
+    std::cerr << "Ornith prefill failed: " << error << '\n';
+    return 1;
+  }
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  std::vector<tokenization::TokenId> generated;
+  const auto start = std::chrono::steady_clock::now();
+  while (generated.size() < opt.max_tokens) {
+    models::qwen35moe::Session::DecodeResult decoded;
+    if (!session.DecodeStep(opt.max_tokens - generated.size(), sampler,
+                            &decoded, &error)) {
+      std::cerr << "Ornith decode failed: " << error << '\n';
+      return 1;
+    }
+    for (const auto token : decoded.tokens) {
+      const auto piece = model.TokenText(token);
+      std::cout << piece << std::flush;
+      if (reply)
+        reply->append(piece);
+      generated.push_back(static_cast<tokenization::TokenId>(token));
+    }
+    if (decoded.stop)
+      break;
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    std::cerr << "Generated " << generated.size() << " tokens ("
+              << generated.size() / seconds << " tok/s)\n";
     PrintTokenTrace(generated);
   }
   return 0;
@@ -927,11 +1021,10 @@ static std::optional<PromptOptions> ParseTextOptions(
       *error_msg = "DFlash2 requires --dflash-model";
     return std::nullopt;
   }
-  if (backend == "mtp" && opt.mtp_model_path.empty()) {
-    if (error_msg != nullptr)
-      *error_msg = "MTP requires --mtp-model";
-    return std::nullopt;
-  }
+  // MTP without --mtp-model stays allowed here: Flash-Next resolves a shared
+  // sidecar beside the artifact and Ornith carries the predictor in-file.
+  // RunPrompt/RunChat reject the remaining architectures once the GGUF
+  // architecture is known.
 
   if (opt.draft_tokens == 0 || opt.min_draft_tokens == 0 ||
       opt.min_draft_tokens > opt.draft_tokens) {
@@ -1045,6 +1138,17 @@ int RunPrompt(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (opt.speculative_backend == "mtp" && opt.mtp_model_path.empty()) {
+    // Flash-Next resolves a shared sidecar beside the artifact and Ornith
+    // carries the predictor in-file; every other architecture needs an
+    // explicit --mtp-model.
+    const auto architecture = reader->GetMetadataString("general.architecture");
+    if (architecture != "qwen4exp" && architecture != "qwen35moe") {
+      std::cerr << "Error: MTP requires --mtp-model\n";
+      PrintModelLoadTime(model_load_start, false);
+      return 1;
+    }
+  }
   ResolvePromptSampling(*reader, &opt);
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -1093,6 +1197,35 @@ int RunPrompt(std::span<const char* const> args) {
   };
 
 #if defined(ENGINE_ENABLE_HIP)
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    auto model = LoadOrnithModel(opt, *reader, model_load_start);
+    if (!model)
+      return 1;
+    auto session =
+        model->CreateSession(opt.speculative_backend.empty()
+                                 ? gufo::core::SessionMode::kAutoregressive
+                                 : gufo::core::SessionMode::kSpeculative,
+                             kDefaultContext, &err);
+    if (!session) {
+      std::cerr << "Ornith session failed: " << err << '\n';
+      return 1;
+    }
+    try {
+      if (!opt.image_paths.empty()) {
+        AttachImages(opt, messages.back());
+        auto vision = PrepareVision(opt, model->tokenizer(), messages,
+                                    model->VisionEncoder());
+        session->ConfigureVision(vision);
+        return GenerateOrnithResponse(opt, *model, *session, vision->tokens);
+      }
+      const auto ids = model->Tokenize(rendered_prompt);
+      const std::vector<tokenization::TokenId> prompt(ids.begin(), ids.end());
+      return GenerateOrnithResponse(opt, *model, *session, prompt);
+    } catch (const std::exception& e) {
+      std::cerr << e.what() << '\n';
+      return 1;
+    }
+  }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     auto model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!model)
@@ -1214,13 +1347,19 @@ int RunPrompt(std::span<const char* const> args) {
   const auto start_time = std::chrono::steady_clock::now();
   std::size_t generated_count = 0;
 
-  const auto tokens = generator->Generate(
-      prompt_tokens, gen_opts,
-      [&](tokenization::TokenId, std::string_view piece) -> bool {
-        std::cout << piece << std::flush;
-        ++generated_count;
-        return true;
-      });
+  std::vector<tokenization::TokenId> tokens;
+  try {
+    tokens = generator->Generate(
+        prompt_tokens, gen_opts,
+        [&](tokenization::TokenId, std::string_view piece) -> bool {
+          std::cout << piece << std::flush;
+          ++generated_count;
+          return true;
+        });
+  } catch (const std::exception& exception) {
+    std::cerr << "\nError generating: " << exception.what() << '\n';
+    return 1;
+  }
 
   std::cout << "\n";
 
@@ -1268,6 +1407,17 @@ int RunChat(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (opt.speculative_backend == "mtp" && opt.mtp_model_path.empty()) {
+    // Flash-Next resolves a shared sidecar beside the artifact and Ornith
+    // carries the predictor in-file; every other architecture needs an
+    // explicit --mtp-model.
+    const auto architecture = reader->GetMetadataString("general.architecture");
+    if (architecture != "qwen4exp" && architecture != "qwen35moe") {
+      std::cerr << "Error: MTP requires --mtp-model\n";
+      PrintModelLoadTime(model_load_start, false);
+      return 1;
+    }
+  }
   ResolvePromptSampling(*reader, &opt);
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -1294,7 +1444,27 @@ int RunChat(std::span<const char* const> args) {
   std::unique_ptr<speculative::SpeculativeVerifier> verifier;
   std::shared_ptr<models::qwen38_flash_next::Model> flash_model;
   std::unique_ptr<models::qwen38_flash_next::Session> flash_session;
-  if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+  std::shared_ptr<models::qwen35moe::Model> ornith_model;
+  std::unique_ptr<models::qwen35moe::Session> ornith_session;
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    ornith_model = LoadOrnithModel(opt, *reader, model_load_start);
+    if (!ornith_model)
+      return 1;
+    ornith_session = ornith_model->CreateSession(
+        opt.speculative_backend.empty()
+            ? gufo::core::SessionMode::kAutoregressive
+            : gufo::core::SessionMode::kSpeculative,
+        kDefaultContext, &err);
+    if (!ornith_session) {
+      std::cerr << "Ornith session failed: " << err << '\n';
+      return 1;
+    }
+    tokenizer = &ornith_model->tokenizer();
+    architecture = "qwen35moe";
+    vision_encoder = ornith_model->VisionEncoder();
+  }
+  if (tokenizer == nullptr &&
+      reader->GetMetadataString("general.architecture") == "qwen4exp") {
     flash_model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!flash_model)
       return 1;
@@ -1416,6 +1586,10 @@ int RunChat(std::span<const char* const> args) {
       if (flash_model) {
         if (GenerateFlashNextResponse(opt, *flash_model, *flash_session,
                                       prompt_tokens, &assistant_reply) != 0)
+          return 1;
+      } else if (ornith_model) {
+        if (GenerateOrnithResponse(opt, *ornith_model, *ornith_session,
+                                   prompt_tokens, &assistant_reply) != 0)
           return 1;
       } else if (gpu_executor != nullptr) {
         GenerateQwenGpuResponse(opt, *gpu_executor, verifier.get(),
