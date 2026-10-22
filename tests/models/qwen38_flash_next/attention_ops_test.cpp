@@ -19,10 +19,7 @@
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
-<<<<<<< HEAD
 namespace qk = gufo::models::qwen38_flash_next;
-=======
->>>>>>> origin/main
 namespace qfn = gufo::models::qwen38_flash_next;
 namespace {
 
@@ -465,12 +462,8 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
       const bool supported = q::PrepareAttention(
           packed.get(), stride, q_gamma.get(), k_gamma.get(), q_out.get(),
           gate_out.get(), k_out.get(), v_out.get(), n, kHeads, kKvHeads, kDim,
-<<<<<<< HEAD
           rotary, pos.get(), 1e7F, 1e-6F, capture.stream, nullptr, false,
           qfn::KvDtypes{}, yarn);
-=======
-          rotary, pos.get(), 1e7F, 1e-6F, capture.stream, nullptr, false, yarn);
->>>>>>> origin/main
       CheckHip(hipStreamEndCapture(capture.stream, &capture.graph),
                "preparation capture end");
       if (!supported)
@@ -503,12 +496,8 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
                 k_gamma.get(), q_out.get() + std::size_t(off) * kQWidth,
                 gate_out.get() + std::size_t(off) * kQWidth, k_out.get(),
                 v_out.get(), std::min(chunk, n - off), kHeads, kKvHeads, kDim,
-<<<<<<< HEAD
                 rotary, pos.get(), 1e7F, 1e-6F, nullptr, nullptr, true,
                 qfn::KvDtypes{}, yarn))
-=======
-                rotary, pos.get(), 1e7F, 1e-6F, nullptr, nullptr, true, yarn))
->>>>>>> origin/main
           throw std::runtime_error("prefill preparation rejected a short tail");
       }
       CheckHip(hipDeviceSynchronize(), "short prefill preparation");
@@ -1148,7 +1137,6 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
     throw std::runtime_error("attention depends on prefill chunk boundary");
 }
 
-<<<<<<< HEAD
 /// Q8_0 write path: PrepareAttention's cache rows must byte-match the host
 /// quantization of the same normalized/rotated F32 values (the F16 case
 /// already proves the arithmetic matches StoreKv's inputs).
@@ -1608,7 +1596,6 @@ int main() {
     CheckQ8Attention(3, 90000, 0x51ED0003U);
     CheckChunks(136, 94);
     CheckChunks(2048, 1025);
-<<<<<<< HEAD
     // The wide-batch sparse cases run before the F16 query-preparation cases
     // below, which hit this toolchain's pre-existing 1-ULP drift and would
     // otherwise abort before them.

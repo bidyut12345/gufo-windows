@@ -173,9 +173,6 @@ void Executor::CombineBatch(float* res, const float* gamma,
 
 bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                                std::string* error) const {
-  // Batched rows mix sessions; the BF16 kernels keep the launch-relative
-  // K rotation here.
-  blaslt_->SetTokenOffset(nullptr);
   const Config& c = config();
   DropReadyQ8();
   if (!has_mtp() || items.empty() || items.size() > kBatchSessions) {
@@ -904,9 +901,6 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
 bool Executor::ForwardBatch(std::span<const BatchItem> items,
                             std::string* error) const {
   selected_logits_ = nullptr;
-  // Batched rows mix sessions; the BF16 kernels keep the launch-relative
-  // K rotation here.
-  blaslt_->SetTokenOffset(nullptr);
   DropReadyQ8();
   const Config& c = config();
   if (items.empty() || items.size() > kBatchSessions) {

@@ -2590,8 +2590,6 @@ __device__ __forceinline__ void LoadQ4K8(const unsigned char* sb_codes,
   }
 }
 
-=======
->>>>>>> origin/main
 // YarnRope travels to the kernels by value as a plain 20-byte argument.
 // Every rope kernel is instantiated with and without YaRN (`kYarn`) and the
 // launcher picks one on the host: a runtime branch in the default kernel let

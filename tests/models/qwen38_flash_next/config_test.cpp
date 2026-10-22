@@ -245,7 +245,6 @@ void CheckMalformedMetadata() {
   assert(draft && trunk && draft->MtpMatches(*trunk));
 }
 
-<<<<<<< HEAD
 void CheckMtpSidecarDiscovery(const std::filesystem::path& root) {
   const auto create = [](const std::filesystem::path& path) {
     std::filesystem::create_directories(path.parent_path());

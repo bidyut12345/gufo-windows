@@ -3531,11 +3531,6 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            bool embeddings_ready) const {
   const Config& c = config();
   if (first_layer == 0) {
-    // The BF16 dense kernels rotate K by the batch's absolute start position
-    // so chunked prefills match single-pass prefills bitwise; the pointer is
-    // the session control word the control upload below maintains (device
-    // memory, so captured graphs replay at any position).
-    blaslt_->SetTokenOffset(&session.control_->position);
     if (!Check(hipMemcpyAsync(session.control_, control_host_,
                               sizeof(Session::Control), hipMemcpyHostToDevice,
                               stream_),
