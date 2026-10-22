@@ -481,18 +481,27 @@ std::optional<speculative::DraftProposal> QwenDFlashGpuDraftBackend::TryLookup(
       });
   if (match.length == 0)
     return std::nullopt;
-  const auto count =
-      std::min({std::size_t{limit}, std::size_t{config_.max_draft_tokens},
-                lookup_.IndexedTokens() - match.start});
-  const auto copied = committed.subspan(match.start, count);
-  if (count == 0 || std::ranges::any_of(copied, [&](auto token) {
-        return std::size_t(token) >=
-               executor_->GetModel().GetConfig().vocab_size;
-      }))
-    return std::nullopt;
+  // The source aligns with the context ending at the anchor, so its
+  // continuation runs past the committed tokens into the anchor and the copy
+  // itself. A short-period repetition then fills the block instead of
+  // proposing one period per verification.
   speculative::DraftProposal proposal;
   proposal.start_pos = position;
-  proposal.tokens.assign(copied.begin(), copied.end());
+  proposal.tokens.reserve(cap);
+  for (std::size_t source = match.start; proposal.tokens.size() < cap;
+       ++source) {
+    const auto token = source <= position
+                           ? tokens[source]
+                           : proposal.tokens[source - position - 1];
+    if (std::size_t(token) >= executor_->GetModel().GetConfig().vocab_size ||
+        std::ranges::find(lookup_boundaries_, token) !=
+            lookup_boundaries_.end())
+      break;
+    proposal.tokens.push_back(token);
+  }
+  const auto count = proposal.tokens.size();
+  if (count == 0)
+    return std::nullopt;
   proposal.from_lookup = true;
   if (sampled) {
     // A deterministic copy is q(token)=1, conditional only on prior history.
