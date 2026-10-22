@@ -29,8 +29,10 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/core/platform/socket.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/platform/net.hpp"
 
 namespace {
+namespace net = gufo::net;
 
 using gufo::server::HttpServer;
 using gufo::server::Logger;
@@ -347,8 +349,7 @@ public:
     }
     const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
     assert(fd >= 0);
-    assert(gufo::platform::SetSocketTimeout(fd, SO_RCVTIMEO,
-                                            std::chrono::seconds{3}) == 0);
+    assert(net::SetSocketTimeouts(fd, 3'000));
     assert(::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) ==
            0);
     return fd;
@@ -357,8 +358,7 @@ public:
                    const std::string& peer = "127.0.0.1") {
     const int fd = Connect(peer);
     while (!request.empty()) {
-      const auto count =
-          ::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+      const auto count = net::SendNoSignal(fd, request.data(), request.size());
       assert(count > 0);
       request.remove_prefix(static_cast<std::size_t>(count));
     }
@@ -376,7 +376,7 @@ public:
       }
       response.append(buffer, static_cast<std::size_t>(count));
     }
-    gufo::platform::CloseSocket(fd);
+    net::CloseSocket(fd);
     return response;
   }
 
@@ -778,7 +778,7 @@ void TestExpectContinue() {
     const int fd = server.Connect();
     const std::string head =
         "POST /echo HTTP/1.1\r\n" + expect + "\r\nContent-Length: 5\r\n\r\n";
-    assert(::send(fd, head.data(), head.size(), MSG_NOSIGNAL) ==
+    assert(net::SendNoSignal(fd, head.data(), head.size()) ==
            static_cast<ssize_t>(head.size()));
     // The interim response arrives before any body byte is sent.
     const std::string_view interim = "HTTP/1.1 100 Continue\r\n\r\n";
@@ -790,7 +790,7 @@ void TestExpectContinue() {
       response.append(buffer, static_cast<std::size_t>(count));
     }
     assert(response == interim);
-    assert(::send(fd, "hello", 5, MSG_NOSIGNAL) == 5);
+    assert(net::SendNoSignal(fd, "hello", 5) == 5);
     response.clear();
     for (;;) {
       const auto count = ::read(fd, buffer, sizeof(buffer));
@@ -799,7 +799,7 @@ void TestExpectContinue() {
         break;
       response.append(buffer, static_cast<std::size_t>(count));
     }
-    ::close(fd);
+    net::CloseSocket(fd);
     ExpectStatus(response, 200);
     assert(response.substr(response.find("\r\n\r\n") + 4) == "hello");
   }
@@ -2363,7 +2363,7 @@ void TestDeviceLossWhileWriterBlocked() {
                       reinterpret_cast<const char*>(&receive_buffer),
                       sizeof(receive_buffer)) == 0);
   const std::string request = "POST /blocked HTTP/1.1\r\n\r\n";
-  assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+  assert(net::SendNoSignal(fd, request.data(), request.size()) ==
          static_cast<ssize_t>(request.size()));
   assert(writing.try_acquire_for(std::chrono::seconds(2)));
   // The peer never drains the response. No health request or completed write
@@ -2372,7 +2372,7 @@ void TestDeviceLossWhileWriterBlocked() {
   assert(hook_called.try_acquire_for(std::chrono::seconds(2)));
   assert(hook_calls == 1 && !write_finished);
   ::shutdown(fd, SHUT_RDWR);
-  ::close(fd);
+  net::CloseSocket(fd);
 }
 
 void TestInvalidBindSettings() {
@@ -2398,7 +2398,7 @@ bool HasIpv6Loopback() {
   address.sin6_addr = in6addr_loopback;
   const bool bound = ::bind(fd, reinterpret_cast<const sockaddr*>(&address),
                             sizeof(address)) == 0;
-  ::close(fd);
+  net::CloseSocket(fd);
   return bound;
 }
 
@@ -2451,7 +2451,7 @@ int FreePort(const std::string& host = "127.0.0.1") {
   assert(::bind(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0);
   assert(::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) ==
          0);
-  ::close(fd);
+  net::CloseSocket(fd);
   return ntohs(address.ss_family == AF_INET6 ? ipv6->sin6_port
                                              : ipv4->sin_port);
 }
@@ -2473,10 +2473,9 @@ int ConnectTo(const std::string& host, int port) {
   }
   const int fd = ::socket(address.ss_family, SOCK_STREAM, 0);
   assert(fd >= 0);
-  assert(gufo::platform::SetSocketTimeout(fd, SO_RCVTIMEO,
-                                          std::chrono::seconds{3}) == 0);
+  assert(net::SetSocketTimeouts(fd, 3'000));
   if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) != 0) {
-    ::close(fd);
+    net::CloseSocket(fd);
     return -1;
   }
   return fd;
@@ -2490,7 +2489,7 @@ std::string SendParts(const std::string& host, int port,
   for (std::size_t index = 0; index < parts.size(); ++index) {
     if (index > 0)
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    assert(::send(fd, parts[index].data(), parts[index].size(), MSG_NOSIGNAL) ==
+    assert(net::SendNoSignal(fd, parts[index].data(), parts[index].size()) ==
            static_cast<ssize_t>(parts[index].size()));
   }
   std::string response;
@@ -2502,7 +2501,7 @@ std::string SendParts(const std::string& host, int port,
       break;
     response.append(buffer, static_cast<std::size_t>(count));
   }
-  ::close(fd);
+  net::CloseSocket(fd);
   return response;
 }
 
@@ -2559,8 +2558,8 @@ void TestLoadingResponder() {
   loading.stop();
   assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
   assert(!loading.listening());
-  ::close(idle);
-  ::close(idle_during_stop);
+  net::CloseSocket(idle);
+  net::CloseSocket(idle_during_stop);
 
   // Handoff: the real server binds the same address and answers health.
   HttpServer server("127.0.0.1", port, nullptr);
@@ -2645,10 +2644,10 @@ void TestPeerDisconnect() {
       "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\n"
       "Content-Type: application/json\r\nContent-Length: " +
       std::to_string(body.size()) + "\r\n\r\n" + body;
-  assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+  assert(net::SendNoSignal(fd, request.data(), request.size()) ==
          static_cast<ssize_t>(request.size()));
   assert(server.backend->entered.try_acquire_for(std::chrono::seconds(2)));
-  gufo::platform::CloseSocket(fd);
+  net::CloseSocket(fd);
   assert(server.backend->finished.try_acquire_for(std::chrono::seconds(2)));
   assert(server.backend->disconnected);
 }
@@ -2992,7 +2991,7 @@ void TestSignalShutdown() {
           const std::string request =
               "POST /v1/completions HTTP/1.1\r\nContent-Length: " +
               std::to_string(body.size()) + "\r\n\r\n" + body;
-          assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+          assert(net::SendNoSignal(fd, request.data(), request.size()) ==
                  static_cast<ssize_t>(request.size()));
           assert(
               server.backend->entered.try_acquire_for(std::chrono::seconds(2)));
@@ -3005,7 +3004,7 @@ void TestSignalShutdown() {
         assert(server.run_finished.try_acquire_for(std::chrono::seconds(2)));
         if (active) {
           assert(server.backend->disconnected);
-          gufo::platform::CloseSocket(fd);
+          net::CloseSocket(fd);
         }
       };
 #ifdef _WIN32

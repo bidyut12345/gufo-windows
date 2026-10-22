@@ -188,6 +188,8 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 add_library(gufo_core STATIC
+  src/core/platform/net.cpp
+  src/core/platform/os_info.cpp
   src/core/image.cpp
   src/core/crypto/sha256.cpp
   src/core/gguf_reader.cpp
@@ -268,7 +270,7 @@ endif()
 add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
   src/cli/prompt/prompt.cpp)
-target_link_libraries(gufo_llm_cli PUBLIC gufo_core)
+target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_qwen38_flash_next)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
     gufo_qwen38_flash_next

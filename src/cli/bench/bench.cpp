@@ -1329,7 +1329,6 @@ int RunQwen38FlashNextBenchmark(
               << " original_context=" << qwen4exp_native_context
               << " context=" << required_context << '\n';
   }
-
   if (!options.logit_eval_path.empty()) {
     return RunFlashNextLogitEval(*model, options);
   }

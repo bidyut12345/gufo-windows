@@ -2590,6 +2590,8 @@ __device__ __forceinline__ void LoadQ4K8(const unsigned char* sb_codes,
   }
 }
 
+=======
+>>>>>>> origin/main
 // YarnRope travels to the kernels by value as a plain 20-byte argument.
 // Every rope kernel is instantiated with and without YaRN (`kYarn`) and the
 // launcher picks one on the host: a runtime branch in the default kernel let
@@ -7583,8 +7585,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     const __half* xn = nullptr, __half* mixed_half = nullptr,
     void* mixed_q8 = nullptr, const float* conv_w = nullptr,
     float* conv_out = nullptr, AttentionProjectionOutput attention = {},
-    std::uint32_t checkpoint_tokens = 0, std::size_t input_stride = 0,
-    const std::uint32_t* token_offset = nullptr) {
+    std::uint32_t checkpoint_tokens = 0, std::size_t input_stride = 0) {
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
   static_assert(!(kBf16 && kHalfWeights));
@@ -7637,43 +7638,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   const unsigned within = (blockIdx.y % kRowGroup) * gridDim.x + blockIdx.x;
   const int r_block = (row_group * kRowGroup + within % kRowGroup) * BM;
   const int t_block = (within / kRowGroup) * BN;
-  // BF16 replaces a library GEMM whose 32-token tile g starts its K loop
-  // (g % 4) * 4 blocks in and wraps. A block takes the four tiles of one
-  // rotation class, one per token wave, so every dot product keeps the
-  // library's order. The 512-token slabs are aligned to ABSOLUTE positions —
-  // `token_offset` names the device word holding the batch's first position —
-  // so a block's class equals the absolute (token / 32) % 4 class of every
-  // token it serves, and any chunk of a prompt places a token on the same K
-  // chain a single-pass prefill used. A constant shift cannot do this: at a
-  // start position that is not a multiple of 32 the floor division carries
-  // and part of each slab would rotate on the wrong class.
-  const int bf16_class = kBf16 ? static_cast<int>(blockIdx.x % 4) : 0;
-  const int batch_start =
-      kBf16 && token_offset != nullptr ? static_cast<int>(*token_offset) : 0;
-  const int slab_abs =
-      ((batch_start + static_cast<int>(blockIdx.x / 4) * 512) / 512) * 512;
-  if constexpr (kBf16) {
-    // Whole slabs entirely before or past the batch only exist because the
-    // grid is sized without the start position; they hold no tokens.
-    if (slab_abs + 512 <= batch_start ||
-        slab_abs >= batch_start + static_cast<int>(batch)) {
-      return;
-    }
-  }
-  const int k_rotation = kBf16 ? (bf16_class * 4) % num_kb : 0;
-  const auto token_of = [&](int local) {
-    if constexpr (kBf16) {
-      static_assert(BN == 128 && WN == 4 && kRowGroup == 1);
-      return slab_abs - batch_start + (bf16_class * 32) + ((local / 32) * 128) +
-             (local % 32);
-    } else {
-      return t_block + local;
-    }
-  };
-  const auto rotate = [&](int kb) {
-    const int r = kb + k_rotation;
-    return r >= num_kb ? r - num_kb : r;
-  };
+  const auto token_of = [&](int local) { return t_block + local; };
 
   // SSM thread tid owns row tid and K block p of the stage. Other paths
   // use row (p*256+tid)/BK and K block (p*256+tid)%BK; rows past m read
@@ -7714,7 +7679,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
       const bool live = a_live[p] && kb < num_kb;
       if constexpr (kRawWeights) {
         const auto* src = reinterpret_cast<const uint4*>(
-            a_ptr[p] + static_cast<std::size_t>(rotate(kb)) * 64);
+            a_ptr[p] + static_cast<std::size_t>(kb) * 64);
 #pragma unroll
         for (int c = 0; c < 4; ++c)
           a_half[p][c] = live ? src[c] : make_uint4(0u, 0u, 0u, 0u);
@@ -7731,8 +7696,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     for (int p = 0; p < kBPer; ++p) {
       const int kb = kb0 + (((p * 256) + tid) % BK);
       if (b_ptr[p] != nullptr && kb < num_kb) {
-        const auto* src =
-            reinterpret_cast<const uint4*>(b_ptr[p] + (rotate(kb) * 32));
+        const auto* src = reinterpret_cast<const uint4*>(b_ptr[p] + (kb * 32));
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
           b_data[p][c] = src[c];
@@ -7888,7 +7852,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
 #pragma unroll
           for (int i = 0; i < kWaveRowTiles; ++i) {
             if constexpr (kBf16) {
-              // One K16 chain in K order, as the library GEMM it replaces.
+              // One K16 chain in K order for every token.
               acc[i][j] = WmmaBf16(a_lo[i], b_lo, acc[i][j]);
               acc[i][j] = WmmaBf16(a_hi[i], b_hi, acc[i][j]);
             } else if constexpr (kHalfWeights) {
@@ -8344,6 +8308,14 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
   // (8.8 to 7.9 ms at 4,096 tokens). One K block per LDS stage halves the
   // stage to 24 KB, so three blocks share a WGP instead of two (7.8 to
   // 7.3 ms); the K order is unchanged.
+  if (yarn.enabled != 0) {
+    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false,
+                                           true, false, false, false, true>),
+                       dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0,
+                       stream, weights, input, nullptr, n_tokens, 13312, 2560,
+                       nullptr, nullptr, nullptr, nullptr, nullptr, output);
+    return true;
+  }
   hipLaunchKernelGGL(
       (DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false, true>),
       dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
@@ -8399,21 +8371,14 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
 }
 
 bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
-                   std::size_t m, std::size_t k, hipStream_t stream,
-                   const std::uint32_t* token_offset) {
+                   std::size_t m, std::size_t k, hipStream_t stream) {
   if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
     return false;
-  // Four blocks, one per K rotation class, cover each 512-token slab. The
-  // slabs align to absolute positions (the kernel reads the batch's first
-  // position), so the grid carries one extra slab to cover the front
-  // partial one; slabs that end up token-free exit immediately.
   hipLaunchKernelGGL((DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false,
                                          false, false, true>),
-                     dim3(((batch + 511) / 512 + 1) * 4, (m + 63) / 64),
-                     dim3(kThreads), 0, stream, w,
-                     static_cast<const __half*>(x), out, batch, m, k, nullptr,
-                     nullptr, nullptr, nullptr, nullptr,
-                     AttentionProjectionOutput{}, 0, 0, token_offset);
+                     dim3((batch + 127) / 128, (m + 63) / 64), dim3(kThreads),
+                     0, stream, w, static_cast<const __half*>(x), out, batch, m,
+                     k);
   return true;
 }
 
@@ -9016,20 +8981,19 @@ std::uint32_t WmmaCausalAttentionContextLimit(std::uint32_t heads,
   return kWmmaMaxMaskWords * kWmmaRatio * 32;
 }
 
-    bool WmmaCausalAttention(
-        const float* q, const float* gate, const void* k_cache,
-        const void* v_cache, const std::uint32_t* mask,
-        std::uint32_t mask_words, float* out, std::uint32_t n_tokens,
-        std::uint32_t start_pos, std::uint32_t heads, std::uint32_t kv_heads,
-        std::uint32_t d, std::uint32_t ratio, hipStream_t stream,
-        bool last_only, KvDtypes kv_dtypes, const std::uint32_t* lead_mask,
-        std::uint32_t lead) {
-      if (heads != kWmmaQueryHeads || kv_heads != kWmmaKvHeads ||
-          d != kWmmaHeadDim || ratio != kWmmaRatio || n_tokens == 0 ||
-          (mask != nullptr && mask_words > kWmmaMaxMaskWords) ||
-          (lead != 0 && (lead >= kWmmaRatio || lead_mask == nullptr))) {
-        return false;
-      }
+bool WmmaCausalAttention(
+    const float* q, const float* gate, const void* k_cache,
+    const void* v_cache, const std::uint32_t* mask,
+    std::uint32_t mask_words, float* out, std::uint32_t n_tokens,
+    std::uint32_t start_pos, std::uint32_t heads, std::uint32_t kv_heads,
+    std::uint32_t d, std::uint32_t ratio, hipStream_t stream,
+    bool last_only, KvDtypes kv_dtypes, const std::uint32_t* lead_mask,
+    std::uint32_t lead) {
+  if (heads != kWmmaQueryHeads || kv_heads != kWmmaKvHeads ||
+      d != kWmmaHeadDim || ratio != kWmmaRatio || n_tokens == 0 ||
+      (lead != 0 && (lead >= kWmmaRatio || lead_mask == nullptr))) {
+    return false;
+  }
       const auto* k_bytes = static_cast<const unsigned char*>(k_cache);
       const auto* v_bytes = static_cast<const unsigned char*>(v_cache);
       const bool kv_q8 = kv_dtypes.key == KvCacheDtype::kQ8_0;

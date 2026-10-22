@@ -1,9 +1,6 @@
 #include "src/cli/serve/websocket.hpp"
 
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <openssl/evp.h>
-#include <sys/socket.h>
 
 #include <array>
 #include <cctype>
@@ -12,7 +9,7 @@
 #include <cstring>
 
 #include "src/cli/serve/audio_stream.hpp"
-#include "src/core/platform/socket.hpp"
+#include "src/core/platform/net.hpp"
 #include "src/core/utf8.hpp"
 
 namespace gufo::server {
@@ -88,26 +85,13 @@ WebSocket::WebSocket(int fd, std::string buffered)
     : fd_(fd), buffered_(std::move(buffered)) {
   // Frame headers and audio payloads are separate writes; do not wait for a
   // delayed TCP acknowledgement before sending the payload.
-  const int no_delay = 1;
-  (void)platform::SetSocketOption(fd_, IPPROTO_TCP, TCP_NODELAY, no_delay);
+  (void)net::SetNoDelay(fd_);
   // Bound backpressure from a client that stops consuming audio. Read timeout
   // stays at the server's idle timeout.
-  (void)platform::SetSocketTimeout(fd_, SO_SNDTIMEO, std::chrono::seconds{5});
-#ifdef _WIN32
-  DWORD idle_ms = 0;
-  int idle_size = sizeof(idle_ms);
-  if (::getsockopt(static_cast<SOCKET>(fd_), SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<char*>(&idle_ms), &idle_size) == 0 &&
-      idle_ms > 0) {
+  (void)net::SetSendTimeout(fd_, 5'000);
+  const long long idle_ms = net::SocketRecvTimeoutMs(fd_);
+  if (idle_ms > 0)
     idle_ = std::chrono::milliseconds(idle_ms);
-  }
-#else
-  timeval idle{};
-  socklen_t idle_size = sizeof(idle);
-  if (::getsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &idle, &idle_size) == 0)
-    idle_ = std::chrono::seconds(idle.tv_sec) +
-            std::chrono::microseconds(idle.tv_usec);
-#endif
   last_send_ = std::chrono::steady_clock::now().time_since_epoch().count();
   reader_ = std::jthread([this] { ReadLoop(); });
 }
@@ -116,7 +100,7 @@ WebSocket::~WebSocket() {
   Close();
   // Cancellation can wake the consumer before the reader finishes its close
   // reply. Let that writer complete before shutting down the send half.
-  platform::StopSocketReads(fd_);
+  (void)::shutdown(fd_, SHUT_RD);
   reader_.join();
   (void)::shutdown(fd_, SHUT_RDWR);
 }
@@ -173,8 +157,8 @@ bool WebSocket::Send(std::uint8_t opcode, std::string_view bytes) {
   }
   for (auto part : {std::string_view(header), bytes}) {
     while (!part.empty()) {
-      const auto count =
-          platform::SocketSend(fd_, part.data(), part.size(), MSG_NOSIGNAL);
+      const auto count = static_cast<long long>(
+          net::SendNoSignal(fd_, part.data(), part.size()));
       if (count < 0 && errno == EINTR)
         continue;
       if (count <= 0) {

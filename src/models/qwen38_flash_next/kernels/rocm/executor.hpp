@@ -273,7 +273,6 @@ public:
     /// Rows of logits (and hidden states) a Forward call may return.
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
-    std::uint32_t max_speculative{1};
     /// KV cache element formats for every session of this executor. Q8_0
     /// stores 32-element blocks (F32→int8 codes, trailing F16 scales) and
     /// roughly halves the per-token bytes; Q4_K stores 256-element

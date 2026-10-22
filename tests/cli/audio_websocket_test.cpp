@@ -16,9 +16,10 @@
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/websocket.hpp"
 #include "src/core/json.hpp"
-#include "src/core/platform/socket.hpp"
+#include "src/core/platform/net.hpp"
 
 namespace {
+namespace net = gufo::net;
 using namespace gufo::server;
 namespace json = gufo::json;
 
@@ -29,8 +30,7 @@ public:
          std::string_view authorization = "Bearer test") {
     fd = ::socket(AF_INET, SOCK_STREAM, 0);
     assert(fd >= 0);
-    assert(gufo::platform::SetSocketTimeout(fd, SO_RCVTIMEO,
-                                            std::chrono::seconds{3}) == 0);
+    assert(net::SetSocketTimeouts(fd, 3'000));
     sockaddr_in address{.sin_family = AF_INET, .sin_port = htons(port)};
     assert(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
     assert(::connect(fd, reinterpret_cast<sockaddr*>(&address),
@@ -49,11 +49,12 @@ public:
   }
   ~Client() {
     ::shutdown(fd, SHUT_RDWR);
-    gufo::platform::CloseSocket(fd);
+    net::CloseSocket(fd);
   }
   void Send(std::string_view bytes) {
     while (!bytes.empty()) {
-      const auto count = ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+      const auto count = static_cast<ssize_t>(
+          net::SendNoSignal(fd, bytes.data(), bytes.size()));
       assert(count > 0);
       bytes.remove_prefix(static_cast<std::size_t>(count));
     }
@@ -122,12 +123,8 @@ private:
 void ListeningClientIsNotIdle() {
   std::array<int, 2> fds{};
   assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
-  const timeval idle{0, 300000};
-  assert(::setsockopt(fds[0], SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle)) ==
-         0);
-  const timeval wait{3, 0};
-  assert(::setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof(wait)) ==
-         0);
+  assert(net::SetSocketTimeouts(fds[0], 300));
+  assert(net::SetSocketTimeouts(fds[1], 3'000));
   {
     WebSocket socket(fds[0], {});
     // Unmasked final binary frame with a five-byte payload.
@@ -149,8 +146,8 @@ void ListeningClientIsNotIdle() {
            std::string_view("\x88\x02\x03\xE9", 4));
     assert(socket.cancelled());
   }
-  ::close(fds[0]);
-  ::close(fds[1]);
+  net::CloseSocket(fds[0]);
+  net::CloseSocket(fds[1]);
 }
 }  // namespace
 

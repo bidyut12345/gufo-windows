@@ -431,28 +431,26 @@ int main(int argc, char** argv) {
                  "[--extended] [--kv-cache f16|q8_0|q8_0-q4_k]\n";
     return 77;
   }
-  return 77;
-}
-try {
-  std::string error;
-  const std::uint32_t kContext = extended ? 409600 : 8192;
-  auto model = qfn::Model::Load(
-      argv[2],
-      {.max_context = kContext,
-       .mtp_model_path = argv[4],
-       .max_draft_tokens = 7,
-       .kv_cache_mode = kv_mode,
-       .rope_scaling = qfn::RopeScalingForContext(kContext, 262144)},
-      &error);
-  Require(model != nullptr, error);
-  if (extended) {
-    for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
-                            gufo::core::SessionMode::kSpeculative}) {
-      for (const auto boundary : {262145U, 294913U})
-        CheckExtendedPrefillCheckpoint(model, mode, boundary);
+  try {
+    std::string error;
+    const std::uint32_t kContext = extended ? 409600 : 8192;
+    auto model = qfn::Model::Load(
+        argv[2],
+        {.max_context = kContext,
+         .mtp_model_path = argv[4],
+         .max_draft_tokens = 7,
+         .kv_cache_mode = kv_mode,
+         .rope_scaling = qfn::RopeScalingForContext(kContext, 262144)},
+        &error);
+    Require(model != nullptr, error);
+    if (extended) {
+      for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
+                              gufo::core::SessionMode::kSpeculative}) {
+        for (const auto boundary : {262145U, 294913U})
+          CheckExtendedPrefillCheckpoint(model, mode, boundary);
+      }
+      return 0;
     }
-    return 0;
-  }
   const auto pattern = model->Tokenize(
       "The quick brown fox jumps over the lazy dog. "
       "Strix Halo executes this deterministic benchmark sequence. ");

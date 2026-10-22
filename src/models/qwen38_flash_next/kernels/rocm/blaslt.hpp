@@ -32,21 +32,13 @@ public:
   [[nodiscard]] bool Gemm(const void* weights, const void* input, float* out,
                           hipDataType type, int m, int n, int k,
                           std::string* error_msg);
-  /// Gemm through the library kernel even where DenseBf16Gemm reproduces it
-  /// (tests compare the two).
+  /// Gemm through the library kernel even where Gemm runs its own kernel
+  /// (benchmarks compare the two).
   [[nodiscard]] bool LibraryGemm(const void* weights, const void* input,
                                  float* out, hipDataType type, int m, int n,
                                  int k, std::string* error_msg);
-  /// Whether Gemm runs DenseBf16Gemm for this shape (tests).
-  [[nodiscard]] bool UsesOwnKernel(hipDataType type, int m, int n, int k,
-                                   std::string* error_msg);
-  /// Device word holding the batch's first absolute position; the own BF16
-  /// kernel reads it so chunked prefills match single-pass prefills
-  /// bitwise. Null keeps the launch-relative rotation. The pointer must
-  /// stay valid for the stream's in-flight work.
-  void SetTokenOffset(const std::uint32_t* token_offset) noexcept {
-    token_offset_ = token_offset;
-  }
+  /// Whether Gemm runs its own position-invariant kernel for this shape.
+  [[nodiscard]] static bool UsesOwnKernel(hipDataType type, int m, int k);
 
 private:
   BlasLt() = default;
@@ -61,7 +53,6 @@ private:
   hipblasLtHandle_t handle_{nullptr};
   hipStream_t stream_{nullptr};
   std::map<std::array<int, 4>, std::unique_ptr<Plan>> plans_;
-  const std::uint32_t* token_offset_{nullptr};
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

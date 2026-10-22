@@ -84,6 +84,8 @@ public:
   InferenceBackend& operator=(InferenceBackend&&) = delete;
 
   /// Loads weights from a GGUF file. Returns false and sets *error on failure.
+  /// `enable_yarn` opts Flash-Next into static YaRN, required for (and only
+  /// accepted with) a `max_context` above its native context.
   bool load(const std::string& model_path, std::string* error,
             std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},

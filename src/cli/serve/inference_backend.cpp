@@ -275,9 +275,13 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
 std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
     std::string_view artifact_fingerprint, std::string_view mtp_fingerprint,
     bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens,
+<<<<<<< HEAD
     std::uint32_t decode_concurrency,
     models::qwen38_flash_next::KvCacheMode kv_cache_mode,
     std::string_view position_policy) {
+=======
+    std::uint32_t decode_concurrency, std::string_view position_policy) {
+>>>>>>> origin/main
   if (!IsSha256Hex(artifact_fingerprint)) {
     throw std::invalid_argument(
         "Qwen3.8-Flash-Next disk cache requires an artifact fingerprint");
@@ -2454,7 +2458,11 @@ public:
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
               use_mtp_, max_context_, max_draft_tokens_,
+<<<<<<< HEAD
               model_->DecodeConcurrency(), model_->kv_cache_mode(),
+=======
+              model_->DecodeConcurrency(),
+>>>>>>> origin/main
               models::qwen38_flash_next::RopePositionPolicy(
                   model_->config().rope_scaling)),
           .payload_version =
@@ -3634,7 +3642,6 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
-                            TextRunnerRamCacheOptions ram_cache_config,
                             models::qwen38_flash_next::KvCacheMode kv_cache_mode,
                             bool managed_experts,
                             bool enable_yarn) {

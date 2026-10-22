@@ -96,7 +96,9 @@ bool ResolveRopeScaling(std::uint32_t requested, std::uint32_t native,
                 std::to_string(requested) + ")");
   }
   if (requested <= native && enable_yarn) {
-    return true;
+    return fail("--enable-yarn has no effect: context " +
+                std::to_string(requested) + " is within the native " +
+                native_text + " tokens");
   }
   *scaling = RopeScalingForContext(requested, native);
   return true;

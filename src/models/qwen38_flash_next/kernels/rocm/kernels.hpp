@@ -242,16 +242,10 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                   std::size_t m, std::size_t k, hipStream_t stream,
                   std::size_t input_stride = 0);
 /// BF16 weight rows [m][k] times BF16 activation rows [batch][k] with one
-/// F32 K16 chain per output. Token t's chain starts (((t / 32) % 4) * 128
-/// elements into K and wraps: hipBLASLt's MT32x32x64 order (BlasLt::Gemm).
-/// `token_offset` names the device word holding the batch's first absolute
-/// position; the 512-token slabs then align to absolute positions, so the
-/// rotation class of every token is its absolute (t / 32) % 4 and any chunk
-/// of a prompt places a token on the same K chain a single-pass prefill
-/// would. Null keeps the launch-relative rotation. out is [batch][m].
+/// F32 K16 chain per output, in K order for every token: a row's result does
+/// not depend on its position in the batch (BlasLt::Gemm). out is [batch][m].
 bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
-                   std::size_t m, std::size_t k, hipStream_t stream,
-                   const std::uint32_t* token_offset = nullptr);
+                   std::size_t m, std::size_t k, hipStream_t stream);
 
 /// SSM Q8_0 projection fused with its four-tap convolution. Supports
 /// [m=16384,k=2560,channels=10240] and at least 1024 tokens. qkvz retains
