@@ -22,6 +22,7 @@ downloads. `tools\windows\package.ps1` makes the zip from a release build.
 | Visual Studio Build Tools | any | "Desktop development with C++": MSVC STL + Windows SDK only; tested with VS 18 (MSVC 14.51) |
 | CMake 3.21+ and Ninja | `PATH`, or Ninja at `C:\tools\ninja` | |
 | Dedicated GPU memory | AMD Software > Performance > Tuning > Variable Graphics Memory | 96 GB for Qwen3.8-Flash-Next at 256K context; see [Memory](#memory) |
+| Virtual memory (pagefile) | `sysdm.cpl` -> Advanced -> Performance -> Virtual memory | **Initial: 98304 MB (96 GB), Max: 131072 MB (128 GB)** custom size on NVMe SSD; prevents `hipErrorOutOfMemory` during 100+ GiB WDDM allocation. See [Virtual Memory Configuration](#virtual-memory-configuration) |
 
 The port is validated on TheRock 10.0.0. Other releases usually build, but a
 newer clang can round fused kernels differently (see [Test status](#test-status)).
@@ -194,6 +195,24 @@ Qwen3.8-Flash-Next at 256K context needs ~89 GiB of device memory (weights,
 KV cache, recurrent state, scratch). With a 96 GB carve-out all of it is
 dedicated: the load takes ~30 s and decode runs at full speed. A 64 GB
 carve-out works, but the load takes ~2 minutes and decode is slower.
+
+### Virtual Memory Configuration (Pagefile)
+
+When allocating 100+ GiB across unified memory on Windows, the Windows WDDM commit limit is enforced against `Physical RAM + Pagefile`. If the pagefile is left at default Windows system-managed sizes (or disabled), Windows aborts memory allocation with `hipErrorOutOfMemory` or causes AMD GPU driver timeouts.
+
+To configure the pagefile properly:
+1. Press <kbd>Win</kbd> + <kbd>R</kbd>, type `sysdm.cpl`, and hit **Enter**.
+2. Select **Advanced** tab &rarr; **Performance** &rarr; click **Settings...**.
+3. Select **Advanced** tab &rarr; **Virtual memory** &rarr; click **Change...**.
+4. **Uncheck** *"Automatically manage paging file size for all drives"*.
+5. Select your fastest NVMe OS drive (`C:`), choose **Custom size**:
+   - **Initial size (MB)**: `98304` (96 GB)
+   - **Maximum size (MB)**: `131072` (128 GB)
+6. Click **Set**, then **OK**, and reboot your system.
+
+<p align="center">
+  <img src="../assets/windows-virtual-memory.png" alt="Windows Virtual Memory Settings" width="360">
+</p>
 
 ## Test status
 

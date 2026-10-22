@@ -87,6 +87,24 @@ Each model guide lists the required files and complete benchmark settings.
 
 ### Windows (Native, gfx1151)
 
+> [!IMPORTANT]
+> **Windows Virtual Memory (Paging File) Requirement**:
+> Because 100+ GiB models like Qwen3.8-Flash-Next require large unified memory commit allocations, Windows will crash with `hipErrorOutOfMemory` or AMD GPU driver loss if the system commit limit is too low.
+> 
+> You **must** configure a custom paging file size on your fastest NVMe SSD (Drive `C:`):
+> 1. Press <kbd>Win</kbd> + <kbd>R</kbd>, type `sysdm.cpl`, and press **Enter** (System Properties).
+> 2. Go to the **Advanced** tab &rarr; **Performance** &rarr; click **Settings...**.
+> 3. Go to the **Advanced** tab &rarr; **Virtual memory** &rarr; click **Change...**.
+> 4. **Uncheck** *"Automatically manage paging file size for all drives"*.
+> 5. Select your OS drive (`C:`), choose **Custom size**, and set:
+>    - **Initial size (MB)**: `98304` (96 GB)
+>    - **Maximum size (MB)**: `131072` (128 GB)
+> 6. Click **Set**, then **OK**, and restart your PC if prompted.
+> 
+> <p align="center">
+>   <img src="assets/windows-virtual-memory.png" alt="Windows Virtual Memory Settings" width="360">
+> </p>
+
 1. Check prerequisites and system configuration:
    ```powershell
    powershell -ExecutionPolicy Bypass -File tools\windows\check.ps1

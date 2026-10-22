@@ -166,6 +166,16 @@ if ($memory.GpuName) {
   } else {
     Note "dedicated GPU memory" "size unknown; 96 GB is recommended for Qwen3.8-Flash-Next"
   }
+  $pagefiles = Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue
+  $totalPagefileMb = ($pagefiles | Measure-Object -Property AllocatedBaseSize -Sum).Sum
+  if ($totalPagefileMb) {
+    $pagefileGb = [math]::Round($totalPagefileMb / 1024, 1)
+    if ($totalPagefileMb -lt 98304) {
+      Note "virtual memory" "$pagefileGb GB paging file allocated; 96-128 GB (Initial: 98304 MB, Max: 131072 MB) recommended for 100+ GiB models (sysdm.cpl > Advanced > Performance > Virtual memory)"
+    } else {
+      Report "virtual memory" $true "$pagefileGb GB paging file allocated ($totalPagefileMb MB)"
+    }
+  }
 } else {
   Report "AMD GPU" $false "no Radeon adapter found" "Gufo needs a gfx1151 GPU (Ryzen AI Max+ 395 / Radeon 8060S)"
 }
