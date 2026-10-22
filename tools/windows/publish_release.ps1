@@ -63,6 +63,14 @@ High-performance native local LLM inference engine optimized for AMD Ryzen AI MA
 
 ## What's New in this Release
 
+### 🧩 New in v0.21.0
+- **Upstream Sync with `gufo-org/gufo` v0.21.0**:
+  - **Natural K-Order BF16 GEMM**: Sum BF16 indexer projections in natural K order for every token, eliminating position-dependent prefill chunk variations and token offsets.
+  - **Sampled MTP Pricing**: Price unseeded sampled MTP drafts at actual decoding occupancy for improved speculative performance.
+  - **Opt-in YaRN Context Extension (`--enable-yarn`)**: Supported seamless long-context RoPE extension up to and beyond native context limits for both serving and benchmarking.
+  - **Advanced MTP Sampling Flags**: Added `--mtp-draft-vocab latin`, `--mtp-policy survival`, and `--prompt-lookup` support to both `gufo serve llm` and `gufo bench llm`.
+  - **Cross-Platform Net Layer**: Clean networking abstraction (`gufo::net`) unifying POSIX and Windows socket operations without legacy macro hacks.
+
 ### 🧩 New in v0.20.3
 - **Qwen 3.8 Flash-Next Kernel Optimizations & Stability Fixes**:
   - **Zero Driver Crashes**: Eliminated in-flight KV reallocations (`EnsureKvCapacity`) that previously caused AMD driver resets and `unspecified launch failure` HIP errors.
