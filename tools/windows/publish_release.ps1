@@ -99,7 +99,7 @@ High-performance native local LLM inference engine optimized for AMD Ryzen AI MA
 | **tg2048** | MTP (`--draft-tokens 7`) | `q8_0-q4_k` | **39.71 ± 0.00** | Stable throughput |
 | **tg8192** | MTP (`--draft-tokens 7`) | `q8_0-q4_k` | **40.39 ± 0.00** | Stable throughput |
 | **tg16384** | MTP (`--draft-tokens 7`) | `q8_0-q4_k` | **40.13 ± 0.00** | Sustained across deep context |
-| **tg65536** (65k) | MTP (`--draft-tokens 7`) | `q8_0-q4_k` | **~40.2 t/s** | Sustained across full 65k generation |
+| **tg65536** (65k) | MTP (`--draft-tokens 7`) | `q8_0-q4_k` | **38.80 ± 0.00** | Full 65k continuous token generation |
 
 ### 🧩 New in v0.20.2
 - **Chat Portal Fix**: Corrected action button label typo and tooltip for message re-generation (`Re-Generate`).
