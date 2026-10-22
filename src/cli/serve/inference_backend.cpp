@@ -3634,6 +3634,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
+                            TextRunnerRamCacheOptions ram_cache_config,
                             models::qwen38_flash_next::KvCacheMode kv_cache_mode,
                             bool managed_experts,
                             bool enable_yarn) {
