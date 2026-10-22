@@ -230,6 +230,23 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
+  parser.AddOption(
+      "", "--mtp-policy", "POLICY",
+      "Qwen3.8-Flash-Next sampled draft length: length (acceptance-history "
+      "controller) or survival (stop on the draft head's confidence) "
+      "(default: length)",
+      "Speculative", &opt.mtp_policy);
+  parser.AddOption(
+      "", "--mtp-draft-vocab", "VOCAB",
+      "Qwen3.8-Flash-Next draft head vocabulary: full, or latin (special and "
+      "ASCII/Latin-script text tokens; half the output head per draft step) "
+      "(default: full)",
+      "Speculative", &opt.mtp_draft_vocab);
+  parser.AddFlag(
+      "", "--prompt-lookup",
+      "Qwen3.8-Flash-Next: after an MTP draft, propose the tokens that "
+      "followed a 12+ token match earlier in the conversation",
+      "Speculative", &opt.prompt_lookup);
   parser.AddCustomOption(
       "", "--kv-cache", "MODE",
       "KV cache storage for Flash-Next: f16 (default), q8_0 (both planes, "
@@ -297,8 +314,57 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
                  "Print detailed timing, latency breakdown, and tok/s metrics",
                  "General", &opt.verbose);
 
+  // Serving compatibility options (accepted as no-ops for convenience when copying CLI flags)
+  static std::string ignored_think;
+  static std::string ignored_preserve_thinking;
+  static std::size_t ignored_cache_ram_bytes = 0;
+  static std::string ignored_cache_disk;
+  static std::size_t ignored_cache_disk_bytes = 0;
+  static std::size_t ignored_cache_disk_staging_bytes = 0;
+  static std::string ignored_served_model_name;
+  static std::string ignored_mmproj;
+  static std::uint32_t ignored_context = 0;
+  static std::int64_t ignored_max_output_bytes = 0;
+  static bool ignored_managed_experts = false;
+  parser.AddOption("", "--think", "MODE",
+                   "Reasoning generation mode (ignored in bench)", "Serving Compatibility",
+                   &ignored_think);
+  parser.AddOption("", "--preserve-thinking", "MODE",
+                   "Preserve thinking (ignored in bench)", "Serving Compatibility",
+                   &ignored_preserve_thinking);
+  parser.AddOption("", "--cache-ram-bytes", "BYTES",
+                   "Cache RAM bytes (ignored in bench)", "Serving Compatibility",
+                   &ignored_cache_ram_bytes);
+  parser.AddOption("", "--cache-disk", "PATH",
+                   "Cache disk path (ignored in bench)", "Serving Compatibility",
+                   &ignored_cache_disk);
+  parser.AddOption("", "--cache-disk-bytes", "BYTES",
+                   "Cache disk bytes (ignored in bench)", "Serving Compatibility",
+                   &ignored_cache_disk_bytes);
+  parser.AddOption("", "--cache-disk-staging-bytes", "BYTES",
+                   "Cache disk staging bytes (ignored in bench)", "Serving Compatibility",
+                   &ignored_cache_disk_staging_bytes);
+  parser.AddOption("", "--served-model-name", "ID",
+                   "Served model name (ignored in bench)", "Serving Compatibility",
+                   &ignored_served_model_name);
+  parser.AddOption("", "--mmproj", "PATH",
+                   "Vision projector path (ignored in bench)", "Serving Compatibility",
+                   &ignored_mmproj);
+  parser.AddOption("-c", "--context", "N",
+                   "Context tokens (ignored in bench)", "Serving Compatibility",
+                   &ignored_context);
+  parser.AddOption("", "--max-output-bytes", "BYTES",
+                   "Max output bytes (ignored in bench)", "Serving Compatibility",
+                   &ignored_max_output_bytes);
+  parser.AddFlag("", "--managed-experts",
+                 "Managed experts (ignored in bench)", "Serving Compatibility",
+                 &ignored_managed_experts);
+
   parser.SetPositionalHandler(
       [&opt](std::string_view arg, std::string*) -> bool {
+        if (arg == "llm") {
+          return true;
+        }
         opt.model_path = std::string(arg);
         return true;
       });
@@ -1244,6 +1310,12 @@ int RunQwen38FlashNextBenchmark(
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
           .kv_cache_mode = options.kv_cache_mode,
           .rope_scaling = rope_scaling,
+          .mtp_survival = options.mtp_policy == "survival",
+          .prompt_lookup = options.prompt_lookup,
+          .draft_vocabulary =
+              options.mtp_draft_vocab == "latin"
+                  ? qfn::DraftVocabulary::kLatinText
+                  : qfn::DraftVocabulary::kFull,
       },
       &error);
   if (model == nullptr) {
@@ -1798,6 +1870,9 @@ void PrintBenchHelp(std::string_view program_name) {
 
 std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
                                               std::string* error_msg) {
+  if (!args.empty() && std::string_view(args.front()) == "llm") {
+    args = args.subspan(1);
+  }
   BenchOptions opt;
   bool explicit_p = false;
   bool explicit_n = false;
@@ -1814,6 +1889,15 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
     return std::nullopt;
   }
   if (parser.IsHelpRequested()) {
+    return std::nullopt;
+  }
+
+  if ((opt.mtp_policy != "length" && opt.mtp_policy != "survival") ||
+      (opt.mtp_draft_vocab != "full" && opt.mtp_draft_vocab != "latin")) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "--mtp-policy must be length or survival; --mtp-draft-vocab must be full or latin";
+    }
     return std::nullopt;
   }
 

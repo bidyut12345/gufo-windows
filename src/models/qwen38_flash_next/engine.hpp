@@ -134,8 +134,6 @@ private:
   Model() = default;
 
   ModelOptions options_;
-  Config config_;
-  std::string model_name_;
   std::shared_ptr<core::GgufReader> reader_;
   std::shared_ptr<core::GgufReader> mtp_reader_;
   std::unique_ptr<ModelWeights> weights_;

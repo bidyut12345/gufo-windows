@@ -152,7 +152,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->device_) {
     return nullptr;
   }
-  if (m->mtp_weights_ && m->device_->output().rows > kMtpDraftVocab) {
+  if (m->mtp_weights_ && m->device_->output().rows > kMtpDraftVocab &&
+      options.draft_vocabulary == DraftVocabulary::kLatinText) {
     std::vector<std::int32_t> specials;
     for (std::uint32_t id = kMtpDraftVocab; id < m->device_->output().rows;
          ++id)
@@ -190,21 +191,11 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
       break;
   }
   exec.max_context = options.max_context;
-  m->config_ = c;
-  m->model_name_ = std::string(m->reader_->GetMetadataString("general.name")
-                                   .value_or("Qwen3.8-Flash-Next"));
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
     return nullptr;
   }
-  // Weights have been uploaded to GPU VRAM and executor is ready.
-  // Release the host GGUF readers and file mappings to unmap the 100+ GiB
-  // virtual memory from the process address space.
-  m->weights_.reset();
-  m->mtp_weights_.reset();
-  m->reader_.reset();
-  m->mtp_reader_.reset();
   return m;
 }
 
@@ -260,7 +251,7 @@ bool Model::IsStopToken(std::int32_t token) const noexcept {
 }
 
 std::uint32_t Model::VocabSize() const noexcept {
-  return config_.vocab_size;
+  return weights_->config.vocab_size;
 }
 
 std::uint32_t Model::PrefillCapacity() const noexcept {
@@ -283,11 +274,12 @@ bool Model::InDraftSubset(std::int32_t token) const {
 }
 
 std::string Model::ModelName() const {
-  return model_name_;
+  return std::string(reader_->GetMetadataString("general.name")
+                         .value_or("Qwen3.8-Flash-Next"));
 }
 
 const Config& Model::config() const noexcept {
-  return config_;
+  return weights_->config;
 }
 
 std::size_t Model::ResidentBytes() const noexcept {
@@ -1231,7 +1223,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // Both execution paths use the same request-local copy rule. Scheduling
   // a peer must not change a sampled request's proposals or RNG sequence.
   // A request's first speculative step copies nothing (see PromptLookup).
-  pending->lookup_cap = lookup_.Step(base) ? cap : 0;
+  pending->lookup_cap =
+      (model_->options_.prompt_lookup && lookup_.Step(base)) ? cap : 0;
   if (pending->lookup_cap != 0) {
     lookup_.Extend(tokens_, sampled);
   }
@@ -1263,6 +1256,14 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       }
       if (AppendLookup(*pending, stop_at_eos)) {
         break;
+      }
+      if (model_->options_.mtp_survival && pending->sampled &&
+          !pending->proposals.empty()) {
+        constexpr float kMtpSurvivalFloor = 0.5F;
+        if (pending->proposals.back().probability < kMtpSurvivalFloor) {
+          pending->width = pending->chain.size();
+          break;
+        }
       }
       if (pending->chain.size() < width &&
           !exec.MtpForward(
