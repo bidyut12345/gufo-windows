@@ -63,6 +63,25 @@ High-performance native local LLM inference engine optimized for AMD Ryzen AI MA
 
 ## What's New in this Release
 
+### 🧩 New in v0.23.0
+- **Upstream Sync with `gufo-org/gufo` v0.23.0 & v0.22.0**:
+  - **EmbeddingGemma 2 Multimodal & Text Embeddings (`/v1/embeddings`)**: Integrated EmbeddingGemma 2 serving with hipBLASLt tuned GEMMs, matrix core attention, and image input support.
+  - **Aliasing via Repeated `--served-model-name`**: Map multiple model aliases to a single running model.
+  - **Connection Lifecycle Management**: Immediate connection counter reclamation upon response completion.
+  - **Greedy Draft Head Optimization**: Greedy requests with penalties or constraints, as well as lone greedy MTP requests, now use the small draft head for lower overhead.
+  - **DFlash-2 Speculative Drafting Acceleration**: High-efficiency verification and reduced draft overhead.
+  - **Flash-Next Selector Optimization**: Reduced register spills and optimized sampled drafting.
+  - **Cross-Platform Storage & Network Leaves**: Mapped GGUF shards through the portable `mapped_file` leaf and integrated platform `fs`, `socket`, and `page_pin` shims on Windows 11.
+- **Server Status & Busy API (`/status`, `/v1/status`, `/busy`, `/v1/busy`)**:
+  - Added dedicated endpoints returning real-time busy status (`busy: true/false`), active slot counts (`active_slots`), total capacity (`total_slots`), and server activity (`idle`, `prefilling`, `decoding`).
+  - Extended `/health` response with real-time `busy`, `active_slots`, and `total_slots` fields for load balancers and orchestrators.
+- **Long-Context Streaming Cache Cliff Fix**:
+  - Resolved prompt processing speed drop on deep context (>49K-262K tokens).
+  - Background persistence queue streams oversized checkpoints directly to disk without memory budget refusal.
+  - History snapshots reserved for disk persistence without blocking memory staging.
+- **Qwen 3.8 Flash-Next Kernel Template Launch Fix**:
+  - Removed duplicate and malformed attention GEMM kernel launch branch in `AttentionF16Gemm`.
+
 ### 🧩 New in v0.21.0
 - **Upstream Sync with `gufo-org/gufo` v0.21.0**:
   - **Natural K-Order BF16 GEMM**: Sum BF16 indexer projections in natural K order for every token, eliminating position-dependent prefill chunk variations and token offsets.
