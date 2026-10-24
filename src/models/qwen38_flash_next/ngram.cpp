@@ -91,7 +91,8 @@ NgramTable::~NgramTable() {
 }
 
 std::unique_ptr<NgramTable> NgramTable::Open(
-    int file_descriptor, const std::string& source_path,
+    platform::PlatformFile file_descriptor,
+    const std::filesystem::path& source_path,
     std::uint64_t file_offset, std::uint64_t rows, std::uint32_t row_dim,
     core::GgmlType type, std::string* error_msg) {
   std::unique_ptr<NgramTable> t(new NgramTable());
@@ -122,13 +123,13 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   // The handle must be asynchronous: ReadFile with a non-null OVERLAPPED on
   // a synchronous handle is undefined, and the worker pool relies on
   // concurrent in-flight reads.
-  HANDLE overlapped = CreateFileA(
+  HANDLE overlapped = CreateFileW(
       source_path.c_str(), GENERIC_READ,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
       OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
   if (overlapped == INVALID_HANDLE_VALUE) {
     if (error_msg != nullptr) {
-      *error_msg = "cannot open bound n-gram table: " + source_path;
+      *error_msg = "cannot open bound n-gram table: " + source_path.string();
     }
     return nullptr;
   }

@@ -19,6 +19,7 @@
 #include <thread>
 #include <utility>
 
+#include "src/core/platform/mapped_file.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -155,8 +156,10 @@ void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
                          .size = source.size};
     (void)hipMemset(static_cast<std::uint8_t*>(device) + source.size, 0,
                     kTailMargin);
-    const auto path = "/proc/self/fd/" + std::to_string(source.file_descriptor);
-    fds[i] = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_CONCURRENT_RANDOM);
+    fds[i] = !source.source_path.empty()
+                 ? ::open(source.source_path.string().c_str(),
+                          O_RDONLY | O_CLOEXEC | O_CONCURRENT_RANDOM)
+                 : -1;
     if (fds[i] < 0) {
       fail("cannot reopen GGUF shard " + std::to_string(i) + ": " +
            std::strerror(errno));
@@ -248,7 +251,7 @@ void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
   }
 #ifdef _WIN32
   if (std::ranges::all_of(source_regions, [](const auto& region) {
-        return region.file_descriptor >= 0;
+        return platform::FileValid(region.file_descriptor);
       })) {
     return UploadDeviceRegions(source_regions, weight_regions, error_msg);
   }

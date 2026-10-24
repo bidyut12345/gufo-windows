@@ -84,7 +84,8 @@ public:
   /// `source_path` backs the Windows unbuffered reopen, where the POSIX
   /// descriptor is not available.
   [[nodiscard]] static std::unique_ptr<NgramTable> Open(
-      int file_descriptor, const std::string& source_path,
+      platform::PlatformFile file_descriptor,
+      const std::filesystem::path& source_path,
       std::uint64_t file_offset, std::uint64_t rows, std::uint32_t row_dim,
       core::GgmlType type, std::string* error_msg = nullptr);
 
