@@ -342,11 +342,7 @@ add_library(gufo_http STATIC
   # the engine library, so no translation unit is linked twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
-<<<<<<< HEAD
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21 ${SQLITE3_TARGET} CURL::libcurl)
-=======
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21 gufo_embedding_gemma2)
->>>>>>> origin/main
+target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21 gufo_embedding_gemma2 ${SQLITE3_TARGET} CURL::libcurl)
 
 add_executable(gufo
   src/cli/main.cpp
@@ -581,19 +577,16 @@ if (BUILD_TESTING)
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)
   set_tests_properties(http_server_test PROPERTIES LABELS "cpu;server;http" TIMEOUT 30)
-<<<<<<< HEAD
-
   add_executable(chat_portal_test tests/cli/chat_portal_test.cpp)
   target_link_libraries(chat_portal_test PRIVATE gufo_http)
   add_test(NAME chat_portal_test COMMAND chat_portal_test)
   set_tests_properties(chat_portal_test PROPERTIES LABELS "cpu;server;chat_portal" TIMEOUT 30)
-=======
+
   add_executable(http_server_signals_test tests/cli/http_server_signals_test.cpp)
   target_link_libraries(http_server_signals_test PRIVATE gufo_http)
   add_test(NAME http_server_signals_test COMMAND http_server_signals_test)
   set_tests_properties(http_server_signals_test
     PROPERTIES LABELS "cpu;server;http" TIMEOUT 60)
->>>>>>> origin/main
   add_executable(audio_websocket_test tests/cli/audio_websocket_test.cpp)
   target_link_libraries(audio_websocket_test PRIVATE gufo_http)
   add_test(NAME audio_websocket_test COMMAND audio_websocket_test)

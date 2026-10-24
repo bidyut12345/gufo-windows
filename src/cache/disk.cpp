@@ -854,21 +854,10 @@ struct DiskStore::Impl {
   }
   void Rename(const platform::Directory& target, const std::string& name) {
     CostTimer timer(publication_stats.filesystem_ns);
-<<<<<<< HEAD
-#ifdef _WIN32
-    if (renameat(temporary.Get(), name.c_str(), target, name.c_str()) < 0)
-      IoError("publish cache file");
-#else
-    if (syscall(SYS_renameat2, temporary.Get(), name.c_str(), target,
-                name.c_str(), RENAME_NOREPLACE) < 0)
-      IoError("publish cache file");
-#endif
-=======
     std::error_code ec;
     if (platform::RenameNoReplace(temporary, name, target, name, ec) !=
         platform::RenameResult::kRenamed)
       IoError("publish cache file", ec);
->>>>>>> origin/main
   }
   void WriteFile(platform::PlatformFile fd,
                  std::span<const std::uint8_t> bytes) {
