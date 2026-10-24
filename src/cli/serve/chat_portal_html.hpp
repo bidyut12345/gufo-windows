@@ -656,9 +656,13 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     /* Markdown inside messages */
     .md-content {
       padding: 12px 16px;
+      word-break: break-word;
+      overflow-wrap: break-word;
     }
     .md-content p { margin-bottom: 8px; }
     .md-content p:last-child { margin-bottom: 0; }
+    .md-content > :first-child { margin-top: 0; }
+    .md-content > :last-child { margin-bottom: 0; }
     .md-content pre {
       background: #000;
       border: 1px solid var(--border);
@@ -713,6 +717,36 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       text-align: left;
     }
     .md-content th { background: var(--bg-elevated); }
+    .md-content h1, .md-content h2, .md-content h3,
+    .md-content h4, .md-content h5, .md-content h6 {
+      margin: 14px 0 6px;
+      line-height: 1.3;
+      font-weight: 600;
+    }
+    .md-content h1 { font-size: 1.3rem; }
+    .md-content h2 { font-size: 1.15rem; }
+    .md-content h3 { font-size: 1.05rem; }
+    .md-content h4, .md-content h5, .md-content h6 { font-size: 0.95rem; }
+    .md-content ul, .md-content ol { margin: 8px 0; padding-left: 26px; }
+    .md-content ul ul, .md-content ol ol,
+    .md-content ul ol, .md-content ol ul { margin: 2px 0; }
+    .md-content li { margin: 2px 0; }
+    .md-content blockquote {
+      margin: 8px 0;
+      padding: 2px 12px;
+      border-left: 3px solid var(--border-strong);
+      color: var(--text-muted);
+    }
+    .md-content hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 14px 0;
+    }
+    .md-content a { color: #60a5fa; text-decoration: none; }
+    .md-content a:hover { text-decoration: underline; }
+    .md-content del { color: var(--text-dim); }
+    .md-table-wrap { overflow-x: auto; margin: 10px 0; }
+    .md-table-wrap table { margin: 0; }
 
     /* Message Actions & Usage Badge */
     .msg-actions {
@@ -2475,7 +2509,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
     <div class="nav-right">
       <div id="slot-indicator" class="slot-pill" title="Server Slots Status">
         <span class="slot-dot"></span>
-        <span id="slot-text">1/1 slots (idle)</span>
+        <span id="slot-text">&mdash; slots</span>
       </div>
       <div id="model-pill" class="model-pill" title="Loaded Model">loading model...</div>
       <button id="btn-open-drawer" class="btn-top" title="Parameters & Settings">
@@ -2782,7 +2816,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               <span class="monitor-card-unit">in-flight</span>
             </div>
             <div class="monitor-card-footer">
-              <span id="mon-sub-queue">Queue: 0 deferred</span> &bull; <span id="mon-sub-slots">1/1 slots idle</span>
+              <span id="mon-sub-queue">Queue: 0 deferred</span> &bull; <span id="mon-sub-slots">&mdash; slots idle</span>
             </div>
           </div>
 
@@ -2866,7 +2900,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         <div class="monitor-slots-container">
           <div class="monitor-slots-title">
             <span>Hardware Execution Slots</span>
-            <span id="mon-slots-summary" style="font-size:0.75rem; color:var(--text-muted); font-family:var(--font-mono);">1 slot allocated</span>
+            <span id="mon-slots-summary" style="font-size:0.75rem; color:var(--text-muted); font-family:var(--font-mono);">&mdash;</span>
           </div>
           <div id="mon-slots-list" style="display:flex; flex-direction:column; gap:8px;">
             <!-- Rendered dynamically -->
@@ -3288,6 +3322,10 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       thinkingLevel: localStorage.getItem('gufo_thinking_level') || 'auto',
       customPrompts: JSON.parse(localStorage.getItem('gufo_custom_prompts') || '[]'),
       isGenerating: false,
+      slotTotal: 0,
+      slotBusy: 0,
+      slotTimer: null,
+      liveSpeed: '',
       abortController: null,
       mode: 'chat', // 'chat' or 'comp'
       toolsEnabled: localStorage.getItem('gufo_tools_enabled') !== 'false',
@@ -3560,45 +3598,192 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
              lower === 'question';
     }
 
+    // Only http(s), mailto:, in-page anchors and site-relative paths may be
+    // used as link targets; quotes and angle brackets are excluded so the value
+    // cannot break out of the href attribute.
+    const SAFE_MD_URL = /^(?:https?:\/\/|mailto:|#|\/[^/])[^"'<>`\s]*$/i;
+    function safeMarkdownUrl(u) {
+      const t = (u || '').trim();
+      return SAFE_MD_URL.test(t) ? t : null;
+    }
+
+    function parseInline(text) {
+      const codes = [];
+      let s = text.replace(/`+([^`\n]+)`+/g, (m, c) => {
+        codes.push(c);
+        return '\u0001IC' + (codes.length - 1) + '\u0001';
+      });
+      s = s.replace(/(!?)\[([^\]]*)\]\(\s*([^)\s]+)(?:\s+[^)]*)?\)/g, (m, bang, label, url) => {
+        const href = safeMarkdownUrl(url);
+        if (!href) return m;
+        // Images are shown as a link instead of an <img>: the portal stays
+        // offline-capable and cannot be probed by remote image requests.
+        const inner = parseInline(label || url);
+        return `<a href="${href}" target="_blank" rel="noopener noreferrer">${bang ? '&#128443; ' + inner : inner}</a>`;
+      });
+      s = s.replace(/(^|[^="'<>(])(https?:\/\/[^\s<]+[^\s<.,;:!?)\]&])/g, (m, pre, url) => {
+        const href = safeMarkdownUrl(url);
+        if (!href) return m;
+        return `${pre}<a href="${href}" target="_blank" rel="noopener noreferrer">${url}</a>`;
+      });
+      s = s.replace(/\*\*\*([^*\n]+)\*\*\*/g, '<strong><em>$1</em></strong>');
+      s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      s = s.replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
+      s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+      s = s.replace(/(^|[\s(])_([^_\n]+)_(?=$|[\s).,!?;:])/g, '$1<em>$2</em>');
+      s = s.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+      s = s.replace(/\u0001IC(\d+)\u0001/g, (m, i) => `<code>${codes[Number(i)]}</code>`);
+      return s;
+    }
+
+    // Block-level renderer. Input is escaped up front, so every branch below can
+    // emit text verbatim; only the tags produced here reach the DOM.
     function parseMarkdown(md) {
       if (!md) return '';
-      const codeBlocks = [];
-      let out = md.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (match, lang, code) => {
-        const id = 'BLOCK_' + codeBlocks.length;
-        codeBlocks.push({ lang: lang || 'code', code: escapeHtml(code.trimEnd()) });
-        return id;
-      });
+      const lines = escapeHtml(md).replace(/\r\n?/g, '\n').split('\n');
+      const out = [];
+      let para = [];
+      let quote = null;
+      // Each entry tracks one open <ul>/<ol>; `open` says whether an <li> of
+      // that level is still accepting nested content.
+      const lists = [];
 
-      // Handle unclosed code block during active streaming
-      out = out.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*)$/g, (match, lang, code) => {
-        const id = 'BLOCK_' + codeBlocks.length;
-        codeBlocks.push({ lang: lang || 'code', code: escapeHtml(code.trimEnd()) });
-        return id;
-      });
+      const closeLi = () => {
+        const top = lists[lists.length - 1];
+        if (top && top.open) { out.push('</li>'); top.open = false; }
+      };
+      const popList = () => {
+        closeLi();
+        out.push('</' + lists.pop().tag + '>');
+        closeLi(); // the enclosing item, if any, ends with its nested list
+      };
+      const closeLists = () => { while (lists.length) popList(); };
+      const flushPara = () => {
+        if (!para.length) return;
+        out.push('<p>' + para.map(parseInline).join('<br>') + '</p>');
+        para = [];
+      };
+      const flushQuote = () => {
+        if (!quote) return;
+        out.push('<blockquote>' + quote.map(parseInline).join('<br>') + '</blockquote>');
+        quote = null;
+      };
 
-      out = escapeHtml(out);
+      const splitRow = l => {
+        let t = l.trim().replace(/\\\|/g, '\u0001P');
+        if (t.startsWith('|')) t = t.slice(1);
+        if (t.endsWith('|')) t = t.slice(0, -1);
+        return t.split('|').map(c => c.trim().replace(/\u0001P/g, '|'));
+      };
+      const isTableSep = l => {
+        const t = l.trim();
+        if (!t) return false;
+        const cells = splitRow(t);
+        return cells.every(c => /^:?-{1,}:?$/.test(c));
+      };
 
-      codeBlocks.forEach((b, idx) => {
-        const rep = `<pre><div class="code-topbar"><span>${b.lang}</span><button class="btn-copy" onclick="copySnippet(this)">Copy</button></div><code>${b.code}</code></pre>`;
-        out = out.replace('BLOCK_' + idx, rep);
-      });
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        let m;
 
-      out = out.replace(/`([^`]+)`/g, '<code>$1</code>');
-      out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-      out = out.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+        // Fenced code: consumed whole so its body never sees inline rules.
+        // An unterminated fence (mid-stream) renders what has arrived so far.
+        if ((m = trimmed.match(/^(`{3,}|~{3,})[ \t]*([\w+#.\-]*)[ \t]*$/))) {
+          flushPara(); flushQuote();
+          const fenceChar = m[1][0];
+          const lang = m[2] || 'code';
+          const closer = new RegExp('^' + (fenceChar === '`' ? '`' : '~') + '{3,}[ \\t]*$');
+          const body = [];
+          while (i + 1 < lines.length && !closer.test(lines[i + 1].trim())) body.push(lines[++i]);
+          if (i + 1 < lines.length) i++; // consume the closing fence
+          // A fence indented under an open list item stays inside that item.
+          const inItem = m[1].length > 0 && lists.length > 0 && lists[lists.length - 1].open;
+          const code = body.map(l => (inItem ? l.replace(new RegExp('^ {1,' + m[1].length + '}'), '') : l)).join('\n');
+          if (!inItem) closeLists();
+          out.push(`<pre><div class="code-topbar"><span>${lang}</span><button class="btn-copy" onclick="copySnippet(this)">Copy</button></div><code>${code}</code></pre>`);
+          continue;
+        }
 
-      const lines = out.split('\n');
-      let inPre = false;
-      const formatted = lines.map(line => {
-        if (line.includes('<pre>')) inPre = true;
-        if (line.includes('</pre>')) { inPre = false; return line; }
-        if (inPre) return line;
-        if (line.startsWith('&gt; ')) return `<blockquote>${line.slice(5)}</blockquote>`;
-        if (line.startsWith('- ') || line.startsWith('* ')) return `<li>${line.slice(2)}</li>`;
-        return line ? `<p>${line}</p>` : '';
-      });
+        if (trimmed === '') { flushPara(); closeLists(); flushQuote(); continue; }
 
-      return formatted.join('');
+        if ((m = trimmed.match(/^&gt;+[ \t]?(.*)$/))) {
+          flushPara(); closeLists();
+          (quote || (quote = [])).push(m[1]);
+          continue;
+        }
+
+        if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmed.replace(/\s+/g, ''))) {
+          flushPara(); closeLists(); flushQuote();
+          out.push('<hr>');
+          continue;
+        }
+
+        if ((m = trimmed.match(/^(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$/))) {
+          flushPara(); closeLists(); flushQuote();
+          const lvl = m[1].length;
+          out.push(`<h${lvl}>${parseInline(m[2])}</h${lvl}>`);
+          continue;
+        }
+
+        // Table: header row plus a dash separator row on the next line.
+        if (trimmed.includes('|') && i + 1 < lines.length && isTableSep(lines[i + 1]) && !/^`/.test(trimmed)) {
+          flushPara(); closeLists(); flushQuote();
+          const head = splitRow(trimmed);
+          const aligns = splitRow(lines[++i]).map(c => {
+            const lft = c.startsWith(':'), rgt = c.endsWith(':');
+            if (lft && rgt) return ' style="text-align:center;"';
+            if (rgt) return ' style="text-align:right;"';
+            if (lft) return ' style="text-align:left;"';
+            return '';
+          });
+          const rows = [];
+          while (i + 1 < lines.length && lines[i + 1].includes('|') && lines[i + 1].trim() !== '') {
+            rows.push(splitRow(lines[++i]));
+          }
+          let t = '<div class="md-table-wrap"><table><thead><tr>';
+          head.forEach((c, ci) => { t += `<th${aligns[ci] || ''}>${parseInline(c)}</th>`; });
+          t += '</tr></thead><tbody>';
+          rows.forEach(r => {
+            t += '<tr>';
+            for (let ci = 0; ci < head.length; ci++) t += `<td${aligns[ci] || ''}>${parseInline(r[ci] || '')}</td>`;
+            t += '</tr>';
+          });
+          out.push(t + '</tbody></table></div>');
+          continue;
+        }
+
+        if ((m = line.match(/^( {0,10})([-*+]|\d{1,9}[.)])[ \t]+(.*)$/))) {
+          flushPara(); flushQuote();
+          // Collapse indentation into nesting buckets so 2- and 4-space styles
+          // both produce a sane list depth.
+          const lead = m[1].length;
+          const key = lead >= 4 ? 4 : (lead >= 2 ? 2 : 0);
+          const tag = /^[-*+]$/.test(m[2]) ? 'ul' : 'ol';
+          let top = lists[lists.length - 1];
+          if (top && key > top.key) {
+            out.push('<' + tag + '>');
+            lists.push({ tag, key, open: false });
+          } else {
+            closeLi();
+            while (lists.length && lists[lists.length - 1].key > key) popList();
+            top = lists[lists.length - 1];
+            if (top && top.key === key && top.tag !== tag) popList();
+            top = lists[lists.length - 1];
+            if (!top || top.key !== key) { out.push('<' + tag + '>'); lists.push({ tag, key, open: false }); }
+          }
+          const text = m[3].replace(/^\[([ xX])\][ \t]+/, (s2, ch) => ch.toLowerCase() === 'x' ? '&#9745; ' : '&#9744; ');
+          out.push('<li>' + parseInline(text));
+          lists[lists.length - 1].open = true;
+          continue;
+        }
+
+        closeLists(); flushQuote();
+        para.push(trimmed);
+      }
+      flushPara(); closeLists(); flushQuote();
+
+      return out.join('');
     }
 
     window.copySnippet = function(btn) {
@@ -3896,6 +4081,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
           if (Array.isArray(slots)) {
             const busyCount = slots.filter(s => s.is_processing).length;
             if (UI.monSubSlots) UI.monSubSlots.textContent = `${slots.length - busyCount}/${slots.length} slots idle`;
+            applySlotStates(slots);
             if (UI.monSlotsSummary) UI.monSlotsSummary.textContent = `${slots.length} total slot(s) &bull; ${busyCount} active`;
 
             if (UI.monSlotsList) {
@@ -6625,6 +6811,51 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       }
     }
 
+    // The slot pill mirrors the server session pool, so a server started with
+    // --sessions N never reports a hardcoded single slot.
+    function renderSlotPill() {
+      if (!UI.slotText || !APP.slotTotal) return;
+      const busy = Math.max(APP.slotBusy, APP.isGenerating ? 1 : 0);
+      const idle = Math.max(APP.slotTotal - busy, 0);
+      let state = 'idle';
+      if (APP.isGenerating) {
+        state = APP.liveSpeed ? `generating: ${APP.liveSpeed} t/s` : 'generating';
+      } else if (APP.slotBusy > 0) {
+        state = 'processing';
+      }
+      UI.slotText.textContent = `${idle}/${APP.slotTotal} slots (${state})`;
+    }
+
+    function applySlotStates(slots) {
+      APP.slotTotal = slots.length;
+      APP.slotBusy = slots.filter(s => s.is_processing).length;
+      renderSlotPill();
+    }
+
+    function updateSlotIndicator(state) {
+      if (!APP.slotTotal) return;
+      if (state === 'idle') {
+        APP.slotBusy = 0;
+      } else {
+        APP.slotBusy = Math.max(APP.slotBusy, 1);
+        if (state === 'processing') APP.liveSpeed = '';
+      }
+      renderSlotPill();
+    }
+
+    async function refreshSlotStates() {
+      if (APP.monitorInterval) return;
+      try {
+        // /slots is a server API route: send the API key (or the portal
+        // bearer token) so the pill works for logged-out visitors too.
+        const headers = APP.token ? { 'Authorization': `Bearer ${APP.token}` } : {};
+        const res = await fetch('/slots', { headers });
+        if (!res.ok) return;
+        const slots = await res.json();
+        if (Array.isArray(slots)) applySlotStates(slots);
+      } catch (e) {}
+    }
+
     function updateLiveSpeed(genTokens, startTime) {
       if (!startTime || genTokens <= 0) return;
       const elapsedSec = (performance.now() - startTime) / 1000;
@@ -6633,9 +6864,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         if (UI.footerSpeedMetrics) {
           UI.footerSpeedMetrics.textContent = `eval: ${tps} t/s | ${genTokens} tokens`;
         }
-        if (UI.slotText) {
-          UI.slotText.textContent = `1/1 slots (generating: ${tps} t/s)`;
-        }
+        APP.liveSpeed = tps;
+        renderSlotPill();
         APP.lastSeenGenSpeed = Number(tps);
         APP.lastSeenGenTokens = genTokens;
       }
@@ -7132,7 +7362,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       APP.isGenerating = true;
       UI.btnSend.style.display = 'none';
       UI.btnStop.style.display = 'flex';
-      UI.slotText.textContent = '1/1 slots (processing)';
+      updateSlotIndicator('processing');
       if (UI.footerSpeedMetrics) {
         UI.footerSpeedMetrics.textContent = 'generating...';
       }
@@ -7299,7 +7529,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         APP.abortController = null;
         UI.btnSend.style.display = 'flex';
         UI.btnStop.style.display = 'none';
-        UI.slotText.textContent = '1/1 slots (idle)';
+        updateSlotIndicator('idle');
         if (UI.footerSpeedMetrics && UI.footerSpeedMetrics.textContent === 'generating...') {
           UI.footerSpeedMetrics.textContent = 'eval: 0.0 t/s | prompt: 0.0 t/s';
         }
@@ -7370,7 +7600,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       APP.isGenerating = true;
       UI.btnSend.style.display = 'none';
       UI.btnStop.style.display = 'flex';
-      UI.slotText.textContent = '1/1 slots (processing)';
+      updateSlotIndicator('processing');
       if (UI.footerSpeedMetrics) {
         UI.footerSpeedMetrics.textContent = 'generating...';
       }
@@ -7524,7 +7754,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         APP.abortController = null;
         UI.btnSend.style.display = 'flex';
         UI.btnStop.style.display = 'none';
-        UI.slotText.textContent = '1/1 slots (idle)';
+        updateSlotIndicator('idle');
 
         const oldActions = group.querySelector('.msg-actions');
         if (oldActions) oldActions.remove();
@@ -7645,7 +7875,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       APP.isGenerating = true;
       UI.btnSend.style.display = 'none';
       UI.btnStop.style.display = 'flex';
-      UI.slotText.textContent = '1/1 slots (processing)';
+      updateSlotIndicator('processing');
 
       const activeTools = getActiveToolsList();
       const msgs = [];
@@ -8118,7 +8348,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
             scrollDown();
 
             let resultStr = '';
-            let isSuccess = true;
+            let isSuccess = false;
             try {
               const execRes = await apiFetch('/api/tools/execute', {
                 method: 'POST',
@@ -8129,12 +8359,21 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
                   conversation_id: APP.activeId
                 }
               });
-              const execData = await execRes.json();
-              isSuccess = execData.success;
-              resultStr = typeof execData.result === 'object' ? JSON.stringify(execData.result, null, 2) : String(execData.result);
+              let execData = null;
+              try { execData = await execRes.json(); } catch (_) {}
+              if (execData && (execData.result !== undefined && execData.result !== null)) {
+                isSuccess = execData.success === true;
+                resultStr = typeof execData.result === 'object' ? JSON.stringify(execData.result, null, 2) : String(execData.result);
+              } else if (execData && execData.error) {
+                isSuccess = false;
+                resultStr = String(execData.error);
+              } else {
+                isSuccess = false;
+                resultStr = `Tool execution failed (HTTP ${execRes.status}).`;
+              }
             } catch (e) {
               isSuccess = false;
-              resultStr = 'Tool execution error: ' + e.message;
+              resultStr = 'Tool execution error: ' + (e && e.message ? e.message : String(e));
             }
 
             toolCard.classList.remove('running');
@@ -8148,6 +8387,8 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
               resultDisplay.innerHTML = `<div style="color:var(--text-dim); margin-bottom:4px; font-size:0.75rem;">Result:</div><pre style="margin:0; color:${isSuccess ? 'var(--text)' : 'var(--danger)'}; white-space:pre-wrap; word-break:break-word; overflow-wrap:break-word;">${escapeHtml(resultStr)}</pre>`;
             }
 
+            // Always feed a tool result back so the tool loop can continue,
+            // even when execution failed — otherwise generation stops dead.
             msgs.push({
               role: 'tool',
               tool_call_id: tc.id,
@@ -8170,7 +8411,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         APP.abortController = null;
         UI.btnSend.style.display = 'flex';
         UI.btnStop.style.display = 'none';
-        UI.slotText.textContent = '1/1 slots (idle)';
+        updateSlotIndicator('idle');
         if (UI.footerSpeedMetrics && UI.footerSpeedMetrics.textContent === 'generating...') {
           UI.footerSpeedMetrics.textContent = 'eval: 0.0 t/s | prompt: 0.0 t/s';
         }
@@ -8283,11 +8524,12 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
         const resSlots = await fetch('/slots', { headers });
         if (resSlots.ok) {
           const slots = await resSlots.json();
-          if (Array.isArray(slots)) {
-            UI.slotText.textContent = `${slots.length}/${slots.length} slots (idle)`;
-          }
+          if (Array.isArray(slots)) applySlotStates(slots);
         }
       } catch (e) {}
+      if (!APP.slotTimer) {
+        APP.slotTimer = setInterval(refreshSlotStates, 2000);
+      }
     }
 
     // Init Session

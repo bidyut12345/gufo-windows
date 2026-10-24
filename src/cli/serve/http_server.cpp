@@ -1522,6 +1522,63 @@ HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
   return Ok(resp);
 }
 
+/// Status and activity endpoint exposing busy state, active slots, and token progress.
+HttpResponse ServerStatus(const HttpRequest&, TextGenerationBackend& b) {
+  auto sessions = b.session_states();
+  std::size_t active_slots = 0;
+  bool is_prefilling = false;
+  bool is_generating = false;
+  json::Value slot_details = json::Value::array();
+
+  for (std::size_t i = 0; i < sessions.size(); ++i) {
+    const auto& s = sessions[i];
+    std::string activity = "idle";
+    if (s.processing) {
+      ++active_slots;
+      if (s.generated_tokens > 0) {
+        activity = "generating";
+        is_generating = true;
+      } else {
+        activity = "prefilling";
+        is_prefilling = true;
+      }
+    }
+    json::Value item = json::Value::object();
+    item["id"] = i;
+    item["busy"] = s.processing;
+    item["activity"] = activity;
+    item["task_id"] =
+        s.processing ? static_cast<std::int64_t>(s.request_id) : -1;
+    item["prompt_tokens"] = s.prompt_tokens;
+    item["cached_tokens"] = s.cached_prompt_tokens;
+    item["processed_tokens"] = s.processed_prompt_tokens;
+    item["generated_tokens"] = s.generated_tokens;
+    item["remaining_tokens"] =
+        s.processing ? static_cast<std::int64_t>(s.remaining_tokens) : -1;
+    slot_details.push_back(std::move(item));
+  }
+
+  const bool busy = (active_slots > 0);
+  std::string activity = "idle";
+  if (is_generating) {
+    activity = "generating";
+  } else if (is_prefilling) {
+    activity = "prefilling";
+  } else if (busy) {
+    activity = "processing";
+  }
+
+  json::Value resp = json::Value::object();
+  resp["status"] = busy ? "busy" : "idle";
+  resp["busy"] = busy;
+  resp["activity"] = activity;
+  resp["active_slots"] = active_slots;
+  resp["total_slots"] = sessions.size();
+  resp["model"] = b.model_id();
+  resp["slots"] = std::move(slot_details);
+  return Ok(resp);
+}
+
 /// Context held by in-flight requests across all sessions.
 double KvCacheUsageRatio(const TextGenerationBackend& b) {
   const auto sessions = b.session_states();
@@ -1885,6 +1942,10 @@ void HttpServer::register_routes() {
   add("GET", "/props", LlamaProps);
   add("GET", "/slots", LlamaSlots);
   add("GET", "/v1/slots", LlamaSlots);
+  add("GET", "/status", ServerStatus);
+  add("GET", "/v1/status", ServerStatus);
+  add("GET", "/busy", ServerStatus);
+  add("GET", "/v1/busy", ServerStatus);
   add("GET", "/metrics", LlamaMetrics);
   add("GET", "/v1/metrics", LlamaMetrics);
 
@@ -2140,7 +2201,34 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       return DeviceLost();
     json::Value body = json::Value::object();
     body["status"] = "ok";
+    if (backend_ != nullptr) {
+      const auto sessions = backend_->session_states();
+      std::size_t active = 0;
+      for (const auto& s : sessions) {
+        if (s.processing)
+          ++active;
+      }
+      body["busy"] = (active > 0);
+      body["active_slots"] = active;
+      body["total_slots"] = sessions.size();
+    }
     return Ok(body);
+  }
+  if (req.method == "GET" &&
+      (req.path == "/status" || req.path == "/v1/status" ||
+       req.path == "/busy" || req.path == "/v1/busy")) {
+    if (device_lost())
+      return DeviceLost();
+    if (backend_ == nullptr) {
+      json::Value body = json::Value::object();
+      body["status"] = "not_ready";
+      body["busy"] = false;
+      body["activity"] = "idle";
+      body["active_slots"] = 0;
+      body["total_slots"] = 0;
+      return Ok(body);
+    }
+    return ServerStatus(req, *backend_);
   }
   if (req.method == "GET" && (req.path == "/ready" || req.path == "/v1/ready" ||
                               req.path == "/readyz")) {

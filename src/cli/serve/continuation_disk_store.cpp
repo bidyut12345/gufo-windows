@@ -734,7 +734,7 @@ struct ContinuationDiskStore::Impl {
     }
     const auto limit =
         std::min(options.capacity_bytes, options.staging_capacity_bytes);
-    if (bytes > limit || used > limit - bytes) {
+    if (used > 0 && (bytes > limit || used > limit - bytes)) {
       Emit(ContinuationDiskEventAction::kSkipped,
            ContinuationDiskEventReason::kStagingCapacity, bytes, payload_bytes,
            token_count, 0.0, used);
@@ -790,9 +790,9 @@ struct ContinuationDiskStore::Impl {
       *file_bytes = static_cast<std::size_t>(status.st_size);
     if (status.st_size <= 0 ||
         static_cast<std::uint64_t>(status.st_size) >
-            static_cast<std::uint64_t>(options.staging_capacity_bytes)) {
+            static_cast<std::uint64_t>(options.capacity_bytes)) {
       *failure_reason = status.st_size > 0
-                            ? ContinuationDiskEventReason::kStagingCapacity
+                            ? ContinuationDiskEventReason::kByteCapacity
                             : ContinuationDiskEventReason::kCorrupt;
       return false;
     }
@@ -1202,12 +1202,6 @@ struct ContinuationDiskStore::Impl {
       file_bytes = CheckedFileBytes(
           descriptor.persistence->compatibility_identity.size(),
           checkpoint_tokens.size(), payload_bytes);
-      if (file_bytes > options.staging_capacity_bytes) {
-        Emit(ContinuationDiskEventAction::kSkipped,
-             ContinuationDiskEventReason::kStagingCapacity, file_bytes,
-             payload_bytes, checkpoint_tokens.size());
-        return {};
-      }
       if (file_bytes > options.capacity_bytes) {
         Emit(ContinuationDiskEventAction::kSkipped,
              ContinuationDiskEventReason::kByteCapacity, file_bytes,

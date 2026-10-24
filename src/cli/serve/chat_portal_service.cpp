@@ -988,7 +988,14 @@ HttpResponse ChatPortalService::Handle(const HttpRequest& req,
         json::Value out = json::Value::object();
         out["success"] = res.success;
         out["output"] = res.output;
-        out["result"] = res.output.empty() ? res.error : res.output;
+        // Keep both output and the failure reason (e.g. exit code) in the
+        // result so the model can read the error and keep working.
+        std::string result = res.output;
+        if (!res.error.empty() && (result.empty() || !res.success)) {
+          result = result.empty() ? res.error : result + "\n" + res.error;
+        }
+        if (result.empty()) result = res.error;
+        out["result"] = result;
         out["error"] = res.error;
         return JsonOk(out);
       }

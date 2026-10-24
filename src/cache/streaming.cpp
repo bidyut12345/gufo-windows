@@ -781,9 +781,14 @@ bool PersistenceQueue::TrySubmit(PersistenceJob job) {
   }
   const auto released =
       replacement == impl_->pending.end() ? 0 : (*replacement)->pinned_bytes_;
+  const auto effective_pending =
+      impl_->stats.pending - (replacement != impl_->pending.end() ? 1 : 0);
+  const auto remaining_budget =
+      impl_->max_bytes > (impl_->stats.pinned_bytes - released)
+          ? impl_->max_bytes - (impl_->stats.pinned_bytes - released)
+          : 0;
   if ((impl_->stats.pending == impl_->pending.size() && !released) ||
-      job.pinned_bytes_ >
-          impl_->max_bytes - (impl_->stats.pinned_bytes - released)) {
+      (effective_pending > 0 && job.pinned_bytes_ > remaining_budget)) {
     ++impl_->stats.skipped;
     return false;
   }

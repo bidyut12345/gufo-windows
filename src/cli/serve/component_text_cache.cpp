@@ -1413,8 +1413,7 @@ bool ComponentTextCache::Lease::TryReserveSnapshot(
     std::size_t bytes, std::size_t boundary, bool preserve,
     SnapshotPurpose purpose, std::span<const ContinuationToken> tokens) {
   if (!boundary || boundary > impl_->prompt.size() ||
-      (bytes > impl_->cache->budget &&
-       (!impl_->cache->queue || purpose == SnapshotPurpose::kHistory)))
+      (bytes > impl_->cache->budget && !impl_->cache->queue))
     return false;
   impl_->capture_boundary = boundary;
   if (tokens.empty())

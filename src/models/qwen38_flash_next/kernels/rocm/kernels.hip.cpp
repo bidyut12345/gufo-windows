@@ -8306,14 +8306,6 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
   // (8.8 to 7.9 ms at 4,096 tokens). One K block per LDS stage halves the
   // stage to 24 KB, so three blocks share a WGP instead of two (7.8 to
   // 7.3 ms); the K order is unchanged.
-  if (yarn.enabled != 0) {
-    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false,
-                                           true, false, false, false, true>),
-                       dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0,
-                       stream, weights, input, nullptr, n_tokens, 13312, 2560,
-                       nullptr, nullptr, nullptr, nullptr, nullptr, output);
-    return true;
-  }
   hipLaunchKernelGGL(
       (DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false, true>),
       dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,

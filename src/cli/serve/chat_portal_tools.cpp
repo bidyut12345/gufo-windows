@@ -831,11 +831,11 @@ ToolExecutionResult ToolEngine::Execute(const std::string& name,
 
     std::string full_cmd;
 #if defined(_WIN32)
-    full_cmd = "cmd.exe /c \"";
-    if (!cwd.empty()) {
-      full_cmd += "cd /D \"" + cwd + "\" && ";
-    }
-    full_cmd += command + "\" 2>&1";
+    // _popen() already executes the string via `cmd.exe /c <string>`. Wrapping
+    // it in a second cmd.exe /c "..." and appending 2>&1 outside the closing
+    // quote mangles any command containing quotes, pipes or parentheses.
+    full_cmd = "cd /D \"" + cwd + "\" && ";
+    full_cmd += command + " 2>&1";
     FILE* pipe = _popen(full_cmd.c_str(), "r");
 #else
     full_cmd = "";
