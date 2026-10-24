@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_TEXT_GENERATION_BACKEND_HPP_
 #define GUFO_SERVER_TEXT_GENERATION_BACKEND_HPP_
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -290,6 +291,14 @@ public:
   TextGenerationBackend& operator=(TextGenerationBackend&&) = delete;
 
   [[nodiscard]] virtual std::string model_id() const = 0;
+  /// Every name requests may select this model by, model_id() first.
+  [[nodiscard]] virtual std::vector<std::string> model_ids() const {
+    return {model_id()};
+  }
+  [[nodiscard]] bool serves_model(std::string_view name) const {
+    const auto names = model_ids();
+    return std::ranges::find(names, name) != names.end();
+  }
   [[nodiscard]] virtual bool ready() const = 0;
   /// True once a failed generation showed that the execution device can no
   /// longer run work, for example after a GPU reset. The loss is permanent.

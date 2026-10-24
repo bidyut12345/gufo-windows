@@ -2,9 +2,7 @@
 
 #include <curl/curl.h>
 #include <jpeglib.h>
-#include <netinet/in.h>
 #include <png.h>
-#include <sys/socket.h>
 #include <webp/decode.h>
 
 #include <algorithm>
@@ -16,6 +14,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+
+#include "src/core/platform/socket.hpp"
 
 namespace gufo::core {
 namespace {
@@ -537,7 +537,8 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
         }
         if (!IsPublicImageAddress(ip))
           return CURL_SOCKET_BAD;
-        return ::socket(endpoint->family, endpoint->socktype | SOCK_CLOEXEC,
+        return ::socket(endpoint->family,
+                        endpoint->socktype | platform::kSocketCloexec,
                         endpoint->protocol);
       });
   struct Download {

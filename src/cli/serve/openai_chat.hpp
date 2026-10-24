@@ -44,12 +44,13 @@ bool ParseAnthropicToolMessage(const json::Value& item,
                                std::string* error);
 /// Responses text output uses the same reasoning/UTF-8 filter and scheduler
 /// as Chat Completions, including streaming cancellation and cache retention.
+/// `model` is the served name to report; empty reports the primary name.
 HttpResponse CreateOpenAiResponse(const HttpRequest& request,
                                   TextGenerationBackend& backend,
                                   const ChatRequest& chat,
                                   std::size_t max_tokens,
                                   const sampling::SamplingConfig& sampling,
-                                  bool stream);
+                                  bool stream, std::string_view model = {});
 /// Messages output through the same path: content blocks when buffered,
 /// Anthropic SSE events when streamed.
 HttpResponse CreateAnthropicMessage(const HttpRequest& request,
@@ -57,7 +58,7 @@ HttpResponse CreateAnthropicMessage(const HttpRequest& request,
                                     const ChatRequest& chat,
                                     std::size_t max_tokens,
                                     const sampling::SamplingConfig& sampling,
-                                    bool stream);
+                                    bool stream, std::string_view model = {});
 
 }  // namespace gufo::server
 

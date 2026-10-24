@@ -35,6 +35,10 @@ void CloseSocket(Socket socket) noexcept {
 #endif
 }
 
+Socket CreateStreamSocket(int address_family) noexcept {
+  return ::socket(address_family, SOCK_STREAM, 0);
+}
+
 int PollSocket(void* descriptors, std::uint32_t count, int timeout_ms) {
 #if defined(_WIN32)
   return WSAPoll(static_cast<WSAPOLLFD*>(descriptors), count, timeout_ms);
@@ -68,6 +72,29 @@ bool SetNonBlocking(Socket socket) noexcept {
   if (flags < 0)
     return false;
   return ::fcntl(socket, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+}
+
+std::intptr_t Receive(Socket socket, void* data, std::size_t bytes,
+                      int flags) noexcept {
+#if defined(_WIN32)
+  // Winsock's recv takes an int length; clamp each call so oversized reads
+  // narrow safely.
+  const int chunk = static_cast<int>(std::min<std::size_t>(
+      bytes, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+  return ::recv(socket, static_cast<char*>(data), chunk, flags);
+#else
+  return ::recv(socket, data, bytes, flags);
+#endif
+}
+
+bool ShutdownSocket(Socket socket, ShutdownHow how) noexcept {
+#if defined(_WIN32)
+  return ::shutdown(socket, how == ShutdownHow::kWrite ? SD_SEND : SD_BOTH) ==
+         0;
+#else
+  return ::shutdown(socket, how == ShutdownHow::kWrite ? SHUT_WR : SHUT_RDWR) ==
+         0;
 #endif
 }
 

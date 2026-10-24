@@ -94,6 +94,9 @@ private:
 class FakeBackend final : public gufo::server::TextGenerationBackend {
 public:
   [[nodiscard]] std::string model_id() const override { return "test-model"; }
+  [[nodiscard]] std::vector<std::string> model_ids() const override {
+    return names;
+  }
   [[nodiscard]] bool ready() const override { return true; }
   [[nodiscard]] SamplingDefaults sampling_defaults() const override {
     return defaults;
@@ -214,6 +217,7 @@ public:
     condition.notify_all();
   }
 
+  std::vector<std::string> names{"test-model"};
   std::vector<std::string> pieces;
   std::vector<PromptProgress> progress;
   std::optional<gufo::sampling::JsonConstraint::ToolFormat> tool_format;
@@ -1860,18 +1864,11 @@ void TestUnsupportedSamplingControlsAreRejected() {
     Expect(gufo::server::HandleOpenAiChat(request, backend).status == 400,
            "n must be exactly one, without truncation or overflow");
   }
-  for (const auto* field : {"draft_temperature",  "temperature_draft",
-                            "draft_top_k",        "draft_top_p",
-                            "draft_min_p",        "draft_seed",
-                            "draft_policy",       "samplers",
-                            "typical_p",          "tfs_z",
-                            "mirostat",           "mirostat_eta",
-                            "mirostat_tau",       "dynatemp_range",
-                            "dynatemp_exponent",  "xtc_probability",
-                            "xtc_threshold",      "dry_multiplier",
-                            "dry_base",           "dry_allowed_length",
-                            "dry_penalty_last_n", "dry_sequence_breakers",
-                            "top_n_sigma",        "logit_bias"}) {
+  for (const auto* field :
+       {"draft_temperature", "temperature_draft", "draft_top_k", "draft_top_p",
+        "draft_min_p", "draft_seed", "draft_policy", "samplers", "typical_p",
+        "mirostat", "dynatemp_range", "xtc_probability", "dry_multiplier",
+        "top_n_sigma", "logit_bias", "xtc_unknown", "dry_unknown"}) {
     auto request = Request(
         R"({"model":"test-model","messages":[{"role":"user","content":"hello"}]})");
     auto body = gufo::json::parse(request.body);
@@ -1923,6 +1920,106 @@ void TestUnsupportedSamplingControlsAreRejected() {
                         {"role":"user","content":"again"}]})");
     Expect(gufo::server::HandleOpenAiChat(request, backend).status == 200,
            "null tools, tool_choice and tool_calls mean absent");
+  }
+}
+
+// llama.cpp sampler fields gufo does not implement are accepted when absent,
+// null or neutral (the llama.cpp chain is unchanged) and rejected when they
+// would activate the sampler (#720).
+void TestNeutralLlamaSamplerFields() {
+  FakeBackend baseline;
+  const auto plain = Request(
+      R"({"model":"test-model","messages":[{"role":"user","content":"hello"}]})");
+  Expect(gufo::server::HandleOpenAiChat(plain, baseline).status == 200,
+         "plain sampling request is accepted");
+  const auto run = [&](std::string_view fields) {
+    FakeBackend backend;
+    auto request = plain;
+    auto body = gufo::json::parse(request.body);
+    const auto extra = gufo::json::parse(std::string(fields));
+    for (const auto& [field, value] : extra.members()) {
+      body[field] = value;
+    }
+    request.body = body.dump();
+    auto response = gufo::server::HandleOpenAiChat(request, backend);
+    if (response.status == 200) {
+      Expect(backend.last_sampling.temperature ==
+                     baseline.last_sampling.temperature &&
+                 backend.last_sampling.top_k == baseline.last_sampling.top_k &&
+                 backend.last_sampling.top_p == baseline.last_sampling.top_p,
+             std::string("neutral fields changed sampling: ") +
+                 std::string(fields));
+    }
+    return response;
+  };
+  for (const auto* fields : {
+           // Open WebUI 0.12 payloads.
+           R"({"mirostat":0,"mirostat_eta":0.1,"mirostat_tau":5.0})",
+           R"({"mirostat":0,"mirostat_eta":0,"mirostat_tau":0})",
+           R"({"mirostat":-1})",
+           R"({"mirostat_tau":5.0})",
+           R"({"typical_p":1.0})",
+           R"({"typical_p":1.5})",
+           R"({"tfs_z":0.5})",
+           R"({"dynatemp_range":0,"dynatemp_exponent":2})",
+           R"({"dynatemp_range":-1})",
+           R"({"top_n_sigma":0})",
+           R"({"top_n_sigma":-1})",
+           R"({"xtc_probability":0,"xtc_threshold":0.1})",
+           R"({"xtc_probability":0.5,"xtc_threshold":0.51})",
+           R"({"xtc_probability":-0.5})",
+           R"({"xtc_threshold":0.3})",
+           R"({"dry_multiplier":0,"dry_base":1.75,"dry_allowed_length":2,)"
+           R"("dry_penalty_last_n":64,"dry_sequence_breakers":["\n"]})",
+           R"({"dry_multiplier":0.8,"dry_penalty_last_n":0})",
+           R"({"dry_base":0.5})",
+           R"({"mirostat":null,"mirostat_tau":null,"mirostat_eta":null,)"
+           R"("typical_p":null,"tfs_z":null,"dynatemp_range":null,)"
+           R"("dynatemp_exponent":null,"top_n_sigma":null,)"
+           R"("xtc_probability":null,"xtc_threshold":null,)"
+           R"("dry_multiplier":null,"dry_base":null,)"
+           R"("dry_allowed_length":null,"dry_penalty_last_n":null,)"
+           R"("dry_sequence_breakers":null})",
+       }) {
+    const auto response = run(fields);
+    Expect(response.status == 200,
+           std::string("neutral llama.cpp sampler fields are accepted: ") +
+               fields);
+  }
+  for (const auto* fields : {
+           R"({"mirostat":1})",
+           R"({"mirostat":2,"mirostat_tau":5.0})",
+           R"({"typical_p":0.99})",
+           R"({"dynatemp_range":0.5})",
+           R"({"top_n_sigma":1})",
+           R"({"xtc_probability":0.5})",
+           R"({"xtc_probability":0.5,"xtc_threshold":0.5})",
+           R"({"xtc_probability":2,"xtc_threshold":-1})",
+           R"({"dry_multiplier":0.8})",
+           R"({"dry_multiplier":0.8,"dry_penalty_last_n":1})",
+           R"({"dry_multiplier":-0.8,"dry_base":0.5})",
+       }) {
+    const auto response = run(fields);
+    Expect(response.status == 400 &&
+               response.body.find("unsupported_sampling") != std::string::npos,
+           std::string("active llama.cpp samplers are rejected: ") + fields);
+  }
+  for (const auto* fields : {
+           R"({"mirostat":"0"})",
+           R"({"tfs_z":true})",
+           R"({"mirostat_eta":[0.1]})",
+           R"({"dry_allowed_length":-1})",
+           R"({"dry_penalty_last_n":2147483648})",
+           R"({"dry_penalty_last_n":1.5})",
+           R"({"dry_sequence_breakers":[]})",
+           R"({"dry_sequence_breakers":[1]})",
+           R"({"dry_sequence_breakers":"\n"})",
+       }) {
+    const auto response = run(fields);
+    Expect(response.status == 400 &&
+               response.body.find("invalid_sampling") != std::string::npos,
+           std::string("malformed llama.cpp sampler fields are rejected: ") +
+               fields);
   }
 }
 
@@ -2269,6 +2366,39 @@ void TestWrongModelIsRejected() {
          "Rejected request never reaches the backend");
 }
 
+void TestServedModelNamesAreEchoed() {
+  FakeBackend backend;
+  backend.names = {"test-model", "additional"};
+  backend.pieces = {"ok"};
+  for (const std::string model : {"test-model", "additional"}) {
+    for (const bool stream : {false, true}) {
+      auto response = gufo::server::HandleOpenAiChat(
+          Request(
+              R"({"model":")" + model +
+              R"(","messages":[{"role":"user","content":"hello"}],"stream":)" +
+              (stream ? "true}" : "false}")),
+          backend);
+      Expect(response.status == 200, "Every served model name is accepted");
+      std::string body = response.body;
+      if (stream)
+        response.streaming_body([&](std::string_view chunk) {
+          body.append(chunk);
+          return true;
+        });
+      Expect(body.find(R"("model":")" + model + R"(")") != std::string::npos,
+             "The response names the model the request selected");
+    }
+  }
+  backend.names = {"test-model"};
+  const auto response = gufo::server::HandleOpenAiChat(
+      Request(
+          R"({"model":"additional","messages":[{"role":"user","content":"hi"}]})"),
+      backend);
+  Expect(response.status == 404 &&
+             response.body.find("model_not_found") != std::string::npos,
+         "A single served name accepts nothing else");
+}
+
 void TestClientIdentityReachesBackend() {
   FakeBackend backend;
   backend.pieces = {"ok"};
@@ -2335,10 +2465,22 @@ void TestImagePartsRetainOrderAndIdentity() {
   for (
       const auto* body :
       {R"({"messages":[{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}]}]})",
-       R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":"low"}}]}]})",
+       R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":"ultra"}}]}]})",
+       R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":1}}]}]})",
        R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///tmp/image.png"}}]}]})"}) {
     Expect(gufo::server::HandleOpenAiChat(Request(body), backend).status == 400,
            "unsupported image role, policy and URL are rejected");
+  }
+  // Codex sends "high" from view_image; every standard value behaves as auto.
+  for (const std::string detail : {"auto", "low", "high", "original"}) {
+    const auto accepted = gufo::server::HandleOpenAiChat(
+        Request(
+            R"({"model":"test-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":")" +
+            detail + R"("}}]}]})"),
+        backend);
+    Expect(accepted.status == 200 &&
+               backend.last_request.messages.front().images.size() == 1,
+           "standard image detail values are accepted as auto");
   }
 }
 
@@ -2493,7 +2635,7 @@ void TestToolImagesRetainOrderAndIdentity() {
   }
   for (const auto* image :
        {R"({"url":17})",
-        R"({"url":"data:image/png;base64,AQID","detail":"high"})",
+        R"({"url":"data:image/png;base64,AQID","detail":"ultra"})",
         R"({"url":"file:///tmp/image.png"})",
         R"({"url":"data:image/png;base64,A==="})"}) {
     auto part = parse(R"({"type":"image_url"})");
@@ -6355,6 +6497,7 @@ int main() {
   TestFlatToolFieldsReachTemplate();
   TestAllSamplingControlsReachBackend();
   TestUnsupportedSamplingControlsAreRejected();
+  TestNeutralLlamaSamplerFields();
   TestSamplingRanges();
   TestAssistantReasoningContentReachesBackend();
   TestPiReasoningControlsAndOutputFraming();
@@ -6381,6 +6524,7 @@ int main() {
   TestDeepSeekSchemaCheckedArguments();
   TestStreamingStopsAtRejectedParameter();
   TestWrongModelIsRejected();
+  TestServedModelNamesAreEchoed();
   TestClientIdentityReachesBackend();
   TestStreamingOverloadIsRejectedBeforeHeaders();
   TestImagePartsRetainOrderAndIdentity();

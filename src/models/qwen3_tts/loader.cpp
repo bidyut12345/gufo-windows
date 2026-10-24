@@ -1,10 +1,5 @@
 #include "src/models/qwen3_tts/loader.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +12,7 @@
 #include <utility>
 
 #include "src/core/json.hpp"
+#include "src/core/platform/mapped_file.hpp"
 
 namespace gufo::models::qwen3_tts {
 namespace {
@@ -44,38 +40,32 @@ public:
     return *this;
   }
 
+  [[nodiscard]] const std::string& open_error() const noexcept {
+    return open_error_;
+  }
+
   void* base() const { return base_; }
   std::size_t size() const { return size_; }
 
-  /// Maps the file read-only. Returns false on failure.
-  bool Open(const std::string& path) {
-    struct stat status{};
-    if (stat(path.c_str(), &status) != 0 || status.st_size <= 0) {
+  /// Maps the file read-only. Returns false on failure; the reason is
+  /// then available through open_error().
+  bool Open(const std::filesystem::path& path) {
+    if (!mapped_.Open(path, platform::MapHint::kNone, &open_error_))
       return false;
-    }
-    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-      return false;
-    }
-    void* mapped = mmap(nullptr, static_cast<std::size_t>(status.st_size),
-                        PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (mapped == MAP_FAILED) {
-      return false;
-    }
-    base_ = mapped;
-    size_ = static_cast<std::size_t>(status.st_size);
+    base_ = mapped_.data;
+    size_ = mapped_.size;
     return true;
   }
 
 private:
   void Unmap() {
-    if (base_ != nullptr) {
-      munmap(base_, size_);
-      base_ = nullptr;
-    }
+    mapped_.Close();
+    base_ = nullptr;
+    size_ = 0;
   }
 
+  platform::RawMappedFile mapped_;
+  std::string open_error_;
   void* base_ = nullptr;
   std::size_t size_ = 0;
 };
@@ -114,11 +104,14 @@ std::uint64_t ReadLE64(const std::byte* p) {
 
 /// Parses one safetensors file, adding tensors to `store`.
 /// Adds a ownership mapping to `mappings` if the file is usable.
-bool LoadSafetensorsFile(const std::string& path, TensorStore* store,
+bool LoadSafetensorsFile(const std::filesystem::path& path, TensorStore* store,
                          std::vector<std::shared_ptr<void>>* mappings,
-                         std::vector<MappedRegion>* mapped_regions) {
+                         std::vector<MappedRegion>* mapped_regions,
+                         std::string* error) {
   auto mapped = std::make_shared<MappedFile>();
   if (!mapped->Open(path) || mapped->size() < 8U) {
+    if (error != nullptr && !mapped->open_error().empty())
+      *error = "cannot open " + path.string() + ": " + mapped->open_error();
     return false;
   }
   const auto* bytes = static_cast<const std::byte*>(mapped->base());
@@ -196,8 +189,8 @@ std::vector<MappedRegion> LoadResult::RegionsFor(
   std::vector<MappedRegion> result;
   if (!store)
     return result;
-  const auto page_size = sysconf(_SC_PAGESIZE);
-  if (page_size <= 0 || page_size % 16 != 0)
+  const auto page_size = platform::SystemPageSize();
+  if (page_size % 16 != 0)
     throw std::runtime_error("TTS cannot determine mapped weight alignment");
   for (const auto& region : mapped_regions) {
     std::size_t begin = region.size, end = 0;
@@ -241,18 +234,24 @@ LoadResult LoadModelDirectory(const std::string& model_dir) {
   }
 
   const std::filesystem::path root(model_dir);
-  if (!LoadSafetensorsFile((root / "model.safetensors").string(),
-                           result.store.get(), &result.mappings,
-                           &result.mapped_regions)) {
+  std::string load_error;
+  if (!LoadSafetensorsFile(root / "model.safetensors", result.store.get(),
+                           &result.mappings, &result.mapped_regions,
+                           &load_error)) {
     result.error =
         "qwen3_tts: cannot load " + (root / "model.safetensors").string();
+    if (!load_error.empty())
+      result.error += ": " + load_error;
     return result;
   }
   const std::filesystem::path speech_weights =
       root / "speech_tokenizer" / "model.safetensors";
-  if (!LoadSafetensorsFile(speech_weights.string(), result.store.get(),
-                           &result.mappings, &result.mapped_regions)) {
+  load_error.clear();
+  if (!LoadSafetensorsFile(speech_weights, result.store.get(), &result.mappings,
+                           &result.mapped_regions, &load_error)) {
     result.error = "qwen3_tts: cannot load " + speech_weights.string();
+    if (!load_error.empty())
+      result.error += ": " + load_error;
     return result;
   }
   result.ok = true;

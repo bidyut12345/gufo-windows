@@ -12,7 +12,7 @@ Q6_K's, so the added rounding is small, but it is not bit-identical).
 `qwen38_flash_next_iq_experts_ops_test` checks those expert paths against a
 double-precision reference.
 
-[Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md)
+[Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [ROCm 10.1 status](ROCM.md)
 
 ## Load and run
 
@@ -39,9 +39,11 @@ fall outside this vocabulary.
 
 Single-session sampling, including the default thinking-on and thinking-off
 presets, can use this smaller head with the existing acceptance/length
-controller and AR backoff. Greedy requests without penalties or constraints
-can use it in C1 and jointly planned batches. Greedy penalties/constraints and
-unplanned C>1 requests retain the full head.
+controller and AR backoff. Greedy requests, including penalties and
+constraints, can use it in C1, when decoding alone and in jointly planned
+batches; drafts ignore both, and verification applies them over the full
+vocabulary. Greedy requests in unplanned multi-request batches retain the full
+head.
 
 The existing length controller and AR backoff apply to every request. The
 target always verifies with its full vocabulary, including

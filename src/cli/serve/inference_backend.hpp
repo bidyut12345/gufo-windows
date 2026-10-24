@@ -143,6 +143,7 @@ public:
 
   /// Stable model identifier used in API responses.
   [[nodiscard]] std::string model_id() const override;
+  [[nodiscard]] std::vector<std::string> model_ids() const override;
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] bool device_lost() const override;
   [[nodiscard]] bool supports_images() const override;
@@ -154,7 +155,8 @@ public:
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;
-  void set_model_id(const std::string& model_id);
+  /// The first name is primary; the rest are additional served names.
+  void set_model_ids(std::vector<std::string> model_ids);
   void set_served_artifact(const std::string& model_path,
                            const std::string& build_info);
   void set_sampling_defaults(std::size_t max_tokens,

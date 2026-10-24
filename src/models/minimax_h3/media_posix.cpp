@@ -1,5 +1,3 @@
-#include "src/models/minimax_h3/media.hpp"
-
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -22,6 +20,8 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "src/models/minimax_h3/media.hpp"
 
 #ifndef GUFO_FFMPEG_EXECUTABLE
 #define GUFO_FFMPEG_EXECUTABLE "ffmpeg"

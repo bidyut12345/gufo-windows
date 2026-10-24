@@ -54,7 +54,7 @@ struct SessionSnapshotHeader {
   std::uint32_t image_identity_bytes;
   std::uint32_t policy_concurrency;
   std::uint32_t reserved{0};
-  PromptLookup::State lookup;
+  speculative::PromptLookup<>::State lookup;
 };
 static_assert(std::is_trivially_copyable_v<SessionSnapshotHeader>);
 
@@ -578,7 +578,7 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot draft policy is invalid");
     return false;
   }
-  if (!PromptLookup::Valid(header.lookup, header.token_count)) {
+  if (!speculative::PromptLookup<>::Valid(header.lookup, header.token_count)) {
     AssignError(error_msg, "session snapshot prompt-lookup state is invalid");
     return false;
   }
@@ -604,10 +604,17 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   valid_ = false;
   rocm::Executor::SnapshotInfo info;
   const auto remaining = ContextSize() - header.token_count;
-  const auto next_drafts =
-      MtpEnabled() ? restored_policy.Choose(remaining ? remaining - 1 : 0,
-                                            header.token_count)
-                   : 0;
+  auto next_drafts = MtpEnabled()
+                         ? restored_policy.Choose(remaining ? remaining - 1 : 0,
+                                                  header.token_count)
+                         : 0;
+  if (MtpEnabled() && model_->draft_subset_) {
+    // The next request's sampler/head is not known yet. Avoid discarding
+    // existing scratch that either eligible policy can use after restore.
+    next_drafts = std::max(next_drafts,
+                           restored_policy.Choose(remaining ? remaining - 1 : 0,
+                                                  header.token_count, 0, true));
+  }
   if (!model_->executor_->RestoreSnapshot(
           *session_,
           std::span<const std::uint8_t>(
@@ -1024,6 +1031,7 @@ struct Session::PendingDecode {
   MtpCandidateLogits candidates;
   std::int32_t draft{0};
   bool draft_subset{false};  ///< this cycle drafts through the subset head
+  bool sampled_subset_cost{false};
   /// Trailing chain tokens copied by prompt lookup (after the MTP drafts).
   std::uint32_t lookup{0};
   /// Committed index the copied tokens were taken from.
@@ -1053,11 +1061,11 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
   if (stop_at_eos && model_->IsStopToken(pending.chain.back())) {
     return false;
   }
-  const auto match =
-      lookup_.Find(tokens_, pending.chain,
-                   pending.sampled ? PromptLookup::kSampledMinMatch
-                                   : PromptLookup::kMinMatch,
-                   require_resume);
+  const auto match = lookup_.Find(
+      tokens_, pending.chain,
+      pending.sampled ? speculative::PromptLookup<>::kSampledMinMatch
+                      : speculative::PromptLookup<>::kMinMatch,
+      require_resume);
   if (match.length == 0) {
     return false;
   }
@@ -1114,17 +1122,14 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t room = ContextSize() - tokens_.size();
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
-  const auto concurrency = model_->DecodeConcurrency();
   // Head eligibility is MtpDraftSubsetAllowed. Sampled cohorts are never
   // jointly planned (DecodeBatchImpl), so a sampled request decides the same
-  // way alone and in any batch. Every request keeps the established length
-  // controller and AR backoff.
-  const bool unmodified = !sampler.config().uses_random_sampling() &&
-                          !sampler.config().penalties_enabled() &&
-                          !sampler.config().constraint;
-  const bool allow_subset =
-      MtpDraftSubsetAllowed(sampler.config().uses_random_sampling(), unmodified,
-                            concurrency, batch_drafts.has_value());
+  // way alone and in any batch. A greedy request decoding alone has no
+  // peers to delay, so it drafts as on one session. Every request keeps the
+  // established length controller and AR backoff.
+  const bool allow_subset = MtpDraftSubsetAllowed(
+      sampler.config().uses_random_sampling(), model_->DecodeConcurrency(),
+      occupancy, batch_drafts.has_value());
   pending->policy_concurrency = MtpPolicyConcurrency(
       sampler.config().uses_random_sampling(), sampler.config().seed >= 0,
       batch_drafts.has_value(), occupancy);
@@ -1218,7 +1223,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   // Both execution paths use the same request-local copy rule. Scheduling
   // a peer must not change a sampled request's proposals or RNG sequence.
-  // A request's first speculative step copies nothing (see PromptLookup).
+  // A request's first speculative step copies nothing (see
+  // speculative::PromptLookup<>).
   pending->lookup_cap =
       (model_->options_.prompt_lookup && lookup_.Step(base)) ? cap : 0;
   if (pending->lookup_cap != 0) {
@@ -1237,6 +1243,20 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                           draft_vocab_.Fits(anchor, [&](std::int32_t token) {
                             return model_->InDraftSubset(token);
                           });
+  // Wider verification slowed short resumed replies in matched controls.
+  // Keep the established costs within two blocks of the remaining budget.
+  // Full target rows (for example, active tool constraints) also keep their
+  // original costs; the smaller-head curve does not price their transfers.
+  pending->sampled_subset_cost =
+      sampled && gpu_verification && pending->draft_subset &&
+      std::min(max_tokens, room) > 2 * exec.max_speculative();
+  if (pending->sampled_subset_cost && !batch_drafts) {
+    // Price the head actually used, after vocabulary fallback and the copy
+    // bypass. The policy depends only on committed history, not timings.
+    pending->width =
+        1 + draft_length_.Choose(static_cast<std::uint32_t>(cap - 1), base,
+                                 pending->policy_concurrency, true);
+  }
   if (!defer_head && !DraftCatchUp(anchor, true, error_msg,
                                    sampled ? &pending->candidates : nullptr,
                                    pending->draft_subset)) {
@@ -1244,7 +1264,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   pending->draft = draft_token_;
   if (!defer_head) {
-    while (pending->chain.size() < width) {
+    while (pending->chain.size() < pending->width) {
       AppendDraft(*pending);
       if (stop_at_eos && model_->IsStopToken(pending->chain.back())) {
         pending->width = pending->chain.size();
@@ -1261,7 +1281,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
           break;
         }
       }
-      if (pending->chain.size() < width &&
+      if (pending->chain.size() < pending->width &&
           !exec.MtpForward(
               *session_, std::span<const std::int32_t>(&pending->draft, 1), -1,
               {.token = sampled ? nullptr : &pending->draft,
@@ -1439,9 +1459,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const std::uint32_t observed = mtp_all ? keep - 1 : mtp_accepted;
   // A target stop ends the request; it does not classify the remaining
   // proposals as failed predictions.
-  draft_length_.Observe(observed,
-                        result->stop || mtp_all ? observed : mtp_drafts, base,
-                        pending.policy_concurrency);
+  draft_length_.Observe(
+      observed, result->stop || mtp_all ? observed : mtp_drafts, base,
+      pending.policy_concurrency, pending.sampled_subset_cost);
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
@@ -1544,7 +1564,7 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
   std::array<BatchOutcome, 8> outcomes{};
   std::array<std::uint64_t, 8> epochs{};
   std::array<sampling::SamplerState::DrawState, 8> draws{};
-  std::array<PromptLookup::State, 8> lookup_states{};
+  std::array<speculative::PromptLookup<>::State, 8> lookup_states{};
   std::vector<Request> active;
   active.reserve(requests.size());
   Model* model = nullptr;

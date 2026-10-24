@@ -190,6 +190,12 @@ inline int SetSocketTimeout(int fd, int name,
 #endif
 }
 
+#ifdef _WIN32
+inline constexpr int kSocketCloexec = 0;
+#else
+inline constexpr int kSocketCloexec = SOCK_CLOEXEC;
+#endif
+
 }  // namespace gufo::platform
 
 #endif  // GUFO_CORE_PLATFORM_SOCKET_HPP_

@@ -1,7 +1,5 @@
 #include "src/cli/serve/video_jobs.hpp"
 
-#include <unistd.h>
-
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>

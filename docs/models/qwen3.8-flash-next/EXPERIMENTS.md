@@ -1,5 +1,24 @@
 # Qwen3.8 Flash-Next experiments
 
+## Selector scheduling on newer LLVM (October 23, 2026)
+
+| Experiment | Outcome |
+| --- | --- |
+| Keep one selector query head live on Clang 23 and newer | Retained: full head unrolling causes 304 scalar-register spills with ROCm 10.1's Clang 24; the bounded loop reduces this to 18 and VGPR use from 169 to 164. Neither 10.1 variant uses private scratch; the original Clang 23 build does. The F32 queries, FMA sequence, reduction tree and selected blocks stay unchanged. On Clang 24, the isolated 64-query × 8,192-block scorer falls from 109.3 to 76.3 µs, with identical output bytes. Clang 22 retains its original unrolling. |
+| Reproduce older activation rounding on newer compilers | Rejected: first-layer Q8 codes differ at 37 of 327,680 values; the newer compiler agrees more often with independent FP32 and FP64 calculations. Restoring the old fused remainder matches the first mixer but does not recover sampled thinking throughput. Production rounding and sampling remain unchanged. |
+| Price the actual C1 sampled draft head | Retained with the compact target path: fixed-history measurements replace full-head estimates only for eligible sampled C1 cycles. The first cycle and short tails keep their established costs; the focused short-reply control passes all 84 phases. Full target-row verification also keeps the original curve, removing a thinking/tool pause increase (111 → 120 ms, then 113 ms with the guard; all 63 focused phases pass). Full-head, greedy and concurrent curves stay unchanged. See [migration qualification and timing limits](ROCM.md). |
+
+The scorer measurement is the median of five warmed calls with production
+compiler flags. Full-model and request-level qualification are recorded in
+[quality](QUALITY.md#llvm-selector-scheduling-october-23-2026); the microbenchmark
+percentage is not an end-to-end speedup.
+
+An independent `tools/prof/prof.py` capture of the final pp2048 pass at d32K
+retains all 1,574 launches, including 45 scorer calls. Scoring falls from
+41.25 to 25.86 ms; total GPU time falls from 1203.93 to 1189.16 ms and the
+pass span from 1207.74 to 1192.95 ms. These are diagnostic profiled timings;
+the HTTP table uses separate unprofiled production runs.
+
 ## Exact sampled decode (October 21, 2026)
 
 | Experiment | Outcome |
@@ -8,13 +27,12 @@
 | Compact sampled target verification | Retained for unconstrained top-k/min-keep up to 64 and bounded penalty history. Transfer the exact top 64 unpenalized logits plus every penalized logit, then apply the existing FP64 target sampler. Grammar activation, forced reasoning closure and unsupported settings use full rows. Independent CPU sorting and full-row distributions agree bit for bit, including correction RNG. Complete transfer/selection/sampling costs for 1/3/7 rows: 94.60/273.17/594.92 → 75.84/156.63/323.45 µs. Reconstructing full CPU rows first was exact but slower and was removed. |
 | KV-only predictor catch-up when no proposal is needed | Retained: scalar and uniform cache-only cohorts stop after K/V and indexer updates; mixed cohorts preserve the original row arithmetic. No discarded attention/output/FFN residual is produced in the uniform path. Independent predictor checks and full-logit/RNG/cache replay pass. |
 | Prepare image-capable slots' stable RoPE descriptor before text graphs | Retained after a cancellation/resume control exposed a repeatable 5.8 ms first-token regression. Admission profiling locates 5.61 ms in image-context setup; the first image descriptor invalidated previously captured text graphs. Preparing the empty descriptor at session creation keeps its pointer stable. The same resumed request falls from 9.45–9.46 to 3.71 ms TTFT (main 3.62–3.78), with identical output and faster decode. Other Qwen models retain their existing lazy initialization. |
-| Recalibrate deterministic sampled draft lengths | Rejected after auditing depths 0/4096/32768, C1/2/4/6/8 and widths 1–8 with the actual small sampled head. New-code generation improved 75.27 → 81.57 tok/s, but thinking fell 51.90 → 49.18 and the focused repeat reproduced 51.67 → 49.04. Original policy and cost tables remain. |
+| Recalibrate deterministic sampled draft lengths | Rejected after auditing depths 0/4096/32768, C1/2/4/6/8 and widths 1–8 with the actual small sampled head. New-code generation improved 75.27 → 81.57 tok/s, but thinking fell 51.90 → 49.18 and the focused repeat reproduced 51.67 → 49.04. That global replacement was not retained. |
 | Pack Q8 output waves and vary Q4 expert rows per wave | Rejected. Q8 variants were flat/slower after matching production allocation and rotating weights beyond MALL. Q4 one-row waves changed result bits for a sub-1% gain; exact four/eight-row variants were slower than the existing two-row path. No production GEMV changes retained. |
 | Wider lookup blocks, lookup without a sidecar and Flash-Next DFlash2 | Not retained. Wider blocks need independently qualified decode arithmetic and recurrent rollback beyond eight rows; the AR-only path currently has no speculative reserve. The available DFlash2 fork still needs an audit of its exported proposal probabilities and restore/batch fallback before a lossless port. These are separate implementation projects, not enabled features. |
 
 Matched serving gains are modest: about 1–2.5% for copying and flat ordinary
-coding/thinking. See [the focused comparison](BENCHMARKS.md#sampled-decode-follow-up-october-21)
-and [quality limits](QUALITY.md#exact-sampled-decode-october-21-2026).
+coding/thinking. See [the focused comparison and quality limits](QUALITY.md#exact-sampled-decode-october-21-2026).
 
 ## Mid-size prefill passes (October 21, 2026)
 

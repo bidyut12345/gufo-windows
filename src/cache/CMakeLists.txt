@@ -1,6 +1,7 @@
 add_library(gufo_cache STATIC completion.cpp identity.cpp ledger.cpp checkpoint.cpp prefix_index.cpp slot.cpp retention.cpp disk.cpp disk_catalog.cpp streaming.cpp)
 target_include_directories(gufo_cache PUBLIC ${PROJECT_SOURCE_DIR})
-target_link_libraries(gufo_cache PUBLIC Threads::Threads)
+# disk.cpp consumes the platform leaves.
+target_link_libraries(gufo_cache PUBLIC Threads::Threads gufo_platform)
 if (BUILD_TESTING)
   target_compile_options(gufo_cache PRIVATE -UNDEBUG)
   target_compile_definitions(gufo_cache PUBLIC GUFO_CACHE_TESTING)

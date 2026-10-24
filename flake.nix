@@ -3,6 +3,11 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # ROCm 10.1.0 as rocmPackages_10, on nixos-unstable (gufo-org/nixpkgs
+    # rocm-10.1). Binaries for gfx1151 are on gufo.cachix.org.
+    # Only the rocm10 package and shell use it; the default stays on the
+    # nixpkgs ROCm release.
+    nixpkgs-rocm10.url = "github:gufo-org/nixpkgs/1a6ba8bc6f744f7a843d025e46bc9911b4b6c37d";
     # Reference ASR/TTS runtime for benchmark comparisons; exposes a
     # ROCm gfx1151 package tuned for Strix Halo.
     audio-cpp = {
@@ -11,8 +16,17 @@
     };
   };
 
+  # Prebuilt outputs that cache.nixos.org lacks (patched ROCr, gufo, the
+  # gfx1151 reference builds and the ROCm Python tools).
+  nixConfig = {
+    extra-substituters = [ "https://gufo.cachix.org" ];
+    extra-trusted-public-keys = [
+      "gufo.cachix.org-1:rfZe3n4lHINgyoACKzs5EthIZmBNvEyCCtufUpth0PE="
+    ];
+  };
+
   outputs =
-    { self, nixpkgs, audio-cpp }:
+    { self, nixpkgs, nixpkgs-rocm10, audio-cpp }:
     let
       # Strix Halo is a Linux x86-64-only target (see README non-goals).
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" ];
@@ -31,6 +45,19 @@
       gufoPackages = forAllSystems (
         system:
         pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit revision; }
+      );
+
+      # Evaluation build against ROCm 10.1.0. The whole package set comes from
+      # nixpkgs-rocm10 so glibc, stdenv and the ROCm compiler stay consistent.
+      gufoRocm10 = forAllSystems (
+        system:
+        let
+          pkgsRocm10 = import nixpkgs-rocm10 { inherit system; };
+        in
+        (pkgsRocm10.callPackage ./.devops/nix/scope.nix { inherit revision; }).gufo.override {
+          # Kernel libraries built for gfx1151 only, cached on gufo.cachix.org.
+          rocmPackages = pkgsRocm10.rocmPackages_10.gfx1151;
+        }
       );
 
       llamaReferences = forAllSystems (
@@ -128,6 +155,17 @@
           # Official artifacts select this output from a tagged source. The
           # default package remains visibly developmental on moving branches.
           release = base.override { inherit releaseVersion; };
+          # ROCm 10.1.0 evaluation build; not a release or check input.
+          rocm10 = gufoRocm10.${system};
+          # Windows test binaries of the platform leaves and the CPU cache,
+          # cross-built here and run on a Windows CI host.
+          windows-platform-tests =
+            pkgs.${system}.pkgsCross.mingwW64.callPackage ./.devops/nix/windows-platform-tests.nix
+              {
+                # The build-host ccache from the main package set, which the
+                # binary cache already holds.
+                inherit (pkgs.${system}) ccache;
+              };
           # Optional benchmark packages: excluded from Gufo, the default
           # development shell and hosted checks.
           ds4-reference = pkgs.${system}.callPackage ./.devops/nix/ds4-reference.nix { };
@@ -179,6 +217,30 @@
             '';
           };
 
+          # ROCm 10.1.0 evaluation shell: builds and profiles the rocm10
+          # package. It omits the ROCm torch tools, which would rebuild torch.
+          rocm10 =
+            let
+              pkgsRocm10 = import nixpkgs-rocm10 { inherit system; };
+              gufo = self.packages.${system}.rocm10;
+            in
+            pkgsRocm10.mkShell {
+              inputsFrom = [ gufo ];
+              packages = [
+                gufo.rocmPackages.rocprofiler-sdk
+                pkgsRocm10.python3
+                pkgsRocm10.gdb
+                pkgsRocm10.git
+                pkgsRocm10.ripgrep
+                pkgsRocm10.ccache
+              ];
+              env.LD_LIBRARY_PATH = pkgsRocm10.lib.makeLibraryPath [
+                gufo.rocmRuntime
+                pkgsRocm10.stdenv.cc.cc.lib
+                pkgsRocm10.zlib
+              ];
+              shellHook = self.devShells.${system}.default.shellHook;
+            };
         }
       );
 

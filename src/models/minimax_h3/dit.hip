@@ -1,9 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 
-#include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -20,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/platform/mapped_file.hpp"
 #include "src/models/minimax_h3/attention.hip.hpp"
 #include "src/models/minimax_h3/dense.hip.hpp"
 #include "src/models/minimax_h3/dit.hpp"
@@ -271,9 +270,11 @@ bool LoadWeight(const ModelInventory& inventory,
     return false;
   }
   const std::filesystem::path path = inventory.model_root() / descriptor.shard;
-  const int file = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (file < 0) {
-    SetError(error, "cannot open MiniMax H3 DiT shard " + path.string());
+  std::string open_error;
+  const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
+  if (!platform::FileValid(file)) {
+    SetError(error, "cannot open MiniMax H3 DiT shard " + path.string() + ": " +
+                        open_error);
     return false;
   }
   std::size_t copied = 0;
@@ -287,17 +288,16 @@ bool LoadWeight(const ModelInventory& inventory,
     const std::size_t chunk = std::min(staging_bytes, bytes - copied);
     std::size_t read_bytes = 0;
     while (read_bytes < chunk) {
-      const ssize_t result = pread(
+      const std::size_t result = platform::ReadFileAt(
           file, static_cast<std::byte*>(staging) + read_bytes,
-          chunk - read_bytes,
-          static_cast<off_t>(descriptor.file_offset + copied + read_bytes));
-      if (result <= 0) {
+          chunk - read_bytes, descriptor.file_offset + copied + read_bytes);
+      if (result == 0) {
         SetError(error,
                  "short read loading MiniMax H3 DiT tensor " + descriptor.name);
         success = false;
         break;
       }
-      read_bytes += static_cast<std::size_t>(result);
+      read_bytes += result;
     }
     if (!success) {
       break;
@@ -318,7 +318,7 @@ bool LoadWeight(const ModelInventory& inventory,
     }
     copied += chunk;
   }
-  (void)close(file);
+  platform::CloseFile(file);
   if (!success) {
     output->storage.Reset();
     return false;
