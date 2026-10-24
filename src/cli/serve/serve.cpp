@@ -806,15 +806,7 @@ void PrintServeHelp(std::string_view program_name,
           return models::qwen38_flash_next::ParseKvCacheMode(value,
                                                              &kv_cache_mode);
         });
-    parser.AddCustomOption(
-        "", "--kv-quant", "MODE",
-        "Alias for --kv-cache: f16, q8, q8_0, fp8, q8_0-q4_k, K8V4",
-        "Cache",
-        [&kv_cache_mode](std::string_view, std::string_view value,
-                         std::string* error) -> bool {
-          return models::qwen38_flash_next::ParseKvCacheMode(value,
-                                                             &kv_cache_mode);
-        });
+
     parser.AddOption("", "--cache-disk", "DIR",
                      "Opt-in restart-safe continuation cache directory "
                      "(Flash-Next: owned by one process)",
@@ -1486,25 +1478,7 @@ int RunServe(std::span<const char* const> args) {
           }
           return true;
         });
-    llm_parser.AddCustomOption(
-        "", "--kv-quant", "MODE",
-        "Alias for --kv-cache: f16, q8, q8_0, fp8, q8_0-q4_k, K8V4",
-        "Cache",
-        [&kv_cache_mode](std::string_view, std::string_view value,
-                         std::string* error) -> bool {
-          if (!models::qwen38_flash_next::ParseKvCacheMode(value,
-                                                           &kv_cache_mode)) {
-            if (error != nullptr) {
-              *error =
-                  "Invalid mode for --kv-quant: '" + std::string(value) +
-                  "' (want " +
-                  std::string(models::qwen38_flash_next::kKvCacheModeList) +
-                  ")";
-            }
-            return false;
-          }
-          return true;
-        });
+
     llm_parser.AddOption("", "--cache-disk", "DIR",
                          "Opt-in restart-safe continuation cache directory "
                          "(Flash-Next: owned by one process)",
