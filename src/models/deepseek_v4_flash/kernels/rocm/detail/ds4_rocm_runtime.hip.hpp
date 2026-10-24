@@ -1,3 +1,7 @@
+#ifdef _WIN32
+#include <io.h>
+#endif
+
 static const void *g_model_host_base;
 static uint64_t g_model_registered_size;
 /* Placement for this model load, decided once from the registered weight size
@@ -731,11 +735,21 @@ static const char *hip_model_range_ptr_from_fd(
     }
     std::string error;
     if (!g_model_uploader) {
+#ifdef _WIN32
+        const gufo::core::GgufMappedRegion region{
+            .data = model_map,
+            .size = static_cast<size_t>(g_model_registered_size),
+            .file_descriptor = g_model_fd >= 0
+                ? reinterpret_cast<gufo::platform::PlatformFile>(_get_osfhandle(g_model_fd))
+                : gufo::platform::kInvalidFile,
+        };
+#else
         const gufo::core::GgufMappedRegion region{
             .data = model_map,
             .size = static_cast<size_t>(g_model_registered_size),
             .file_descriptor = g_model_fd,
         };
+#endif
         g_model_uploader = gufo::hip::WeightUpload::Create({&region, 1}, &error);
     }
     if (!g_model_uploader ||
