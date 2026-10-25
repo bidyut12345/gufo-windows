@@ -1,7 +1,3 @@
-#include <arpa/inet.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -11,7 +7,7 @@
 #include <string_view>
 #include <thread>
 
-#include "src/core/platform/socket.hpp"
+#include "src/core/platform/net.hpp"
 #include "src/eval/http_client.hpp"
 
 namespace {

@@ -6,9 +6,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#include <unistd.h>  // fmemopen, gufo_tmpfile (compat/win32)
-#endif
 
 #include <algorithm>
 #include <array>
@@ -17,6 +14,7 @@
 
 #include "../kernels/rocm/resident_api.h"
 #include "src/cli/serve/logging.hpp"
+#include "src/core/platform/fs.hpp"
 #include "dspark_internal.h"
 #include "dspark_policy.h"
 #include "model_data_internal.h"
@@ -7942,29 +7940,19 @@ int ds4_rocm_graph_save_snapshot(const ds4_rocm_graph* graph,
     snap->cap = bytes + 1u;
   }
 
-#ifdef _WIN32
-  // No writable fmemopen on Windows: serialize through a delete-on-close
-  // temporary file and copy it back.
-  FILE* fp = gufo_tmpfile();
-#else
-  FILE* fp = fmemopen(snap->ptr, static_cast<size_t>(bytes + 1u), "wb");
-#endif
+  FILE* fp = gufo::platform::OpenMemoryWriteStream(
+      snap->ptr, static_cast<size_t>(bytes + 1u));
   if (!fp) {
     payload_set_err(err, errlen,
                     "failed to open memory stream for session snapshot");
     return 1;
   }
-  int rc = rocm_graph_save_payload(graph, checkpoint, logits, prefill_capacity,
-                                   context_size, state, fp, err, errlen);
-#ifdef _WIN32
-  if (rc == 0 && (fflush(fp) != 0 || fseek(fp, 0, SEEK_SET) != 0 ||
-                  fread(snap->ptr, 1, static_cast<size_t>(bytes), fp) !=
-                      static_cast<size_t>(bytes))) {
-    payload_set_err(err, errlen, "failed to read back session snapshot");
-    rc = 1;
-  }
-#endif
-  if (fclose(fp) != 0 && rc == 0) {
+  const int rc =
+      rocm_graph_save_payload(graph, checkpoint, logits, prefill_capacity,
+                              context_size, state, fp, err, errlen);
+  if (!gufo::platform::FinishMemoryWriteStream(fp, snap->ptr,
+                                               static_cast<size_t>(bytes)) &&
+      rc == 0) {
     payload_set_err(err, errlen, "failed to finalize memory session snapshot");
     return 1;
   }
@@ -7990,7 +7978,7 @@ int ds4_rocm_graph_load_snapshot(ds4_rocm_graph* graph, ds4_tokens* checkpoint,
         return 1;
     }
 
-    FILE *fp = fmemopen((void *)snap->ptr, (size_t)snap->len, "rb");
+    FILE *fp = gufo::platform::OpenMemoryReadStream(snap->ptr, (size_t)snap->len);
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot restore");
         return 1;

@@ -21,10 +21,26 @@ import service_phases
 
 class PlanTest(unittest.TestCase):
     def setUp(self):
-        self.data = devlab_models.registry()
+        # Ownership contracts hold for every model, disabled ones included.
+        self.registry = devlab_models.registry()
+        self.data = {**self.registry, 'disabled': {}}
 
     def plan(self, *paths, **kwargs):
         return devlab_plan.select(paths, self.data, **kwargs)
+
+    def test_disabled_models_are_named_and_not_planned(self):
+        self.assertIn('deepseek4', self.registry['disabled'])
+        plan = devlab_plan.select(['src/models/deepseek_v4_flash/model.cpp', 'src/core/sampling.cpp'],
+                                  self.registry)
+        self.assertEqual({item['id'] for item in plan['models']}, {'flash-next-q4'})
+        self.assertNotIn('deepseek4', {group['profile'].split('/')[0] for group in plan['groups']})
+        self.assertEqual([row['id'] for row in plan['disabled']], ['deepseek4'])
+        self.assertTrue(plan['disabled'][0]['reason'])
+        self.assertEqual(devlab_models.asset_keys(plan, self.registry), ['flash-next'])
+        broken = {**self.registry, 'disabled': {'deepseek-typo': 'reason'}}
+        with patch('devlab_models.json.loads', return_value=broken):
+            with self.assertRaises(ValueError):
+                devlab_models.registry()
 
     def models(self, *paths, **kwargs):
         return {item['id'] for item in self.plan(*paths, **kwargs)['models']}

@@ -80,14 +80,13 @@ public:
   NgramTable(const NgramTable&) = delete;
   NgramTable& operator=(const NgramTable&) = delete;
 
-  /// Borrows the bound GGUF descriptor during Open; retains its own handle.
-  /// `source_path` backs the Windows unbuffered reopen, where the POSIX
-  /// descriptor is not available.
+  /// Borrows the bound GGUF descriptor during Open; retains its own handle,
+  /// unbuffered where the platform allows it and a buffered duplicate
+  /// otherwise.
   [[nodiscard]] static std::unique_ptr<NgramTable> Open(
-      platform::PlatformFile file_descriptor,
-      const std::filesystem::path& source_path,
-      std::uint64_t file_offset, std::uint64_t rows, std::uint32_t row_dim,
-      core::GgmlType type, std::string* error_msg = nullptr);
+      platform::PlatformFile file, std::uint64_t file_offset,
+      std::uint64_t rows, std::uint32_t row_dim, core::GgmlType type,
+      std::string* error_msg = nullptr);
 
   /// Gathers `rows.size()` rows into `out` (rows.size() * row_dim floats).
   /// Duplicate ids are read once. Returns false on any failed read.
@@ -126,10 +125,9 @@ private:
   // occurrence in the current input, so no row-cache state is retained here.
   std::vector<std::size_t> first_rows_;
   void DecodeRow(const std::uint8_t* src, float* dst) const;
-  void StoreRow(std::uint32_t row, const std::uint8_t* src, float* dst);
   bool ReadCached(std::uint32_t row, float* dst);
   bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf,
-               NgramCounters* owner, void* io_event);
+               NgramCounters* owner);
   void Worker();
 
   struct CacheEntry {
@@ -141,10 +139,7 @@ private:
   std::vector<std::uint8_t> cache_rows_;
   std::size_t cache_count_{0};
 
-  int fd_{-1};
-#if defined(_WIN32)
-  void* file_handle_{nullptr};
-#endif
+  platform::PlatformFile file_{platform::kInvalidFile};
   bool direct_{false};
   std::uint64_t base_offset_{0};
   std::uint64_t rows_{0};

@@ -292,6 +292,8 @@ def render_models(args, plan, summary):
             lines += ['', '⚠️ Speed comparison is incomplete.']
         if item.get('timing_error'):
             lines += ['', 'Timing runner: ' + short(item['timing_error'], ERROR_CHARS)]
+    for row in plan.get('disabled', []):
+        lines += ['', f"⚠️ {definitions[row['id']]['title']} not run: {row['reason']}."]
     if args.benchmark:
         read = lambda name: (args.results / name).read_text() if (args.results / name).exists() else ''
         lines += bench_section(read('bench-base.md'), read('bench-head.md'))

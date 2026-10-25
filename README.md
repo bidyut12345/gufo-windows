@@ -4,7 +4,7 @@
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-Gufo is a vertical local inference engine specifically built and optimized for the AMD Strix Halo hardware:
+Gufo is a vertical local inference engine for Linux and Windows, specifically built and optimized for AMD Strix Halo hardware:
 Ryzen AI MAX+ 395 systems with Radeon 8060S (`gfx1151`), up to 128 GiB of unified memory.
 
 **Contributions are welcome!**
@@ -13,7 +13,10 @@ See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-
 for user-facing changes and release history.
 
 > [!NOTE]
-> This repository provides native Windows 11 x64 support (`gfx1151`) with AMD TheRock ROCm, fully updated with all upstream Gufo features and major enhancements from [dardeaw/MBufo](https://github.com/dardeaw/MBufo) and [endyjasmi/gufo](https://github.com/endyjasmi/gufo), featuring a complete llama.cpp-style Gufo Chat Web UI with SQLite persistence, sandboxed per-user workspaces, KV cache quantization, interactive model inquiries, and 1-click release publishing.
+> This repository provides native Windows 11 x64 support (`gfx1151`) with AMD TheRock ROCm 10.1.0, fully updated with all upstream Gufo features and major enhancements from [dardeaw/MBufo](https://github.com/dardeaw/MBufo) and [endyjasmi/gufo](https://github.com/endyjasmi/gufo), featuring a complete llama.cpp-style Gufo Chat Web UI with SQLite persistence, sandboxed per-user workspaces, interactive model inquiries, and 1-click release publishing.
+
+> [!TIP]
+> Check out **[Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo)**, a Gufo variant that has not been merged yet!
 
 ## 🚀 Latest Updates in This Fork
 
@@ -34,28 +37,40 @@ for user-facing changes and release history.
   3. **Working Directory**: Per-chat working directory inside user's sandbox (`UserData/{user_id}_{username}/{conv_id} - {title}`).
   4. **Tools & MCP Master Switch & Groups**: Enable/disable all tools or toggle individual tool groups (Filesystem, Code Inspection, Shell, Web, MCP/Custom).
   5. **System Prompt Presets**: Select from Default, Coder, Concise, Reasoner, Creative, or create custom presets.
-  6. **6 Thinking Levels**: Quick selection of `auto`, `minimum` (512 budget), `low` (2048 budget), `medium` (4096 budget), `high` (8192 budget), and `xhigh` (16384 budget).
+  6. **6 Thinking Levels**: Quick selection of `auto`, `minimum` (512 budget), `low` (2048 budget), `medium` (4096 budget), and `xhigh` (16384 budget).
   7. **Context Usage & Compaction**: Live token meter for 262k context with 1-click history compaction (`🧹 Compact`).
 - **Cleaned Navigation**: Removed redundant "Tools & MCP" button from the top header since the Settings drawer already manages tools.
 
-### ⚡ KV Cache Quantization & UD-IQ4_XS Support (VRAM/RAM Optimization)
-- **KV Cache Quantization for Qwen 3.8 Flash-Next (`--kv-cache`)**:
-  - `--kv-cache f16`: Standard 16-bit float KV cache (default reference, full fidelity).
-  - `--kv-cache q8_0` (or `q8`): 8-bit quantized KV cache on both K and V planes (~47% memory reduction).
-  - `--kv-cache q8_0-q4_k` (or `K8V4`): Mixed quantization with Q8_0 keys and Q4_K values (~59% memory reduction, cutting KV footprint down to ~1.81 GB at 262k context).
-- **Unsloth `UD-IQ4_XS` Support**: Full support for Unsloth's ultra-compact `UD-IQ4_XS` quantized weights alongside `UD-Q4_K_XL` and `UD-Q8_K_XL`, minimizing VRAM and system memory bandwidth contention.
-- **Quantization-Aware Memory Estimation**: `inventory.ps1` and `launcher.ps1` automatically compute KV cache memory requirements based on selected quantization and total context.
+### ⚡ Server Status & Busy API
+- Dedicated endpoints `/status`, `/v1/status`, `/busy`, `/v1/busy` returning real-time busy status and active slot count.
 
 ### 📦 1-Click GitHub Release Publish
-- **Double-Clickable `publish_release.cmd`**: One-click publishing that packages the Windows distribution with all DLLs and ROCm dependencies, generates comprehensive release notes, tags the release with `version.txt` (currently `v0.18.0`), and uploads to GitHub via `gh release create`.
-- **PowerShell Script**: `tools\windows\publish_release.ps1` for automated CI/CD and scripted release pipelines.
+- **Double-Clickable `publish_release.cmd`**: One-click publishing that packages the Windows distribution with all DLLs and ROCm dependencies, generates comprehensive release notes, tags the release with `version.txt`, and uploads to GitHub via `gh release create`.
+- **PowerShell Script**: `tools/windows/publish_release.ps1` for automated CI/CD and scripted release pipelines.
 
 ---
-
 
 ## Models and benchmarks
 
 All model documentation lives under [docs/models](docs/models/README.md):
+
+### 📊 Measured Benchmarks: Qwen3.8 Flash-Next (Windows 11, ROCm 10.1.0, gfx1151)
+
+**Model:** `Qwen3.8 Flash-Next UD-Q4_K_XL` (103.69 GiB)  
+**Hardware:** AMD Ryzen AI MAX+ 395 (`gfx1151`), Unified Memory  
+**Platform:** Windows 11 x64, AMD TheRock ROCm 10.1.0 (HIP), Model Load Time: **17.71 s**
+
+#### Autoregressive (AR) vs. Speculative (MTP) Performance
+
+| Context Depth | Mode | pp2048 (t/s) | pp4096 (t/s) | pp32768 (t/s) | tg128 (t/s) | tg1024 (t/s) | tg4096 (t/s) |
+|---|---|---|---|---|---|---|---|
+| **d0 (Pure AR)** | Autoregressive (Baseline) | 1,468.17 ± 0.00 | 1,511.16 ± 0.00 | 1,423.12 ± 0.00 | 52.69 ± 0.00 | 41.27 ± 0.00 | 45.57 ± 0.00 |
+| **d16384 (16k)** | Speculative MTP | 1,340.66 ± 0.00 | 1,406.34 ± 0.00 | 1,382.49 ± 0.00 | 63.26 ± 0.00 *(+20%)* | 66.50 ± 0.00 *(+61%)* | 69.75 ± 0.00 *(+53%)* |
+| **d32768 (32k)** | Speculative MTP | 1,310.61 ± 0.00 | 1,376.73 ± 0.00 | 1,358.81 ± 0.00 | 86.02 ± 0.00 *(+63%)* | 90.37 ± 0.00 *(+119%)* | 72.96 ± 0.00 *(+60%)* |
+
+- **Prompt Processing (pp):** Reaches **1,511.16 t/s** peak at pp4096 and maintains **>1,310–1,423 t/s** across deep 16k–32k context histories with optimized `kDenseF16MinRows = 1024` and `--cache-disk-staging-bytes 0`.
+- **Token Generation (tg):** Autoregressive baseline delivers **41–53 t/s**, while MTP speculative drafting scales generation up to **90.37 t/s** at 32k depth (+119% speedup).
+
 
 | Model | Inference modes | Hugging Face weights | Benchmarks | Quality |
 | --- | --- | --- | --- | --- |
@@ -214,6 +229,11 @@ Reasoning tokens count toward that response limit.
 ## Build from source
 
 AMD Strix Halo (`gfx1151`) is supported natively on both **Windows 11 x64** and **Linux x86-64**.
+For Windows development setup, see [BUILD-WINDOWS.md](BUILD-WINDOWS.md) and [docs/WINDOWS.md](docs/WINDOWS.md).
+Production packages target Linux x86-64 on AMD Strix Halo (`gfx1151`). CMake owns
+one production configuration for both Nix and ordinary Linux builds. Tests,
+profilers, tuning executables and Python reference runners are not installed
+with the production package. No `build.sh` wrapper is needed.
 
 ### Windows 11 x64 (Native)
 

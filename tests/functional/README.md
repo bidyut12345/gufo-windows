@@ -233,15 +233,25 @@ priority rules contribute a union. Unknown paths expand to all compatible
 coverage. Suite metadata must cover every name in `run.py`; dependencies are
 deliberately conservative, so even narrow source rules can select many suites.
 
-`--tier pr` plans the per-PR set. Suites marked `"tier": "release"` (the deep
-cache histories, `cache-stalls`, `long-context` and `reasoning-budget`) then move
-to `release_only` unless a changed path matches their `escalate` patterns: cache
-code, the suite's own module, or Flash-Next model code for depth checks. `run.py
+`--tier pr` plans the per-PR set: one or two suites per behavior (`discovery`,
+`state-edges`, `messages-count-tokens`, `responses`, `stops`, `conversation`,
+`image-inputs`, `structured`, `tools`, `tool-streaming`, `sampling-defaults`,
+`batch` and `cache`). Every other suite is marked `"tier": "release"` and moves
+to `release_only`; the deep cache histories, `cache-stalls`, `long-context` and
+`reasoning-budget` still run on a PR when a changed path matches their
+`escalate` patterns: cache code, the suite's own module, or Flash-Next model
+code for depth checks. `run.py
 --tier pr` also trims transport matrices that a case does not depend on:
 `tool-reasoning` keeps the streamed mode, whose partial parses end in the same
 final parse a buffered reply uses, and `tool-native-schemas` rotates endpoint,
 stream and tool choice across cases. `--tier full` (the default for manual runs)
 keeps every suite and combination.
+
+The literal-closer cases from #786 (a lone `</invoke>` and a closer before or
+between calls) use the deterministic HTTP fixtures in
+`tests/cli/openai_chat_test.cpp`, with buffered/streamed and whole/bytewise output.
+Qwen27 Q4/Q8 can omit the requested line or call a tool instead, so these parser
+checks must not depend on a model following a request to copy tool markup.
 
 `Devlab functional checks` runs on every push to a non-draft PR, like `CI`
 (`pull_request`), with the repository's fork approval policy. A newer push cancels
@@ -261,11 +271,16 @@ Selections from separate paths are combined:
 | --- | --- |
 | Shared LLM behavior, cache, sampling or Qwen framing/vision | Flash-Next Q4/MTP |
 | Private Qwen27 implementation | Qwen27 Q4/DFlash2 |
-| Private DeepSeek implementation | DeepSeek V4/DSpark |
-| Shared LLM and private DeepSeek code | Flash-Next and DeepSeek |
+| Private DeepSeek implementation | DeepSeek V4/DSpark (disabled, see below) |
+| Shared LLM and private DeepSeek code | Flash-Next and DeepSeek (disabled, see below) |
 | Embedding, ASR or TTS code | That category's representative |
 | Shared infrastructure or unmapped paths | One representative per supported category |
 | Documentation, image generation or H3-only paths | No GPU job in this workflow |
+
+Models listed under `disabled` in `devlab.json`, with a reason, are left out of
+the plan and named in the report. DeepSeek V4 is disabled for now: its 81 GiB
+of weights and its suite set make the run too long to finish within a PR.
+Remove its entry to restore it.
 
 The embedding and ASR representatives are EmbeddingGemma 2 and Qwen3-ASR. TTS
 uses Base cloning in the PR tier; the full tier exercises Base, CustomVoice and
