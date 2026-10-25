@@ -88,6 +88,7 @@ if ($Mode -eq "serve") {
     "--max-request-bytes", "33554432",
     "llm", "--model", $model, "--served-model-name", "flash-next",
     "--context", "$Context", "--max-output-bytes", "8388608",
+    "--prefill-chunk", "2048", "--cache-disk-staging-bytes", "0",
     "--think", $Think) + $sampling + $speculative
   if ($vision) { $arguments += @("--mmproj", $vision) }
 } else {

@@ -24,7 +24,7 @@ enum class TextRequestPhase : std::uint8_t {
   kTerminal,
 };
 
-inline constexpr std::size_t kDefaultDecodeActivePrefillTokens = 512;
+inline constexpr std::size_t kDefaultDecodeActivePrefillTokens = 2048;
 inline constexpr std::size_t kDefaultMaxOutputBytes =
     static_cast<std::size_t>(1024) * 1024;
 inline constexpr std::size_t kDefaultMaxBufferedOutputBytes =

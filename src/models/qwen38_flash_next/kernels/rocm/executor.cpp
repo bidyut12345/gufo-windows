@@ -131,7 +131,7 @@ constexpr std::uint32_t kAttnSplits = 8;
 /// 10240x320 1.02 -> 0.79, 2560x2560 0.81 -> 0.74, 2560x640 0.24 -> 0.21;
 /// against 2560x6144 1.8 -> 2.1+, 640x2560 0.19 -> 0.23 and 320x10240
 /// 0.40 -> 1.3, which keep the int8 route.
-constexpr std::uint32_t kDenseF16MinRows = 2048;
+constexpr std::uint32_t kDenseF16MinRows = 1024;
 constexpr std::uint32_t kDenseF16MaxCols = 2560;
 
 /// Token rows per routed F16 expert GEMM tile: the narrow tile for batches

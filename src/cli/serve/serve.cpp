@@ -1421,7 +1421,7 @@ int RunServe(std::span<const char* const> args) {
         "Speculative", &prompt_lookup);
     llm_parser.AddOption(
         "", "--prefill-chunk", "N",
-        "Maximum prompt tokens between active decode rounds (default: 512)",
+        "Maximum prompt tokens between active decode rounds (default: 2048)",
         "Scheduling", &prefill_chunk_tokens);
     llm_parser.AddOption("", "--max-pending", "N",
                          "Maximum queued generation requests (default: 16)",
