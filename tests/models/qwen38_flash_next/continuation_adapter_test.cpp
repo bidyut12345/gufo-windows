@@ -409,7 +409,7 @@ void CheckTransferAndGuardLifetime(const std::shared_ptr<qfn::Model>& model,
 
   // The real slot guard leases a new independent transfer for every piece.
   // The idle worker is kept dormant so each foreground mutation is the oracle.
-  for (const int path : {0, 1, 2, 3, 4}) {
+  for (const int path : {0, 1, 2, 3, 4, 5}) {
     cache::ResourceLedger ledger({1 << 30, 1 << 30, 1 << 30, 1 << 30});
     IncompatibleStream unused;
     cache::LeasedSlot leased(
@@ -423,7 +423,10 @@ void CheckTransferAndGuardLifetime(const std::shared_ptr<qfn::Model>& model,
     auto lease = leased.Acquire();
     auto& session = adapter.GetSession(lease.Execution());
     std::string error;
-    const auto depth = path == 0 ? 2047u : path == 1 ? 8203u : 17u;
+    const auto depth = path == 0   ? 2047u
+                       : path == 1 ? 8203u
+                       : path == 5 ? 2050u
+                                   : 17u;
     Require(session.Sync(prompt.first(depth), &error), error);
     const auto positions = adapter.Positions(lease.Execution());
     auto legacy = session.SaveSnapshot(&error);
@@ -485,6 +488,8 @@ void CheckTransferAndGuardLifetime(const std::shared_ptr<qfn::Model>& model,
           std::vector<std::int32_t>(prompt.begin(), prompt.begin() + 17);
       edited[3] = edited[3] == 1 ? 2 : 1;
       Require(session.Sync(edited, &error), error);
+    } else if (path == 5) {
+      Require(session.Sync(prompt.first(2051), &error), error);
     } else {
       Guard peer_guard;
       auto peer = adapter.CreateSlot(peer_guard);

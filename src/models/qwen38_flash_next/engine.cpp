@@ -513,8 +513,6 @@ std::unique_ptr<SessionSnapshot> Session::SaveAlignedSnapshot(
 
 bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                               std::string* error_msg) {
-  if (continuation_hooks_)
-    continuation_hooks_->BeforeRestore();
   return RestoreSnapshotImpl({snapshot.data_.get(), snapshot.size_},
                              snapshot.deferred_.get(), error_msg);
 }
@@ -541,14 +539,14 @@ std::uint32_t SessionSnapshot::ValidContext() const {
 
 bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
                               std::string* error_msg) {
-  if (continuation_hooks_)
-    continuation_hooks_->BeforeRestore();
   return RestoreSnapshotImpl(payload, nullptr, error_msg);
 }
 
 bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
                                   const rocm::SnapshotState* deferred,
                                   std::string* error_msg) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeRestore();
   rewind_.reset();
   SessionSnapshotHeader header{};
   if (payload.size() < sizeof(header)) {

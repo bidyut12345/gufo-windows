@@ -146,7 +146,8 @@ public:
     Check(hipStreamSynchronize(adapter.model_->executor_->stream()));
   }
   void BeforeRestore() override {
-    BeforeExecution();
+    if (restoring || pending || checkpoint)
+      throw std::logic_error("Flash-Next slot is not ready for restore");
     GuardAll();
   }
   void BeforeRelease() noexcept override {
@@ -686,6 +687,9 @@ cache::Completion ContinuationAdapter::CopyRowsOut(const cache::Slot& slot,
   const auto& native = state.CaptureState();
   const auto rows =
       component.part == ContinuationPart::kTokens ? native.position_
+      : state.guarding ? (Pool(component.part)
+                              ? context_ / model_->config().compress_ratio + 1
+                              : context_)
       : Pool(component.part)
           ? (Draft(component.part) ? native.mtp_.blocks : native.blocks_)
           : (Draft(component.part) ? native.mtp_.position : native.position_);
