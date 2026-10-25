@@ -61,7 +61,14 @@ $notesTemplate = @'
 
 High-performance native local LLM inference engine optimized for AMD Ryzen AI MAX+ 395 with Radeon 8060S (`gfx1151`) on Windows 11.
 
-## What's New in this Release
+### 🧩 New in v0.23.1
+- **Canonical CLI Options**:
+  - Removed deprecated `--kv-quant` option alias in favor of the canonical `--kv-cache` parameter.
+- **Windows Platform Interop**:
+  - Resolved `PlatformFile` handle conversions across `model_loader`, `ngram`, and `ds4_rocm_runtime`.
+  - Added wide path support (`CreateFileW`) for bound n-gram tables.
+- **Server Status & Busy API**:
+  - Real-time endpoints `/status`, `/v1/status`, `/busy`, `/v1/busy`, and updated `/health` reporting busy status and slot usage.
 
 ### 🧩 New in v0.23.0
 - **Upstream Sync with `gufo-org/gufo` v0.23.0 & v0.22.0**:
