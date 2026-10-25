@@ -23,6 +23,7 @@
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/pages.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/device_headroom.hpp"
 
 namespace qfn::testing {
 std::atomic<std::size_t> reported_device_free_limit{

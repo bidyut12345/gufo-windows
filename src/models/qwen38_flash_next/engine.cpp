@@ -127,8 +127,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (c.ple_layer >= 0) {
     const auto& t = m->weights_->ple_table;
     m->ngram_ = NgramTable::Open(
-        m->reader_->GetMappedRegions()[t.shard].file_descriptor,
-        m->reader_->GetMappedRegions()[t.shard].source_path, t.file_offset,
+        m->reader_->GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
         t.rows, c.ple_head_dim, t.type, error_msg);
     if (!m->ngram_) {
       return nullptr;

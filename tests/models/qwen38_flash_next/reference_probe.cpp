@@ -131,9 +131,8 @@ int main(int argc, char** argv) {
   if (c.ple_layer >= 0) {
     const auto& t = weights->ple_table;
     ngram = q::NgramTable::Open(
-        reader->GetMappedRegions()[t.shard].file_descriptor,
-        reader->GetMappedRegions()[t.shard].source_path, t.file_offset, t.rows,
-        c.ple_head_dim, t.type, &error);
+        reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
+        t.rows, c.ple_head_dim, t.type, &error);
     if (!ngram) {
       std::fprintf(stderr, "n-gram table failed: %s\n", error.c_str());
       return 1;

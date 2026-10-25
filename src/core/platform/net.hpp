@@ -17,6 +17,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 // clang-format on
 #ifndef SHUT_RD
 #define SHUT_RD SD_RECEIVE
