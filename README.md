@@ -217,11 +217,11 @@ AMD Strix Halo (`gfx1151`) is supported natively on both **Windows 11 x64** and 
 
 ### Windows 11 x64 (Native)
 
-Windows 11 x64 builds natively against AMD's TheRock ROCm 10.0.0 and Visual Studio C++ Build Tools (MSVC STL + Windows SDK) without WSL.
+Windows 11 x64 builds natively against AMD's TheRock ROCm 10.1.0 and Visual Studio C++ Build Tools (MSVC STL + Windows SDK) without WSL.
 
 | Piece | Default location | Notes |
 | --- | --- | --- |
-| TheRock ROCm 10.0.0 (Windows, gfx1151) | `C:\TheRock\build` | Extracted from AMD TheRock distribution tarball |
+| TheRock ROCm 10.1.0 (Windows, gfx1151) | `C:\TheRock\build` | Extracted from AMD TheRock distribution tarball |
 | vcpkg | `C:\vcpkg` | `vcpkg install icu curl openssl libpng libjpeg-turbo --triplet x64-windows` |
 | Visual Studio Build Tools | Any | "Desktop development with C++" |
 | CMake 3.21+ & Ninja | `PATH` or `C:\tools\ninja` | |

@@ -6,7 +6,7 @@ Write-Host "=== Setting up Gufo Build Prerequisites for Windows ===" -Foreground
 # 1. Ensure directories exist
 $rockDir = "C:\TheRock"
 $rockBuild = "C:\TheRock\build"
-$tarball = "therock-dist-windows-gfx1151-10.0.0.tar.gz"
+$tarball = "therock-dist-windows-gfx1151-10.1.0.tar.gz"
 $tarballPath = Join-Path $rockDir $tarball
 $url = "https://stable.repo.amd.com/rocm/core/tarball/$tarball"
 
@@ -17,18 +17,18 @@ if (-not (Test-Path $rockBuild)) {
     New-Item -ItemType Directory -Path $rockBuild -Force | Out-Null
 }
 
-# 2. Download TheRock ROCm 10.0.0 if not already extracted
+# 2. Download TheRock ROCm 10.1.0 if not already extracted
 $versionFile = Join-Path $rockBuild ".info\version"
 if (-not (Test-Path $versionFile)) {
     if (-not (Test-Path $tarballPath) -or (Get-Item $tarballPath).Length -lt 1600000000) {
-        Write-Host "Downloading TheRock ROCm 10.0.0 (~1.57 GB)..." -ForegroundColor Yellow
+        Write-Host "Downloading TheRock ROCm 10.1.0 (~1.53 GB)..." -ForegroundColor Yellow
         & curl.exe -L -C - --retry 5 -o $tarballPath $url
         if ($LASTEXITCODE -ne 0) { throw "Failed to download TheRock tarball" }
     }
-    Write-Host "Extracting TheRock ROCm 10.0.0 to $rockBuild..." -ForegroundColor Yellow
+    Write-Host "Extracting TheRock ROCm 10.1.0 to $rockBuild..." -ForegroundColor Yellow
     & tar.exe -xzf $tarballPath -C $rockBuild
     if ($LASTEXITCODE -ne 0) { throw "Failed to extract TheRock tarball" }
-    Write-Host "TheRock ROCm 10.0.0 extracted successfully." -ForegroundColor Green
+    Write-Host "TheRock ROCm 10.1.0 extracted successfully." -ForegroundColor Green
 } else {
     Write-Host "TheRock ROCm is already present at $rockBuild." -ForegroundColor Green
 }

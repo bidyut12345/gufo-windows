@@ -17,14 +17,14 @@ downloads. `tools\windows\package.ps1` makes the zip from a release build.
 
 | Piece | Default location | Notes |
 | --- | --- | --- |
-| TheRock ROCm 10.0.0 (Windows, gfx1151) | `C:\TheRock\build` | [`therock-dist-windows-gfx1151-10.0.0.tar.gz`](https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx1151-10.0.0.tar.gz), SHA-256 `1293927b06b3b8d4bd7e0265823fb998bc9e0d83c68f33dcfa5d32663b30ce38`; extract so that `C:\TheRock\build\bin` exists. Its clang compiles C, C++ and HIP |
+| TheRock ROCm 10.1.0 (Windows, gfx1151) | `C:\TheRock\build` | [`therock-dist-windows-gfx1151-10.1.0.tar.gz`](https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx1151-10.1.0.tar.gz); extract so that `C:\TheRock\build\bin` exists. Its clang compiles C, C++ and HIP |
 | vcpkg | `C:\vcpkg` | `vcpkg install icu curl openssl libpng libjpeg-turbo --triplet x64-windows` |
 | Visual Studio Build Tools | any | "Desktop development with C++": MSVC STL + Windows SDK only; tested with VS 18 (MSVC 14.51) |
 | CMake 3.21+ and Ninja | `PATH`, or Ninja at `C:\tools\ninja` | |
 | Dedicated GPU memory | AMD Software > Performance > Tuning > Variable Graphics Memory | 96 GB for Qwen3.8-Flash-Next at 256K context; see [Memory](#memory) |
 | Virtual memory (pagefile) | `sysdm.cpl` -> Advanced -> Performance -> Virtual memory | **Initial: 98304 MB (96 GB), Max: 131072 MB (128 GB)** custom size on NVMe SSD; prevents `hipErrorOutOfMemory` during 100+ GiB WDDM allocation. See [Virtual Memory Configuration](#virtual-memory-configuration) |
 
-The port is validated on TheRock 10.0.0. Other releases usually build, but a
+The port is validated on TheRock 10.1.0. Other releases usually build, but a
 newer clang can round fused kernels differently (see [Test status](#test-status)).
 
 ```powershell

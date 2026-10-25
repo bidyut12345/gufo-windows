@@ -2,9 +2,8 @@
 #
 # Prerequisites (paths overridable by parameter; tools\windows\check.ps1
 # checks them all):
-#   - TheRock 10.0.0 for Windows gfx1151, extracted to C:\TheRock\build:
-#     https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx1151-10.0.0.tar.gz
-#     (SHA-256 1293927b06b3b8d4bd7e0265823fb998bc9e0d83c68f33dcfa5d32663b30ce38)
+#   - TheRock 10.1.0 for Windows gfx1151, extracted to C:\TheRock\build:
+#     https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx1151-10.1.0.tar.gz
 #   - vcpkg at C:\vcpkg with: icu curl openssl libpng libjpeg-turbo (x64-windows)
 #   - Visual Studio Build Tools (MSVC STL + Windows SDK; the compiler is TheRock clang)
 #   - CMake 3.21+, and ninja on PATH or at C:\tools\ninja\ninja.exe
@@ -27,7 +26,7 @@ $root = (Resolve-Path "$PSScriptRoot\..\..").Path
 
 # The port is validated on one TheRock release; a newer clang can round the
 # fused kernels differently (see docs\WINDOWS.md).
-$validatedRock = "10.0.0"
+$validatedRock = "10.1.0"
 $rockVersionFile = Join-Path $Rocm ".info\version"
 if (-not (Test-Path $rockVersionFile)) {
   throw "TheRock not found at $Rocm (see docs\WINDOWS.md, or run tools\windows\check.ps1)"

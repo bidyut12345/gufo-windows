@@ -17,7 +17,7 @@ param(
   [string[]]$ModelDir = @()
 )
 . "$PSScriptRoot\inventory.ps1"
-$validatedRock = "10.0.0"
+$validatedRock = "10.1.0"
 $tarball = "therock-dist-windows-gfx1151-$validatedRock.tar.gz"
 $failures = 0
 $next = @()
