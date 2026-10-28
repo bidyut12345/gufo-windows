@@ -3066,37 +3066,46 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const WeightType gate_type =
         l.ffn_gate_exps.type == GgmlType::kQ5_K    ? WeightType::kQ5_K
         : l.ffn_gate_exps.type == GgmlType::kIQ3_S ? WeightType::kIQ3_S
-                                                   : WeightType::kQ4_K;
+        : l.ffn_gate_exps.type == GgmlType::kQ8_0  ? WeightType::kQ8_0
+        : l.ffn_gate_exps.type == GgmlType::kQ4_K  ? WeightType::kQ4_K
+                                                   : WeightType::kF32;
     // The paired gate/up kernel stages the Q4_K/Q5_K block layouts and, for
     // IQ3_S, reassembles each half's 16-element strip of the stage's two
     // blocks into the chunk layout the separate decode consumes.
-    const bool pair_ok = gate_type == WeightType::kQ4_K ||
-                         gate_type == WeightType::kQ5_K ||
-                         gate_type == WeightType::kIQ3_S;
+    const bool pair_ok = (gate_type == WeightType::kQ4_K ||
+                          gate_type == WeightType::kQ5_K ||
+                          gate_type == WeightType::kIQ3_S) &&
+                         (l.ffn_up_exps.type == l.ffn_gate_exps.type);
     // Wide batches build 64-row tiles for the down projection (and the
     // paired gate/up path); the separate projections reuse that map rather
     // than the narrow one, which the wide batch never populates.
     const bool wide_tiles = routed_64_tiles_ != 0;
     const std::uint32_t separate_tiles =
         wide_tiles ? routed_64_tiles_ : routed_n_tiles_;
-    const std::uint32_t separate_rows = wide_tiles ? 64 : routed_tile_rows_;
+    const std::uint32_t separate_rows =
+        (wide_tiles && gate_type != WeightType::kQ5_K) ? 64 : routed_tile_rows_;
     const bool gated_ok =
-        pair_ok && routed_64_tiles_ != 0
-            ? RoutedGatedF16Gemm(
-                  l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
-                  s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
-                  s_.routed_bounds, s_.rows_token, s_.rows_slot, up_half,
-                  c.expert_ff, c.hidden_size, stream_)
-            : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
-                             s_.routed_tiles, separate_tiles, separate_rows,
-                             s_.routed_bounds, s_.rows_token, s_.rows_slot,
-                             nullptr, s_.gate_e, nullptr, c.expert_ff,
-                             c.hidden_size, stream_) &&
-               RoutedF16Gemm(l.ffn_up_exps.data, gate_type, x_half,
-                             s_.routed_tiles, separate_tiles, separate_rows,
-                             s_.routed_bounds, s_.rows_token, s_.rows_slot,
-                             s_.gate_e, nullptr, up_half, c.expert_ff,
-                             c.hidden_size, stream_));
+        (routed_64_tiles_ == 0 && routed_n_tiles_ == 0)
+            ? true
+            : (pair_ok && routed_pair_tiles_ != 0
+                   ? RoutedGatedF16Gemm(
+                         l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type,
+                         x_half, s_.routed_tiles + routed_pair_offset_,
+                         routed_pair_tiles_, s_.routed_bounds, s_.rows_token,
+                         s_.rows_slot, up_half, c.expert_ff, c.hidden_size,
+                         stream_)
+                   : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
+                                    s_.routed_tiles, separate_tiles,
+                                    separate_rows, s_.routed_bounds,
+                                    s_.rows_token, s_.rows_slot, nullptr,
+                                    s_.gate_e, nullptr, c.expert_ff,
+                                    c.hidden_size, stream_) &&
+                      RoutedF16Gemm(l.ffn_up_exps.data, gate_type, x_half,
+                                    s_.routed_tiles, separate_tiles,
+                                    separate_rows, s_.routed_bounds,
+                                    s_.rows_token, s_.rows_slot, s_.gate_e,
+                                    nullptr, up_half, c.expert_ff,
+                                    c.hidden_size, stream_)));
     if (!gated_ok) {
       AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
@@ -3104,15 +3113,19 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const WeightType down_type =
         l.ffn_down_exps.type == GgmlType::kQ8_0     ? WeightType::kQ8_0
         : l.ffn_down_exps.type == GgmlType::kIQ4_NL ? WeightType::kIQ4_NL
-                                                    : WeightType::kQ5_1;
+        : l.ffn_down_exps.type == GgmlType::kQ4_K   ? WeightType::kQ4_K
+        : l.ffn_down_exps.type == GgmlType::kQ5_1   ? WeightType::kQ5_1
+                                                    : WeightType::kF32;
     // Prefill takes the 64-token down tiles: they decode each expert's
     // weights over more rows, also where narrower tiles would be fewer.
     const bool wide_down = routed_64_tiles_ != 0;
+    const std::uint32_t down_tiles =
+        wide_down ? routed_64_tiles_ : routed_n_tiles_;
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
-    if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half,
-                       s_.routed_tiles,
-                       wide_down ? routed_64_tiles_ : routed_n_tiles_,
+    if (down_tiles != 0 &&
+        !RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half,
+                       s_.routed_tiles, down_tiles,
                        wide_down ? 64 : routed_tile_rows_, s_.routed_bounds,
                        s_.rows_slot, s_.rows_slot, nullptr, nullptr,
                        reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
