@@ -12,10 +12,16 @@ namespace gufo::server {
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
                               TextGenerationBackend& backend);
 
+/// llama-server's /apply-template: the prompt a Chat Completions body renders
+/// to, with the server's reasoning defaults applied, without generating.
+/// `model` is optional, as outside llama-server router mode.
+HttpResponse HandleApplyTemplate(const HttpRequest& request,
+                                 TextGenerationBackend& backend);
+
 /// Responses nests output schema under text.format and effort under reasoning.
 /// Shared controls stay validated as in Chat Completions, but the Responses
 /// adapter tolerates standard Responses fields with no native effect (hosted
-/// tool types, include, reasoning.summary, text.verbosity) rather than reject
+/// tool types, reasoning.summary, text.verbosity) rather than reject
 /// the whole request, because conforming Responses clients routinely send them.
 std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
                                                         ChatRequest* chat);

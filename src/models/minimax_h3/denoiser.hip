@@ -343,9 +343,16 @@ public:
     }
     if (Execute(weight, input, output, batch, rows, columns) !=
         rocblas_status_success) {
-      SetError(error,
-               "pinned gfx1151 MiniMax H3 BF16 GEMM solution is unavailable");
-      return false;
+      // Solution indices belong to a rocBLAS database, not to a matrix
+      // shape. Validate the current library's default when that database
+      // no longer contains the pinned index (as the DiT GEMM does).
+      solution_index_ = 0;
+      if (Execute(weight, input, output, batch, rows, columns) !=
+          rocblas_status_success) {
+        SetError(error,
+                 "pinned gfx1151 MiniMax H3 BF16 GEMM solution is unavailable");
+        return false;
+      }
     }
     hipError_t status =
         hipMemcpyAsync(reference->data(), output, reference->bytes(),
@@ -448,11 +455,12 @@ private:
         output, rocblas_datatype_bf16_r, static_cast<rocblas_int>(rows), output,
         rocblas_datatype_bf16_r, static_cast<rocblas_int>(rows),
         rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index,
-        kGfx1151RocblasBf16Solution, 0);
+        solution_index_, 0);
   }
 
   rocblas_handle handle_{nullptr};
   std::vector<Plan> plans_;
+  rocblas_int solution_index_{kGfx1151RocblasBf16Solution};
 };
 
 class F32Gemm {

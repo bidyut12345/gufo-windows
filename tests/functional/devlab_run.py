@@ -54,6 +54,8 @@ def execute(plan, binary, baseline, assets_path, output, report, logs):
             else:
                 destination = output / key
                 command = service_args(key, binary, baseline, assets, destination)
+                if model['category'] == 'embedding':
+                    command += ['--embedding-suite', 'smoke' if plan['tier'] == 'pr' else 'full']
                 with (output / (key + '.log')).open('w') as log:
                     result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=900)
                 path = destination / 'report.json'
@@ -89,7 +91,7 @@ def execute(plan, binary, baseline, assets_path, output, report, logs):
                               for side in ('base', 'head')))
             if passed:
                 for phase in observed['phases']:
-                    phase['checked'] = any(fnmatch.fnmatchcase(phase['key'], pattern)
+                    phase['checked'] = phase.get('checked', True) and any(fnmatch.fnmatchcase(phase['key'], pattern)
                                            for pattern in selection['timing_checks'])
                 observed['timing_checks'] = selection['timing_checks']
                 write(destination, observed)

@@ -213,22 +213,20 @@ Weights::Weights(const std::filesystem::path& root) {
 
 void Weights::Load(const std::filesystem::path& path,
                    const std::string& prefix) {
-  auto* mapped = new platform::RawMappedFile();
   std::string open_error;
-  if (!mapped->Open(path, platform::MapHint::kNone, &open_error) ||
-      mapped->size < 8) {
-    delete mapped;
+  auto mapped = std::make_shared<platform::ReadOnlyMappedFile>(
+      platform::ReadOnlyMappedFile::Open(path, &open_error));
+  if (!mapped->valid() || mapped->size() < 8) {
     throw std::runtime_error(open_error.empty()
                                  ? "invalid safetensors file " + path.string()
                                  : "cannot open " + path.string() + ": " +
                                        open_error);
   }
-  const auto size = mapped->size;
-  void* data = mapped->data;
-  auto owner = std::shared_ptr<void>(data, [mapped](void*) {
-    mapped->Close();
-    delete mapped;
-  });
+  const auto size = mapped->size();
+  const void* data = mapped->data();
+  // Retain the handle backing the mapping: reopening the pathname could read
+  // a replacement file with different tensor contents or offsets.
+  const auto file = mapped->PlatformHandle();
   std::uint64_t header_size;
   std::memcpy(&header_size, data, 8);
   if (!header_size || header_size > (32U << 20U) || header_size > size - 8)
@@ -267,6 +265,8 @@ void Weights::Load(const std::filesystem::path& path,
       throw std::runtime_error("invalid tensor extent " + name);
     weight.data = static_cast<const char*>(data) + 8 + header_size + begin;
     weight.bytes = bytes;
+    weight.file = static_cast<std::uint32_t>(files_.size());
+    weight.offset = 8 + header_size + begin;
     ranges.emplace_back(begin, end);
     if (!weights_.emplace(prefix + name, std::move(weight)).second)
       throw std::runtime_error("duplicate tensor " + name);
@@ -280,8 +280,12 @@ void Weights::Load(const std::filesystem::path& path,
   }
   if (cursor != payload_size)
     throw std::runtime_error("unexpected safetensors data");
-  mappings_.push_back(std::move(owner));
+  mappings_.push_back(std::move(mapped));
   regions_.emplace_back(static_cast<const std::byte*>(data), size);
+  files_.push_back({.data = data,
+                    .size = size,
+                    .file_descriptor = file,
+                    .source_path = path});
 }
 
 void Weights::Prefetch(std::string_view prefix) const {
@@ -300,6 +304,15 @@ void Weights::Prefetch(std::string_view prefix) const {
     if (end > begin)
       core::PrefaultMappedRange(region.data() + begin, end - begin);
   }
+}
+
+std::vector<std::pair<std::string_view, const Weight*>> Weights::Group(
+    std::string_view prefix) const {
+  std::vector<std::pair<std::string_view, const Weight*>> group;
+  for (auto it = weights_.lower_bound(prefix);
+       it != weights_.end() && it->first.starts_with(prefix); ++it)
+    group.emplace_back(it->first, &it->second);
+  return group;
 }
 
 const Weight& Weights::Get(std::string_view name) const {

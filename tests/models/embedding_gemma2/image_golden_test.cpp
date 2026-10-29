@@ -67,13 +67,16 @@ int main(int argc, char** argv) {
     for (const auto& probe : fixture.find("cases")->items()) {
       const auto name = probe.member_str("name");
 #if defined(GUFO_IMAGE_TEST_GPU)
-      model::hip::EncoderSequence sequence;
+      model::EncoderSequence sequence;
       for (const auto& id : probe.find("token_ids")->items())
         sequence.tokens.push_back(static_cast<std::uint32_t>(id.as_size()));
       std::size_t cursor = 0;
 #endif
+      const auto budget = static_cast<std::uint32_t>(
+          probe.member_size("max_soft_tokens", model::kDefaultImageSoftTokens));
       for (const auto& specification : probe.find("images")->items()) {
-        auto patches = model::ProcessImage(MakeImage(specification));
+        auto patches = model::ProcessImage(MakeImage(specification), budget);
+        Check(patches.soft_tokens() <= budget, name + " soft-token budget");
         Check(patches.rows == specification.member_size("rows") &&
                   patches.columns == specification.member_size("columns"),
               name + " patch grid");

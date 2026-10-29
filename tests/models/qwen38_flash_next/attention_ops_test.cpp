@@ -1092,6 +1092,77 @@ void CheckLists(std::uint32_t n_tokens, std::uint32_t start_pos,
   std::cout << " bitwise-equal\n";
 }
 
+// The position is a device value while the host sizes the mask rows. A
+// position past a row must attend as if the blocks after it were not
+// selected, without reading the words that follow the row.
+void CheckPositionPastMask() {
+  constexpr std::uint32_t kBudget = 512;
+  constexpr std::uint32_t mask_words = 20, start_pos = 4 * 32 * 26 + 2;
+  constexpr std::uint32_t wide_words = 32, guard = 64;
+  constexpr std::uint32_t n_kv = start_pos + 1;
+  const std::size_t kv_count = static_cast<std::size_t>(n_kv) * kKvWidth;
+  const auto qv = MakeValues(kQWidth, 0x9A5C0DE5U, 4.0F);
+  std::vector<__half> kh(kv_count);
+  std::vector<__half> vh(kv_count);
+  {
+    const auto kf = MakeValues(kv_count, 0x6B1D7A11U, 1.0F);
+    const auto vf = MakeValues(kv_count, 0x1F00D5EDU, 1.0F);
+    for (std::size_t i = 0; i < kv_count; ++i) {
+      kh[i] = __float2half(kf[i]);
+      vh[i] = __float2half(vf[i]);
+    }
+  }
+  // Every fourth block of the row is selected. Past the row, the narrow
+  // mask is followed by guard words that would select every block; the
+  // wide mask selects none of them.
+  std::vector<std::uint32_t> narrow(mask_words + guard, 0xFFFFFFFFU);
+  std::vector<std::uint32_t> wide(wide_words, 0U);
+  for (std::uint32_t w = 0; w < mask_words; ++w)
+    narrow[w] = wide[w] = 0x11111111U;
+  HipBuffer<float> d_q(kQWidth);
+  HipBuffer<__half> d_k(kv_count);
+  HipBuffer<__half> d_v(kv_count);
+  HipBuffer<std::uint32_t> d_narrow(narrow.size());
+  HipBuffer<std::uint32_t> d_wide(wide.size());
+  HipBuffer<std::uint32_t> d_pos(1);
+  HipBuffer<std::uint32_t> d_lists(kBudget);
+  HipBuffer<std::uint32_t> d_counts(1);
+  Upload(&d_q, qv);
+  Upload(&d_k, kh);
+  Upload(&d_v, vh);
+  Upload(&d_narrow, narrow);
+  Upload(&d_wide, wide);
+  Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
+  for (const std::uint32_t splits : {0U, 8U}) {
+    HipBuffer<float> d_partials(static_cast<std::size_t>(kHeads) *
+                                std::max(splits, 1U) * (kDim + 2));
+    float* partials = splits == 0 ? nullptr : d_partials.get();
+    const auto attend = [&](HipBuffer<std::uint32_t>& mask, std::uint32_t words,
+                            bool lists) {
+      HipBuffer<float> d_out(kQWidth);
+      q::Attention(d_q.get(), d_k.get(), d_v.get(), mask.get(), words,
+                   d_out.get(), partials, splits, 1, d_pos.get(), kHeads,
+                   kKvHeads, kDim, kRatio, nullptr,
+                   lists ? d_lists.get() : nullptr,
+                   lists ? d_counts.get() : nullptr, lists ? kBudget : 0);
+      CheckHip(hipDeviceSynchronize(), "attention past the mask row");
+      return Download(&d_out, kQWidth);
+    };
+    const auto reference = attend(d_wide, wide_words, false);
+    for (const bool lists : {false, true}) {
+      const auto out = attend(d_narrow, mask_words, lists);
+      if (std::memcmp(out.data(), reference.data(), kQWidth * sizeof(float)) !=
+          0)
+        throw std::runtime_error(std::string("attention read past its mask "
+                                             "row: ") +
+                                 (lists ? "lists" : "walk") +
+                                 " splits=" + std::to_string(splits));
+    }
+  }
+  std::cout << "attention past " << mask_words * 32
+            << " mask bits: walk and lists ignore the following words\n";
+}
+
 void CheckChunks(std::uint32_t n, std::uint32_t split) {
   const std::size_t count = std::size_t(n) * kQWidth;
   HipBuffer<float> queries(count), gates(count), full(count), chunked(count);
@@ -1562,19 +1633,25 @@ void CheckWmmaLiveExtent() {
   HipBuffer<float> qv(kQWidth), gate(kQWidth), out(kQWidth);
   HipBuffer<__half> k(kKvWidth), v(kKvWidth);
   HipBuffer<std::uint32_t> mask(3200);
+  // Both cases are refused before any launch, so the small buffers are safe.
   const auto accepts = [&](std::uint32_t n, std::uint32_t start,
                            std::uint32_t words) {
     return q::WmmaCausalAttention(qv.get(), gate.get(), k.get(), v.get(),
                                   mask.get(), words, out.get(), n, start,
                                   kHeads, kKvHeads, kDim, kRatio, nullptr);
   };
-  // 262,141 + 4 visible tokens need 65,537 blocks = 2,049 words.
-  if (accepts(4, 262141, 3200))
-    throw std::runtime_error("WMMA accepted a live extent past 2048 words");
   // A row stride narrower than the live extent is a caller error.
   if (accepts(4, 131069, 1024))
     throw std::runtime_error("WMMA accepted a stride below the live extent");
-  std::cout << "WMMA live extent: rejects past 262,144 visible tokens\n";
+  // Compact entries hold 28-bit block indices: 2^30 visible tokens at most.
+  const std::uint32_t limit =
+      q::WmmaCausalAttentionContextLimit(kHeads, kKvHeads, kDim, kRatio);
+  if (limit != (1U << 30))
+    throw std::runtime_error("WMMA context limit is not 2^30 tokens");
+  if (accepts(4, limit - 3, (1U << 23) + 1))
+    throw std::runtime_error("WMMA accepted an extent past 2^28 blocks");
+  std::cout << "WMMA live extent: limit " << limit
+            << " tokens, narrow stride refused\n";
 }
 
 }  // namespace
@@ -1630,6 +1707,7 @@ int main() {
       }
     }
     CheckWmmaLiveExtent();
+    CheckPositionPastMask();
     CheckPreparation(1, 0, 64);
     CheckPreparation(8, 4096, 64);
     CheckPreparation(65, 131069, 64);
@@ -1756,13 +1834,28 @@ int main() {
       // values of order one.
       ok = ok && worst < 2e-2;
     }
-    // A capacity wider than 262,144 (3,200 words at 409,600) keeps chunks
-    // whose visible extent fits 2,048 words on the fused kernel.
-    for (const auto& [n, start] :
-         {std::pair{5U, 131069U}, std::pair{4U, 262140U}}) {
-      const double worst = Compare(n, start, true, seed2++, true, true, 3200);
-      std::cout << "WMMA attention n=" << n << " start=" << start
-                << " stride=3200 worst absolute error " << worst << '\n';
+    // A capacity wider than 262,144 (3,200 words at 409,600). Up to 2,048
+    // live words the union mask is built in one pass; past it (2,049 words
+    // at 262,141 + 4, then up to 3,200 at 409,600) in several. Budgeted rows
+    // compact their union; one-in-sixteen random rows overflow the list and
+    // walk the union words, in LDS up to 2,052 words and recomputed from
+    // the rows' masks beyond.
+    struct Wide {
+      std::uint32_t n_tokens;
+      std::uint32_t start_pos;
+      bool bounded;
+    };
+    for (const Wide& c :
+         {Wide{5, 131069, true}, Wide{4, 262140, true}, Wide{4, 262141, true},
+          Wide{4, 262141, false}, Wide{7, 262141, true}, Wide{4, 397688, true},
+          Wide{7, 397688, true}, Wide{5, 409595, true},
+          Wide{5, 409595, false}}) {
+      const double worst =
+          Compare(c.n_tokens, c.start_pos, true, seed2++, true, c.bounded, 3200);
+      std::cout << "WMMA attention n=" << c.n_tokens << " start=" << c.start_pos
+                << " stride=3200 " << (c.bounded ? "budgeted" : "sparse")
+                << " worst absolute error " << worst << '
+';
       ok = ok && worst < 2e-2;
     }
     return ok ? 0 : 1;

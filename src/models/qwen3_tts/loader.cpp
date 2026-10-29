@@ -13,6 +13,7 @@
 
 #include "src/core/json.hpp"
 #include "src/core/platform/mapped_file.hpp"
+#include "src/core/platform/prefault.hpp"
 
 namespace gufo::models::qwen3_tts {
 namespace {
@@ -28,17 +29,8 @@ public:
   MappedFile(const MappedFile&) = delete;
   MappedFile& operator=(const MappedFile&) = delete;
 
-  MappedFile(MappedFile&& other) noexcept
-      : base_(std::exchange(other.base_, nullptr)), size_(other.size_) {}
-
-  MappedFile& operator=(MappedFile&& other) noexcept {
-    if (this != &other) {
-      Unmap();
-      base_ = std::exchange(other.base_, nullptr);
-      size_ = other.size_;
-    }
-    return *this;
-  }
+  MappedFile(MappedFile&&) = delete;
+  MappedFile& operator=(MappedFile&&) = delete;
 
   [[nodiscard]] const std::string& open_error() const noexcept {
     return open_error_;
@@ -46,14 +38,18 @@ public:
 
   void* base() const { return base_; }
   std::size_t size() const { return size_; }
+  platform::PlatformFile file_descriptor() const {
+    return mapped_.PlatformHandle();
+  }
 
   /// Maps the file read-only. Returns false on failure; the reason is
   /// then available through open_error().
   bool Open(const std::filesystem::path& path) {
-    if (!mapped_.Open(path, platform::MapHint::kNone, &open_error_))
+    mapped_ = platform::ReadOnlyMappedFile::Open(path, &open_error_);
+    if (!mapped_.valid())
       return false;
-    base_ = mapped_.data;
-    size_ = mapped_.size;
+    base_ = const_cast<std::uint8_t*>(mapped_.data());
+    size_ = mapped_.size();
     return true;
   }
 
@@ -64,7 +60,7 @@ private:
     size_ = 0;
   }
 
-  platform::RawMappedFile mapped_;
+  platform::ReadOnlyMappedFile mapped_;
   std::string open_error_;
   void* base_ = nullptr;
   std::size_t size_ = 0;
@@ -177,12 +173,25 @@ bool LoadSafetensorsFile(const std::filesystem::path& path, TensorStore* store,
   mapped_regions->push_back(
       {.data = bytes,
        .size = static_cast<std::size_t>(mapped->size()),
-       .payload_offset = static_cast<std::size_t>(payload_offset)});
+       .payload_offset = static_cast<std::size_t>(payload_offset),
+       .file_descriptor = mapped->file_descriptor()});
   mappings->push_back(std::move(mapped));
   return true;
 }
 
 }  // namespace
+
+void LoadResult::ReleaseHostPages() const noexcept {
+  for (const auto& region : mapped_regions)
+    platform::ReleaseMappedPages(region.data, region.size);
+}
+
+std::vector<core::GgufMappedRegion> LoadResult::WeightUploadRegions() const {
+  std::vector<core::GgufMappedRegion> result;
+  for (const auto& region : mapped_regions)
+    result.push_back({region.data, region.size, region.file_descriptor});
+  return result;
+}
 
 std::vector<MappedRegion> LoadResult::RegionsFor(
     std::string_view prefix) const {

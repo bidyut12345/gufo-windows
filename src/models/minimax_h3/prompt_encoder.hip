@@ -210,6 +210,8 @@ struct HostMapping {
   std::uint64_t file_offset{0};
   void* device{nullptr};
   bool registered{false};
+  // `host` is pinned memory filled from the file, not a mapping view.
+  bool pinned{false};
 
   HostMapping() = default;
   HostMapping(const HostMapping&) = delete;
@@ -221,7 +223,8 @@ struct HostMapping {
         bytes(std::exchange(other.bytes, 0)),
         file_offset(other.file_offset),
         device(std::exchange(other.device, nullptr)),
-        registered(std::exchange(other.registered, false)) {}
+        registered(std::exchange(other.registered, false)),
+        pinned(std::exchange(other.pinned, false)) {}
   HostMapping& operator=(HostMapping&& other) noexcept {
     if (this != &other) {
       Release();
@@ -232,12 +235,18 @@ struct HostMapping {
       file_offset = other.file_offset;
       device = std::exchange(other.device, nullptr);
       registered = std::exchange(other.registered, false);
+      pinned = std::exchange(other.pinned, false);
     }
     return *this;
   }
   ~HostMapping() { Release(); }
 
   void Release() noexcept {
+    if (pinned && host != nullptr) {
+      (void)hipHostFree(host);
+      g_registered_host_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+      pinned = false;
+    }
     if (registered && host != nullptr) {
       (void)hipHostUnregister(host);
       g_registered_host_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
@@ -310,6 +319,44 @@ struct BatchLoadResult {
   std::string error;
 };
 
+// Windows HIP rejects hipHostRegister on file mapping views, so there the
+// interval is read into mapped pinned memory that the GPU reads the same way.
+bool ReadIntervalPinned(const std::filesystem::path& path, std::uint64_t offset,
+                        std::size_t length, HostMapping* mapping,
+                        std::string* error) {
+  hipError_t status =
+      hipHostMalloc(&mapping->host, length, hipHostMallocMapped);
+  if (status != hipSuccess) {
+    mapping->host = nullptr;
+    *error = HipError("hipHostMalloc(H3 text weight)", status);
+    return false;
+  }
+  mapping->pinned = true;
+  mapping->bytes = length;
+  std::string open_error;
+  const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
+  if (!platform::FileValid(file)) {
+    *error = "cannot open H3 text shard " + path.string() + ": " + open_error;
+    return false;
+  }
+  std::size_t read_bytes = 0;
+  while (read_bytes < length) {
+    const std::size_t result = platform::ReadFileAt(
+        file, static_cast<std::byte*>(mapping->host) + read_bytes,
+        length - read_bytes, offset + read_bytes);
+    if (result == 0) {
+      break;
+    }
+    read_bytes += result;
+  }
+  platform::CloseFile(file);
+  if (read_bytes != length) {
+    *error = "short read loading H3 text shard " + path.string();
+    return false;
+  }
+  return true;
+}
+
 BatchLoadResult LoadBatch(const ModelInventory& inventory,
                           std::vector<const TensorDescriptor*> descriptors,
                           int device, const CancellationToken* cancellation) {
@@ -343,6 +390,13 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
       const auto length = static_cast<std::size_t>(length64);
       HostMapping mapping;
       mapping.shard = interval.shard;
+      mapping.file_offset = interval.begin;
+#if defined(_WIN32)
+      if (!ReadIntervalPinned(path, interval.begin, length, &mapping,
+                              &result.error)) {
+        return result;
+      }
+#else
       std::string map_error;
       if (!mapping.mapping_file.OpenRange(path, interval.begin, length,
                                           platform::MapHint::kNone,
@@ -353,7 +407,6 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
       }
       mapping.host = mapping.mapping_file.data;
       mapping.bytes = length;
-      mapping.file_offset = interval.begin;
       core::PrefaultMappedRange(mapping.host, length);
       status = hipHostRegister(mapping.host, length,
                                hipHostRegisterMapped | hipHostRegisterReadOnly);
@@ -362,6 +415,7 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
         return result;
       }
       mapping.registered = true;
+#endif
       status = hipHostGetDevicePointer(&mapping.device, mapping.host, 0);
       if (status != hipSuccess) {
         result.error =

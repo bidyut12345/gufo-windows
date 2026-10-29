@@ -20,12 +20,25 @@ else()
 endif()
 
 function(gufo_qwen_image_21_register_tests)
+  add_executable(qwen_image_21_weights_test
+    ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/weights_test.cpp)
+  target_link_libraries(qwen_image_21_weights_test PRIVATE gufo_qwen_image_21)
+  add_test(NAME qwen_image_21_weights_test COMMAND qwen_image_21_weights_test)
+  set_tests_properties(qwen_image_21_weights_test PROPERTIES LABELS "cpu;models;qwen-image")
   add_executable(qwen_image_21_test
     ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/model_test.cpp)
   target_link_libraries(qwen_image_21_test PRIVATE gufo_qwen_image_21 gufo_http)
   add_test(NAME qwen_image_21_test COMMAND qwen_image_21_test)
   set_tests_properties(qwen_image_21_test PROPERTIES LABELS "cpu;models;qwen-image")
   if(ENGINE_ENABLE_HIP)
+    add_executable(qwen_image_21_weight_upload_test
+      ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/weights_test.cpp)
+    target_compile_definitions(qwen_image_21_weight_upload_test PRIVATE
+      GUFO_TEST_WEIGHT_UPLOAD=1)
+    target_link_libraries(qwen_image_21_weight_upload_test PRIVATE gufo_qwen_image_21)
+    add_test(NAME qwen_image_21_weight_upload_test COMMAND qwen_image_21_weight_upload_test)
+    set_tests_properties(qwen_image_21_weight_upload_test PROPERTIES
+      LABELS "gpu;qwen-image" SKIP_RETURN_CODE 77)
     add_executable(qwen_image_21_kernel_test
       ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/kernel_test.hip)
     target_link_libraries(qwen_image_21_kernel_test PRIVATE gufo_qwen_image_21)

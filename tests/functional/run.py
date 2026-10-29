@@ -29,9 +29,9 @@ import zlib
 from metrics import compare, comparison_status, join_server_timings, timing_measurement
 
 TESTS = Path(__file__).resolve().parent
-SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "structured", "structured-limits",
+SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "image-detail", "structured", "structured-limits",
           "tool-reasoning", "tool-streaming", "reasoning-separator", "reasoning-budget",
-          "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-parameter-order", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
+          "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-parameter-order", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "logprobs", "responses-logprobs", "batch",
           "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix", "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "system-injection", "cache")
 # Suites that already run another suite's checks; selecting both repeats the work.
 INCLUDED_IN = {"auto-tools": "tools", "tool-native-types": "tool-native-schemas"}
@@ -52,7 +52,8 @@ COMPARISON_FIELDS = ("comparison_command", "sampling_preset", "sampling_override
 HARNESS_ROOTS = ("run.py", "metrics.py", "progress.py", "stream_start.py", "prefill_scheduling.py", "server_metrics.py", "openai_sdk.py", "continuation.py",
                  "tool_reasoning.py", "tool_streaming.py", "tool_agent.py", "tool_native.py", "discovery.py", "image_inputs.py", "cache_edits.py", "cache_growth.py", "cache_depth.py", "cache_rotation.py", "cache_concurrency.py", "cache_shared_prefix.py", "cache_bridge.py", "system_injection.py",
                  "cache_compaction.py", "cache_workloads.py", "cache_messages_loop.py", "cache_stalls.py",
-                 "cache_disk_spacing.py", "tool_images.py", "reasoning_budget.py")
+                 "cache_disk_spacing.py", "cache_persist.py", "tool_images.py",
+                 "reasoning_budget.py")
 
 
 def harness_files():
@@ -188,6 +189,17 @@ def compare_runs(baseline_dir, candidate_dir):
     return comparison
 
 
+# Windows Popen cannot deliver SIGINT. A server started in its own process
+# group receives CTRL_BREAK_EVENT instead, which gufo handles like SIGINT.
+SERVER_POPEN = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                if os.name == "nt" else {})
+
+
+def interrupt_server(process):
+    """Requests the graceful shutdown that Ctrl+C starts."""
+    process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+
+
 @contextlib.contextmanager
 def server(command, log_path, startup_timeout, environment=None):
     def interrupt(signum, frame):
@@ -203,7 +215,7 @@ def server(command, log_path, startup_timeout, environment=None):
             previous_handlers = {signum: signal.signal(signum, interrupt)
                                  for signum in stop_signals}
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                                       env=environment)
+                                       env=environment, **SERVER_POPEN)
             deadline = time.monotonic() + startup_timeout
             while time.monotonic() < deadline:
                 if process.poll() is not None:
@@ -224,13 +236,7 @@ def server(command, log_path, startup_timeout, environment=None):
             yield process
         finally:
             if process is not None and process.poll() is None:
-                try:
-                    process.send_signal(signal.SIGINT)
-                except ValueError:
-                    # Windows Popen cannot deliver SIGINT; TerminateProcess
-                    # still reaps the server, but graceful shutdown is never
-                    # exercised there.
-                    process.terminate()
+                interrupt_server(process)
                 try:
                     process.wait(timeout=30)
                 except subprocess.TimeoutExpired:
@@ -292,14 +298,14 @@ def main():
             parser.error(f"the test runner owns {reserved}; omit it from the server command")
     if option(command, "--api-key") is not None:
         parser.error("omit --api-key for the isolated loopback test server")
-    if set(args.suite) & {"image-inputs", "image-count", "tool-images"} and option(command, "--mmproj") is None:
-        parser.error("image-inputs, image-count and tool-images require --mmproj in the server command")
+    if set(args.suite) & {"image-inputs", "image-count", "tool-images", "image-detail"} and option(command, "--mmproj") is None:
+        parser.error("image-inputs, image-count, tool-images, and image-detail require --mmproj in the server command")
     selected = args.suite
     if "all" in selected:
         if len(selected) != 1:
             parser.error("all cannot be combined with other suites")
         selected = [suite for suite in SUITES if suite not in (*INCLUDED_IN, "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "prefill-scheduling")
-                    and (suite not in ("image-inputs", "image-count", "tool-images")
+                    and (suite not in ("image-inputs", "image-count", "tool-images", "image-detail")
                          or option(command, "--mmproj") is not None)]
     selected = [suite for suite in dict.fromkeys(selected) if INCLUDED_IN.get(suite) not in selected]
     disk_enabled = bool(set(selected) & {"cache", "image-count"})
@@ -420,6 +426,7 @@ def main():
         ]
     ready_to_restore = []
     spacing = False
+    persist = False
     try:
         if "cache-rotation" in selected:
             from cache_rotation import check_snapshot_budget, host_available_bytes
@@ -478,7 +485,10 @@ def main():
                 spacing = run("disk-spacing", "cache_disk_spacing.py", [
                     "--url", base_url, "--model", model,
                     "--output", str(output / "disk-spacing.json")])
-        if ready_to_restore or spacing:
+                persist = run("cache-persist", "cache_persist.py", [
+                    "--url", base_url, "--model", model,
+                    "--output", str(output / "cache-persist.json")])
+        if ready_to_restore or spacing or persist:
             startup_started = time.monotonic()
             with server(command, output / "server-restarted.log", args.startup_timeout):
                 report["restart_ms"] = (time.monotonic() - startup_started) * 1000
@@ -487,6 +497,11 @@ def main():
                         "--url", base_url, "--model", model,
                         "--restore", str(output / (label + ".json")),
                         "--output", str(output / (label + "-disk.json"))])
+                if persist:
+                    run("cache-persist-disk", "cache_persist.py", [
+                        "--url", base_url, "--model", model,
+                        "--restore", str(output / "cache-persist.json"),
+                        "--output", str(output / "cache-persist-disk.json")])
                 if spacing:
                     spacing = run("disk-spacing-disk", "cache_disk_spacing.py", [
                         "--url", base_url, "--model", model,

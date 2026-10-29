@@ -84,12 +84,20 @@ if (GUFO_PLATFORM_ONLY)
   endif()
   return()
 endif()
+# Linux libstdc++ must be parsed before HIP defines its __noinline__ macro.
+if (NOT WIN32)
+  add_compile_options(
+    "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include \"${CMAKE_SOURCE_DIR}/src/core/hip/libstdcxx_noinline.hpp\">")
+endif()
 find_package(ICU REQUIRED COMPONENTS uc i18n)
 find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_package(PNG REQUIRED)
 find_package(JPEG REQUIRED)
 if (WIN32)
+  find_program(PKG_CONFIG_EXECUTABLE pkgconf REQUIRED
+    HINTS "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/pkgconf")
+  find_package(PkgConfig REQUIRED)
   find_package(WebP CONFIG QUIET)
   if (TARGET WebP::webp)
     if (NOT TARGET PkgConfig::WEBP)
@@ -97,15 +105,15 @@ if (WIN32)
       target_link_libraries(PkgConfig::WEBP INTERFACE WebP::webp WebP::webpdemux)
     endif()
   else()
-    find_program(PKG_CONFIG_EXECUTABLE pkgconf REQUIRED
-      HINTS "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/pkgconf")
-    find_package(PkgConfig REQUIRED)
     pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
   endif()
 else()
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
 endif()
+pkg_check_modules(SNDFILE REQUIRED IMPORTED_TARGET sndfile)
+pkg_check_modules(SOXR REQUIRED IMPORTED_TARGET soxr)
+pkg_check_modules(AV REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(unofficial-sqlite3 CONFIG QUIET)
 if (TARGET unofficial::sqlite3::sqlite3)
@@ -150,6 +158,16 @@ if (ENGINE_ENABLE_HIP)
     set(CMAKE_DEPFILE_FLAGS_HIP "/showIncludes")
     set(CMAKE_HIP_DEPFILE_FORMAT msvc)
     message(STATUS "gufo: compiling HIP through ${GUFO_CCACHE_PROGRAM}")
+  endif()
+  # clang-cl maps the MSVC RelWithDebInfo /Ob1 to -finline-hint-functions for
+  # the device compile too, which marks every __device__ helper without
+  # inline/__forceinline__ noinline: the kernels then call them. Linux builds
+  # inline them; /Ob2 restores the normal inliner for HIP sources.
+  if (WIN32)
+    string(REPLACE "/Ob1" "/Ob2" CMAKE_HIP_FLAGS_RELWITHDEBINFO
+      "${CMAKE_HIP_FLAGS_RELWITHDEBINFO}")
+    string(REPLACE "/Ob1" "/Ob2" CMAKE_HIP_FLAGS_MINSIZEREL
+      "${CMAKE_HIP_FLAGS_MINSIZEREL}")
   endif()
   find_package(hip REQUIRED)
   find_package(hipblas REQUIRED)
@@ -268,6 +286,24 @@ add_subdirectory(src/cache)
 if (ENGINE_ENABLE_HIP)
   add_library(gufo_hip_host STATIC src/core/hip/host_allocations.cpp)
   target_link_libraries(gufo_hip_host PUBLIC hip::host gufo_platform)
+  # HIP loads ROCr through libamdhip64's own RUNPATH, so a build tree runs
+  # the unpatched runtime unless LD_LIBRARY_PATH names the patched one (the
+  # Nix package wraps `gufo` for this). With GUFO_ROCR_LIBRARY_DIR (the Nix
+  # shells export it) every HIP binary links that ROCr directly: the loader
+  # maps it first and HIP reuses it, one soname per process.
+  set(GUFO_ROCR_LIBRARY_DIR "" CACHE PATH
+      "ROCr runtime directory HIP binaries load (empty: HIP's own)")
+  set(gufo_rocr_dir "${GUFO_ROCR_LIBRARY_DIR}")
+  if (NOT gufo_rocr_dir AND DEFINED ENV{GUFO_ROCR_LIBRARY_DIR})
+    set(gufo_rocr_dir "$ENV{GUFO_ROCR_LIBRARY_DIR}")
+  endif()
+  if (gufo_rocr_dir AND NOT WIN32)
+    find_library(GUFO_ROCR_LIBRARY hsa-runtime64 PATHS "${gufo_rocr_dir}"
+                 NO_DEFAULT_PATH NO_CACHE REQUIRED)
+    target_link_libraries(gufo_hip_host PUBLIC
+                          "${GUFO_ROCR_LIBRARY}")
+    message(STATUS "gufo: ROCr runtime ${GUFO_ROCR_LIBRARY}")
+  endif()
   target_include_directories(gufo_hip_host PUBLIC ${PROJECT_SOURCE_DIR})
   add_library(gufo_cache_hip STATIC
     src/core/hip/committed_backing.cpp
@@ -572,6 +608,17 @@ if (BUILD_TESTING)
     tests/functional/cache_disk_faults.cpp)
   target_link_libraries(cache_disk_faults PRIVATE ${CMAKE_DL_LIBS})
   endif()
+  # The fault libraries are LD_PRELOADed into uninstrumented processes (the
+  # test's Python, a release server); a sanitized library aborts there with
+  # "ASan runtime does not come first".
+  if (GUFO_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    foreach(preload device_loss_faults cache_disk_faults)
+      if (TARGET ${preload})
+        target_compile_options(${preload} PRIVATE -fno-sanitize=all)
+        target_link_options(${preload} PRIVATE -fno-sanitize=all)
+      endif()
+    endforeach()
+  endif()
 
   add_subdirectory(tests/models/qwen)
   add_subdirectory(tests/models/qwen27b)
@@ -657,6 +704,11 @@ if (BUILD_TESTING)
   target_link_libraries(sampling_test PRIVATE gufo_core)
   add_test(NAME sampling_test COMMAND sampling_test)
   set_tests_properties(sampling_test PROPERTIES LABELS "cpu;sampling")
+
+  add_executable(logprobs_test tests/cli/logprobs_test.cpp)
+  target_link_libraries(logprobs_test PRIVATE gufo_core)
+  add_test(NAME logprobs_test COMMAND logprobs_test)
+  set_tests_properties(logprobs_test PROPERTIES LABELS "cpu;server;api;openai")
 
   add_executable(openai_chat_test
     tests/cli/openai_chat_test.cpp
@@ -1124,6 +1176,25 @@ if (BUILD_TESTING)
   add_test(NAME kernel_bench_test COMMAND kernel_bench_test)
   set_tests_properties(kernel_bench_test PROPERTIES
     LABELS "cpu;benchmarks;statistics;json")
+
+  add_library(platform_library_fixture SHARED tests/core/platform_library_fixture.cpp)
+  set_target_properties(platform_library_fixture PROPERTIES
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/core/fixtures"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/core")
+  add_executable(platform_library_test tests/core/platform_library_test.cpp)
+  target_link_libraries(platform_library_test PRIVATE gufo_platform)
+  add_dependencies(platform_library_test platform_library_fixture)
+  add_test(NAME platform_library_test COMMAND platform_library_test
+    "$<TARGET_FILE:platform_library_fixture>")
+  set_tests_properties(platform_library_test PROPERTIES LABELS "cpu;platform")
+  if(NOT WIN32)
+    add_test(NAME platform_library_relocated_test COMMAND platform_library_test
+      "/gufo-missing-build-path/$<TARGET_FILE_NAME:platform_library_fixture>")
+    set_tests_properties(platform_library_relocated_test PROPERTIES
+      LABELS "cpu;platform"
+      ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:platform_library_fixture>")
+  endif()
 
   # the publish suite drives descriptors through dup2
   if (NOT WIN32)

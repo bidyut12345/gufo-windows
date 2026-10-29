@@ -103,12 +103,13 @@ public:
       const CancellationCheck& cancellation, bool stream, bool ignore_eos,
       std::string_view client_id,
       const std::vector<std::string>& stop_sequences, bool return_progress,
-      bool cache_prompt) override {
+      bool cache_prompt, bool cache_persist) override {
     last_ignore_eos = ignore_eos;
     return std::make_shared<ProgressRequest>(
         TextGenerationBackend::start_complete(
             prompt, max_tokens, sampling, cancellation, stream, false,
-            client_id, stop_sequences, return_progress, cache_prompt),
+            client_id, stop_sequences, return_progress, cache_prompt,
+            cache_persist),
         progress, admit.load());
   }
   std::shared_ptr<GenerationRequest> start_chat(
@@ -142,14 +143,26 @@ public:
   std::optional<std::size_t> chat_token_count;
   mutable std::size_t counted_messages{0};
   mutable std::size_t counted_tools{0};
+  std::optional<std::string> render_chat_prompt(
+      const gufo::server::ChatRequest& request) const override {
+    rendered_chat = request;
+    if (render_error)
+      throw std::invalid_argument(*render_error);
+    return rendered_prompt;
+  }
+  std::optional<std::string> rendered_prompt;
+  std::optional<std::string> render_error;
+  mutable gufo::server::ChatRequest rendered_chat;
   Result complete(std::string_view prompt, std::size_t limit,
                   const gufo::sampling::SamplingConfig& sampling,
                   const CancellationCheck& cancel, const TokenCallback& token,
                   std::string_view client_id = "anonymous",
                   const std::vector<std::string>& stop_sequences = {},
-                  bool cache_prompt = true) override {
+                  bool cache_prompt = true,
+                  bool cache_persist = true) override {
     ++calls;
     last_cache_prompt = cache_prompt;
+    last_cache_persist = cache_persist;
     if (failure == 1)
       throw std::length_error("context exceeded");
     if (failure == 2)
@@ -204,9 +217,18 @@ public:
       result.finish_reason = FinishReason::kStopSequence;
       result.stop_sequence = forced_stop_sequence;
     }
+    if (sampling.logprobs) {
+      gufo::server::DecodedLogprobs probabilities;
+      probabilities.entries.push_back({3, result.text, -3.0});
+      if (*sampling.logprobs > 0)
+        probabilities.entries.push_back({1, "alternative", -0.5});
+      result.logprobs.push_back(std::move(probabilities));
+    }
     if (token && failure != 8) {
       std::this_thread::sleep_for(token_delay);
-      (void)token(result.text);
+      (void)token(gufo::server::TokenPiece(
+          result.text,
+          result.logprobs.empty() ? nullptr : &result.logprobs.front()));
     }
     if (failure == 6)
       throw std::runtime_error("context exceeded");
@@ -233,6 +255,7 @@ public:
   std::atomic<int> calls{0};
   std::atomic<bool> last_ignore_eos{false};
   std::atomic<bool> last_cache_prompt{true};
+  std::atomic<bool> last_cache_persist{true};
   std::vector<PromptProgress> progress;
   // Report a scheduler admission before generation, as the HIP backend does.
   std::atomic<bool> admit{false};

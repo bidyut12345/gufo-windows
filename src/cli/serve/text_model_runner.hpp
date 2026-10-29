@@ -54,7 +54,15 @@ struct TextRunnerRamCacheOptions {
   /// Explicit limits may exceed that budget up to the model's ceiling, which
   /// keeps kHostSnapshotHeadroomBytes of host RAM free.
   std::size_t capacity_bytes{0};
+  /// False keeps no RAM checkpoints and reserves no RAM-cache backing, and
+  /// capacity_bytes is ignored. Sessions still reuse their own live state.
+  bool enabled{true};
 };
+
+/// Parses a --cache-ram-bytes value: "off", or a byte count where 0 selects
+/// the automatic budget. Returns nullopt and sets `error` for anything else.
+[[nodiscard]] std::optional<TextRunnerRamCacheOptions> ParseRamCacheOption(
+    std::string_view text, std::string* error);
 
 struct TextRunnerDiskCacheOptions {
   static constexpr std::size_t kDefaultCapacityBytes =
@@ -197,6 +205,7 @@ struct TextDecodeSelection {
   bool stop{false};
   TextRunnerToken token{0};
   std::string piece;
+  std::optional<sampling::TokenLogprobs> logprobs;
 };
 
 struct TextDecodeStep {
@@ -209,6 +218,7 @@ struct TextDecodeStep {
   std::size_t lookup_tokens{0};
   std::size_t lookup_accepted_tokens{0};
   bool stop{false};
+  std::optional<sampling::TokenLogprobs> terminal_logprobs;
   /// Execution actually used for this request, including model-owned subgroup
   /// dispatch. A runner's advertised maximum is not evidence of batching.
   TextExecutionPlan execution_plan{};
@@ -366,6 +376,12 @@ public:
     if (!prompt)
       return std::nullopt;
     return prompt->tokens.size();
+  }
+  /// The text RenderAndTokenize tokenizes, or empty when the runner cannot
+  /// render its template as text.
+  [[nodiscard]] virtual std::optional<std::string> RenderPrompt(
+      const ChatRequest&) const {
+    return std::nullopt;
   }
   /// Called before cache restoration, prefill or selection, including
   /// a complete prefix hit. Must replace, never inherit, the previous request.
@@ -646,7 +662,7 @@ public:
       const CancellationCheck& is_cancelled = {},
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
-      bool stop_at_eos = true);
+      bool stop_at_eos = true, bool persist = true);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
   /// Longest RAM-retained prefix of prompt that Acquire could reuse, without

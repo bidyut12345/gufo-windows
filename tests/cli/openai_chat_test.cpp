@@ -93,6 +93,7 @@ private:
 
 class FakeBackend final : public gufo::server::TextGenerationBackend {
 public:
+  std::vector<gufo::server::DecodedLogprobs> logprob_pieces;
   [[nodiscard]] std::string model_id() const override { return "test-model"; }
   [[nodiscard]] std::vector<std::string> model_ids() const override {
     return names;
@@ -116,7 +117,7 @@ public:
   Result complete(std::string_view, std::size_t,
                   const gufo::sampling::SamplingConfig&,
                   const CancellationCheck&, const TokenCallback&,
-                  std::string_view, const std::vector<std::string>&,
+                  std::string_view, const std::vector<std::string>&, bool,
                   bool) override {
     return {};
   }
@@ -158,7 +159,15 @@ public:
       result.cache_checkpoint_tokens = 5;
     }
     for (const std::string& piece : pieces) {
-      if ((is_cancelled && is_cancelled()) || (on_token && !on_token(piece))) {
+      const auto* probabilities =
+          sampling.logprobs && result.tokens.size() < logprob_pieces.size()
+              ? &logprob_pieces[result.tokens.size()]
+              : nullptr;
+      if (probabilities)
+        result.logprobs.push_back(*probabilities);
+      if ((is_cancelled && is_cancelled()) ||
+          (on_token &&
+           !on_token(gufo::server::TokenPiece(piece, probabilities)))) {
         result.cancelled = true;
         result.finish_reason = FinishReason::kCancelled;
         return result;
@@ -431,6 +440,38 @@ void TestCachePromptOption() {
         Expect(backend.last_request.cache_prompt ==
                    (std::string_view(value) != "false"),
                "cache_prompt reaches both buffered and streaming backends");
+      }
+    }
+  }
+}
+
+void TestCachePersistOption() {
+  for (bool stream : {false, true}) {
+    for (const auto value : {"true", "false", "null", "0", "\"false\""}) {
+      FakeBackend backend;
+      auto response = gufo::server::HandleOpenAiChat(
+          Request(
+              std::string(
+                  R"({"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":)") +
+              (stream ? "true" : "false") + R"(,"cache_persist":)" + value +
+              "}"),
+          backend);
+      const bool valid = std::string_view(value) == "true" ||
+                         std::string_view(value) == "false" ||
+                         std::string_view(value) == "null";
+      Expect(response.status == (valid ? 200 : 400),
+             "cache_persist accepts only JSON booleans or null");
+      if (valid) {
+        if (response.streaming_body)
+          response.streaming_body([](std::string_view) { return true; });
+        Expect(backend.last_request.cache_persist ==
+                   (std::string_view(value) != "false"),
+               "cache_persist reaches both buffered and streaming backends");
+        Expect(backend.last_request.cache_prompt,
+               "cache_persist leaves prompt reuse enabled");
+      } else {
+        Expect(response.body.find("invalid_cache_persist") != std::string::npos,
+               "a non-boolean cache_persist names its error code");
       }
     }
   }
@@ -843,8 +884,8 @@ void TestResponsesClientCompatTolerances() {
            "A namespace without a tools array is rejected");
   }
   {
-    // The shared 128-function cap counts flattened functions at append time,
-    // so both orderings around a full namespace reject the 129th function.
+    // #820: no fixed function count. Claude Code with MCP servers sends
+    // more than 128 tools; the request body size bounds the count.
     std::string nested = R"({"type":"namespace","name":"crm","tools":[)";
     for (int i = 0; i < 128; ++i) {
       if (i != 0)
@@ -853,21 +894,44 @@ void TestResponsesClientCompatTolerances() {
     }
     nested += "]}";
     const std::string outside = R"({"type":"function","name":"outside"})";
-    gufo::server::ChatRequest accepted;
-    Expect(!gufo::server::ParseOpenAiResponseControls(
-               gufo::json::parse(R"({"tools":[)" + nested + "]}"), &accepted) &&
-               accepted.tools.size() == 128,
-           "Exactly 128 functions flattened from a namespace are accepted");
     for (const bool outside_first : {false, true}) {
       const auto body = outside_first
                             ? R"({"tools":[)" + outside + "," + nested + "]}"
                             : R"({"tools":[)" + nested + "," + outside + "]}";
-      gufo::server::ChatRequest overflow;
-      Expect(gufo::server::ParseOpenAiResponseControls(gufo::json::parse(body),
-                                                       &overflow)
-                 .has_value(),
-             "Both boundary orderings reject the 129th flattened function");
+      gufo::server::ChatRequest accepted;
+      Expect(!gufo::server::ParseOpenAiResponseControls(gufo::json::parse(body),
+                                                        &accepted)
+                     .has_value() &&
+                 accepted.tools.size() == 129,
+             "Both orderings accept a 129th flattened function");
     }
+    const std::string duplicate = R"({"type":"function","name":"f127"})";
+    gufo::server::ChatRequest repeated;
+    Expect(gufo::server::ParseOpenAiResponseControls(
+               gufo::json::parse(R"({"tools":[)" + nested + "," + duplicate +
+                                 "]}"),
+               &repeated)
+               .has_value(),
+           "A name repeated after a namespace is still rejected");
+  }
+  {
+    // The Messages tools of Claude Code with MCP servers (#820).
+    std::string tools = "[";
+    for (int i = 0; i < 200; ++i) {
+      if (i != 0)
+        tools += ",";
+      tools +=
+          R"({"name":"mcp__srv__t)" + std::to_string(i) +
+          R"(","input_schema":{"type":"object","properties":{"q":{"type":"string"}}}})";
+    }
+    tools += "]";
+    gufo::server::ChatRequest chat;
+    Expect(!gufo::server::ParseAnthropicToolControls(
+                gufo::json::parse(R"({"tools":)" + tools + "}"), &chat)
+                   .has_value() &&
+               chat.tools.size() == 200 &&
+               chat.tools.back().name == "mcp__srv__t199",
+           "Messages accepts 200 custom tools");
   }
   {
     gufo::server::ChatRequest chat;
@@ -2471,16 +2535,20 @@ void TestImagePartsRetainOrderAndIdentity() {
     Expect(gufo::server::HandleOpenAiChat(Request(body), backend).status == 400,
            "unsupported image role, policy and URL are rejected");
   }
-  // Codex sends "high" from view_image; every standard value behaves as auto.
+  // Codex sends "high" from view_image. Only low changes the resolution.
+  using Detail = gufo::tokenization::ChatMessage::ImageDetail;
   for (const std::string detail : {"auto", "low", "high", "original"}) {
     const auto accepted = gufo::server::HandleOpenAiChat(
         Request(
             R"({"model":"test-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":")" +
             detail + R"("}}]}]})"),
         backend);
-    Expect(accepted.status == 200 &&
-               backend.last_request.messages.front().images.size() == 1,
-           "standard image detail values are accepted as auto");
+    const auto& images = backend.last_request.messages.front().images;
+    Expect(accepted.status == 200 && images.size() == 1 &&
+               images[0].detail ==
+                   (detail == "low" ? Detail::kLow : Detail::kAuto),
+           "standard image detail values are accepted, and only low bounds "
+           "the resolution");
   }
 }
 
@@ -2572,6 +2640,33 @@ void TestToolImagesRetainOrderAndIdentity() {
              chat.content == "left  right" && chat.images.size() == 2 &&
              chat.images[0].offset == 5 && chat.images[1].offset == 11,
          "Chat images stay attached to the tool result at their text offsets");
+  {
+    using Detail = gufo::tokenization::ChatMessage::ImageDetail;
+    const auto detailed = gufo::server::HandleOpenAiChat(Request(R"({
+      "model":"test-model",
+      "messages":[{"role":"tool","tool_call_id":"call_picture","content":[
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":"low"}}
+      ]}]
+    })"),
+                                                         backend);
+    Expect(detailed.status == 200 &&
+               backend.last_request.messages.front().images.size() == 1 &&
+               backend.last_request.messages.front().images[0].detail ==
+                   Detail::kLow,
+           "tool images carry their requested detail");
+    auto item =
+        parse(R"({"type":"function_call_output","call_id":"call_picture",
+      "output":[{"type":"input_image","detail":"low",
+                 "image_url":"data:image/png;base64,AQID"}]})");
+    gufo::core::ImageReadBudget budget;
+    gufo::tokenization::ChatMessage message;
+    std::string error;
+    Expect(gufo::server::ParseOpenAiResponseMessage(item, &message, budget,
+                                                    &error) &&
+               message.images.size() == 1 &&
+               message.images[0].detail == Detail::kLow,
+           "Responses input_image.detail reaches the image part: " + error);
+  }
 
   for (const auto* kind : {"function_call_output", "custom_tool_call_output"}) {
     for (const bool text : {false, true}) {
@@ -2754,7 +2849,7 @@ void TestStopSequencesAndDefaultFields() {
              200,
          "explicit text-only and disabled logprobs defaults work");
   for (const auto* request :
-       {R"({"logprobs":true})", R"({"top_logprobs":3})",
+       {R"({"logprobs":1})", R"({"top_logprobs":3})",
         R"({"modalities":["text","audio"]})", R"({"audio":{}})",
         R"({"response_format":{"type":"text","unexpected":true}})"}) {
     auto invalid = base;
@@ -5003,17 +5098,229 @@ void TestResponsesOutput() {
   }
 }
 
+void TestResponsesLogprobs() {
+  using Backend = gufo::server::TextGenerationBackend;
+  using Value = gufo::json::Value;
+  using Initial = Backend::InitialOutputState;
+  const std::string call =
+      "<tool_call>\n<function=record>\n<parameter=value>repeat\n"
+      "</parameter>\n</function>\n</tool_call>";
+  struct Fixture {
+    std::vector<std::string> pieces;
+    std::vector<std::size_t> visible;
+    Initial initial = Initial::kContent;
+    bool tools = false;
+    bool structured = false;
+    bool deepseek = false;
+  };
+  const std::vector<Fixture> fixtures{
+      {{"Hel", "lo", ""}, {0, 1}},
+      {{"only thought", ""}, {}, Initial::kReasoning},
+      {{call, "\n"}, {}, Initial::kContent, true},
+      {{"repeat" + call + "repeat"}, {0}, Initial::kContent, true},
+      {{"repeat", "<｜DSML｜tool_calls><｜DSML｜invoke name=\"record\">",
+        "<｜DSML｜parameter name=\"value\" "
+        "string=\"true\">repeat</｜DSML｜parameter>",
+        "</｜DSML｜invoke></｜DSML｜tool_calls>", "repeat"},
+       {0, 4},
+       Initial::kContent,
+       true,
+       false,
+       true},
+      {{"<think>", "repeat", "</thi", "nk>", "\n", "repeat", "!"},
+       {5, 6},
+       Initial::kReasoning},
+      {{" \n", "<thi", "nk>", "secret", "</think>", "\n", "answer"},
+       {6},
+       Initial::kAuto},
+      {{"secret</think>answer"}, {0}, Initial::kReasoning},
+      {{"A", "\xc3", "\xa9", "Z"}, {0, 1, 2, 3}},
+      {{"\xe2", "A", "\xe2"}, {0, 1, 2}},
+      {{"literal <", "tool_call>", "text"}, {0, 1, 2}},
+      {{"repeat", " <", "not-a-call>"}, {0, 1, 2}, Initial::kContent, true},
+      {{"repeat", " ", "<tool", "_call>\n<function=record>\n",
+        "<parameter=value>repeat\n</parameter>\n</function>\n</tool_call>",
+        "\n", "repeat"},
+       {0, 1, 5, 6},
+       Initial::kContent,
+       true},
+      {{call, "\n", "repeat"}, {1, 2}, Initial::kContent, true},
+      {{"repeat", "</think>\n", call, "\n", "repeat"},
+       {3, 4},
+       Initial::kReasoning,
+       true},
+      {{"{\"tag\":\"", "<think>", "<tool_call>", "\"}"},
+       {0, 1, 2, 3},
+       Initial::kContent,
+       false,
+       true},
+  };
+  for (std::size_t fixture_index = 0; fixture_index < fixtures.size();
+       ++fixture_index) {
+    const auto& fixture = fixtures[fixture_index];
+    for (const unsigned count : {0U, 2U, 20U}) {
+      for (const bool limited : {false, true}) {
+        FakeBackend backend;
+        backend.initial_output_state_override = fixture.initial;
+        backend.pieces = fixture.pieces;
+        backend.finish_reason = limited ? Backend::FinishReason::kLength
+                                        : Backend::FinishReason::kStop;
+        gufo::server::ChatRequest chat;
+        if (fixture.tools) {
+          const auto body = gufo::json::parse(R"({"tools":[{"type":"function",
+            "name":"record","parameters":{"type":"object","properties":{
+            "value":{"type":"string"}},"required":["value"]}}]})");
+          Expect(!gufo::server::ParseOpenAiResponseControls(body, &chat),
+                 "Responses logprobs tool fixture parses");
+          backend.tool_format =
+              fixture.deepseek
+                  ? gufo::sampling::JsonConstraint::ToolFormat::kDeepSeek
+                  : gufo::sampling::JsonConstraint::ToolFormat::kQwen;
+        }
+        if (fixture.structured) {
+          Expect(!gufo::server::ParseOpenAiResponseControls(
+                     gufo::json::parse(
+                         R"({"text":{"format":{"type":"json_object"}}})"),
+                     &chat),
+                 "Responses logprobs structured fixture parses");
+        }
+        // Independent scores identify the source token even when its spelling
+        // is repeated in thought, a tool argument and visible text.
+        gufo::server::LogprobDecoder decoder;
+        for (std::size_t i = 0; i < backend.pieces.size(); ++i) {
+          const auto id = static_cast<gufo::sampling::TokenId>(i);
+          auto values = decoder.DecodeToken(
+              {{id, -1.0 - i}, {}},
+              [&](auto token) { return backend.pieces.at(token); });
+          for (unsigned top = 1; top < 20; ++top)
+            values.entries.push_back({1000 + top, "alternative", -100.0 - top});
+          backend.logprob_pieces.push_back(std::move(values));
+        }
+        const auto baseline =
+            gufo::json::parse(gufo::server::CreateOpenAiResponse(
+                                  Request("{}"), backend, chat, 128, {}, false)
+                                  .body);
+        const auto visible_text = [](const Value& response) {
+          std::string text;
+          for (const auto& item : response.find("output")->items())
+            if (item.member_str("type") == "message")
+              for (const auto& part : item.find("content")->items())
+                text += part.member_str("text");
+          return text;
+        };
+        gufo::sampling::SamplingConfig sampling;
+        sampling.logprobs = count;
+        const auto buffered = gufo::server::CreateOpenAiResponse(
+            Request("{}"), backend, chat, 128, sampling, false);
+        const auto body = gufo::json::parse(buffered.body);
+        Expect(visible_text(body) == visible_text(baseline),
+               "enabling Responses logprobs preserves visible text");
+        Expect(body.find("usage")->dump() == baseline.find("usage")->dump(),
+               "enabling Responses logprobs preserves usage");
+        std::vector<std::size_t> actual;
+        const auto check_entries = [&](const Value& entries, bool bytes) {
+          std::vector<std::size_t> indices;
+          for (const auto& entry : entries.items()) {
+            const auto value = entry.find("logprob")->as_double();
+            Expect(
+                value <= -1 &&
+                    value >= -static_cast<double>(fixture.pieces.size()),
+                "Responses preserves independently assigned selected scores");
+            indices.push_back(static_cast<std::size_t>(-value - 1));
+            Expect(entry.find("top_logprobs")->size() == count,
+                   "Responses retains the requested candidate count");
+            Expect(entry.contains("bytes") == bytes,
+                   "Responses uses the part/event byte schemas");
+          }
+          return indices;
+        };
+        const auto check_output = [&](const Value& output) {
+          auto parts = Value::array();
+          for (const auto& item : output.items()) {
+            if (item.member_str("type") != "message")
+              continue;
+            for (const auto& part : item.find("content")->items()) {
+              const auto indices = check_entries(*part.find("logprobs"), true);
+              actual.insert(actual.end(), indices.begin(), indices.end());
+              parts.push_back(part);
+            }
+          }
+          return parts;
+        };
+        const auto buffered_parts = check_output(*body.find("output"));
+        if (actual != fixture.visible)
+          std::cerr << "Responses logprobs fixture " << fixture_index << " got "
+                    << body.dump() << '\n';
+        Expect(actual == fixture.visible,
+               "only visible source tokens have Responses scores");
+        auto streamed_indices = std::vector<std::size_t>{};
+        std::vector<std::size_t> item_indices;
+        Value terminal;
+        std::size_t sequence = 0;
+        const auto stream = gufo::server::CreateOpenAiResponse(
+            Request("{}"), backend, chat, 128, sampling, true);
+        stream.streaming_body([&](std::string_view chunk) {
+          const auto event =
+              gufo::json::parse(chunk.substr(chunk.find("\ndata: ") + 7));
+          Expect(event.member_size("sequence_number") == sequence++,
+                 "logprob events keep contiguous sequence numbers");
+          const auto type = event.member_str("type");
+          if (type == "response.output_text.delta") {
+            const auto indices = check_entries(*event.find("logprobs"), false);
+            streamed_indices.insert(streamed_indices.end(), indices.begin(),
+                                    indices.end());
+            item_indices.insert(item_indices.end(), indices.begin(),
+                                indices.end());
+          } else if (type == "response.output_text.done") {
+            Expect(
+                check_entries(*event.find("logprobs"), false) == item_indices,
+                "done events contain exactly the accumulated delta scores");
+            item_indices.clear();
+          } else if (type == "response.content_part.done") {
+            (void)check_entries(*event.find("part")->find("logprobs"), true);
+          } else if (type.starts_with("response.reasoning") ||
+                     type.starts_with("response.function_call_arguments")) {
+            Expect(!event.contains("logprobs"),
+                   "reasoning and tool events do not acquire text scores");
+          }
+          if (type == "response.completed" || type == "response.incomplete")
+            terminal = *event.find("response");
+          return true;
+        });
+        Expect(streamed_indices == fixture.visible,
+               "streaming preserves token order without duplicates");
+        actual.clear();
+        Expect(
+            check_output(*terminal.find("output")).dump() ==
+                buffered_parts.dump(),
+            "buffered and streamed Responses have identical text and logprobs");
+        Expect(terminal.find("usage")->dump() == body.find("usage")->dump(),
+               "logprob transport leaves usage unchanged");
+      }
+    }
+  }
+}
+
 void TestResponsesLiveAndCancellation() {
   FakeBackend backend;
+  gufo::sampling::SamplingConfig sampling;
+  sampling.logprobs = 1;
+  backend.logprob_pieces = {{{{1, "<tool_call>first", -1}}},
+                            {{{2, "second", -2}}}};
   backend.pieces = {"<tool_call>first", "second"};
   backend.block_after_first_piece = true;
   auto response = gufo::server::CreateOpenAiResponse(Request("{}"), backend, {},
-                                                     0, {}, true);
+                                                     0, sampling, true);
   std::atomic<bool> first{false};
   std::jthread writer([&] {
     response.streaming_body([&](std::string_view chunk) {
-      if (chunk.find("event: response.output_text.delta") != std::string::npos)
+      if (chunk.find("event: response.output_text.delta") !=
+          std::string::npos) {
+        if (!first)
+          Expect(chunk.find(R"("logprob":-1)") != std::string::npos,
+                 "Responses streams logprobs before generation finishes");
         first = true;
+      }
       return true;
     });
   });
@@ -5025,7 +5332,7 @@ void TestResponsesLiveAndCancellation() {
   backend.block_after_first_piece = false;
   backend.completed = false;
   auto cancelled = gufo::server::CreateOpenAiResponse(Request("{}"), backend,
-                                                      {}, 0, {}, true);
+                                                      {}, 0, sampling, true);
   bool terminal = false;
   cancelled.streaming_body([&](std::string_view chunk) {
     terminal |= chunk.find("event: response.completed") != std::string::npos;
@@ -5188,6 +5495,15 @@ void TestToolClosingFraming() {
       {call, 1, R"({"text":"42"})", ""},
       {"</invoke>\n\n" + call, 1, R"({"text":"42"})", "</invoke>\n\n"},
       {"</invoke>", 0, "", "</invoke>"},
+      // The prose shapes of tool_reasoning.py ENVELOPE_CASES, which Qwen27 Q4
+      // answers with a terminal call instead of writing them.
+      {"</invoke>\nIt closes an invoke element.", 0, "",
+       "</invoke>\nIt closes an invoke element."},
+      {"<｜DSML｜invoke name=\"f\">", 0, "", "<｜DSML｜invoke name=\"f\">"},
+      {"The call opens with `<invoke name=\"f\">` and that is only the opener.",
+       0, "",
+       "The call opens with `<invoke name=\"f\">` and that is only the "
+       "opener."},
       {"Text </parameter>", 0, "", "Text </parameter>"},
       {"The token is <|im_end|>", 0, "", "The token is <|im_end|>"},
       {"<parameter>x</parameter>", 0, "", "<parameter>x</parameter>"},
@@ -6459,7 +6775,128 @@ void TestParallelCallSeparatorIsNotContent() {
     }
 }
 
+void TestLogprobs() {
+  using gufo::json::Value;
+  for (const bool stream : {false, true}) {
+    for (const unsigned count : {0U, 1U, 2U, 20U}) {
+      FakeBackend backend;
+      backend.pieces = {"A", "é"};
+      // Independent vLLM v0.32.0 fixture: selected token is outside top two.
+      backend.logprob_pieces = {
+          {{{3, "A", -3.0}, {1, "B", -0.5}, {2, "C", -1.5}}},
+          {{{4, "é", -0.25}, {1, "B", -10000.0}}}};
+      auto body = gufo::json::parse(
+          R"({"model":"test-model","messages":[{"role":"user","content":"go"}],"logprobs":true})");
+      body["stream"] = stream;
+      body["top_logprobs"] = static_cast<int>(count);
+      const auto response =
+          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+      Expect(response.status == 200, "logprobs request accepted");
+      std::vector<Value> entries;
+      const auto collect = [&](const Value& payload) {
+        for (const auto& choice : payload.find("choices")->items())
+          if (const auto* probabilities = choice.find("logprobs");
+              probabilities && !probabilities->is_null())
+            for (const auto& entry : probabilities->find("content")->items())
+              entries.push_back(entry);
+      };
+      if (stream) {
+        response.streaming_body([&](std::string_view chunk) {
+          if (chunk != "data: [DONE]\n\n")
+            collect(gufo::json::parse(chunk.substr(6)));
+          return true;
+        });
+      } else {
+        collect(gufo::json::parse(response.body));
+      }
+      Expect(backend.last_sampling.logprobs == count, "count reaches backend");
+      Expect(entries.size() == 2 && entries[0].member_str("token") == "A" &&
+                 entries[0].find("logprob")->as_double() == -3.0,
+             "selected probability remains independent of alternatives");
+      Expect(entries[1].find("bytes")->dump() == "[195,169]",
+             "UTF-8 byte arrays");
+      const auto& top = entries[0].find("top_logprobs")->items();
+      Expect(top.size() == std::min<std::size_t>(count, 3),
+             "chat candidate limit");
+      if (count)
+        Expect(top[0].member_str("token") == "A",
+               "vLLM sampled-first ordering");
+    }
+  }
+  for (const bool tools : {false, true}) {
+    for (const bool stream : {false, true}) {
+      FakeBackend backend;
+      backend.pieces =
+          tools
+              ? std::vector<
+                    std::
+                        string>{"<tool_call>",
+                                R"({"name":"get_weather","arguments":{"city":"Rome"}})",
+                                "</tool_call>"}
+              : std::vector<std::string>{"consider", "</think>", "answer"};
+      for (std::size_t i = 0; i < backend.pieces.size(); ++i)
+        backend.logprob_pieces.push_back(
+            {{{static_cast<unsigned>(i), backend.pieces[i], -1.0}}});
+      auto body = gufo::json::parse(
+          R"({"model":"test-model","messages":[{"role":"user","content":"go"}],"logprobs":true})");
+      body["stream"] = stream;
+      body["chat_template_kwargs"]["enable_thinking"] = !tools;
+      if (tools)
+        body["tools"] = gufo::json::parse(
+            R"([{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}])");
+      const auto response =
+          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+      Expect(response.status == 200, "parsed logprob request accepted");
+      std::vector<std::string> tokens;
+      std::string wire;
+      const auto collect = [&](const Value& payload) {
+        for (const auto& choice : payload.find("choices")->items())
+          if (const auto* probabilities = choice.find("logprobs");
+              probabilities && !probabilities->is_null())
+            for (const auto& entry : probabilities->find("content")->items())
+              tokens.push_back(entry.member_str("token"));
+      };
+      if (stream) {
+        response.streaming_body([&](std::string_view chunk) {
+          wire += chunk;
+          if (chunk != "data: [DONE]\n\n")
+            collect(gufo::json::parse(chunk.substr(6)));
+          return true;
+        });
+        Expect(wire.ends_with("data: [DONE]\n\n"), "logprob stream terminates");
+      } else {
+        wire = response.body;
+        collect(gufo::json::parse(wire));
+      }
+      Expect(tokens == backend.pieces,
+             "reasoning and tool markers retain their token metadata");
+      Expect(wire.find(tools ? "tool_calls" : "reasoning_content") !=
+                 std::string::npos,
+             "logprobs preserve parser output");
+    }
+  }
+  for (const auto* fields :
+       {R"({"logprobs":"true"})", R"({"logprobs":true,"top_logprobs":-1})",
+        R"({"logprobs":true,"top_logprobs":21})",
+        R"({"logprobs":true,"top_logprobs":1.5})",
+        R"({"logprobs":true,"top_logprobs":true})",
+        R"({"logprobs":false,"top_logprobs":1})"}) {
+    FakeBackend backend;
+    auto body = gufo::json::parse(
+        R"({"model":"test-model","messages":[{"role":"user","content":"go"}]})");
+    const auto parsed_fields = gufo::json::parse(fields);
+    for (const auto& [key, value] : parsed_fields.members())
+      body[key] = value;
+    Expect(
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend).status ==
+                400 &&
+            backend.chat_calls == 0,
+        "invalid logprobs rejected before generation");
+  }
+}
+
 int main() {
+  TestLogprobs();
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();
   TestStreamingQuotedAndMalformedTools();
@@ -6478,6 +6915,7 @@ int main() {
   TestExplicitStopOutputFraming();
   TestStopInsideToolArguments();
   TestResponsesOutput();
+  TestResponsesLogprobs();
   TestNativeToolTransports();
   TestParallelCallSeparatorIsNotContent();
   TestJsonToolStringOwnership();
@@ -6490,6 +6928,7 @@ int main() {
   TestToolMetadataAndFraming();
   TestResponsesLiveAndCancellation();
   TestCachePromptOption();
+  TestCachePersistOption();
   TestToolChoiceEnforcement();
   TestStreamingIsLive();
   TestLessThanProseStreamsBeforeCompletion();

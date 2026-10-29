@@ -417,6 +417,33 @@ std::vector<std::uint8_t> ReadImageFile(const std::filesystem::path& path) {
   return bytes;
 }
 
+enum class MediaKind { kImage, kAudio, kVideo };
+
+static std::vector<std::uint8_t> ReadMediaUrl(std::string_view url,
+                                              ImageReadBudget& budget,
+                                              MediaKind media_kind);
+
+std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
+                                       ImageReadBudget& budget) {
+  return ReadMediaUrl(url, budget, MediaKind::kImage);
+}
+std::vector<std::uint8_t> ReadAudioUrl(std::string_view url,
+                                       ImageReadBudget& budget) {
+  if (url.starts_with("data:") || url.starts_with("https://") ||
+      url.starts_with("http://") || url.starts_with("file:"))
+    return ReadMediaUrl(url, budget, MediaKind::kAudio);
+  // Raw base64 has no scheme. The strict decoder rejects paths and bad padding.
+  return ReadMediaUrl("data:audio/wav;base64," + std::string(url), budget,
+                      MediaKind::kAudio);
+}
+std::vector<std::uint8_t> ReadVideoUrl(std::string_view url,
+                                       ImageReadBudget& budget) {
+  if (url.starts_with("data:") || url.starts_with("https://") ||
+      url.starts_with("http://") || url.starts_with("file:"))
+    return ReadMediaUrl(url, budget, MediaKind::kVideo);
+  return ReadMediaUrl("data:video/mp4;base64," + std::string(url), budget,
+                      MediaKind::kVideo);
+}
 std::vector<std::uint8_t> ReadImageUrl(std::string_view url) {
   ImageReadBudget budget;
   return ReadImageUrl(url, budget);
@@ -446,8 +473,9 @@ bool IsPublicImageAddress(std::span<const std::uint8_t> address) noexcept {
            (address[2] & 0xf0) == 0);
 }
 
-std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
-                                       ImageReadBudget& budget) {
+static std::vector<std::uint8_t> ReadMediaUrl(std::string_view url,
+                                              ImageReadBudget& budget,
+                                              MediaKind media_kind) {
   if (!budget.accepts_images)
     throw std::invalid_argument("model does not support image input");
   const auto remaining_ms =
@@ -470,10 +498,20 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
     if (!header.ends_with(";base64"))
       throw std::invalid_argument("image data URL must be base64-encoded");
     const std::string media = header.substr(0, header.find(';'));
-    if (media != "image/png" && media != "image/jpeg" && media != "image/jpg" &&
-        media != "image/webp")
-      throw std::invalid_argument("image data URL type \"" + media +
-                                  "\" is not supported; use PNG, JPEG or WebP");
+    if (media_kind == MediaKind::kVideo
+            ? (media != "video/mp4" && media != "video/webm" &&
+               media != "video/x-matroska" && media != "video/quicktime")
+        : media_kind == MediaKind::kAudio
+            ? (media != "audio/wav" && media != "audio/x-wav" &&
+               media != "audio/mpeg" && media != "audio/mp3" &&
+               media != "audio/flac" && media != "audio/ogg")
+            : (media != "image/png" && media != "image/jpeg" &&
+               media != "image/jpg" && media != "image/webp"))
+      throw std::invalid_argument(
+          media_kind != MediaKind::kImage
+              ? "unsupported media data URL type"
+              : "image data URL type \"" + media +
+                    "\" is not supported; use PNG, JPEG or WebP");
     const auto encoded = url.substr(comma + 1);
     // Check the decoded size before allocating, including base64 padding.
     const auto padding = encoded.ends_with("==")  ? 2U

@@ -50,6 +50,17 @@ with tempfile.TemporaryDirectory() as temporary:
         check(HipMemory.for_binary(link) is None, "unsupported wrapper has no HIP library")
         check(not ldd.called, "do not inspect shell scripts with ldd")
 
+with tempfile.TemporaryDirectory() as temporary:
+    directory = Path(temporary)
+    executable = directory / "gufo.exe"
+    executable.touch()
+    with patch("gufo.model_bench.servers.sys.platform", "win32"), \
+            patch("gufo.model_bench.servers.ctypes.CDLL"), \
+            patch("gufo.model_bench.servers.subprocess.run") as ldd:
+        (directory / "amdhip64_7.dll").touch()
+        check(HipMemory.for_binary(executable) is None, "no outside memory sampler under WDDM")
+        check(not ldd.called, "Windows resolution does not run ldd")
+
 
 GUFO_USAGE = {
     "prompt_tokens": 12,

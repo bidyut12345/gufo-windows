@@ -36,6 +36,7 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
+#include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
@@ -660,6 +661,7 @@ struct CompatibilityAllowances {
   bool stream{false};
   bool stream_options{false};
   bool ignore_eos{false};
+  bool logprobs{false};
   bool response_controls{false};
   bool thinking{false};
   bool output_config{false};
@@ -740,6 +742,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
     if (field != allowances.stop_field &&
         !(field == "stream_options" && allowances.stream_options) &&
         !(field == "ignore_eos" && allowances.ignore_eos) &&
+        !(field == "logprobs" && allowances.logprobs) &&
         !(field == "thinking" && allowances.thinking) &&
         !(field == "output_config" && allowances.output_config) &&
         !((field == "tools" || field == "tool_choice") && allowances.tools) &&
@@ -747,10 +750,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
         !(allowances.response_controls &&
           (field == "text" || field == "reasoning" || field == "tools" ||
            field == "tool_choice" || field == "parallel_tool_calls" ||
-           // include is a standard Responses field (for example encrypted
-           // reasoning); gufo keeps no server-side conversation, so its value
-           // is accepted and ignored.
-           field == "include"))) {
+           field == "include" || field == "top_logprobs"))) {
       return InvalidCompatibilityRequest("request field '" + field +
                                          "' is not supported on this endpoint");
     }
@@ -889,9 +889,12 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                                                 .stream = true,
                                                 .stream_options = true,
                                                 .ignore_eos = true,
+                                                .logprobs = true,
                                             })) {
     return std::move(*error);
   }
+  if (const auto error = ParseLogprobs(body, false, &sampling_config))
+    return InvalidCompatibilityRequest(error->message);
   const auto* stream_field = body.find("stream");
   const bool stream = stream_field != nullptr && stream_field->as_bool();
   bool include_usage = false;
@@ -930,6 +933,13 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
       return InvalidCompatibilityRequest("'cache_prompt' must be a boolean");
     cache_prompt = value->as_bool();
   }
+  bool cache_persist = true;
+  if (const auto* value = body.find("cache_persist");
+      value != nullptr && !value->is_null()) {
+    if (!value->is_bool())
+      return InvalidCompatibilityRequest("'cache_persist' must be a boolean");
+    cache_persist = value->as_bool();
+  }
   std::vector<std::string> stop_sequences;
   if (const auto error = ParseStopSequences(
           body.find("stop"), StopSequenceFormat::kOpenAi, &stop_sequences))
@@ -945,9 +955,10 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                "invalid_request_error", "missing_prompt");
   }
 
-  auto generation = b.start_complete(
-      prompt, max_tokens, sampling_config, req.is_cancelled, stream, ignore_eos,
-      req.client_id, stop_sequences, return_progress, cache_prompt);
+  auto generation =
+      b.start_complete(prompt, max_tokens, sampling_config, req.is_cancelled,
+                       stream, ignore_eos, req.client_id, stop_sequences,
+                       return_progress, cache_prompt, cache_persist);
   const std::string id = "cmpl-" + RandomId();
   const long long created = Now();
   const std::string model = RequestedModel(body, b);
@@ -962,9 +973,12 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                     {"X-Accel-Buffering", "no"}},
         .streaming_body =
             [generation = std::move(generation), id, created, model,
-             include_usage, return_progress,
+             include_usage, return_progress, cache_persist,
+             logprobs = sampling_config.logprobs,
              stream_log](const HttpResponse::BodyWriter& writer) {
               bool started = return_progress;
+              std::optional<json::Value> pending_logprobs;
+              std::size_t text_offset = 0;
               const auto write_chunk =
                   [&](std::string_view piece, std::string_view finish_reason,
                       const json::Value* usage = nullptr,
@@ -980,7 +994,10 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       json::Value choice = json::Value::object();
                       choice["text"] = std::string(piece);
                       choice["index"] = 0;
-                      choice["logprobs"] = json::Value();
+                      choice["logprobs"] = pending_logprobs
+                                               ? std::move(*pending_logprobs)
+                                               : json::Value();
+                      pending_logprobs.reset();
                       choice["finish_reason"] =
                           finish_reason.empty()
                               ? json::Value()
@@ -992,6 +1009,9 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       chunk["usage"] = *usage;
                     if (timings != nullptr)
                       chunk["timings"] = *timings;
+                    // The finishing and usage chunks echo the applied value.
+                    if (usage != nullptr || timings != nullptr)
+                      chunk["cache_persist"] = cache_persist;
                     if (progress != nullptr)
                       chunk["prompt_progress"] = *progress;
                     started = true;
@@ -1011,8 +1031,12 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
               }
               try {
                 const auto result = generation->Wait(
-                    [&](std::string_view piece) {
-                      const auto text = decoder.Push(piece, false);
+                    [&](const TokenPiece& piece) {
+                      if (logprobs && piece.logprobs)
+                        pending_logprobs = CompletionLogprobs(
+                            std::span(piece.logprobs, 1), text_offset);
+                      const auto text = decoder.Push(piece.text, false);
+                      text_offset += UnicodeLength(text);
                       connected = write_chunk(text, {});
                       return connected;
                     },
@@ -1091,7 +1115,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   json::Value c = json::Value::object();
   c["text"] = core::Utf8Decoder{}.Push(res.text, true);
   c["index"] = 0;
-  c["logprobs"] = json::Value();
+  c["logprobs"] = sampling_config.logprobs ? CompletionLogprobs(res.logprobs)
+                                           : json::Value();
   c["finish_reason"] =
       res.finish_reason == TextGenerationBackend::FinishReason::kLength
           ? "length"
@@ -1100,6 +1125,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   resp["choices"] = std::move(choices);
   resp["usage"] = UsageJson(res);
   resp["timings"] = GenerationTimings(res);
+  resp["cache_persist"] = cache_persist;
   return WithTiming(Ok(resp), res);
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
@@ -1131,6 +1157,9 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
           {.stream = true, .response_controls = true})) {
     return std::move(*error);
   }
+  if (const auto error = ParseResponsesLogprobs(body, &sampling_config))
+    return Err(400, "Bad Request", error->message.c_str(),
+               "invalid_request_error", error->code.c_str());
 
   std::vector<tokenization::ChatMessage> messages;
   if (const auto* instructions = body.find("instructions")) {
@@ -1378,10 +1407,17 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
       return InvalidCompatibilityRequest("'cache_prompt' must be a boolean");
     cache_prompt = value->as_bool();
   }
+  bool cache_persist = true;
+  if (const auto* value = body.find("cache_persist");
+      value != nullptr && !value->is_null()) {
+    if (!value->is_bool())
+      return InvalidCompatibilityRequest("'cache_persist' must be a boolean");
+    cache_persist = value->as_bool();
+  }
 
   const auto res =
       b.complete(prompt, max_tokens, sampling_config, req.is_cancelled, {},
-                 req.client_id, stop_sequences, cache_prompt);
+                 req.client_id, stop_sequences, cache_prompt, cache_persist);
 
   json::Value resp = json::Value::object();
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
@@ -1400,6 +1436,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   resp["tokens_cached"] = res.cached_prompt_tokens;
   resp["timings"] = GenerationTimings(res);
   resp["usage"] = UsageJson(res);
+  resp["cache_persist"] = cache_persist;
   return WithTiming(Ok(resp), res);
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
@@ -1810,8 +1847,10 @@ void LoadingResponder::serve() {
   loading.headers.emplace_back("Retry-After", "1");
   const std::string reply = BuildResponse(loading);
   // One connection at a time is enough for probes. Read the request head
-  // before replying so closing does not reset an unread request, but bound
-  // the wait: a client that connects and sends nothing must not delay stop().
+  // before replying, and after replying read what the client still sends (a
+  // request body) until it closes: closing with unread data resets the
+  // connection, and the client can lose the reply. Bound both waits: a client
+  // that connects and sends nothing must not delay stop().
   constexpr auto kRequestWait = std::chrono::milliseconds(500);
   while (!stopped_.load(std::memory_order_acquire)) {
     if (net::PollReadable(listen_fd_, 100) <= 0)
@@ -1819,26 +1858,36 @@ void LoadingResponder::serve() {
     const int client_fd = static_cast<int>(net::AcceptClientSocket(listen_fd_));
     if (client_fd < 0)
       continue;
-    std::string head;
-    const auto deadline = std::chrono::steady_clock::now() + kRequestWait;
-    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
-           !stopped_.load(std::memory_order_acquire)) {
+    // Appends one read to `into` (when set); false once the deadline passes,
+    // the client closes or stop() runs.
+    const auto receive = [&](std::chrono::steady_clock::time_point deadline,
+                             std::string* into) {
       const auto remaining =
           std::chrono::duration_cast<std::chrono::milliseconds>(
               deadline - std::chrono::steady_clock::now())
               .count();
-      if (remaining <= 0 ||
+      if (stopped_.load(std::memory_order_acquire) || remaining <= 0 ||
           net::PollReadable(client_fd, static_cast<int>(remaining)) <= 0)
-        break;
-      char buffer[2048];
+        return false;
+      char buffer[4096];
       const std::intptr_t received =
           net::Receive(client_fd, buffer, sizeof(buffer), 0);
       if (received <= 0)
-        break;
-      head.append(buffer, static_cast<std::size_t>(received));
+        return false;
+      if (into != nullptr)
+        into->append(buffer, static_cast<std::size_t>(received));
+      return true;
+    };
+    std::string head;
+    const auto head_deadline = std::chrono::steady_clock::now() + kRequestWait;
+    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
+           receive(head_deadline, &head)) {
     }
     (void)SendAll(client_fd, reply);
     (void)net::ShutdownSocket(client_fd, net::ShutdownHow::kWrite);
+    const auto drain_deadline = std::chrono::steady_clock::now() + kRequestWait;
+    while (receive(drain_deadline, nullptr)) {
+    }
     net::CloseSocket(client_fd);
   }
 }
@@ -1945,6 +1994,7 @@ void HttpServer::register_routes() {
   add("POST", "/rerank", NotImplemented);
   add("POST", "/infill", NotImplemented);
   add("POST", "/completion", LlamaCompletion);
+  add("POST", "/apply-template", HandleApplyTemplate);
   add("GET", "/props", LlamaProps);
   add("GET", "/slots", LlamaSlots);
   add("GET", "/v1/slots", LlamaSlots);
@@ -2042,7 +2092,12 @@ void HttpServer::run(bool handle_signals) {
                             "configure HTTP listener");
   Logger::Info(
       "server",
-      "event=listening address=http://" +
+      "event=listening monotonic_us=" +
+          std::to_string(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count()) +
+          " address=http://" +
           (host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") +
           ":" + std::to_string(port_) +
           " auth=" + (options_.api_key.empty() ? "off" : "bearer") +

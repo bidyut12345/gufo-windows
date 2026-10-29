@@ -99,7 +99,7 @@ int main() {
 
   std::array<gufo::core::GgufMappedRegion, 2> regions;
   for (std::size_t i = 0; i < paths.size(); ++i) {
-    regions[i] = {nullptr, source[i].size(),
+    regions[i] = {source[i].data(), source[i].size(),
                   gufo::platform::OpenReadFile(paths[i])};
     Require(gufo::platform::FileValid(regions[i].file_descriptor),
             "open original shard");
@@ -133,18 +133,24 @@ int main() {
   Device device(expected.size());
   Require(hipMemset(device.data, 0xa5, expected.size()) == hipSuccess,
           "initialize guards");
-  // The uploads run on non-blocking streams, which do not order after the
-  // null-stream memset; the Windows runtime completes it asynchronously.
-  Require(hipDeviceSynchronize() == hipSuccess, "initialize guards");
+  // The uploads run on non-blocking streams, which do not wait for the null
+  // stream; a late guard fill would overwrite them.
+  Require(hipDeviceSynchronize() == hipSuccess, "wait for guards");
   std::string error;
   auto upload = WeightUpload::Create(regions, &error);
   Require(upload != nullptr, error);
+  // These addresses identify file offsets; their contents must never supply
+  // upload bytes or enter HIP's pageable host-registration cache.
+  for (auto& buffer : source)
+    std::fill(buffer.begin(), buffer.end(), 0);
   for (const auto& s : slices) {
-    Require(
-        upload->Copy(s.shard, s.offset, s.size,
-                     static_cast<char*>(device.data) + s.destination, &error),
-        error);
+    Require(upload->CopyMapped(source[s.shard].data() + s.offset, s.size,
+                               static_cast<char*>(device.data) + s.destination,
+                               &error),
+            error);
   }
+  Require(!upload->CopyMapped(&error, 1, device.data, &error),
+          "reject a pointer outside the source mappings");
   Require(upload->Copy(1, source[1].size(), 0, nullptr, &error),
           "empty range at EOF");
   Require(upload->Finish(&error), error);

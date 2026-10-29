@@ -292,20 +292,31 @@ public:
     }
     constexpr float alpha = 1.0F;
     constexpr float beta = 0.0F;
-    const rocblas_int solution =
+    const rocblas_int pinned =
         (rows == kFeedForward * 2U && columns == kHidden) ||
                 (rows == kHidden && columns == kFeedForward)
             ? kGfx1151RocblasF32WideSolution
             : kGfx1151RocblasF32CompactSolution;
-    const rocblas_status status = rocblas_gemm_ex(
-        handle_, rocblas_operation_transpose, rocblas_operation_none,
-        static_cast<rocblas_int>(rows), static_cast<rocblas_int>(batch),
-        static_cast<rocblas_int>(columns), &alpha, weight,
-        rocblas_datatype_f32_r, static_cast<rocblas_int>(columns), input,
-        rocblas_datatype_f32_r, static_cast<rocblas_int>(columns), &beta,
-        output, rocblas_datatype_f32_r, static_cast<rocblas_int>(rows), output,
-        rocblas_datatype_f32_r, static_cast<rocblas_int>(rows),
-        rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, solution, 0);
+    const auto gemm = [&](rocblas_int solution) {
+      return rocblas_gemm_ex(
+          handle_, rocblas_operation_transpose, rocblas_operation_none,
+          static_cast<rocblas_int>(rows), static_cast<rocblas_int>(batch),
+          static_cast<rocblas_int>(columns), &alpha, weight,
+          rocblas_datatype_f32_r, static_cast<rocblas_int>(columns), input,
+          rocblas_datatype_f32_r, static_cast<rocblas_int>(columns), &beta,
+          output, rocblas_datatype_f32_r, static_cast<rocblas_int>(rows),
+          output, rocblas_datatype_f32_r, static_cast<rocblas_int>(rows),
+          rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, solution,
+          0);
+    };
+    rocblas_status status =
+        gemm(pinned_unavailable_ ? 0 : pinned);
+    if (status != rocblas_status_success && !pinned_unavailable_) {
+      // The pinned indices come from one rocBLAS database (ROCm 10.1); a
+      // library without them takes its default solution instead.
+      pinned_unavailable_ = true;
+      status = gemm(0);
+    }
     if (status != rocblas_status_success) {
       SetError(error, "MiniMax H3 VisualVAE F32 GEMM failed: " +
                           std::to_string(static_cast<int>(status)));
@@ -316,6 +327,7 @@ public:
 
 private:
   rocblas_handle handle_{nullptr};
+  bool pinned_unavailable_{false};
 };
 
 class AttentionGemm {

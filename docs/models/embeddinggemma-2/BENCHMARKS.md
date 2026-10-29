@@ -58,6 +58,46 @@ Measured on 2026-10-24 on the node gpuworker01 with a Radeon 8060S GPU of archit
 
 Image requests change by about 1 percent because the vision tower, which this PR does not change, takes most of their time.  Server load took 1.98 s for this PR and 2.20 s for main.  The [record](artifacts/gfx1151-2026-10-24-attention-ab.json) holds each pass's median, the p95 values, and the quality and test results.
 
+## Cross-request batching
+
+Measured on 2026-10-24 on the node gpuworker01 with a Radeon 8060S GPU of architecture gfx1151, using BF16 safetensors and the production `gufo` from one Nix container image that holds both builds.  Main is commit 194db882, which has the hipBLASLt GEMMs from #751, image inputs from #759, and matrix-core attention from #770.  This PR is commit 9a06aa43, which differs from the PR head only in documentation, a removed include, and a rewrite of the return path of `EmbedMultimodal` that does not change behavior.  The pod was the only GPU pod on the node.  Each build ran its nine EmbeddingGemma 2 GPU test binaries, then four HTTP passes in the order main, this PR, this PR, main, main, this PR, this PR, main, each with a new server and 60 requests per row.  The table shows the mean of the four passes' medians, and speedup is main's median divided by this PR's median.  The text rows use `http_bench.py` with the labels of the HTTP table above, including the new 16 × 1 × 16 row.  The image rows send one 320 × 180 PNG followed by a newline in the typed `content` format, which is 269 tokens, at 1, 4, and 16 clients.  The earlier tables predate cross-request batching, so in them concurrent requests take turns one batch at a time.  With this change, text requests that wait for the device share batches of up to 8,192 tokens, oldest first, and a lone request runs at once.
+
+| Concurrency × inputs × words | Tokens/request | Main median | This PR median | Speedup | This PR tokens/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 × 1 × 16 | 40 | 6.63 ms | 6.59 ms | 1.01 | 5,900 |
+| 1 × 1 × 128 | 404 | 12.88 ms | 13.04 ms | 0.99 | 30,372 |
+| 1 × 1 × 512 | 1,940 | 61.08 ms | 61.23 ms | 1.00 | 31,589 |
+| 1 × 1 × 2100 | 8,072 | 339.43 ms | 337.65 ms | 1.01 | 23,876 |
+| 1 × 8 × 128 | 3,495 | 93.51 ms | 94.10 ms | 0.99 | 37,037 |
+| 1 × 32 × 128 | 15,670 | 394.59 ms | 394.56 ms | 1.00 | 39,608 |
+| 4 × 1 × 128 | 404 | 48.16 ms | 45.82 ms | 1.05 | 34,991 |
+| 16 × 1 × 16 | 40 | 95.96 ms | 27.16 ms | 3.53 | 21,368 |
+| 16 × 1 × 128 | 404 | 192.38 ms | 159.16 ms | 1.21 | 39,755 |
+| 4 × 8 × 128 | 3,495 | 343.98 ms | 335.15 ms | 1.03 | 41,479 |
+| 16 × 8 × 128 | 3,495 | 1,377.72 ms | 1,340.11 ms | 1.03 | 41,501 |
+| 1 × 1 image | 269 | 584.58 ms | 583.75 ms | 1.00 | 461 |
+| 4 × 1 image | 269 | 2,246.65 ms | 2,246.21 ms | 1.00 | 479 |
+| 16 × 1 image | 269 | 8,984.98 ms | 8,979.05 ms | 1.00 | 479 |
+
+Sixteen clients that each send one 16-word input are 3.53 times faster, at 27.16 ms against 95.96 ms, because up to sixteen of those requests now share one device batch.  Sixteen clients of 128 words are 1.21 times faster and four clients are 1.05 times faster.  The concurrent rows of 8 inputs, which already fill a batch, are about 1.03 times faster.
+
+The single-client rows are within 1.3 percent of main.  The three shortest single-input rows differ by at most 0.16 ms, and 1 × 1 × 2100 is 1.78 ms faster.  On 1 × 8 × 128 this PR is 0.59 ms slower, which is 0.6 percent.  It is the only single-client row where the four passes of the two builds do not overlap, with main between 93.21 and 93.82 ms and this PR between 93.91 and 94.63 ms.  Image-only rows are unchanged at every client count, because an image request runs in a batch of its own and the vision tower sets its pace.  Server load took 1.99 s for this PR and 1.98 s for main.
+
+| Mixed measurement | Main median | This PR median | Speedup | Main p95 | This PR p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Alternating, image requests | 5,094.55 ms | 4,952.76 ms | 1.03 | 6,767.15 ms | 7,315.21 ms |
+| Alternating, text requests | 4,193.52 ms | 3,974.50 ms | 1.06 | 5,651.22 ms | 5,929.67 ms |
+| Separate streams, image requests | 4,513.24 ms | 4,488.04 ms | 1.01 | 4,533.84 ms | 4,499.03 ms |
+| Separate streams, text requests | 3,953.90 ms | 3,928.41 ms | 1.01 | 4,511.70 ms | 4,460.02 ms |
+
+In the alternating row, 16 client threads take 120 requests that alternate an image and a 16-word text request, so each kind has 60 requests per pass.  The medians were 1.06 times faster for text and 1.03 times faster for images.  The image p95 was 8 percent higher on average, and every pass of this PR, at 7,278 to 7,406 ms, was above every pass of main, at 6,731 to 6,796 ms.  The text p95 was 4.9 percent higher on average.  Two of this PR's passes were above every pass of main, at 6,281 and 6,178 ms, and the other two were at 5,636 and 5,623 ms, inside main's range of 5,606 to 5,681 ms.
+
+In the separate-streams run, 8 threads each send 8 image requests while 8 other threads send 16-word text requests until the image threads finish, with four passes per build in the same order.  Each value in the table is the mean of the four passes.  The image median, p95, and mean match main or are slightly lower, with means of 4,242.39 ms for this PR and 4,272.37 ms for main.  The text median and p95 match main, and the text mean is 3,546.61 ms against 3,529.07 ms.  The image p95 did not rise as it did in the alternating row.  The alternating row couples the two kinds through shared client threads, so faster text replies may make those threads send images sooner.  That is untested.
+
+Under either mixed load, a text request that queues behind images waits about 4 s on both builds, because the queue is first come, first served and each image takes about 560 ms.  This PR does not change that.
+
+Both functional suites passed on both builds.  The concurrent-versus-lone check of `tests/functional/embeddings.py` has a worst cosine of 0.99997162 on this PR.  The [record](artifacts/gfx1151-2026-10-24-batching-ab.json) holds each pass's median and p95, the separate-streams passes, and the quality results.
+
 ## Reference comparison
 
 The llama.cpp comparison is TODO.  It requires a llama.cpp build with EmbeddingGemma 2 support and the matching GGUF.  Measure both over HTTP with the same texts and report the ratio per row.
@@ -78,7 +118,7 @@ PNG reading, preprocessing, vision/text inference and response transport.
 
 This is a new workload with no supported main image path to compare. The first
 image request additionally loads **335.5 MB** of vision/projector weights; text
-startup still loads only the text backbone. Audio weights are never uploaded.
+startup still loads only the text backbone. Audio weights load lazily on the first audio request; see the audio measurements below.
 
 The affected text controls retain every request. Main and candidate alternate
 per workload, with 60 requests each and no per-request failures at the 5% and
@@ -98,3 +138,84 @@ evidence against worktree revision `8e7979cc`, which was not origin/main. Its
 initial isolated 152.8 ms outlier remains marked inconclusive and is not used
 to qualify the rebased PR. Earlier published text benchmark rows above remain
 their original measurements.
+
+## Audio, October 26, 2026
+
+Production release binary `cb49012f75b4`, checkpoint and official reference pins
+as recorded in [quality](QUALITY.md#audio-and-interleaved-input-parity).
+Loopback HTTP C1 server durations below keep each request separately. The first
+audio request includes lazy tower/projector loading; subsequent requests reuse
+weights and bounded scratch. Text and vision were already resident.
+
+| Input | First request (ms) | Second (ms) | Third (ms) |
+| --- | ---: | ---: | ---: |
+| Generated one-second tone, 29 expanded tokens | 146.9 | 28.3 | 27.8 |
+| Ten-second English speech, 254 tokens | 99.8 | 99.7 | 100.4 |
+| Two clips with text, 35 tokens | 46.8 | 47.2 | 47.1 |
+| Audio/image/text, 288 tokens | 511.4 | 498.6 | 498.1 |
+
+An isolated native test measured **1,410,707,456 bytes (1.31 GiB)** less free
+device memory after constructing the audio runtime, including widened float32
+weights, fixed scratch and BLAS reservations. This is a `hipMemGetInfo` allocation
+delta, not process RSS. Audio is float32 to retain the independent stage contract;
+text and vision keep their existing numerical paths.
+
+[Raw measurements](artifacts/gfx1151-2026-10-26-audio.json) retain all runs and
+all standard HTTP benchmark requests (60 per workload). The first candidate pass
+overlapped the CPU contract workload, so that standard comparison is
+**inconclusive**, without a speed claim. After it finished, matched main
+`9dd2d24d` and candidate controls repeated only the affected C1 histories:
+40/404/1,940-token text inputs and a 256-token image. Every individual request's
+server and client time passes the unchanged 5% and 10 ms margins. All vectors
+are byte-identical and work counts match. The two unchanged-main runs are
+retained as controls; the first inconclusive observations are not discarded.
+
+## Image budgets
+
+The following table is historical evidence from the original image-budget
+branch before video integration, using ROCm 7.2.3. It is not a comparison with
+current main or the pinned ROCm 10.1 toolchain; see the rebase controls below.
+
+Measured on 2026-10-29 on Linux with a Radeon 8060S GPU of architecture gfx1151, using BF16 safetensors and release builds with the ROCm 7.2.3 runtime, not the Nix image.  Each request sends one 1231 × 947 PNG at concurrency 1 after one warm-up request, with `mm_processor_kwargs.max_soft_tokens` set to the budget, or left out for the default.  The default rows ran main f1b6c54f and this change in the order main, change, change, main, 30 requests each; the other rows ran this change once with 20 requests each.  GTT growth is `mem_info_gtt_used` after each budget minus the value after the default budget.
+
+| Budget | Tokens/request | Median | p95 | GTT growth |
+| --- | ---: | ---: | ---: | ---: |
+| default, main | 270 | 582.50 ms | 585.37 ms | — |
+| default, this change | 270 | 580.49 ms | 582.51 ms | 0 MiB |
+| 70 | 67 | 107.63 ms | 108.77 ms | 0 MiB |
+| 140 | 134 | 216.32 ms | 217.57 ms | 0 MiB |
+| 280 | 270 | 582.20 ms | 584.71 ms | 0 MiB |
+| 560 | 524 | 1,772.30 ms | 1,775.97 ms | 86 MiB |
+| 1120 | 1,106 | 6,853.92 ms | 6,863.86 ms | 256 MiB |
+
+The default rows show the mean of the two passes.  The vision scratch grows only when a larger budget arrives, so a server that only sees the default keeps main's device footprint.
+
+### Image-budget rebase controls
+
+Requalified on gfx1151 against main `a3edb56f`, with the pinned Nix GCC 16.2.0 /
+ROCm 10.1 toolchain and the production release preset. Each arm starts a fresh
+server and uses the same text, image, video and mixed-media request history.
+Local review evidence retains every request, startup phase, memory
+observation, comparison and unchanged-main control. Timings below are server milliseconds for each paired repeat, without
+averaging across requests.
+
+| Request | Repeat 1 main → candidate | Repeat 2 main → candidate |
+| --- | ---: | ---: |
+| Cold default image | 595.6 → 603.1 | 599.3 → 594.4 |
+| Warm default image | 525.5 → 537.8 | 526.9 → 525.6 |
+| Second image shape | 467.4 → 472.5 | 469.6 → 466.7 |
+| Default video | 183.1 → 180.2 | 183.7 → 181.1 |
+| First mixed video/image/audio input | 1202.0 → 1209.4 | 1207.1 → 1208.7 |
+| Warm mixed input | 1115.3 → 1116.5 | 1113.2 → 1113.1 |
+| Mixed replay | 1119.0 → 1116.2 | 1116.4 → 1116.4 |
+
+Every request in this follow-up, including the standard short/second/replay
+text benchmark, stays within the unchanged 5% and 10 ms margins. Work counts
+match exactly and main/candidate vector cosine is at least 0.99999. Default
+image GTT usage is identical across main and candidate arms.
+
+The initial run flagged the first mixed-media request at 1215.3 → 1277.7 ms
+and 1206.7 → 1307.7 ms; video was noisy. These observations remain visibly
+inconclusive in the record. They did not reproduce in the affected-history
+follow-up, which also retains warm mixed replays and two unchanged-main arms.
+No overall speedup is claimed and the initial flags are not discarded.

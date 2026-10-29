@@ -195,6 +195,8 @@ NO_TOOLS_PROMPT = "Go."
 # output in TestToolClosingFraming (tests/cli/openai_chat_test.cpp). Qwen27 Q4
 # can omit the requested literal line and Q8 can call a tool instead; these
 # prompts tested instruction following rather than whether the parser lost text.
+# Asked to write markup, Qwen27 Q4 also prints it with terminal instead, so the
+# prose shapes below accept a native call and have exact unit fixtures there.
 ENVELOPE_CASES = {
     # Quoted inside a fence the same tags are prose, and prose survives.
     "closer_quoted": (
@@ -291,7 +293,14 @@ QWEN_ENVELOPE_SYSTEM = (
     "<tool_call>terminal<arg_key>command</arg_key><arg_value>SHELL</arg_value>"
     "</tool_call>"
 )
-SHAPE_SYSTEM = {"qwen_envelope_documented_then_prose": QWEN_ENVELOPE_SYSTEM}
+# A call carrying envelope or vocabulary spellings must be the model's native
+# call. Documenting the client envelope offers a second call syntax, and
+# Flash-Next can answer with that envelope, which names a declared tool and is
+# removed as framing rather than executed. Those cases get no system prompt.
+SHAPE_SYSTEM = {"qwen_envelope_documented_then_prose": QWEN_ENVELOPE_SYSTEM,
+                "closer_in_arguments": None,
+                "vocab_token_in_arguments": None,
+                "lookalike_in_arguments": None}
 
 
 TAIL_LOOKALIKE_SYSTEM = (
@@ -446,9 +455,10 @@ def check_envelope_closer_framing(client, model, checks, chat_result, deepseek=F
         for streaming in streaming_modes():
             mode = "stream" if streaming else "buffered"
             label = f"envelope_closer_{name}_{mode}"
-            request = dict(model=model,
-                           messages=[{"role": "system", "content": system},
-                                     {"role": "user", "content": prompt}],
+            messages = [{"role": "user", "content": prompt}]
+            if system is not None:
+                messages.insert(0, {"role": "system", "content": system})
+            request = dict(model=model, messages=messages,
                            tools=[terminal_tool(commands.get(name))],
                            tool_choice="auto", reasoning_effort="none",
                            temperature=0, max_completion_tokens=256,
@@ -465,13 +475,13 @@ def check_envelope_closer_framing(client, model, checks, chat_result, deepseek=F
                     "markup the model wrote instead of a call stays visible", result)
             elif name in commands:
                 assert_terminal_call(result, commands[name])
-            elif (not deepseek and result["tools"] and name in (
-                    "explain_tool_call_syntax", "envelope_documented_then_prose",
-                    "qwen_envelope_documented_then_prose")):
+            elif not deepseek and result["tools"]:
                 # A literal <tool_call> in Qwen prose triggers the call grammar,
-                # and calls end the output, exactly as in llama.cpp (#438). The
-                # forced call must still be native and leak no framing.
-                assert result["finish"] == "tool_calls", result
+                # and calls end the output, exactly as in llama.cpp (#438), and a
+                # model asked to write markup may print it with terminal instead.
+                # Either call must still be native and leak no framing; the
+                # documented shapes can keep calling until the token limit.
+                assert result["finish"] in ("tool_calls", "length"), result
                 assert all(call["function"]["name"] == "terminal"
                            for call in result["tools"]), result
                 assert not any(tag in text for tag in ENVELOPE_CLOSERS), result
@@ -602,11 +612,14 @@ def check_literal_protocol_data(client, model, checks, chat_result):
     for name, literal in literals.items():
         for streaming in streaming_modes():
             label = f"literal_protocol_{name}_{'stream' if streaming else 'buffered'}"
+            # The Qwen preset's presence penalty covers the prompt window, so
+            # an exact echo is penalized; llama.cpp declines this one too.
             request = dict(model=model, messages=[{"role": "user", "content":
                 "Reply with exactly the following literal text, without any code fence, "
                 "explanation or tool call:\n" + literal}], tools=[terminal_tool()],
                 tool_choice="auto", reasoning_effort="none", temperature=0,
-                max_completion_tokens=128, extra_body={"cache_prompt": False})
+                max_completion_tokens=128, presence_penalty=0,
+                extra_body={"cache_prompt": False})
             result = chat_result(client, request, streaming)
             checks[label] = result
             print(f"CHECK {label}", file=sys.stderr, flush=True)

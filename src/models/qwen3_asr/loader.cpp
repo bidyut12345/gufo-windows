@@ -13,6 +13,7 @@
 
 #include "src/core/json.hpp"
 #include "src/core/platform/mapped_file.hpp"
+#include "src/core/platform/prefault.hpp"
 
 namespace gufo::models::qwen3_asr {
 namespace {
@@ -28,10 +29,11 @@ public:
   MappedFile& operator=(MappedFile&&) = delete;
 
   [[nodiscard]] bool Open(const std::filesystem::path& path) {
-    if (!mapped_.Open(path, platform::MapHint::kSequential, &open_error_))
+    mapped_ = platform::ReadOnlyMappedFile::Open(path, &open_error_);
+    if (!mapped_.valid())
       return false;
-    data_ = mapped_.data;
-    size_ = mapped_.size;
+    data_ = const_cast<std::uint8_t*>(mapped_.data());
+    size_ = mapped_.size();
     return true;
   }
 
@@ -43,6 +45,9 @@ public:
     return static_cast<const std::byte*>(data_);
   }
   [[nodiscard]] std::size_t size() const noexcept { return size_; }
+  platform::PlatformFile file_descriptor() const {
+    return mapped_.PlatformHandle();
+  }
 
 private:
   void Reset() noexcept {
@@ -51,7 +56,7 @@ private:
     size_ = 0;
   }
 
-  platform::RawMappedFile mapped_;
+  platform::ReadOnlyMappedFile mapped_;
   std::string open_error_;
   void* data_{nullptr};
   std::size_t size_{0};
@@ -156,12 +161,25 @@ bool LoadSafetensors(const std::filesystem::path& path, TensorStore* store,
       .data = mapping->data(),
       .size = mapping->size(),
       .payload_offset = static_cast<std::size_t>(payload_offset),
+      .file_descriptor = mapping->file_descriptor(),
   });
   mappings->push_back(std::move(mapping));
   return true;
 }
 
 }  // namespace
+
+void LoadResult::ReleaseHostPages() const noexcept {
+  for (const auto& region : mapped_regions)
+    platform::ReleaseMappedPages(region.data, region.size);
+}
+
+std::vector<core::GgufMappedRegion> LoadResult::WeightUploadRegions() const {
+  std::vector<core::GgufMappedRegion> result;
+  for (const auto& region : mapped_regions)
+    result.push_back({region.data, region.size, region.file_descriptor});
+  return result;
+}
 
 std::vector<MappedRegion> LoadResult::RegionsFor(
     std::initializer_list<std::string_view> prefixes) const {

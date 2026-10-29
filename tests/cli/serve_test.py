@@ -44,6 +44,7 @@ def main():
     check(["serve", "embedding"], 2, "--model <DIR> is required")
     text = check(["serve", "embedding", "--help"], 0, "--served-model-name")
     assert "--context" not in text and "--sessions" not in text
+    assert "--default-prompt-name" in text
     check(["serve", "embedding", "--context", "8"], 2, "Unknown option")
     check(["serve", "help", "embedding"], 0, "EmbeddingGemma 2")
     check(["serve", "embedding", "--model", "/missing"], 1,
@@ -77,6 +78,14 @@ def main():
     assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
     assert "--log-progress" in help_text
     assert "--enable-yarn" in help_text
+    assert "--cache-ram-bytes <N|off>" in help_text
+    for value in ("off", "0", "536870912"):
+        check(["serve", "llm", "--cache-ram-bytes", value,
+               "--model", "missing.gguf"], 1,
+              "Error loading model 'missing.gguf'")
+    for value in ("OFF", "-1", "16G"):
+        check(["serve", "llm", "--cache-ram-bytes", value], 2,
+              "--cache-ram-bytes must be off or a byte count")
     assert "it applies to every request" in help_text
     # The flag is a plain switch: it must not swallow the next argument.
     check(["serve", "llm", "--enable-yarn", "--model", "missing.gguf"], 1,
