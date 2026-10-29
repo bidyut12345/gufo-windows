@@ -109,5 +109,15 @@ foreach ($dir in @("hipblaslt", "rocblas")) {
     Copy-Item $libraryDir -Destination $bin -Recurse -Force
   }
 }
-Get-ChildItem "$Vcpkg\installed\x64-windows\bin\*.dll" | Copy-Item -Destination $bin -Force
+$vcpkgDllDirs = @(
+  (Join-Path $build "vcpkg_installed\x64-windows\bin"),
+  (Join-Path $build "vcpkg_installed\x64-windows-release\bin"),
+  "$Vcpkg\installed\x64-windows\bin",
+  "$Vcpkg\installed\x64-windows-release\bin"
+)
+foreach ($dir in $vcpkgDllDirs) {
+  if (Test-Path $dir) {
+    Get-ChildItem "$dir\*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination $bin -Force
+  }
+}
 Write-Host "gufo: built $build"

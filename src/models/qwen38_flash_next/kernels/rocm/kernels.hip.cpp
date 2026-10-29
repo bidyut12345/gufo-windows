@@ -9432,17 +9432,22 @@ bool WmmaCausalAttention(
 
     __global__ void RemapDraftIdsKernel(std::uint32_t* ids, std::uint32_t n,
                                         std::uint32_t prefix,
-                                        const std::int32_t* table) {
+                                        const std::int32_t* table,
+                                        std::uint32_t table_rows) {
       const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-      if (i < n && ids[i] >= prefix)
-        ids[i] = static_cast<std::uint32_t>(table[ids[i] - prefix]);
+      if (i >= n || ids[i] < prefix)
+        return;
+      // A row past the table reads as an empty slot (-1), not past the table.
+      const std::uint32_t row = ids[i] - prefix;
+      ids[i] =
+          row < table_rows ? static_cast<std::uint32_t>(table[row]) : UINT32_MAX;
     }
 
-    void RemapDraftIds(std::uint32_t* ids, std::uint32_t n,
-                       std::uint32_t prefix, const std::int32_t* table,
+    void RemapDraftIds(std::uint32_t* ids, std::uint32_t n, std::uint32_t prefix,
+                       const std::int32_t* table, std::uint32_t table_rows,
                        hipStream_t stream) {
-      hipLaunchKernelGGL(RemapDraftIdsKernel, dim3(Blocks(n)), dim3(kThreads),
-                         0, stream, ids, n, prefix, table);
+      hipLaunchKernelGGL(RemapDraftIdsKernel, dim3(Blocks(n)), dim3(kThreads), 0,
+                         stream, ids, n, prefix, table, table_rows);
     }
 
     void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,

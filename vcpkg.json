@@ -12,6 +12,7 @@
     "libsndfile",
     "soxr",
     {"name": "ffmpeg", "default-features": false, "features": ["avcodec", "avformat", "swscale"]},
+    "sqlite3",
     "pkgconf"
   ]
 }

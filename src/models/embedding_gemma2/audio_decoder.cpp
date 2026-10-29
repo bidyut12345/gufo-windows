@@ -1,5 +1,6 @@
 #include "src/models/embedding_gemma2/audio_decoder.hpp"
 
+#if defined(GUFO_HAVE_SNDFILE_SOXR)
 #include <sndfile.h>
 #include <soxr.h>
 
@@ -128,4 +129,11 @@ std::vector<float> DecodeAudio(std::span<const std::uint8_t> bytes,
   output.resize(length);  // librosa's fix_length uses ceil, padding with zero.
   return output;
 }
+#else
+std::vector<float> DecodeAudio(std::span<const std::uint8_t> /*bytes*/,
+                               const std::function<bool()>& /*is_cancelled*/) {
+  throw std::runtime_error(
+      "embedding audio decoding is not available in this build (libsndfile/soxr not installed)");
+}
+#endif
 }  // namespace gufo::models::embedding_gemma2

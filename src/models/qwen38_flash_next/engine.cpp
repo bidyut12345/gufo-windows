@@ -1464,8 +1464,6 @@ bool Session::FinishDecode(const DecodeRequest& request,
                  gpu_verification && !cpu_rows ? logits_.data() : nullptr)) {
     return false;
   }
-    return false;
-  }
   if (!gpu_verification || cpu_rows) {
     std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
                 logits_.begin());

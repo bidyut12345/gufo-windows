@@ -875,7 +875,6 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   if (output->model.empty()) {
     return Error(400, "Bad Request", "'model' is required", "missing_model");
   }
-  }
   if (!backend.serves_model(output->model)) {
     return Error(404, "Not Found",
                  "model '" + output->model + "' is not served by this process",

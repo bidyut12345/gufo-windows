@@ -1,11 +1,13 @@
 #include "src/models/embedding_gemma2/video_processor.hpp"
 
+#if defined(GUFO_HAVE_AV)
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -23,6 +25,7 @@ extern "C" {
 #include "src/models/embedding_gemma2/config.hpp"
 
 namespace gufo::models::embedding_gemma2 {
+#if defined(GUFO_HAVE_AV)
 namespace {
 // Thread-safe first-use loading preserves text/image/audio startup latency.
 // Hold handles before the typed symbols so every function pointer stays valid.
@@ -310,6 +313,7 @@ struct Decoder {
   }
 };
 }  // namespace
+#endif
 
 std::vector<std::size_t> SampleVideoFrames(std::size_t frames, double fps,
                                            const VideoOptions& options) {
@@ -378,6 +382,7 @@ std::vector<VideoFrame> ProcessVideo(std::span<const std::uint8_t> bytes,
                                      const VideoOptions& options,
                                      const std::function<bool()>& is_cancelled,
                                      std::size_t frame_budget) {
+#if defined(GUFO_HAVE_AV)
   if (bytes.empty() || bytes.size() > 20 * 1024 * 1024)
     throw std::invalid_argument("embedding video is empty or exceeds 20 MiB");
   Budget budget{is_cancelled};
@@ -434,6 +439,14 @@ std::vector<VideoFrame> ProcessVideo(std::span<const std::uint8_t> bytes,
   if (frames.size() != selected.size())
     throw std::invalid_argument("embedding video lost selected frames");
   return frames;
+#else
+  (void)bytes;
+  (void)options;
+  (void)is_cancelled;
+  (void)frame_budget;
+  throw std::runtime_error(
+      "embedding video processing is not available in this build (FFmpeg headers not installed)");
+#endif
 }
 
 std::string FrameVideo(const std::vector<VideoFrame>& frames,
