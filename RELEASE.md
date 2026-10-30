@@ -1,16 +1,19 @@
-# Gufo for Windows v0.24.0 (AMD Strix Halo gfx1151)
+# Gufo for Windows v0.27.0 (AMD Strix Halo gfx1151)
 
 High-performance native local LLM inference engine optimized for AMD Ryzen AI MAX+ 395 with Radeon 8060S (`gfx1151`) on Windows 11. Built natively with AMD TheRock ROCm 10.1.0.
 
 ---
 
-### 🚀 Highlights in v0.24.0
+### 🚀 Highlights in v0.27.0
 
-- **Full Upstream Sync with `gufo-org/gufo` v0.24.0**:
-  - Native Windows x86-64 hosted support merged upstream in `src/core/platform/`.
+- **Full Upstream Sync with `gufo-org/gufo` v0.27.0**:
+  - Full EmbeddingGemma 2 support with optional audio (libsndfile, libsoxr) and video (FFmpeg avcodec/avformat/avutil/swscale) processing.
+  - Compile HIP sources with `/Ob2` instead of `/Ob1` for inline optimization parity with Linux kernels.
+  - Native Windows x86-64 hosted support in `src/core/platform/`.
   - Upstream feature integration across EmbeddingGemma 2, DFlash-2 speculative drafting, and DeepSeek V4 Flash.
 - **AMD TheRock ROCm 10.1.0 Toolchain**:
-  - Full compatibility with ROCm 10.1.0 (Clang 24.0.0git) on Windows 11 x64.
+  - Full native build and runtime compatibility with ROCm 10.1.0 (Clang 24.0.0git) on Windows 11 x64.
+  - Automatic `vcpkg.json` manifest mode dependency resolution and bundling.
 - **Prompt Processing & Prefill Optimization**:
   - Raised default scheduler prefill chunk from 512 to 2048 tokens (`--prefill-chunk 2048`).
   - Optimized dense F16 matrix core GEMM threshold (`kDenseF16MinRows = 1024`) for higher prefill throughput.
@@ -51,7 +54,7 @@ High-performance native local LLM inference engine optimized for AMD Ryzen AI MA
 powershell -ExecutionPolicy Bypass -File tools\windows\check.ps1
 
 # 2. Launch Gufo with Qwen3.8 Flash-Next and MTP
-.\build\release\gufo.exe serve --host 0.0.0.0 --port 8080 llm `
+.\bin\gufo.exe serve --host 0.0.0.0 --port 8080 llm `
   --model "C:\models\Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf" `
   --draft-model "C:\models\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" `
   --draft-tokens 7 --prefill-chunk 2048 --cache-disk-staging-bytes 0

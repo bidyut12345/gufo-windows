@@ -24,6 +24,8 @@ $bin = Join-Path $stage "bin"
 New-Item -ItemType Directory -Force $bin, (Join-Path $stage "tools\windows") | Out-Null
 
 Copy-Item (Join-Path $build "gufo.exe") $bin
+if (Test-Path (Join-Path $build "gufo-server.exe")) { Copy-Item (Join-Path $build "gufo-server.exe") $bin }
+if (Test-Path (Join-Path $build "gufo-video-libraries.txt")) { Copy-Item (Join-Path $build "gufo-video-libraries.txt") $bin }
 Get-ChildItem (Join-Path $build "*.dll") | Copy-Item -Destination $bin
 foreach ($dir in "rocblas", "hipblaslt") {
   if (Test-Path (Join-Path $build $dir)) { Copy-Item (Join-Path $build $dir) -Destination $bin -Recurse }
