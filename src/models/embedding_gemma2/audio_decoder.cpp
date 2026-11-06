@@ -2,6 +2,8 @@
 
 #include <stdexcept>
 
+namespace gufo::models::embedding_gemma2 {
+
 #if defined(GUFO_HAVE_SNDFILE_SOXR)
 #include <sndfile.h>
 #include <soxr.h>
@@ -14,9 +16,7 @@
 #include <memory>
 
 #include "audio_processor.hpp"
-#endif
 
-namespace gufo::models::embedding_gemma2 {
 namespace {
 struct Reader {
   std::span<const std::uint8_t> bytes;
