@@ -2291,7 +2291,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     page.headers.emplace_back("Cache-Control", "no-store");
     return page;
   }
-  }
+
   // `/health` and `/ready` are the native spelling and match llama-server's
   // `/health`. `/healthz` and `/readyz` are aliases so Kubernetes-style probe
   // configuration works unmodified. `GET /` answers like `/health` so
