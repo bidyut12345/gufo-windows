@@ -700,8 +700,6 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     server::TextRunnerRamCacheOptions cache_ram;
-    models::qwen38_flash_next::KvCacheMode kv_cache_mode =
-        models::qwen38_flash_next::KvCacheMode::kF16;
     bool managed_experts = false;
     bool enable_yarn = false;
     std::filesystem::path cache_disk_directory;
@@ -839,17 +837,6 @@ void PrintServeHelp(std::string_view program_name,
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
     AddCacheRamOption(parser, &cache_ram);
-    parser.AddCustomOption(
-        "", "--kv-cache", "MODE",
-        "KV cache storage for Flash-Next: f16 (default), q8 / q8_0 (both "
-        "planes, ~47% fewer bytes), q8_0-q4_k / K8V4 (Q8_0 keys, Q4_K values, "
-        "~59% fewer bytes); lossy except f16",
-        "Cache",
-        [&kv_cache_mode](std::string_view, std::string_view value,
-                         std::string* error) -> bool {
-          return models::qwen38_flash_next::ParseKvCacheMode(value,
-                                                             &kv_cache_mode);
-        });
     parser.AddOption("", "--cache-disk", "DIR",
                      "Opt-in restart-safe continuation cache directory "
                      "(Flash-Next: owned by one process)",
@@ -1411,8 +1398,6 @@ int RunServe(std::span<const char* const> args) {
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
     server::TextRunnerRamCacheOptions cache_ram;
-    models::qwen38_flash_next::KvCacheMode kv_cache_mode =
-        models::qwen38_flash_next::KvCacheMode::kF16;
     bool managed_experts = false;
     bool enable_yarn = false;
     std::filesystem::path cache_disk_directory;
@@ -1558,27 +1543,6 @@ int RunServe(std::span<const char* const> args) {
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
     AddCacheRamOption(llm_parser, &cache_ram);
-    llm_parser.AddCustomOption(
-        "", "--kv-cache", "MODE",
-        "KV cache storage for Flash-Next: f16 (default), q8 / q8_0 (both "
-        "planes, ~47% fewer bytes), q8_0-q4_k / K8V4 (Q8_0 keys, Q4_K values, "
-        "~59% fewer bytes); lossy except f16",
-        "Cache",
-        [&kv_cache_mode](std::string_view, std::string_view value,
-                         std::string* error) -> bool {
-          if (!models::qwen38_flash_next::ParseKvCacheMode(value,
-                                                           &kv_cache_mode)) {
-            if (error != nullptr) {
-              *error =
-                  "Invalid mode for --kv-cache: '" + std::string(value) +
-                  "' (want " +
-                  std::string(models::qwen38_flash_next::kKvCacheModeList) +
-                  ")";
-            }
-            return false;
-          }
-          return true;
-        });
     llm_parser.AddOption("", "--cache-disk", "DIR",
                          "Opt-in restart-safe continuation cache directory "
                          "(Flash-Next: owned by one process)",
