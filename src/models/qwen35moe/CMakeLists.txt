@@ -43,5 +43,6 @@ if (ENGINE_ENABLE_HIP)
     ${ROCPRIM_INCLUDE_DIR}
     ${ROCWMMA_INCLUDE_DIR})
   target_link_libraries(gufo_qwen35moe PUBLIC
-    gufo_qwen38_flash_next_mmq hip::host roc::hipblas roc::hipblaslt)
+    gufo_qwen38_flash_next_mmq hip::host roc::hipblas roc::hipblaslt
+    gufo_qwen_kernels gufo_qwen_hip_common gufo_qwen_text gufo_qwen_vision)
 endif()

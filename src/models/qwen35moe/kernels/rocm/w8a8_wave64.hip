@@ -1,4 +1,4 @@
-#include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
+#include "src/families/qwen/kernels/prefill_quant_gemm.hpp"
 #include "src/models/qwen35moe/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::qwen35moe::rocm {

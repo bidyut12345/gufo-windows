@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "src/models/qwen/vision/prompt.hpp"
+#include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen35moe/weights.hpp"
 
 namespace gufo::models::qwen35moe {

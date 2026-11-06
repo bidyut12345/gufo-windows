@@ -15,9 +15,9 @@
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
-#include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen/vision/encoder.hpp"
-#include "src/models/qwen/vision/prompt.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
+#include "src/families/qwen/vision/encoder.hpp"
+#include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen35moe/config.hpp"
 #include "src/models/qwen35moe/mtp_policy.hpp"
 

@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "src/models/qwen/vision/rope.hpp"
+#include "src/families/qwen/hip_common/rope.hpp"
 
 #include "src/models/qwen35moe/kernels/rocm/kv_layout.hpp"
 
