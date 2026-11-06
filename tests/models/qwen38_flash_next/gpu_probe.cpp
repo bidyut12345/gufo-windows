@@ -30,8 +30,8 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
-#include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
@@ -44,9 +44,6 @@ void AuditMtp(q::rocm::Executor& executor, const q::rocm::DeviceModel& device,
               const q::ModelWeights& weights, const q::MtpWeights& mtp,
               const gufo::tokenization::QwenTokenizer& tokenizer,
               const std::filesystem::path& path);
-void AuditChainCosts(q::rocm::Executor& executor,
-                     const gufo::tokenization::QwenTokenizer& tokenizer,
-                     std::uint32_t depth);
 void AuditMtpCosts(q::rocm::Executor& executor,
                    const gufo::tokenization::QwenTokenizer& tokenizer,
                    std::span<const std::uint32_t> depths,
@@ -103,7 +100,6 @@ int main(int argc, char** argv) {
   bool mtp_audit = false;
   bool reference = false;
   bool cost_audit = false;
-  bool chain_audit = false;
   bool sampled_head = false;
   std::vector<std::uint32_t> cost_concurrencies;
   std::optional<std::uint32_t> cost_depth;
@@ -121,8 +117,6 @@ int main(int argc, char** argv) {
       mtp_path = next();
     } else if (arg == "--mtp-audit") {
       mtp_audit = true;
-    } else if (arg == "--chain-audit") {
-      chain_audit = true;
     } else if (arg == "--sampled-head") {
       sampled_head = true;
     } else if (arg == "--cost-audit") {
@@ -229,7 +223,7 @@ int main(int argc, char** argv) {
                  "be combined with other probes; --decode-ids requires it\n");
     return 2;
   }
-  if ((mtp_audit || cost_audit || chain_audit) && mtp_path.empty()) {
+  if ((mtp_audit || cost_audit) && mtp_path.empty()) {
     std::fprintf(stderr, "MTP audits require --mtp-model\n");
     return 2;
   }
@@ -247,13 +241,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--cost-audit cannot be combined with other probes\n");
     return 2;
   }
-  if (chain_audit &&
-      (mtp_audit || reference || cost_audit || decode || !dump_path.empty())) {
-    std::fprintf(stderr,
-                 "--chain-audit cannot be combined with other probes\n");
-    return 2;
-  }
-  if ((cost_depth || sampled_head) && !cost_audit && !chain_audit) {
+  if ((cost_depth || sampled_head) && !cost_audit) {
     std::fprintf(stderr, "--depth and --sampled-head require --cost-audit\n");
     return 2;
   }
@@ -323,11 +311,12 @@ int main(int argc, char** argv) {
   }
   if (sampled_head) {
     std::vector<std::int32_t> specials;
-    for (std::uint32_t id = q::kMtpDraftVocab; id < c.vocab_size; ++id)
+    for (std::uint32_t id = gufo::speculative::kDraftVocabPrefix;
+         id < c.vocab_size; ++id)
       if (tokenizer->IsSpecialToken(id))
         specials.push_back(id);
-    if (!device->SetDraftVocab(q::kMtpDraftVocab, std::move(specials),
-                               &error)) {
+    if (!device->SetDraftVocab(gufo::speculative::kDraftVocabPrefix,
+                               std::move(specials), &error)) {
       std::fprintf(stderr, "draft vocabulary failed: %s\n", error.c_str());
       return 1;
     }
@@ -340,7 +329,7 @@ int main(int argc, char** argv) {
           ? batch
           : std::min<std::uint32_t>(
                 batch, every_pass_rows != 0 ? every_pass_rows : 64);
-  if (mtp_audit || cost_audit || chain_audit)
+  if (mtp_audit || cost_audit)
     options.max_speculative = 8;
 
   if (cost_audit) {
@@ -352,15 +341,6 @@ int main(int argc, char** argv) {
   if (!executor) {
     std::fprintf(stderr, "executor failed: %s\n", error.c_str());
     return 1;
-  }
-  if (chain_audit) {
-    try {
-      AuditChainCosts(*executor, *tokenizer, cost_depth.value_or(0));
-      return 0;
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "chain audit failed: %s\n", e.what());
-      return 1;
-    }
   }
   if (cost_audit) {
     try {
@@ -435,8 +415,7 @@ int main(int argc, char** argv) {
     if (!executor->Forward(
             *session, std::span<const std::int32_t>(tokens.data() + off, n),
             rows, out.data(), q::rocm::Executor::ForwardMode::kPrefill, &error,
-            nullptr,
-            std::span<const std::int32_t>(tokens.data() + off + n, next))) {
+            {}, std::span<const std::int32_t>(tokens.data() + off + n, next))) {
       std::fprintf(stderr, "prefill failed: %s\n", error.c_str());
       return 1;
     }

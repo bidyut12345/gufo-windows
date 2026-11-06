@@ -1,4 +1,3 @@
-// SYNCPROBE-2026-09-29A
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_
 
@@ -7,10 +6,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/sampling.hpp>
 
-#include "src/core/sampling.hpp"
-#include "src/models/qwen/vision/rope.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/kv_layout.hpp"
+#include "src/families/qwen/hip_common/rope.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 /// Model-private HIP launchers for everything outside the quantized GEMM
@@ -44,11 +42,8 @@ enum class WeightType : std::uint32_t {
   kF16 = 1,
   kQ5_1 = 7,
   kQ8_0 = 8,
-  kIQ4_NL = 20,
   kQ4_K = 12,
   kQ5_K = 13,
-  kQ6_K = 14,
-  kIQ3_S = 21,
   kBF16 = 30,
 };
 
@@ -111,6 +106,43 @@ bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
                    std::uint32_t inject_parts, const float* gamma, float* xn,
                    void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
                    std::uint32_t streams, float eps, hipStream_t stream);
+/// Operands of HcMixQ8Fused: the decode combine HcCombineQ8_1 would run
+/// (res, block_out, inject, gamma, xn, xn_q8), the next mixer's Q8_0
+/// projections with its SiluScaleQ8_1 rows (lo, lo_q8 of `lo_q8_cols`), and
+/// HcMixEpilogue's outputs; a null `inject_w` writes no inject partials.
+struct HcFusedMix {
+  const void* down;  ///< Q8_0 [rank][streams * hidden]
+  const void* up;    ///< Q8_0 [streams * hidden][rank]
+  float* res;
+  const float* block_out;
+  const float* inject;
+  std::uint32_t inject_parts;
+  const float* gamma;
+  float* xn;
+  void* xn_q8;
+  float* lo;
+  void* lo_q8;
+  std::uint32_t lo_q8_cols;
+  const float* inject_w;
+  float* mixed;
+  void* mixed_q8;     ///< optional Q8_1 rows of mixed
+  float* inject_out;  ///< HcInjectParts(hidden) partials per logit
+  std::uint32_t hidden;
+  std::uint32_t streams;
+  std::uint32_t rank;
+  float eps;
+  float scale;  ///< the SiLU input scale, 1 / streams
+};
+/// Device bytes of HcMixQ8Fused's counters and intermediates. Allocate them
+/// zeroed once; every launch leaves its counters zero again, so captured
+/// graphs replay it. Launches sharing one state must be stream-ordered.
+std::size_t HcMixQ8FusedStateBytes();
+/// A decode batch's (1..8 tokens) HcCombineQ8_1, down projection, SiLU
+/// scale, up projection and HcMixEpilogue in one launch, byte for byte their
+/// outputs (the up projection's gate rows are not stored). Only the model's
+/// 4 x 2560 streams and rank 320; false, with nothing launched, otherwise.
+bool HcMixQ8Fused(void* state, const HcFusedMix& mix, std::uint32_t n_tokens,
+                  hipStream_t stream);
 /// HcCombine writing the normalized output as F16, the width the next
 /// mixer's projection and epilogue consume on the F16 mixer input route.
 /// A non-null `xn_q8` also receives the norm quantized into the tiled Q8
@@ -212,19 +244,18 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
                    std::uint32_t n_tokens, hipStream_t stream);
 
 /// Stacked Q8_0 QKV projection [13312,2560], head normalization and RoPE.
-/// Writes Q/gates in F32 and K/V caches in F16 (or quantized with
-/// `kv_dtypes`), preserving separate rounding.
+/// Writes Q/gates in F32 and K/V caches in F16, preserving separate rounding.
 /// Fixed geometry: 24 query heads, two KV heads, 256 dimensions, 64 rotary.
 /// Requires at least 1024 tokens; cache capacity must include position +
 /// tokens.
-/// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
+/// With yarn enabled, applies YaRN with its constants (see rope_scaling.hpp).
 bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
-                      float* gate, void* keys, void* values,
+                      float* gate, __half* keys, __half* values,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      KvDtypes kv_dtypes = {}, const YarnRope& yarn = {});
+                      const YarnRope& yarn = {});
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -250,6 +281,16 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
 bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
                    std::size_t m, std::size_t k, hipStream_t stream);
 
+/// Most checkpoints one prefill pass captures in place.
+inline constexpr std::uint32_t kMaxPassCheckpoints = 4;
+
+/// Prefixes of a prefill pass, in rows from its start and ascending, whose
+/// state an in-pass checkpoint captures while the pass continues.
+struct PassCheckpoints {
+  std::uint32_t tokens[kMaxPassCheckpoints] = {};
+  std::uint32_t count = 0;
+};
+
 /// SSM Q8_0 projection fused with its four-tap convolution. Supports
 /// [m=16384,k=2560,channels=10240] and at least 1024 tokens. qkvz retains
 /// every Z row plus the QKV rows required for tile boundaries and rolling
@@ -265,7 +306,7 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      const float* history, float* qkvz, float* convolved,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                      std::uint32_t channels, std::uint32_t kernel,
-                     hipStream_t stream, std::uint32_t checkpoint_tokens = 0,
+                     hipStream_t stream, PassCheckpoints checkpoints = {},
                      hipStream_t z_stream = nullptr,
                      hipEvent_t z_start = nullptr);
 
@@ -289,7 +330,8 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
 /// projection's F32 output over the same rows) turns it into
 /// silu(gate) * result.
 /// `tile_rows` is the token rows per tile the map was built with: 16 or 48,
-/// or 64 for Q5_1/Q8_0.
+/// or 128 for the prefill down projection (Q5_1/Q8_0, F16 output and no
+/// `swiglu_gate`). Every tile height gives each row the same bits.
 /// Q4_K and Q5_K need k % 256 == 0, Q5_1 and Q8_0 k % 64 == 0; other types
 /// and tile widths return false.
 bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
@@ -301,7 +343,8 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
 
 /// Paired Q4_K/Q5_K gate/up GEMM with SwiGLU and F16 output. Uses the same
 /// routing layout as RoutedF16Gemm, with 128 token rows per tile. The two
-/// projections share one launch and never materialize the gate output.
+/// projections share one launch and never materialize the gate output;
+/// every row equals the separate gate and up launches bit for bit.
 bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const __half* x, const std::int32_t* tiles,
                         std::uint32_t n_tiles, const std::int32_t* pad_bounds,
@@ -344,10 +387,14 @@ void HistoryPrefix(const float* in, std::uint32_t stride, const float* history,
                    std::uint32_t channels, std::uint32_t history_rows,
                    hipStream_t stream);
 
+/// The recurrent state and rolling convolution history at each prefix of
+/// `tokens` (ascending rows from the pass start). Null entries skip that
+/// part of a checkpoint.
 struct GdnCheckpoint {
-  float* state = nullptr;
-  float* history = nullptr;
-  std::uint32_t tokens = 0;
+  float* state[kMaxPassCheckpoints] = {};
+  float* history[kMaxPassCheckpoints] = {};
+  std::uint32_t tokens[kMaxPassCheckpoints] = {};
+  std::uint32_t count = 0;
 };
 
 /// Gated DeltaNet over a chunk of tokens for one layer. Runs the causal
@@ -361,7 +408,9 @@ struct GdnCheckpoint {
 /// ([n_tokens-1][(kernel-1)*channels]), when populated, receive the state after
 /// each proper prefix. The live state already holds the full batch.
 /// Scratch: `conv_scratch` ((n_tokens + kernel) * channels), `qn`/`kn`
-/// (n_tokens * k_heads * d), `raw` (n_tokens * v_heads * d).
+/// (n_tokens * k_heads * d), `raw` (n_tokens * v_heads * d). The `row_split`
+/// route for 128-wide heads without snapshots (prefill) runs as one fused
+/// launch and leaves `qn`, `kn` and `raw` untouched.
 /// `qkv` rows are `qkv_stride` floats apart and `z` rows `z_stride`, so a
 /// stacked [qkv|z] projection feeds both without unpacking. A non-null
 /// `out_q8` receives the rows quantized into the W8A8 tiled layout
@@ -424,38 +473,35 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
                  hipStream_t stream);
 
 /// Unpacks a stacked Q/gate/K/V projection, normalizes and rotates Q/K,
-/// and writes the caches (F16 values, or Q8_0 blocks with `kv_dtype`).
-/// Returns false for heads wider than 256.
+/// and writes the F16 caches. Returns false for heads wider than 256.
 /// With zero query heads, packed contains only K/V and q/gate may be null.
-/// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
+/// With yarn enabled, applies YaRN with its constants (see rope_scaling.hpp).
 bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const float* q_gamma, const float* k_gamma, float* q,
-                      float* gate, void* k_cache, void* v_cache,
+                      float* gate, __half* k_cache, __half* v_cache,
                       std::uint32_t n_tokens, std::uint32_t heads,
                       std::uint32_t kv_heads, std::uint32_t d,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false, KvDtypes kv_dtypes = {},
-                      const YarnRope& yarn = {});
+                      bool prefill = false, const YarnRope& yarn = {});
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
 /// session's control block) so a captured decode graph replays at any
 /// position.
-/// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
+/// With yarn enabled, applies YaRN with its constants (see rope_scaling.hpp).
 void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
           std::uint32_t d, std::uint32_t rotary_dim,
           const std::uint32_t* start_pos, float theta, hipStream_t stream,
           const qwen::vision::DeviceRope* rope = nullptr,
           const YarnRope& yarn = {});
 
-/// Stores f32 rows into the cache at positions start_pos + t:
-/// cache[(start_pos + t)][row_dim], rounded to F16 or quantized to Q8_0/Q4_K
-/// blocks per `kv_dtype`.
-void StoreKv(const float* src, void* cache, std::uint32_t n_tokens,
+/// Stores f32 rows into the f16 cache at positions start_pos + t:
+/// cache[(start_pos + t)][row_dim].
+void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
              std::uint32_t row_dim, const std::uint32_t* start_pos,
-             hipStream_t stream, KvCacheDtype kv_dtype = KvCacheDtype::kF16);
+             hipStream_t stream);
 /// Stores raw indexer rows in a power-of-two ring of `capacity` rows.
 void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
                std::uint32_t row_dim, const std::uint32_t* start_pos,
@@ -467,7 +513,7 @@ void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
 /// block start position, then round once to F16 for scoring.
 /// `grid_blocks` bounds how many blocks one launch
 /// can pool (a device-side bound is not available at launch time).
-/// With yarn enabled, applies static YaRN (see rope_scaling.hpp).
+/// With yarn enabled, applies YaRN with its constants (see rope_scaling.hpp).
 void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        __half* blocks, const std::uint32_t* first_block,
                        const std::uint32_t* start_pos, std::uint32_t n_tokens,
@@ -476,6 +522,17 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        float eps, std::uint32_t capacity, hipStream_t stream,
                        const qwen::vision::DeviceRope* rope = nullptr,
                        const YarnRope& yarn = {});
+
+/// Dynamic YaRN: re-rotates `n_rows` cached post-RoPE key rows of `heads`
+/// heads (`head_dim` apart, first `rotary` dimensions rotated split-half)
+/// from the scaling `from` to `to`. Row r of `source` is at rope position
+/// (first_row + r) * pos_stride. `destination` may alias `source`.
+void RerotateKeys(const __half* source, __half* destination,
+                  std::uint32_t first_row, std::uint32_t n_rows,
+                  std::uint32_t heads, std::uint32_t head_dim,
+                  std::uint32_t rotary, std::uint32_t pos_stride, float theta,
+                  const qwen::vision::DeviceRope* rope, const YarnRope& from,
+                  const YarnRope& to, hipStream_t stream);
 
 /// Per query t (position *start_pos + first_token + t): scores every
 /// complete block below its own tail, keeps the `budget` highest, and
@@ -504,14 +561,17 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
 /// output is bitwise identical to the mask walk. Null lists use the mask walk.
 /// Complete blocks past a row's `mask_words` * 32 bits are not selected,
 /// whatever the device position; keys up to the position must exist.
-void Attention(const float* q, const void* k_cache, const void* v_cache,
+/// Rows seeing at most `dense_extent` keys ignore the mask and sweep densely,
+/// as they do without one; pass the token budget so a row's arithmetic does
+/// not depend on whether its batch crosses the budget.
+void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
                hipStream_t stream, std::uint32_t* lists = nullptr,
                std::uint32_t* counts = nullptr, std::uint32_t list_capacity = 0,
-               KvDtypes kv_dtypes = {});
+               std::uint32_t dense_extent = 0);
 
 /// Maximum visible sparse context for this WMMA geometry, or zero when the
 /// geometry is unsupported. Checkpoint planning uses the same dispatch limit.
@@ -528,17 +588,21 @@ void Attention(const float* q, const void* k_cache, const void* v_cache,
 /// Returns false when the visible extent exceeds
 /// WmmaCausalAttentionContextLimit or the mask stride; the caller falls back
 /// to Attention.
-/// `lead` selection rows precede the batch at `lead_mask`: they align the
-/// packed query groups to absolute positions so a chunk starting mid-group
-/// unions the same four selections a full pass unions. Zero keeps the
-/// launch-relative grouping.
-bool WmmaCausalAttention(
-    const float* q, const float* gate, const void* k_cache, const void* v_cache,
-    const std::uint32_t* mask, std::uint32_t mask_words, float* out,
-    std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t heads,
-    std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
-    hipStream_t stream, bool last_only = false, KvDtypes kv_dtypes = {},
-    const std::uint32_t* lead_mask = nullptr, std::uint32_t lead = 0);
+/// With a mask, each tile packs four consecutive queries from the first row
+/// and gathers the union of their selections, so a row's rounding depends on
+/// which queries share its tile. A prompt split therefore matches one pass
+/// only when every pass after the first starts on a multiple of four.
+/// Session::Feed keeps its own passes there, and the serving runner rounds
+/// pass ends and checkpoints to TextRunnerCapabilities::prefill_alignment
+/// (asserted in TextRunnerPool::Request::Prefill).
+bool WmmaCausalAttention(const float* q, const float* gate,
+                         const __half* k_cache, const __half* v_cache,
+                         const std::uint32_t* mask, std::uint32_t mask_words,
+                         float* out, std::uint32_t n_tokens,
+                         std::uint32_t start_pos, std::uint32_t heads,
+                         std::uint32_t kv_heads, std::uint32_t d,
+                         std::uint32_t ratio, hipStream_t stream,
+                         bool last_only = false);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
@@ -576,15 +640,6 @@ void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
                float* dst, std::uint32_t n_tokens, std::uint32_t width,
                hipStream_t stream);
 
-/// Advances the draft control block after one chained draft stage: the draft
-/// position moves by `count` tokens and, once past the indexer budget, the
-/// pooled block count tracks it. `hidden_row` falls back to the carried
-/// residual.
-void MtpAdvanceControl(std::uint32_t* mtp_position, std::uint32_t* mtp_blocks,
-                       std::int32_t* hidden_row, std::uint32_t count,
-                       std::uint32_t top_k, std::uint32_t compress_ratio,
-                       hipStream_t stream);
-
 /// Add the projected embedding once to each projected hidden branch.
 void MtpAddEmbedding(const float* embedding, float* residual,
                      std::uint32_t n_tokens, std::uint32_t hidden,
@@ -600,6 +655,9 @@ struct ArgmaxCandidate {
 /// n_tokens * kArgmaxParts candidates.
 void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
             std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream);
+/// row[1] = float bits of softmax(logits)[row[0]] over `vocab` entries.
+void ArgmaxConfidence(const float* logits, std::int32_t* row,
+                      std::uint32_t vocab, hipStream_t stream);
 
 /// Gather selected IDs and their original logits from independent rows.
 /// The caller checks finite values only for the verification prefix it visits.
@@ -665,28 +723,6 @@ std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab);
 void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t* scratch_ids, float* scores,
                       std::uint32_t vocab, hipStream_t stream);
-
-/// Vocabulary rows a chained greedy draft step ranks its proposal over.
-inline constexpr std::uint32_t kMtpDraftShortlist = 512;
-
-/// Shortlist-buffer ID capacity of one selection pass: the first reduction
-/// keeps this many of the vocabulary's top candidates.
-std::uint32_t MtpDraftShortlistWorkspaceSize(std::uint32_t vocab);
-
-/// Exact top-`kMtpDraftShortlist` of one full-vocab logit row, descending
-/// score with lowest-token-ID ties. Both ID buffers have room for
-/// MtpDraftShortlistWorkspaceSize(vocab). Graph-safe.
-void MtpDraftShortlist(const float* logits, std::uint32_t* ids,
-                       std::uint32_t* scratch_ids, float* scores,
-                       std::uint32_t vocab, hipStream_t stream);
-
-/// Copies the shortlisted rows of the Q4_0 draft head into one compact
-/// row-major matrix of `rows` rows (`row_bytes` encoded bytes each) so the
-/// chained steps' head GEMV reads only the shortlist. `row_bytes` must be a
-/// multiple of 16. Graph-safe.
-void GatherDraftHeadRows(const void* weights, const std::uint32_t* ids,
-                         void* gathered, std::uint32_t row_bytes,
-                         std::uint32_t rows, hipStream_t stream);
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 

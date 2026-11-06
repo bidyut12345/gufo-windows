@@ -2,8 +2,6 @@
 
 #include <cassert>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -245,43 +243,6 @@ void CheckMalformedMetadata() {
   assert(draft && trunk && draft->MtpMatches(*trunk));
 }
 
-void CheckMtpSidecarDiscovery(const std::filesystem::path& root) {
-  const auto create = [](const std::filesystem::path& path) {
-    std::filesystem::create_directories(path.parent_path());
-    std::ofstream file(path, std::ios::binary);
-    Require(file.good(), "sidecar discovery fixture file created");
-  };
-  const auto target = root / "UD-Q4_K_XL" / "target.gguf";
-  create(target);
-  Require(qfn::DiscoverMtpSidecar(target.string()).empty(),
-          "discovery found a sidecar with none present");
-
-  // Unsloth snapshot layout: draft in a sibling MTP/ directory.
-  const auto snapshot_draft = root / "MTP" / "mtp-X-shared-Q8_0.gguf";
-  create(snapshot_draft);
-  Require(qfn::DiscoverMtpSidecar(target.string()) == snapshot_draft.string(),
-          "discovery missed the snapshot MTP/ sidecar");
-
-  // Non-shared drafts and wrong extensions never qualify.
-  create(root / "MTP" / "mtp-X-Q8_0.gguf");
-  create(root / "MTP" / "mtp-X-shared-Q8_0.gguf.txt");
-  Require(qfn::DiscoverMtpSidecar(target.string()) == snapshot_draft.string(),
-          "discovery accepted a non-shared or non-GGUF draft");
-
-  // Quant preference overrides distance; flat layout still discovered.
-  const auto flat_draft = root / "mtp-Y-shared-Q8_0.gguf";
-  const auto flat_bf16 = root / "mtp-Y-shared-BF16.gguf";
-  create(flat_draft);
-  create(flat_bf16);
-  Require(qfn::DiscoverMtpSidecar(target.string()) == flat_draft.string(),
-          "discovery did not prefer the Q8_0 sidecar");
-  Require(qfn::DiscoverMtpSidecar((root / "flat.gguf").string()) ==
-              flat_draft.string(),
-          "discovery missed a sidecar beside the target");
-
-  std::filesystem::remove_all(root);
-}
-
 void CheckScaledContext() {
   qfn::Config c;
   c.context_length = 262144;
@@ -306,8 +267,6 @@ void CheckScaledContext() {
 int main() {
   CheckSidecarCompatibility();
   CheckMalformedMetadata();
-  CheckMtpSidecarDiscovery(std::filesystem::temp_directory_path() /
-                           "gufo_qfn_discovery_test");
   CheckScaledContext();
   std::cout << "Flash-Next metadata checks passed.\n";
 }

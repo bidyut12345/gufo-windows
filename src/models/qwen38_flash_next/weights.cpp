@@ -35,10 +35,6 @@ struct Format {
       return {256, 176};
     case GgmlType::kQ6_K:
       return {256, 210};
-    case GgmlType::kIQ3_S:
-      return {256, 110};
-    case GgmlType::kIQ4_XS:
-      return {256, 136};
     default:
       return {0, 0};
   }
@@ -145,8 +141,7 @@ struct Binder {
     const auto dense = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
                         GgmlType::kF32};
     const auto experts = {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
-                          GgmlType::kQ5_1, GgmlType::kQ8_0, GgmlType::kIQ3_S,
-                          GgmlType::kIQ4_XS, GgmlType::kIQ4_NL};
+                          GgmlType::kQ5_1, GgmlType::kQ8_0};
 
     l.hc_attn = Mixer(p + "hc_attn", c, true);
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
@@ -283,8 +278,9 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
     if (rows < c.ple_rows) {
       b.Fail("per_layer_token_embd.weight is missing or too short");
     } else {
-      w.ple_table = b.Get("per_layer_token_embd.weight", c.ple_head_dim, rows,
-                          1, {GgmlType::kIQ4_NL, GgmlType::kBF16});
+      w.ple_table =
+          b.Get("per_layer_token_embd.weight", c.ple_head_dim, rows, 1,
+                {GgmlType::kIQ4_NL, GgmlType::kQ8_0, GgmlType::kBF16});
     }
   }
   w.layers.reserve(c.num_layers);

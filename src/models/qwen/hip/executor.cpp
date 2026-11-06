@@ -3,15 +3,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <gufo/ext/experimental/dispatch_telemetry.hpp>
+#include <gufo/ext/experimental/hip_utils.hpp>
 #include <stdexcept>
 #include <utility>
 
-#include "src/core/hip/detail/dispatch_telemetry.hpp"
-#include "src/core/hip/hip_utils.hpp"
+#include "src/families/qwen/kernels/copy_27b.hpp"
+#include "src/families/qwen/kernels/sample_27b.hpp"
 #include "src/models/qwen/hip/cycle_profile.hpp"
-#include "src/models/qwen/hip/kernels/copy_27b.hpp"
-#include "src/models/qwen/hip/kernels/sample_27b.hpp"
-
 namespace gufo::hip {
 namespace {
 
@@ -270,7 +269,7 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
     for (std::uint32_t offset = 0; offset < count;) {
       const auto start = position + offset;
       const auto until_wrap = static_cast<std::uint32_t>(
-          kSsmReplayCapacity - (start % kSsmReplayCapacity));
+          arena_.replay_capacity_ - (start % arena_.replay_capacity_));
       const auto rows =
           std::min({count - offset, until_wrap, arena_.GetMaxBatch()});
       LaunchSSMConvRecurrenceRows(

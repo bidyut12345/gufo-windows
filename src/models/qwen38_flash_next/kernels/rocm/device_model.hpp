@@ -3,12 +3,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/gguf_reader.hpp>
 #include <memory>
 #include <span>
 #include <string>
 #include <vector>
 
-#include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -61,6 +61,31 @@ struct DeviceLayer {
   DeviceMixer nextn_head;
 };
 
+/// How Upload stores a hyper-connection inject projection read in `disk`
+/// format. The binder accepts F32, Q8_0 and BF16 rows, and each reaches the
+/// device as F32 rows for the fused inject kernels, which compute a prompt
+/// row the same way at any pass width. A separate 16-bit projection would
+/// take the library GEMM, whose sums depend on the pass width, and on the
+/// wide HC route it shares the half staging buffer with the mixed row.
+enum class HcInjectUpload { kCopy, kExpandQ8_0, kWidenBF16 };
+
+[[nodiscard]] constexpr HcInjectUpload HcInjectUploadFor(
+    core::GgmlType disk) noexcept {
+  switch (disk) {
+    case core::GgmlType::kQ8_0:
+      return HcInjectUpload::kExpandQ8_0;
+    case core::GgmlType::kBF16:
+      return HcInjectUpload::kWidenBF16;
+    default:
+      return HcInjectUpload::kCopy;
+  }
+}
+
+/// Widens `count` BF16 values to F32 exactly: a BF16 value is the upper half
+/// of an F32.
+void WidenBF16(const std::uint16_t* src, float* dst,
+               std::size_t count) noexcept;
+
 /// The trunk (and optionally the MTP draft block) uploaded to the GPU. The
 /// n-gram table is never uploaded: it is read from disk per token.
 class DeviceModel {
@@ -78,8 +103,6 @@ public:
   const Config& config() const noexcept { return config_; }
   const DeviceTensor& token_embd() const noexcept { return token_embd_; }
   const DeviceTensor& output() const noexcept { return output_; }
-  /// Q4_0 copy of the LM head for draft proposals (empty when absent).
-  const DeviceTensor& output_draft() const noexcept { return output_draft_; }
   /// The leading output() rows the MTP draft head scores in place (see
   /// draft_vocab.hpp); empty when the draft projects the full vocabulary.
   const DeviceTensor& draft_output() const noexcept { return draft_output_; }
@@ -115,12 +138,12 @@ public:
   }
 
 private:
+  friend struct DeviceModelTestAccess;  // synthetic models in GPU tests
   DeviceModel() = default;
 
   Config config_;
   DeviceTensor token_embd_;
   DeviceTensor output_;
-  DeviceTensor output_draft_{};
   std::size_t output_bytes_{0};
   DeviceTensor draft_output_;
   std::vector<std::int32_t> draft_specials_;

@@ -1,4 +1,4 @@
-#include "src/models/embedding_gemma2/audio_decoder.hpp"
+#include "audio_decoder.hpp"
 
 #if defined(GUFO_HAVE_SNDFILE_SOXR)
 #include <sndfile.h>
@@ -12,7 +12,7 @@
 #include <memory>
 #include <stdexcept>
 
-#include "src/models/embedding_gemma2/audio_processor.hpp"
+#include "audio_processor.hpp"
 
 namespace gufo::models::embedding_gemma2 {
 namespace {

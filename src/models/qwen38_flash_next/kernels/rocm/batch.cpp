@@ -1,17 +1,21 @@
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstring>
+#include <gufo/ext/experimental/managed_alloc.hpp>
 #include <stdexcept>
 
-#include "qfn_ggml_stubs.h"
 #include "qfn_mmq.h"
-#include "src/core/hip/managed_alloc.hpp"
-#include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
+
+constexpr std::uint32_t kBatchSessions = 8;
+constexpr std::uint32_t kDecodeRows = 8;
 
 bool Fail(std::string* error, const std::string& message) {
   if (error != nullptr) {
@@ -206,14 +210,6 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     rows += n;
     final_rows[i] = rows - 1;
   }
-  // A catch-up starts a cycle: any shortlist a previous cycle seeded ranks a
-  // distribution this cycle has not computed yet.
-  for (const auto& item : items) {
-    if (item.hidden_row >= 0) {
-      batch_shortlist_count_ = 0;
-      break;
-    }
-  }
   if (rows > options_.max_batch)
     return Fail(error, "MTP body batch exceeds executor capacity");
   if (!AnyActive(items))
@@ -318,13 +314,13 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         session.mtp_.residual_valid = false;
         const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
         const auto capacity = session.index_capacity_;
+        UseYarn(session);
         if (!PrepareAttention(
                 base.qg + std::size_t{offsets[i]} * kv.rows, kv.rows, nullptr,
                 l.attn_k_norm.f32(), nullptr, nullptr, session.mtp_.k_cache,
                 session.mtp_.v_cache, n, 0, c.num_kv_heads, c.head_dim,
                 c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
-                c.rms_eps, stream_, session.vision_input_.rope(), false,
-                options_.kv_dtypes, yarn_))
+                c.rms_eps, stream_, session.vision_input_.rope(), false, yarn_))
           return Fail(error, "batched MTP cache projection failed");
         StoreRows(base.ik + std::size_t{offsets[i]} * c.indexer_head_dim,
                   session.mtp_.index_k, n, c.indexer_head_dim,
@@ -377,6 +373,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       const bool sparse = session.mtp_.position + n > c.indexer_top_k;
       const auto complete = (session.mtp_.position + n) / c.compress_ratio;
       const auto pool = sparse ? complete - session.mtp_.blocks : 0;
+      UseYarn(session);
       if (!Attention(l, attention, s_.mixed, s_.block_out, n,
                      &session.control_->mtp_position,
                      &session.control_->mtp_blocks, session.mtp_.position, pool,
@@ -458,8 +455,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   return true;
 }
 
-bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
-                        bool seed_shortlist) const {
+bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
+                        std::string* error) const {
   selected_logits_ = nullptr;
   if (!has_mtp() || items.empty() || items.size() > kBatchSessions ||
       items.size() > options_.max_batch) {
@@ -480,8 +477,6 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
       }
     }
   }
-  const auto& output = model_->output();
-  const auto& draft_output = model_->output_draft();
   const auto& head = model_->mtp().nextn_head;
   if (!AnyActive(items))
     return true;
@@ -494,12 +489,15 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
                    UseDraftSubset(*item.session, item.output.draft_subset)
                        ? item.session
                        : nullptr,
-                   nullptr, false, error) ||
+                   error) ||
           !Check(hipStreamSynchronize(stream_), error)) {
         return false;
       }
-      if (item.output.token != nullptr)
-        *item.output.token = *mtp_token_host_;
+      if (item.output.token != nullptr) {
+        *item.output.token = mtp_token_host_[0];
+        if (item.output.confidence != nullptr)
+          *item.output.confidence = std::bit_cast<float>(mtp_token_host_[1]);
+      }
       if (item.output.candidates != nullptr)
         *item.output.candidates = *mtp_candidates_host_;
     }
@@ -528,7 +526,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
   const auto& full_head = model_->output();
   const std::size_t vocab = full_head.rows;
   const std::size_t prefix = prefix_head.rows;
-  const std::size_t kSmall = prefix + kMtpDraftExtraRows;
+  const std::size_t kSmall = prefix + speculative::kDraftVocabExtraRows;
   std::array<std::uint32_t, kBatchSessions> slot{};
   std::uint32_t subset_rows = 0;
   for (std::uint32_t i = 0; i < n; ++i)
@@ -545,46 +543,10 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
                                                  items[i].output.draft_subset)
                   ? a++
                   : b++;
-  // Greedy proposals only rank candidates the target verifies exactly, so an
-  // all-greedy round can score the exact Q4_0 copy of the head — the full
-  // rows when nothing is seeded, or each session's gathered top-512 from the
-  // round that seeded this cycle. Sampled sessions need the full Q8 head for
-  // exact p/q verification, so any candidate request keeps the dense path.
-  // A round with small-head requests scores those through their tables and
-  // never touches the Q4_0 shortlist machinery.
-  const bool shortlist_ok =
-      subset_rows == 0 && s_.mtp_short_row_bytes != 0 &&
-      !draft_output.empty() && n <= options_.max_logit_rows;
-  bool all_greedy = true;
-  for (const auto& item : items)
-    all_greedy = all_greedy && item.output.candidates == nullptr;
-  std::array<std::uint32_t, kBatchSessions> slots{};
-  bool use_shortlist =
-      shortlist_ok && all_greedy && batch_shortlist_count_ != 0;
-  if (use_shortlist) {
-    for (std::size_t i = 0; i < n && use_shortlist; ++i) {
-      use_shortlist = false;
-      for (std::uint32_t j = 0; j < batch_shortlist_count_; ++j) {
-        if (batch_shortlist_slots_[j] == items[i].session) {
-          slots[i] = j;
-          use_shortlist = true;
-          break;
-        }
-      }
-    }
-  }
-  // A cycle's first all-greedy round seeds; later rounds of the same cycle
-  // consume. The caller only asks when another round will follow.
-  const bool seed = seed_shortlist && shortlist_ok && all_greedy &&
-                    !use_shortlist && batch_shortlist_count_ == 0;
   const auto rows_of = [&](std::uint32_t i) {
-    if (subset_rows == 0 && use_shortlist)
-      return static_cast<std::uint32_t>(kMtpDraftShortlist);
     return static_cast<std::uint32_t>(slot[i] < subset_rows ? kSmall : vocab);
   };
-  const auto logits_of = [&](std::uint32_t i) -> float* {
-    if (subset_rows == 0 && use_shortlist)
-      return batch_logits_ + std::size_t{i} * kMtpDraftShortlist;
+  const auto logits_of = [&](std::uint32_t i) {
     if (mixed)
       return batch_logits_ + slot[i] * vocab;
     return slot[i] < subset_rows ? batch_logits_ + slot[i] * kSmall
@@ -595,7 +557,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
   const auto body = [&]() {
     if (!AnyActive(items))
       return true;
-    for (std::size_t i = 0; i < n; ++i) {
+    for (std::uint32_t i = 0; i < n; ++i) {
       RmsNormRows(items[i].session->mtp_.h, head.norm.f32(),
                   base.xn + std::size_t{slot[i]} * config().HcDim(), 1,
                   config().HcDim(), config().hc_count, config().rms_eps,
@@ -606,102 +568,42 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
       return false;
     if (!AnyActive(items))
       return true;
-    static_assert(kMtpDraftExtraRows <= 1024, "GatherDraftLogits is one block");
-    if (subset_rows != 0) {
-      if (mixed) {
-        if (!DenseBatch(full_head, base.mixed, batch_logits_, n, error))
-          return false;
-        for (std::uint32_t i = 0; i < n; ++i) {
-          if (slot[i] < subset_rows)
-            GatherDraftLogits(logits_of(i), items[i].session->mtp_.draft_ids,
-                              static_cast<std::uint32_t>(prefix),
-                              kMtpDraftExtraRows, stream_);
-        }
-      } else {
-        float* staged = batch_logits_ + kBatchSessions * vocab -
-                        std::size_t{subset_rows} * prefix;
-        if (!DenseBatch(prefix_head, base.mixed, staged, subset_rows, error) ||
-            !Check(
-                hipMemcpy2DAsync(batch_logits_, kSmall * sizeof(float), staged,
-                                 prefix * sizeof(float), prefix * sizeof(float),
-                                 subset_rows, hipMemcpyDeviceToDevice, stream_),
-                error))
-          return false;
-        for (std::uint32_t i = 0; i < n; ++i) {
-          if (slot[i] >= subset_rows)
-            continue;
-          const Session& session = *items[i].session;
-          if (!Dense(DraftTable(session),
-                     base.mixed + std::size_t{slot[i]} * full_head.cols,
-                     logits_of(i) + prefix, 1, error))
-            return false;
-          MaskDraftLogits(logits_of(i) + prefix, session.mtp_.draft_ids,
-                          kMtpDraftExtraRows, stream_);
-        }
-      }
-    } else if (use_shortlist) {
-      // One Q4_0 GEMV over every session's gathered rows: token t reads the
-      // expert (shortlist slice) its session was seeded into.
-      for (std::size_t i = 0; i < n; ++i)
-        batch_short_ids_host_[i] = static_cast<std::int32_t>(slots[i]);
-      if (!Check(hipMemcpyAsync(s_.mtp_batch_ids, batch_short_ids_host_,
-                                n * sizeof(std::int32_t), hipMemcpyHostToDevice,
-                                stream_),
-                 error)) {
+    static_assert(speculative::kDraftVocabExtraRows <= 1024,
+                  "GatherDraftLogits is one block");
+    if (mixed) {
+      if (!DenseBatch(full_head, base.mixed, batch_logits_, n, error))
         return false;
+      for (std::uint32_t i = 0; i < n; ++i) {
+        if (slot[i] < subset_rows)
+          GatherDraftLogits(logits_of(i), items[i].session->mtp_.draft_ids,
+                            static_cast<std::uint32_t>(prefix),
+                            speculative::kDraftVocabExtraRows, stream_);
       }
-      if (qfn_mmq_moe_vec(GGML_TYPE_Q4_0, s_.mtp_short_w, base.mixed,
-                          s_.mtp_batch_ids, batch_logits_, kMtpDraftShortlist,
-                          output.cols, n, batch_shortlist_count_, 1, stream_,
-                          nullptr, nullptr) != 0) {
-        return Fail(error, "batched shortlist head GEMV failed");
+    } else if (subset_rows != 0) {
+      float* staged = batch_logits_ + kBatchSessions * vocab -
+                      std::size_t{subset_rows} * prefix;
+      if (!DenseBatch(prefix_head, base.mixed, staged, subset_rows, error) ||
+          !Check(
+              hipMemcpy2DAsync(batch_logits_, kSmall * sizeof(float), staged,
+                               prefix * sizeof(float), prefix * sizeof(float),
+                               subset_rows, hipMemcpyDeviceToDevice, stream_),
+              error))
+        return false;
+      for (std::uint32_t i = 0; i < n; ++i) {
+        if (slot[i] >= subset_rows)
+          continue;
+        const Session& session = *items[i].session;
+        if (!Dense(DraftTable(session),
+                   base.mixed + std::size_t{slot[i]} * full_head.cols,
+                   logits_of(i) + prefix, 1, error))
+          return false;
+        MaskDraftLogits(logits_of(i) + prefix, session.mtp_.draft_ids,
+                        speculative::kDraftVocabExtraRows, stream_);
       }
-    } else if (all_greedy && shortlist_ok) {
-      // The exact Q4_0 copy of the head halves the dense round's read; its
-      // logits only rank proposals.
-      if (qfn_mmq_moe_vec(GGML_TYPE_Q4_0, draft_output.data, base.mixed,
-                          s_.mtp_zero_ids, batch_logits_, output.rows,
-                          output.cols, n, 1, 1, stream_, nullptr,
-                          nullptr) != 0) {
-        return Fail(error, "batched Q4_0 head GEMV failed");
-      }
-    } else if (!draft_output.empty()) {
-      // Sampled rounds must rank proposals through the same draft head copy
-      // the single-session head reads; the target head is a different
-      // distribution, and mixed greedy/sampled rounds still verify against
-      // it exactly later in the cycle.
-      if (qfn_mmq_moe_vec(GGML_TYPE_Q4_0, draft_output.data, base.mixed,
-                          s_.mtp_zero_ids, batch_logits_, output.rows,
-                          output.cols, n, 1, 1, stream_, nullptr,
-                          nullptr) != 0) {
-        return Fail(error, "batched draft head GEMV failed");
-      }
-    } else if (!DenseBatch(output, base.mixed, batch_logits_, n, error)) {
+    }
+    if (subset_rows == 0 &&
+        !DenseBatch(full_head, base.mixed, batch_logits_, n, error))
       return false;
-    }
-    if (seed) {
-      // Keep each session's exact top-512 of this round's distribution and
-      // the matching gathered head rows. Selection and gather are pure
-      // device operations, so the shortlist is ready for the next round.
-      const auto workspace =
-          MtpDraftShortlistWorkspaceSize(config().vocab_size);
-      const auto vocab = config().vocab_size;
-      for (std::size_t i = 0; i < n; ++i) {
-        const float* row = batch_logits_ + std::size_t{i} * output.rows;
-        auto* ids = s_.mtp_short_ids + std::size_t{i} * workspace;
-        MtpDraftShortlist(
-            row, ids, s_.mtp_short_scratch + std::size_t{i} * workspace,
-            s_.mtp_short_scores + std::size_t{i} * kMtpDraftShortlist, vocab,
-            stream_);
-        GatherDraftHeadRows(
-            draft_output.data, ids,
-            static_cast<std::uint8_t*>(s_.mtp_short_w) +
-                std::size_t{i} * kMtpDraftShortlist * s_.mtp_short_row_bytes,
-            s_.mtp_short_row_bytes, kMtpDraftShortlist, stream_);
-        batch_shortlist_slots_[i] = items[i].session;
-      }
-      batch_shortlist_count_ = static_cast<std::uint32_t>(n);
-    }
     for (std::uint32_t i = 0; i < n; ++i) {
       if (!items[i].session->CheckCancellation(nullptr))
         continue;
@@ -710,13 +612,15 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
           slot[i] < subset_rows ? items[i].session->mtp_.draft_ids : nullptr;
       const auto count = std::min<std::size_t>(rows, kMtpCandidates);
       if (items[i].output.candidates == nullptr) {
+        // The token and its confidence (float bits) land in ids[0..1].
         Argmax(logits_of(i), s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
+        ArgmaxConfidence(logits_of(i), s_.mtp_token, rows, stream_);
         if (table != nullptr)
           RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1,
                         static_cast<std::uint32_t>(prefix), table,
-                        kMtpDraftExtraRows, stream_);
+                        speculative::kDraftVocabExtraRows, stream_);
         if (!Check(hipMemcpyAsync(batch_candidates_host_[i].ids.data(),
-                                  s_.mtp_token, sizeof(std::int32_t),
+                                  s_.mtp_token, 2 * sizeof(std::int32_t),
                                   hipMemcpyDeviceToHost, stream_),
                    error))
           return false;
@@ -727,7 +631,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
       if (table != nullptr)
         RemapDraftIds(s_.mtp_ids, static_cast<std::uint32_t>(count),
                       static_cast<std::uint32_t>(prefix), table,
-                      kMtpDraftExtraRows, stream_);
+                      speculative::kDraftVocabExtraRows, stream_);
       if (!Check(hipMemcpyAsync(batch_candidates_host_ + i, s_.mtp_ids,
                                 offsetof(MtpCandidateLogits, logits) +
                                     count * sizeof(float),
@@ -754,8 +658,12 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items, std::string* error,
   for (std::size_t i = 0; i < items.size(); ++i) {
     if (items[i].session->Cancelled())
       continue;
-    if (items[i].output.token != nullptr)
+    if (items[i].output.token != nullptr) {
       *items[i].output.token = batch_candidates_host_[i].ids[0];
+      if (items[i].output.confidence != nullptr)
+        std::memcpy(items[i].output.confidence,
+                    batch_candidates_host_[i].ids.data() + 1, sizeof(float));
+    }
     if (items[i].output.candidates != nullptr)
       *items[i].output.candidates = batch_candidates_host_[i];
   }
@@ -903,10 +811,24 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
 
 bool Executor::ForwardBatch(std::span<const BatchItem> items,
                             std::string* error) const {
+  return ForwardBatchImpl(items, false, error);
+}
+
+bool Executor::ForwardWide(Session& session,
+                           std::span<const std::int32_t> tokens,
+                           std::string* error) const {
+  const BatchItem item{&session, tokens, true};
+  return ForwardBatchImpl(std::span(&item, 1), true, error);
+}
+
+bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
+                                std::string* error) const {
   selected_logits_ = nullptr;
+  wide_rows_ = 0;
   DropReadyQ8();
   const Config& c = config();
-  if (items.empty() || items.size() > kBatchSessions) {
+  if (items.empty() || items.size() > kBatchSessions ||
+      (wide && items.size() != 1)) {
     return Fail(error, "decode batch must contain 1..8 sessions");
   }
   std::array<std::uint32_t, kBatchSessions> offsets{};
@@ -917,9 +839,13 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     if (item.session == nullptr || item.session->owner_ != this ||
-        item.tokens.empty() || item.tokens.size() > kDecodeRows ||
-        item.tokens.size() > options_.max_logit_rows ||
-        (item.speculative && item.tokens.size() > options_.max_speculative) ||
+        item.tokens.empty() ||
+        (wide ? item.tokens.size() > max_copy_rows() || !item.speculative ||
+                    !item.session->mtp_enabled_
+              : item.tokens.size() > kDecodeRows ||
+                    item.tokens.size() > options_.max_logit_rows ||
+                    (item.speculative &&
+                     item.tokens.size() > options_.max_speculative)) ||
         item.session->position_ + item.tokens.size() >
             item.session->max_context_) {
       return Fail(error, "invalid session or chain in decode batch");
@@ -962,9 +888,62 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       item.session->PreserveSnapshots(item.session->position_,
                                       item.session->mtp_.position);
     if (item.speculative &&
-        !EnsureRollback(*item.session, item.tokens.size() - 1, error))
+        !EnsureRollback(
+            *item.session,
+            static_cast<std::uint32_t>(
+                std::min<std::size_t>(item.tokens.size(), kDecodeRows) - 1),
+            error))
       return false;
   }
+  // A wide chain's later segments roll back through executor-owned rows.
+  const auto segment_count =
+      wide ? (static_cast<std::uint32_t>(items[0].tokens.size()) + kDecodeRows -
+              1) /
+                 kDecodeRows
+           : 1U;
+  if (wide) {
+    auto& session = *items[0].session;
+    if (session.ngram_snapshots_.size() < items[0].tokens.size() - 1)
+      session.ngram_snapshots_.resize(items[0].tokens.size() - 1);
+    if (!EnsureWideSegments(segment_count - 1, error))
+      return false;
+  }
+  // Segments of one item: the rows [offset, offset + count) start at
+  // position `start` with `blocks` pooled indexer blocks, exactly as
+  // consecutive verification passes of at most kDecodeRows would.
+  struct Segment {
+    std::uint32_t offset, count, start, blocks;
+    bool sparse;
+    std::uint32_t complete;
+    const std::uint32_t* position;
+    const std::uint32_t* first_block;
+  };
+  const auto segments_of = [&](std::size_t i) {
+    std::vector<Segment> out;
+    auto& session = *items[i].session;
+    const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
+    if (!wide) {
+      out.push_back({offsets[i], n, session.position_, session.blocks_,
+                     sparse[i], complete[i], &session.control_->position,
+                     &session.control_->blocks});
+      return out;
+    }
+    std::uint32_t blocks = session.blocks_;
+    for (std::uint32_t first = 0, s = 0; first < n; first += kDecodeRows, ++s) {
+      const auto count = std::min(kDecodeRows, n - first);
+      const auto start = session.position_ + first;
+      const auto end = start + count;
+      const bool seg_sparse = c.compress_ratio > 0 && end > c.indexer_top_k;
+      const auto seg_complete =
+          c.compress_ratio > 0 ? end / c.compress_ratio : 0;
+      auto* control = s == 0 ? session.control_ : wide_controls_ + s;
+      out.push_back({offsets[i] + first, count, start, blocks, seg_sparse,
+                     seg_complete, &control->position, &control->blocks});
+      if (seg_sparse)
+        blocks = seg_complete;
+    }
+    return out;
+  };
   if (!AllocateBatch(error)) {
     return false;
   }
@@ -1044,6 +1023,21 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         return false;
       }
     }
+    if (wide) {
+      // Later segments read their own positions; their controls stage in
+      // the batch slots a single-session pass leaves unused.
+      const auto segs = segments_of(0);
+      for (std::size_t s = 1; s < segs.size(); ++s) {
+        batch_controls_[s] = batch_controls_[0];
+        batch_controls_[s].position = segs[s].start;
+        batch_controls_[s].blocks = segs[s].blocks;
+        if (!Check(hipMemcpyAsync(wide_controls_ + s, batch_controls_ + s,
+                                  sizeof(Session::Control),
+                                  hipMemcpyHostToDevice, stream_),
+                   error))
+          return false;
+      }
+    }
     if (!Check(hipMemcpyAsync(base.tokens, tokens_host_,
                               rows * sizeof(std::int32_t),
                               hipMemcpyHostToDevice, stream_),
@@ -1069,11 +1063,32 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         return false;
       for (std::size_t i = 0; i < items.size(); ++i) {
         const auto& item = items[i];
-        const auto n = static_cast<std::uint32_t>(item.tokens.size());
-        UseScratch(RowScratch(base, offsets[i]));
-        if (!item.session->Cancelled() && c.IsPleLayer(il) &&
-            !Ple(l, *item.session, n, s_.res, item.speculative, error, true)) {
-          return false;
+        if (item.session->Cancelled() || !c.IsPleLayer(il))
+          continue;
+        auto& session = *item.session;
+        const auto segs = segments_of(i);
+        for (std::size_t s = 0; s < segs.size(); ++s) {
+          UseScratch(RowScratch(base, segs[s].offset));
+          bool ok = true;
+          if (s == 0) {
+            ok = Ple(l, session, segs[s].count, s_.res, item.speculative, error,
+                     true);
+          } else {
+            // The segment starts from the history the previous one left;
+            // keep it for a rollback to this segment's first row.
+            auto& seg = wide_segments_[s - 1];
+            if (!Check(hipMemcpyAsync(seg.ple_start, session.ple_history_,
+                                      std::size_t{c.PleConvHistory()} *
+                                          c.HcDim() * sizeof(float),
+                                      hipMemcpyDeviceToDevice, stream_),
+                       error))
+              return false;
+            std::swap(session.ple_snapshots_, seg.ple);
+            ok = Ple(l, session, segs[s].count, s_.res, true, error, true);
+            std::swap(session.ple_snapshots_, seg.ple);
+          }
+          if (!ok)
+            return false;
         }
       }
       UseScratch(base);
@@ -1124,7 +1139,37 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
             return false;
           continue;
         }
-        if (l.linear) {
+        if (l.linear && wide) {
+          const auto segs = segments_of(i);
+          const std::size_t conv_bytes = std::size_t{c.ssm_conv_kernel - 1} *
+                                         c.SsmConvChannels() * sizeof(float);
+          const std::size_t state_bytes = std::size_t{c.ssm_num_v_heads} *
+                                          c.ssm_head_dim * c.ssm_head_dim *
+                                          sizeof(float);
+          for (std::size_t s = 0; s < segs.size(); ++s) {
+            UseScratch(RowScratch(base, segs[s].offset));
+            auto state = session.linear_[il];
+            if (s != 0) {
+              // Keep the segment's starting state for a rollback that keeps
+              // every row before it; its own rows snapshot the later ones.
+              auto& seg = wide_segments_[s - 1];
+              if (!Check(hipMemcpyAsync(seg.conv_start[il], state.conv_state,
+                                        conv_bytes, hipMemcpyDeviceToDevice,
+                                        stream_),
+                         error) ||
+                  !Check(hipMemcpyAsync(seg.state_start[il], state.state,
+                                        state_bytes, hipMemcpyDeviceToDevice,
+                                        stream_),
+                         error))
+                return false;
+              state.conv_snapshots = seg.conv[il];
+              state.state_snapshots = seg.state[il];
+            }
+            if (!LinearAttention(l, state, s_.mixed, s_.block_out,
+                                 segs[s].count, true, error, true, false))
+              return false;
+          }
+        } else if (l.linear) {
           if (batch_gdn) {
             const auto& state = session.linear_[il];
             batch_gdn_host_[il * kBatchSessions + i] = {
@@ -1144,10 +1189,28 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                                       true, false)) {
             return false;
           }
+        } else if (wide) {
+          for (const auto& seg : segments_of(i)) {
+            auto seg_view = RowScratch(base, seg.offset);
+            if (l.attn_qkv.empty()) {
+              seg_view.qg = base.qg + static_cast<std::size_t>(seg.offset) * 2 *
+                                          c.AttentionQDim();
+            }
+            UseScratch(seg_view);
+            const auto pool = seg.sparse && seg.complete > seg.blocks
+                                  ? seg.complete - seg.blocks
+                                  : 0;
+            if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out,
+                           seg.count, seg.position, seg.first_block, seg.start,
+                           pool, session.max_context_, seg.sparse, error, false,
+                           true, false))
+              return false;
+          }
         } else {
           const auto pool = sparse[i] && complete[i] > session.blocks_
                                 ? complete[i] - session.blocks_
                                 : 0;
+          UseYarn(session);
           if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
                          &session.control_->position, &session.control_->blocks,
                          session.position_, pool, session.max_context_,
@@ -1201,25 +1264,6 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       }
     }
     UseScratch(base);
-    // Decode-sized batches normalize the head one row at a time (the
-    // batched mixer epilogue reduces rows differently than single-token
-    // decode), then run one batched vocabulary projection: the vocab GEMV
-    // reduces each row independently, so its rows match single-token
-    // decode while the weights are read once. Wider (prefill replay)
-    // batches keep the fully batched route.
-    if (rows <= 8) {
-      for (std::uint32_t row = 0; row < rows; ++row) {
-        if (!HcMix(model_->hc_head(),
-                   base.res + static_cast<std::size_t>(row) * c.HcDim(),
-                   false,
-                   s_.mixed + static_cast<std::size_t>(row) * c.hidden_size,
-                   nullptr, 1, error)) {
-          return false;
-        }
-      }
-      return DenseBatch(model_->output(), s_.mixed, batch_logits_, rows,
-                        error);
-    }
     return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
                       rows, error) &&
            DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
@@ -1246,28 +1290,32 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     }
   }
   batch_rows_ = rows;
+  wide_rows_ = wide ? rows : 0;
   return true;
 }
 
 bool Executor::SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
                                  float* logits, std::string* error) const {
-  if (rows == 0 || rows > options_.max_logit_rows || offset > batch_rows_ ||
-      rows > batch_rows_ - offset) {
+  if (rows == 0 || rows > std::max(options_.max_logit_rows, wide_rows_) ||
+      offset > batch_rows_ || rows > batch_rows_ - offset) {
     return Fail(error, "logit rows outside the completed decode batch");
   }
-  const std::size_t count =
-      static_cast<std::size_t>(rows) * config().vocab_size;
-  selected_logits_ =
-      batch_logits_ + static_cast<std::size_t>(offset) * config().vocab_size;
-  if (logits != nullptr) {
-    if (!Check(hipMemcpyAsync(logits_host_, selected_logits_,
+  const std::size_t vocab = config().vocab_size;
+  selected_logits_ = batch_logits_ + static_cast<std::size_t>(offset) * vocab;
+  // The pinned staging buffer holds max_logit_rows rows; a wide
+  // verification's rows download through it in pieces.
+  for (std::uint32_t first = 0; logits != nullptr && first < rows;
+       first += options_.max_logit_rows) {
+    const std::size_t count =
+        std::min(options_.max_logit_rows, rows - first) * vocab;
+    if (!Check(hipMemcpyAsync(logits_host_, selected_logits_ + first * vocab,
                               count * sizeof(float), hipMemcpyDeviceToHost,
                               stream_),
                error) ||
         !Check(hipStreamSynchronize(stream_), error)) {
       return false;
     }
-    std::copy_n(logits_host_, count, logits);
+    std::copy_n(logits_host_, count, logits + first * vocab);
   }
   return true;
 }

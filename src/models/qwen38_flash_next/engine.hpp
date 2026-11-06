@@ -4,6 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <gufo/ext/prompt_lookup.hpp>
+#include <gufo/ext/sampling.hpp>
+#include <gufo/ext/session_mode.hpp>
 #include <memory>
 #include <optional>
 #include <span>
@@ -11,15 +14,11 @@
 #include <string_view>
 #include <vector>
 
-#include "src/core/sampling.hpp"
-#include "src/core/session_mode.hpp"
-#include "src/core/speculative/prompt_lookup.hpp"
-#include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen/vision/encoder.hpp"
-#include "src/models/qwen/vision/prompt.hpp"
+#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
+#include "src/families/qwen/vision/encoder.hpp"
+#include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
-#include "src/models/qwen38_flash_next/draft_vocab.hpp"
-#include "src/models/qwen38_flash_next/kv_cache_mode.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
@@ -42,16 +41,6 @@ class SnapshotState;
 struct PrefillCheckpoint;
 }  // namespace rocm
 
-/// Tokens the MTP draft head may propose.
-enum class DraftVocabulary {
-  kFull,
-  /// Special tokens plus every token whose text is ASCII (English, code,
-  /// numbers, markup and the unaccented pieces of Latin-script languages)
-  /// or ASCII with common typographic marks: about half of the vocabulary,
-  /// so each draft step reads half of the output head.
-  kLatinText,
-};
-
 struct ModelOptions {
   std::uint32_t max_context = 4096;
   /// Optional MTP draft sidecar (`mtp-...-shared-*.gguf`). Empty leaves
@@ -63,19 +52,11 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
-  /// Attention KV cache storage: F16 halves by default, Q8_0 blocks for
-  /// both planes, or Q8_0 keys with Q4_K super-block values. Lossy beyond
-  /// F16; snapshots of different modes are not interchangeable.
-  KvCacheMode kv_cache_mode = KvCacheMode::kF16;
   /// Static YaRN scaling, derived by the caller (serve, bench) from the
   /// requested context via `RopeScalingForContext`. Empty leaves the
   /// artifact's own setting, which is always off: no GGUF metadata key sets
   /// it today.
   std::optional<RopeScaling> rope_scaling{};
-  bool mtp_survival = false;
-  bool prompt_lookup = false;
-  DraftVocabulary draft_vocabulary = DraftVocabulary::kFull;
-  bool managed_experts = false;
 };
 
 class Session;
@@ -116,9 +97,6 @@ public:
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
-  [[nodiscard]] KvCacheMode kv_cache_mode() const noexcept {
-    return options_.kv_cache_mode;
-  }
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] const tokenization::QwenTokenizer& tokenizer() const noexcept {
@@ -129,6 +107,9 @@ public:
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
+  /// Caps wide copy verification (Executor::LimitCopyRows); call before any
+  /// session is created.
+  void LimitCopyRows(std::uint32_t rows) noexcept;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
     return vision_;
@@ -182,21 +163,17 @@ public:
                                  std::unique_ptr<SessionSnapshot>* checkpoint,
                                  std::string* error_msg = nullptr,
                                  double* capture_ms = nullptr);
+  /// The same for ascending boundaries anywhere beyond the frontier: each
+  /// is captured inside the pass that covers it (at most
+  /// rocm::kMaxPassCheckpoints per pass), without splitting it.
+  /// `checkpoints` receives one snapshot per boundary.
+  [[nodiscard]] bool SyncThrough(
+      std::span<const std::int32_t> prompt,
+      std::span<const std::uint32_t> boundaries,
+      std::vector<std::unique_ptr<SessionSnapshot>>* checkpoints,
+      std::string* error_msg = nullptr, double* capture_ms = nullptr);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
-  /// Widest verify pass TeacherForce accepts; 1 without MTP.
-  [[nodiscard]] std::uint32_t MaxVerifyWidth() const noexcept;
-  /// Feeds `tokens` through the target arithmetic without consulting the
-  /// draft head and writes every row's logits (n * vocab floats): one token
-  /// as a decode step, 2..MaxVerifyWidth() as a verify pass whose every row
-  /// is kept, or — with `prefill` on an MTP-free session — prompt
-  /// arithmetic at any width. Teacher-forced dumps compare targets,
-  /// schedules and builds bit for bit; the session continues from the last
-  /// row.
-  [[nodiscard]] bool TeacherForce(std::span<const std::int32_t> tokens,
-                                  std::vector<float>* rows,
-                                  std::string* error_msg = nullptr,
-                                  bool prefill = false);
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
@@ -278,13 +255,7 @@ public:
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept;
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  /// 17: KV cache sections may be planar Q8_0 (kv_dtype header field).
-  /// 18: K/V planes carry separate dtypes (kv_v_dtype header field); Q4_K
-  /// value planes.
-  /// 19: per-layer sparse selection tails (partial-group chunk invariance).
-  /// 20: MTP drafts scored over the request vocabulary (upstream 17).
-  /// 21: MTP drafts copy repeated context (upstream 18).
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 21;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 20;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(
@@ -294,14 +265,6 @@ public:
   /// until a rewind, reset, destruction, fork or byte reader needs them.
   enum class SnapshotMode { kBorrowed, kMaterialized };
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
-      std::string* error_msg = nullptr,
-      SnapshotMode mode = SnapshotMode::kBorrowed) const;
-  /// Continuation-cache capture: the payload's context ends on the sparse
-  /// group boundary this model's prefill arithmetic is exact at, so a
-  /// restored session re-prefills at most one group of tokens to reach the
-  /// original frontier. Falls back to SaveSnapshot when the live context is
-  /// already aligned or no aligned point was kept for it.
-  [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveAlignedSnapshot(
       std::string* error_msg = nullptr,
       SnapshotMode mode = SnapshotMode::kBorrowed) const;
   [[nodiscard]] bool OwnsSnapshot(
@@ -321,21 +284,30 @@ private:
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
   void ResetImpl(bool reuse_mtp);
 
-  using PrefillCapture = std::function<void(const rocm::PrefillCheckpoint&)>;
-  bool SyncThroughComponents(std::span<const std::int32_t>, std::uint32_t,
-                             const PrefillCapture&, std::string*);
+  /// Receives the index of a boundary and its in-pass checkpoint view, or
+  /// null when the live session is at the boundary.
+  using PrefillCapture =
+      std::function<void(std::size_t, const rocm::PrefillCheckpoint*)>;
+  /// `next`, as for Sync, names the tokens the following step appends.
+  bool SyncThroughComponents(std::span<const std::int32_t>,
+                             std::span<const std::uint32_t>,
+                             const PrefillCapture&, std::string*,
+                             std::span<const std::int32_t> next = {});
+  /// True when `boundaries` ascend strictly beyond the frontier, within
+  /// `prompt`.
+  bool ValidCheckpointBoundaries(std::span<const std::int32_t> prompt,
+                                 std::span<const std::uint32_t> boundaries,
+                                 std::string* error_msg) const;
 
-  bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
-            bool prefill = false, std::uint32_t boundary = 0,
-            std::unique_ptr<SessionSnapshot>* checkpoint = nullptr,
-            double* capture_ms = nullptr,
-            std::span<const std::int32_t> after = {},
-            const PrefillCapture& capture = {},
-            std::uint32_t rewind_boundary = 0,
-            std::unique_ptr<SessionSnapshot>* rewind_out = nullptr);
+  bool Feed(
+      std::span<const std::int32_t> tokens, std::string* error_msg,
+      bool prefill = false, std::span<const std::uint32_t> boundaries = {},
+      std::vector<std::unique_ptr<SessionSnapshot>>* checkpoints = nullptr,
+      double* capture_ms = nullptr, std::span<const std::int32_t> after = {},
+      const PrefillCapture& capture = {});
   bool SyncImpl(std::span<const std::int32_t> prompt, std::string* error_msg,
-                std::uint32_t boundary,
-                std::unique_ptr<SessionSnapshot>* checkpoint,
+                std::span<const std::uint32_t> boundaries,
+                std::vector<std::unique_ptr<SessionSnapshot>>* checkpoints,
                 double* capture_ms = nullptr,
                 std::span<const std::int32_t> next = {},
                 const PrefillCapture& capture = {});
@@ -370,6 +342,8 @@ private:
                      std::optional<std::uint32_t> batch_drafts = {},
                      std::uint32_t occupancy = 1);
   static void AppendDraft(PendingDecode& pending);
+  /// Whether the chain ends after its latest neural proposal.
+  static bool GateStops(const PendingDecode& pending);
   /// Appends copies within the prepared budget, stopping at EOG when enabled.
   bool AppendLookup(PendingDecode& pending, bool stop_at_eos,
                     std::size_t minimum = 1, bool require_resume = false);
@@ -381,27 +355,27 @@ private:
   std::vector<std::int32_t> tokens_;
   std::vector<float> logits_;
   std::int32_t draft_token_{0};
+  float draft_confidence_{1.0F};  ///< the head's probability of draft_token_
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
   speculative::PromptLookup<> lookup_;
+  /// Verification rows (anchor included) the next copy-only cycle of a
+  /// greedy session decoding alone may use; 0 before the first. A copy
+  /// accepted whole at this width doubles it up to max_copy_rows(); any
+  /// rejected copy returns it to the ordinary verifier width.
+  std::uint32_t copy_rows_{0};
+  /// Whole copies accepted in a row at copy_rows_ (two widen it).
+  std::uint32_t copy_streak_{0};
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
       std::size_t token_count) const;
   bool valid_{true};
   ContinuationHooks* continuation_hooks_{nullptr};
-  /// Group-aligned rewind point of the last prefill: taken when the pass
-  /// ended inside a sparse group, consumed by the next continuing Sync.
-  /// The packed sparse attention of a pass that ends mid-group unions fewer
-  /// query masks than a pass that runs through, so those trailing rows can
-  /// never match a fresh prefill; restoring here and re-prefilling the tail
-  /// keeps every continuation on the exact single-pass arithmetic.
-  std::unique_ptr<SessionSnapshot> rewind_;
-  std::uint32_t rewind_full_{0};  ///< frontier the rewind point was taken at
   /// This request's draft vocabulary; the device table follows it.
-  MtpDraftVocab draft_vocab_;
+  speculative::DraftVocab draft_vocab_;
   bool draft_vocab_stale_{false};
   std::vector<std::int32_t> draft_added_;
   /// After the token history is replaced: the table restarts from it.
@@ -429,8 +403,6 @@ public:
   /// Materializes borrowed rows; may throw on a failed device transfer.
   [[nodiscard]] std::span<const std::uint8_t> bytes() const;
   [[nodiscard]] bool CopyTo(std::span<std::uint8_t> destination) const noexcept;
-  /// Tokens the restored session would own, from the payload header.
-  [[nodiscard]] std::uint32_t ValidContext() const;
 
 private:
   explicit SessionSnapshot(std::uint64_t size);
