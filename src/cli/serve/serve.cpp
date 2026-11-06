@@ -1688,15 +1688,6 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --model <PATH> is required\n";
       return 2;
     }
-    if ((mtp_policy != "length" && mtp_policy != "survival") ||
-        (mtp_draft_vocab != "full" && mtp_draft_vocab != "latin")) {
-      std::cerr << "Error: --mtp-policy is length or survival, "
-                   "--mtp-draft-vocab is full or latin\n";
-      return 2;
-    }
-    speculative_config.mtp_survival = mtp_policy == "survival";
-    speculative_config.mtp_latin_draft_vocabulary = mtp_draft_vocab == "latin";
-    speculative_config.prompt_lookup = prompt_lookup;
     std::string err;
     ModelLoadLog load_log("text", model);
     backend = std::make_shared<server::InferenceBackend>();
