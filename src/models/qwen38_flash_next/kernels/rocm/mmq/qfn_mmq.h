@@ -31,6 +31,18 @@ int qfn_mmq_q4_K_moe_pair_unique(const void* W_a, const void* W_b,
                                  int n_tokens, int n_experts, int n_expert_used,
                                  hipStream_t stream);
 
+int qfn_mmq_iq3_s_moe_pair_unique(const void* W_a, const void* W_b,
+                                  const float* X_f32, const int32_t* ids,
+                                  float* out_a, float* out_b, int M, int K,
+                                  int n_tokens, int n_experts,
+                                  int n_expert_used, hipStream_t stream);
+
+int qfn_mmq_iq4_xs_moe_pair_unique(const void* W_a, const void* W_b,
+                                   const float* X_f32, const int32_t* ids,
+                                   float* out_a, float* out_b, int M, int K,
+                                   int n_tokens, int n_experts,
+                                   int n_expert_used, hipStream_t stream);
+
 // Routed vector projection for GGML Q4_K/Q5_K/Q5_1/Q8_0. Optional paired
 // weights use the same shape, routing and quantized input; both outputs are
 // [n_tokens][n_expert_used][M]. W_b and out_b must be supplied together.

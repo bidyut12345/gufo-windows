@@ -604,6 +604,26 @@ extern "C" int qfn_mmq_q4_K_moe_pair_unique(
         W_b, out_b);
 }
 
+extern "C" int qfn_mmq_iq3_s_moe_pair_unique(
+    const void * W_a, const void * W_b, const float * X, const int32_t * ids,
+    float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
+    int n_expert_used, hipStream_t stream) {
+    if (!W_b || !out_b) return -1;
+    return qfn_mmq_moe_impl<GGML_TYPE_IQ3_S>("qfn_mmq_iq3_s_moe_pair_unique",
+        W_a, X, ids, out_a, M, K, n_tokens, n_experts, n_expert_used, stream,
+        W_b, out_b);
+}
+
+extern "C" int qfn_mmq_iq4_xs_moe_pair_unique(
+    const void * W_a, const void * W_b, const float * X, const int32_t * ids,
+    float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
+    int n_expert_used, hipStream_t stream) {
+    if (!W_b || !out_b) return -1;
+    return qfn_mmq_moe_impl<GGML_TYPE_IQ4_XS>("qfn_mmq_iq4_xs_moe_pair_unique",
+        W_a, X, ids, out_a, M, K, n_tokens, n_experts, n_expert_used, stream,
+        W_b, out_b);
+}
+
 extern "C" size_t qfn_mmq_q8_1_bytes(int N, int K) {
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     return (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
