@@ -47,7 +47,7 @@ HttpResponse Error(int status, const std::string& message,
                     : status == 503 ? "Service Unavailable"
                                     : "Internal Server Error",
           .body = body.dump(),
-          .headers = {{"Content-Type", "application/json"}}};
+          .headers = {{"Content-Type", "application/json; charset=utf-8"}}};
 }
 
 struct Parsed {
@@ -333,7 +333,7 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
     return {.status = 200,
             .reason = "OK",
             .body = body.dump(),
-            .headers = {{"Content-Type", "application/json"}}};
+            .headers = {{"Content-Type", "application/json; charset=utf-8"}}};
   } catch (const std::invalid_argument& error) {
     return Error(400, error.what(), "invalid_request");
   } catch (const ext::ImageResourceError& error) {

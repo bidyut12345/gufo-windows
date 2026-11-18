@@ -3,12 +3,14 @@
 # re-anchored to this target instead of gufo_core. The list order is the order
 # gufo_core used, which keeps the archive layout comparable when auditing.
 add_library(gufo_qwen_kernels STATIC
+  attention_27b.hip
   attention_batched.hip
   attention_decode_graph.hip
   attention_decode.hip
   attention_decode_verify_wave64.hip
   attention_tile.hip
   attention_wmma.hip
+  copy_27b.hip
   dflash_kernels.hip
   embed.hip
   fused.hip
@@ -32,6 +34,7 @@ add_library(gufo_qwen_kernels STATIC
   residual.hip
   rope.hip
   sample.hip
+  sample_27b.hip
   small_batch_quant16_wave64.hip
   small_batch_wave64.hip
   ssm_decode_recurrence.hip

@@ -121,7 +121,6 @@ struct ContentSpan {
   std::size_t offset{0};
   std::size_t size{0};
 };
-
 /// Longest Qwen3.8 vocabulary entry in bytes (Flash-Next GGUF, 248,320
 /// tokens). A prompt of N tokens cannot render to more than N times this.
 inline constexpr std::size_t kMaxRenderedBytesPerToken = 128;

@@ -4,7 +4,6 @@
 #include "src/core/platform/pages.hpp"
 
 namespace gufo::hip {
-
 HostAllocations::~HostAllocations() {
   Reset();
 }

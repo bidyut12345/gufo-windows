@@ -29,7 +29,6 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
     replaying_ssm_state_ = false;
     arena_.DisableSsmReplayCapture();
   }
-
   arena_.MarkSsmReplayPosition(pos);
   // One recurrent pass per step. Its buffer pair is part of the graph key below
   // because the captured launches bake the state pointers.

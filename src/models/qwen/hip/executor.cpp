@@ -8,6 +8,9 @@
 #include <stdexcept>
 #include <utility>
 
+#include "src/families/qwen/kernels/copy_27b.hpp"
+#include "src/families/qwen/kernels/sample_27b.hpp"
+#include "src/models/qwen/hip/cycle_profile.hpp"
 namespace gufo::hip {
 namespace {
 
@@ -213,6 +216,7 @@ void QwenGpuExecutor::RestoreCompactSnapshot(
 }
 
 void QwenGpuExecutor::SaveState(std::uint32_t valid_context) {
+  qwen27::PhaseScope profile(qwen27::Phase::kState);
   CheckReset();
   replaying_ssm_state_ = false;
   arena_.SaveState(valid_context);
@@ -224,6 +228,7 @@ void QwenGpuExecutor::SaveState(std::uint32_t valid_context) {
 }
 
 void QwenGpuExecutor::RestoreState() {
+  qwen27::PhaseScope profile(qwen27::Phase::kState);
   CheckReset();
   models::qwen::ContinuationRestore restore(continuation_hooks_, true);
   if (arena_.IsSsmReplayCaptureActive())
@@ -244,6 +249,7 @@ void QwenGpuExecutor::FinishVerification() {
 
 void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
                                      std::uint32_t count) {
+  qwen27::PhaseScope profile(qwen27::Phase::kState);
   const auto& config = weights_.config;
   auto scratch = arena_.GetScratchView();
   // The replay is one pass: it reads the restored (pinned) state and leaves it
@@ -286,6 +292,7 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
 
 std::span<const float> QwenGpuExecutor::CopyLastLogits() {
   CheckReset();
+  const qwen27::ScopedPromptStep step("copy_last_logits", 1);
   auto scratch = arena_.GetScratchView();
   HIP_CHECK(hipMemcpyAsync(h_logits_.data(), scratch.decode.logits.data(),
                            h_logits_.size() * sizeof(float),
@@ -306,10 +313,10 @@ tokenization::TokenId QwenGpuExecutor::SampleLastLogits(
 
   auto scratch = arena_.GetScratchView();
   auto* const d_out_token = scratch.decode.sampled_token.data();
-  LaunchGPUSampling(scratch.decode.logits.data(), d_out_token,
-                    weights_.config.vocab_size, parameters,
-                    sampler.penalties().data(), sampler.penalties().size(),
-                    &sampling_workspace_, arena_.stream);
+  LaunchGPUSampling27(scratch.decode.logits.data(), d_out_token,
+                      weights_.config.vocab_size, parameters,
+                      sampler.penalties().data(), sampler.penalties().size(),
+                      &sampling_workspace_, arena_.stream);
 
   tokenization::TokenId token = 0;
   HIP_CHECK(hipMemcpyAsync(&token, d_out_token, sizeof(token),
@@ -365,10 +372,10 @@ tokenization::TokenId QwenGpuExecutor::SampleVerificationLogits(
   }
   auto scratch = arena_.GetScratchView();
   auto* const d_out_token = scratch.decode.sampled_token.data();
-  LaunchGPUSampling(d_verification_logits_ + (row * weights_.config.vocab_size),
-                    d_out_token, weights_.config.vocab_size, parameters,
-                    sampler.penalties().data(), sampler.penalties().size(),
-                    &sampling_workspace_, arena_.stream);
+  LaunchGPUSampling27(
+      d_verification_logits_ + (row * weights_.config.vocab_size), d_out_token,
+      weights_.config.vocab_size, parameters, sampler.penalties().data(),
+      sampler.penalties().size(), &sampling_workspace_, arena_.stream);
 
   tokenization::TokenId token = 0;
   HIP_CHECK(hipMemcpyAsync(&token, d_out_token, sizeof(token),
@@ -394,6 +401,7 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
         "Qwen sampled verification proposal is malformed");
   }
 
+  qwen27::PhaseScope profile(qwen27::Phase::kVerifyRow);
   if (sampler.NeedsConstraintMask()) {
     const auto target = sampler.Distribution(CopyVerificationLogits(row));
     if (sampler.Uniform() * draft_token_probability <
@@ -406,7 +414,6 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
                                            sampler.mutable_rng_state()),
             .accepted = false};
   }
-
   auto parameters = PrepareGpuSamplingParameters(sampler);
   const double acceptance_uniform = sampler.Uniform();
   const std::uint64_t residual_rng_checkpoint = sampler.rng_state();
@@ -414,7 +421,7 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
 
   auto scratch = arena_.GetScratchView();
   auto* const d_out_token = scratch.decode.sampled_token.data();
-  LaunchGPUSpeculativeSampling(
+  LaunchGPUSpeculativeSampling27(
       d_verification_logits_ + (row * weights_.config.vocab_size), d_out_token,
       sampling_workspace_.speculative_accepted, weights_.config.vocab_size,
       parameters, draft_token, static_cast<float>(draft_token_probability),
@@ -425,12 +432,34 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
 
   QwenSampledVerificationResult result;
   std::uint32_t accepted = 0;
+  profile.Enqueued();
+#ifdef _WIN32
+  if (h_row_result_ == nullptr) {
+    std::uint32_t* pinned = nullptr;
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void**>(&pinned),
+                            4 * sizeof(std::uint32_t),
+                            hipHostMallocCoherent | hipHostMallocMapped));
+    h_row_result_.reset(pinned);
+    pinned[0] = pinned[1] = pinned[2] = pinned[3] = 0;
+    HIP_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&d_row_result_),
+                                      pinned, 0));
+  }
+  const std::uint32_t sequence = ++row_sequence_;
+  const std::uint32_t* const sources[] = {
+      d_out_token, sampling_workspace_.speculative_accepted};
+  LaunchPublishWords27(sources, 2, d_row_result_, sequence, arena_.stream);
+  volatile std::uint32_t* const published = h_row_result_.get();
+  WaitPublished27(published, 2, sequence, arena_.stream);
+  result.token = published[0];
+  accepted = published[1];
+#else
   HIP_CHECK(hipMemcpyAsync(&result.token, d_out_token, sizeof(result.token),
                            hipMemcpyDeviceToHost, arena_.stream));
   HIP_CHECK(hipMemcpyAsync(&accepted, sampling_workspace_.speculative_accepted,
                            sizeof(accepted), hipMemcpyDeviceToHost,
                            arena_.stream));
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
+#endif
   if (result.token >= weights_.config.vocab_size || accepted > 1)
     throw std::runtime_error(
         "target logit distribution contains no finite values");

@@ -6,6 +6,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
+#include <thread>
 
 #include "src/core/hip/heap_placement.hpp"
 
@@ -52,7 +54,11 @@ namespace gufo::hip {
   std::size_t total_bytes = 0;
   if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess ||
       !HeapFitsAboveReserve(free_bytes, bytes)) {
+#if defined(_WIN32)
+    return AllocateDeviceOrManaged(pointer, bytes);
+#else
     return AllocateManaged(pointer, bytes);
+#endif
   }
   return AllocateDeviceOrManaged(pointer, bytes);
 }

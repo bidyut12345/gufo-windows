@@ -27,6 +27,22 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(GUFO_RELEASE_VERSION "development" CACHE STRING "Gufo release version")
 set(GUFO_REVISION "unknown" CACHE STRING "Gufo source revision")
 include_directories(${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include)
+if (WIN32)
+  # Windows: POSIX shadow headers (compat/win32/include) plus their Win32
+  # implementation, linked into every target. The UCRT's own deprecated POSIX
+  # aliases are disabled so they cannot collide with the shim.
+  include_directories(BEFORE ${CMAKE_SOURCE_DIR}/compat/win32/include)
+  add_compile_definitions(_CRT_DECLARE_NONSTDC_NAMES=0 WIN32_LEAN_AND_MEAN
+    NOMINMAX _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
+  # Linux gives every thread 8 MiB of stack; Windows defaults to 1 MiB, and
+  # std::thread inherits the executable's reserve size. Match Linux.
+  add_link_options(LINKER:/STACK:8388608)
+  add_library(gufo_posix_compat STATIC
+    compat/win32/posix.cpp
+    compat/win32/spawn.cpp)
+  target_link_libraries(gufo_posix_compat PUBLIC ws2_32 psapi bcrypt)
+  link_libraries(gufo_posix_compat)
+endif()
 
 # Reuse the compiler cache whenever it is installed, as the CPU check
 # derivations do. HIP kernels stay uncached: hipcc drive files and bitcode
@@ -67,11 +83,26 @@ find_package(CURL REQUIRED)
 find_package(PNG REQUIRED)
 find_package(JPEG REQUIRED)
 if (WIN32)
-  # Windows has no system pkg-config; locate the pkgconf tool vcpkg installs.
-  # .pc files resolve via CMAKE_PREFIX_PATH, which the vcpkg toolchain already
-  # points at the manifest install tree.
-  find_program(PKG_CONFIG_EXECUTABLE pkgconf REQUIRED
+  find_program(PKG_CONFIG_EXECUTABLE pkgconf
     HINTS "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/pkgconf")
+  find_package(PkgConfig QUIET)
+  find_package(WebP CONFIG QUIET)
+  if (TARGET WebP::webp)
+    if (NOT TARGET PkgConfig::WEBP)
+      add_library(PkgConfig::WEBP INTERFACE IMPORTED)
+      target_link_libraries(PkgConfig::WEBP INTERFACE WebP::webp WebP::webpdemux)
+    endif()
+  elseif(PKG_CONFIG_FOUND)
+    pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
+  endif()
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
+endif()
+if (PKG_CONFIG_FOUND)
+  pkg_check_modules(SNDFILE IMPORTED_TARGET sndfile)
+  pkg_check_modules(SOXR IMPORTED_TARGET soxr)
+  pkg_check_modules(AV IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
@@ -156,8 +187,18 @@ endif()
 if (EXISTS /opt/rocm)
   list(APPEND CMAKE_SYSTEM_PREFIX_PATH /opt/rocm)
 endif()
+if (WIN32 AND DEFINED ENV{HIP_PATH})
+  list(APPEND CMAKE_PREFIX_PATH $ENV{HIP_PATH})
+endif()
 
 if (ENGINE_ENABLE_HIP)
+  if (WIN32 AND NOT CMAKE_HIP_FLAGS MATCHES "compat/win32/hip_include")
+    # Before enable_language so CMake's compiler probe gets it too; see the
+    # header for the MSVC 14.5x <cmath> conflict it works around.
+    set(CMAKE_HIP_FLAGS
+      "${CMAKE_HIP_FLAGS} -I${CMAKE_SOURCE_DIR}/compat/win32/hip_include"
+      CACHE STRING "HIP flags" FORCE)
+  endif()
   enable_language(HIP)
   # clang-cl compiles HIP like C++ on Windows, so ccache covers it there.
   if (GUFO_CCACHE_CLANG_CL)
@@ -221,6 +262,7 @@ function(gufo_stage_hip_runtime target)
     endforeach()
   endif()
 endfunction()
+
 
 
 
@@ -402,6 +444,10 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/weight_upload.cpp
     src/core/speculative/speculative_verifier.cpp
   )
+  if (WIN32)
+    target_sources(gufo_core PRIVATE src/core/platform/device_memory.cpp)
+    target_link_libraries(gufo_core PUBLIC dxgi)
+  endif()
   target_compile_definitions(gufo_core PUBLIC ENGINE_ENABLE_HIP=1)
   target_include_directories(gufo_core SYSTEM PRIVATE
     ${HIPCUB_INCLUDE_DIR}
@@ -443,6 +489,9 @@ add_library(gufo_llm_cli STATIC
   src/cli/provider_options.cpp
   src/cli/speculative_settings.cpp)
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_compare gufo_ext_runtime)
+if(ENGINE_ENABLE_HIP)
+  target_link_libraries(gufo_llm_cli PUBLIC gufo_qwen35moe)
+endif()
 
 add_subdirectory(src/ext)
 
@@ -457,6 +506,9 @@ add_library(gufo_serving STATIC
   src/cli/serve/inference_backend.cpp)
 target_link_libraries(gufo_serving PUBLIC gufo_ext_runtime gufo_logging
   gufo_core gufo_cache gufo_sched)
+if(ENGINE_ENABLE_HIP)
+  target_link_libraries(gufo_serving PUBLIC gufo_qwen35moe)
+endif()
 # The executable's own objects carried production NDEBUG, the test binaries that
 # re-compiled these sources forced assertions on. One library can only pick
 # one: test builds keep assertions, so a test-preset `gufo` now asserts where it
@@ -539,6 +591,7 @@ set_property(SOURCE src/cli/extension/modules.cpp
 include(cmake/GufoExtensionHost.cmake)
 gufo_extension_host(gufo)
 gufo_stage_hip_runtime(gufo)
+add_subdirectory(src/models/qwen35moe)
 target_compile_definitions(gufo PRIVATE
   GUFO_RELEASE_VERSION="${GUFO_RELEASE_VERSION}"
   GUFO_REVISION="${GUFO_REVISION}"
@@ -558,7 +611,7 @@ if (NOT WIN32)
   )
 else()
   add_custom_target(gufo-server ALL
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gufo> ${CMAKE_CURRENT_BINARY_DIR}/gufo-server.exe
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:gufo> ${CMAKE_CURRENT_BINARY_DIR}/gufo-server.exe
     DEPENDS gufo
   )
 endif()
@@ -897,6 +950,10 @@ endfunction()
   add_test(NAME wav_decode_test COMMAND wav_decode_test)
   set_tests_properties(wav_decode_test PROPERTIES LABELS "cpu;audio;correctness")
 
+  add_executable(platform_tuning_test tests/core/platform_tuning_test.cpp)
+  add_test(NAME platform_tuning_test COMMAND platform_tuning_test)
+  set_tests_properties(platform_tuning_test PROPERTIES LABELS "cpu")
+
   add_executable(heap_placement_test tests/core/heap_placement_test.cpp)
   target_link_libraries(heap_placement_test PRIVATE gufo_core)
   add_test(NAME heap_placement_test COMMAND heap_placement_test)
@@ -997,6 +1054,10 @@ endfunction()
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)
   set_tests_properties(http_server_test PROPERTIES LABELS "cpu;server;http" TIMEOUT 30)
+  add_executable(chat_portal_test tests/cli/chat_portal_test.cpp)
+  target_link_libraries(chat_portal_test PRIVATE gufo_http)
+  add_test(NAME chat_portal_test COMMAND chat_portal_test)
+  set_tests_properties(chat_portal_test PROPERTIES LABELS "cpu;server;chat_portal" TIMEOUT 30)
 
   add_executable(http_server_signals_test tests/cli/http_server_signals_test.cpp)
   target_link_libraries(http_server_signals_test PRIVATE gufo_http)
@@ -1118,6 +1179,7 @@ endfunction()
 
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)
+  add_subdirectory(tests/models/qwen35moe)
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test
@@ -1901,3 +1963,4 @@ endif()
 if (BUILD_TESTING)
   include(cmake/Checks.cmake)
 endif()
+

@@ -1,0 +1,11 @@
+{
+  "multi-mixed": {
+    "4": "greedy completions diverge from the isolated AR reference at this width: batched speculative verification co-batches sessions beyond the 8-row vector-kernel contract, whose tiled fallback does not reproduce the vector path's arithmetic; the measurements are withheld rather than published",
+    "6": "same consistency-gate failure as C4",
+    "8": "same consistency-gate failure as C4"
+  },
+  "multi-repetition": {
+    "6": "same consistency-gate failure as multi-mixed C4 (repetitive text flips later because its logit margins are wider)",
+    "8": "same consistency-gate failure as multi-mixed C4"
+  }
+}

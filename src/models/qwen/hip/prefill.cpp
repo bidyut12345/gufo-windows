@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <thread>
 
+#include "src/models/qwen/hip/cycle_profile.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 
 namespace gufo::hip {
@@ -80,6 +81,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   if (prompt_tokens.empty()) {
     return 0;
   }
+  const qwen27::ScopedPromptStep step("target_prefill", prompt_tokens.size());
   replaying_ssm_state_ = false;
   arena_.DisableSsmReplayCapture();
   if (capture_prompt_hidden_) {

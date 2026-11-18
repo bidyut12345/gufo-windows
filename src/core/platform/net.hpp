@@ -5,7 +5,6 @@
 #include <cstdint>
 
 #if defined(_WIN32)
-// clang-format off
 // winsock2.h must precede windows.h (which would pull in winsock 1), and
 // iphlpapi.h needs windows.h first; keep the chain unsorted. The macro
 // guards keep windows.h's min/max macros out of std:: calls downstream.
@@ -20,6 +19,15 @@
 #include <windows.h>
 #include <iphlpapi.h>
 // clang-format on
+#ifndef SHUT_RD
+#define SHUT_RD SD_RECEIVE
+#endif
+#ifndef SHUT_WR
+#define SHUT_WR SD_SEND
+#endif
+#ifndef SHUT_RDWR
+#define SHUT_RDWR SD_BOTH
+#endif
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>

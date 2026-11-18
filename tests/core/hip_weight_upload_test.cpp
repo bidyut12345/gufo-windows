@@ -35,6 +35,7 @@ void Require(bool ok, const std::string& message) {
   }
 }
 
+
 struct Device {
   void* data{nullptr};
   explicit Device(std::size_t size) {

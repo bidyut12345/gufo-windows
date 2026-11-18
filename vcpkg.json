@@ -12,6 +12,7 @@
     "opus",
     "sqlite3",
     {"name": "ffmpeg", "default-features": false, "features": ["avcodec", "avformat", "swscale"]},
+    "sqlite3",
     "pkgconf"
   ],
   "overrides": [

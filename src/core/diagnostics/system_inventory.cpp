@@ -3,6 +3,7 @@
 #include <cctype>
 #include <iomanip>
 #include <sstream>
+#include <string>
 
 #include "src/core/platform/os_info.hpp"
 
@@ -86,6 +87,15 @@ SystemInventory CollectSystemInventory(const LinuxSysfs& sysfs) {
   } else {
     inv.toolchain.kernel_release = "unknown";
   }
+#if defined(_WIN32) && defined(ENGINE_ENABLE_HIP)
+  // No pinned toolchain on Windows: report the HIP runtime actually loaded
+  // (HIP encodes major * 10^7 + minor * 10^5 + patch).
+  if (int version = 0; hipRuntimeGetVersion(&version) == hipSuccess) {
+    inv.toolchain.rocm_version = std::to_string(version / 10000000) + "." +
+                                 std::to_string(version / 100000 % 100) + "." +
+                                 std::to_string(version % 100000);
+  }
+#endif
 
 #if defined(GUFO_ROCM_VERSION)
   // The ROCm release Gufo was built against, from rocm-core.

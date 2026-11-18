@@ -1,0 +1,92 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 0,
+      "cpuModel": "unavailable (could not read /proc/cpuinfo)",
+      "cpuPhysicalCores": 0,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon(TM) 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "unknown",
+      "memoryTotalBytes": 0,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "7.2.3",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "9784b12f75010eba3737eb3759a9ec406094115513b05a7cf8aefa68e2c0e8ac",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-09-29",
+  "mode": "mtp",
+  "model": {
+    "id": "Ornith-1.5-35B-A3B",
+    "variant": null
+  },
+  "notes": [
+    "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
+    "synthetic text: 1.167 tokens/word, template overhead 12 tokens"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "0": {
+      "acceptance": 54.78,
+      "acceptance_sd": null,
+      "accepted_per_step": 0.97,
+      "accepted_per_step_sd": null,
+      "command": "D:\\gufo\\build\\windows-release\\gufo.exe serve --port 54337 --sessions 1 llm --model C:\\Users\\EndyJasmi\\.cache\\huggingface\\hub\\models--ornith-ai--Ornith-1.5-35B-A3B-GGUF\\snapshots\\12393612fd4f730ff5aadc23e9b8f9648aa49ceb\\Ornith-1.5-35B-Q8_0.gguf --context 4096 --served-model-name bench --think off --max-pending-per-client 8 --speculative mtp",
+      "counts": [
+        {
+          "cache_n": 0,
+          "completion_sha256": "f74a745ba4432c3698457dbc2dec9372e1708c58da5648a18afdb4548e4e49be",
+          "draft_n": 115,
+          "draft_n_accepted": 63,
+          "predicted_n": 128,
+          "prompt_n": 2040
+        }
+      ],
+      "pp": 2762.06,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 63.0,
+      "tg_sd": null,
+      "workload": "prose"
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "D:\\gufo\\build\\windows-release\\gufo.exe",
+      "serve",
+      "--port",
+      "54337",
+      "--sessions",
+      "1",
+      "llm",
+      "--model",
+      "C:\\Users\\EndyJasmi\\.cache\\huggingface\\hub\\models--ornith-ai--Ornith-1.5-35B-A3B-GGUF\\snapshots\\12393612fd4f730ff5aadc23e9b8f9648aa49ceb\\Ornith-1.5-35B-Q8_0.gguf",
+      "--context",
+      "4096",
+      "--served-model-name",
+      "bench",
+      "--think",
+      "off",
+      "--max-pending-per-client",
+      "8",
+      "--speculative",
+      "mtp"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "c5324a8fa961a8bf0b8ff5967112003d61a0ac5c"
+  },
+  "table": "single-mtp",
+  "target": "gufo"
+}

@@ -13,6 +13,7 @@
 
 #include "src/families/qwen/hip_common/attention_policy.hpp"
 #include "src/families/qwen/kernels/ops/gemm.hpp"
+#include "src/models/qwen/hip/cycle_profile.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 
 namespace gufo::hip {
@@ -471,6 +472,7 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
   if (valid_context > max_context_) {
     throw std::length_error("Qwen snapshot exceeds the context length");
   }
+  const qwen27::ScopedPromptStep step("target_snapshot", valid_context);
 
   auto snapshot = std::unique_ptr<QwenGpuSnapshot>(new QwenGpuSnapshot());
   snapshot->num_layers_ = config_.num_layers;
@@ -967,6 +969,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   replay_last_position_ = other.replay_last_position_;
   replay_captured_positions_ = other.replay_captured_positions_;
   has_saved_state_ = other.has_saved_state_;
+  saved_aliases_live_ = other.saved_aliases_live_;
   replay_capture_active_ = other.replay_capture_active_;
 
   other.d_hidden = nullptr;
@@ -1014,6 +1017,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.replay_last_position_ = 0;
   other.replay_captured_positions_ = 0;
   other.has_saved_state_ = false;
+  other.saved_aliases_live_ = false;
   other.replay_capture_active_ = false;
 }
 
@@ -1071,6 +1075,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     replay_last_position_ = other.replay_last_position_;
     replay_captured_positions_ = other.replay_captured_positions_;
     has_saved_state_ = other.has_saved_state_;
+    saved_aliases_live_ = other.saved_aliases_live_;
     replay_capture_active_ = other.replay_capture_active_;
 
     other.d_hidden = nullptr;
@@ -1118,6 +1123,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.replay_last_position_ = 0;
     other.replay_captured_positions_ = 0;
     other.has_saved_state_ = false;
+    other.saved_aliases_live_ = false;
     other.replay_capture_active_ = false;
   }
   return *this;
@@ -1157,6 +1163,7 @@ void QwenGpuArena::Reset() {
   replay_last_position_ = 0;
   replay_captured_positions_ = 0;
   has_saved_state_ = false;
+  saved_aliases_live_ = false;
 }
 
 void QwenGpuArena::FreeAll() noexcept {
@@ -1277,6 +1284,7 @@ void QwenGpuArena::FreeAll() noexcept {
   replay_last_position_ = 0;
   replay_captured_positions_ = 0;
   has_saved_state_ = false;
+  saved_aliases_live_ = false;
   replay_capture_active_ = false;
   hipblas_handle = nullptr;
   stream = nullptr;

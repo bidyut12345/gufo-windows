@@ -91,6 +91,12 @@ private:
   friend class QwenDFlashGpuExecutor;
 };
 
+struct QwenDFlashBlockCandidates {
+  std::uint32_t top_k{0};
+  std::vector<tokenization::TokenId> ids;
+  std::vector<float> logits;
+};
+
 /// Immutable GPU-visible DFlash / DFlash-2 model weights and topology.
 class QwenDFlashGpuModel final {
 public:
@@ -101,9 +107,21 @@ public:
   QwenDFlashGpuModel(QwenDFlashGpuModel&&) = delete;
   QwenDFlashGpuModel& operator=(QwenDFlashGpuModel&&) = delete;
 
+  struct TiedTarget {
+    core::ModelConfig config;
+    models::QwenTensorRef token_embedding;
+    models::QwenTensorRef output;
+  };
+
   [[nodiscard]] static std::shared_ptr<const QwenDFlashGpuModel> Create(
       std::shared_ptr<const core::GgufReader> dflash_reader,
       std::shared_ptr<const QwenGpuModel> target_model,
+      std::string* error_msg = nullptr);
+
+  [[nodiscard]] static std::shared_ptr<const QwenDFlashGpuModel> Create(
+      std::shared_ptr<const core::GgufReader> dflash_reader,
+      const TiedTarget& target,
+      std::shared_ptr<const void> target_lifetime = nullptr,
       std::string* error_msg = nullptr);
 
   [[nodiscard]] const speculative::QwenDFlashWeights& GetWeights()
@@ -143,12 +161,14 @@ public:
 private:
   QwenDFlashGpuModel(std::shared_ptr<const core::GgufReader> dflash_reader,
                      std::shared_ptr<const QwenGpuModel> target_model,
+                     std::shared_ptr<const void> target_lifetime,
                      speculative::QwenDFlashWeights weights,
                      std::vector<void*> allocations,
                      std::size_t packed_weight_bytes);
 
   std::shared_ptr<const core::GgufReader> dflash_reader_;
   std::shared_ptr<const QwenGpuModel> target_model_;
+  std::shared_ptr<const void> target_lifetime_;
   speculative::QwenDFlashWeights weights_;
   std::vector<void*> allocations_;
   std::size_t packed_weight_bytes_{0};
@@ -194,7 +214,8 @@ public:
       std::vector<float>* out_candidate_probabilities = nullptr,
       const DFlashTrace& trace = {},
       const sampling::SamplerState* sampler = nullptr,
-      bool draft_subset = false);
+      bool draft_subset = false,
+      QwenDFlashBlockCandidates* out_candidates = nullptr);
 
   /// Clears the draft table from slot `first`: the slots score -inf.
   void ClearDraftRows(std::uint32_t first);
@@ -469,6 +490,8 @@ private:
   std::uint32_t copy_streak_{0};
   std::vector<float> pending_target_features_;
   std::vector<tokenization::TokenId> proposed_tokens_;
+  // Diagnostics only (GUFO_QWEN27_DRAFTLOG): the pending proposal's draft
+  // probabilities and position.
   bool primed_{false};
   bool proposal_active_{false};
   /// This request's draft vocabulary; the executor's table follows it.

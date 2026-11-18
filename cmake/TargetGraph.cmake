@@ -25,7 +25,8 @@ set(GUFO_LINK_GRAPH_FORBIDDEN gufo_serving gufo_http)
 # library stays classified.
 set(GUFO_LINK_GRAPH_SYSTEM_LIBS
   dl m pthread rt atomic stdc++ gcc_s uuid
-  ws2_32 iphlpapi bcrypt advapi32 delayimp)
+  ws2_32 iphlpapi bcrypt advapi32 delayimp psapi dxgi shlwapi ole32 shell32
+  userenv ntdll windowscodecs)
 if (DEFINED GUFO_PLATFORM_LIBS)
   list(APPEND GUFO_LINK_GRAPH_SYSTEM_LIBS ${GUFO_PLATFORM_LIBS})
 endif()
