@@ -1,19 +1,20 @@
 # Qwen3.8 Flash-Next
 
 Qwen3.8 Flash-Next is a mixture-of-experts model that reads text and images and
-writes text. Gufo runs its Q4 GGUF, optionally sped up with its own
-multi-token prediction (MTP) head.
+writes text. Gufo runs its `UD-Q4_K_XL` and `UD-IQ4_XS` GGUF builds,
+optionally sped up with its multi-token prediction (MTP) head.
 
 ## Files
 
 | File | Needed for |
 | --- | --- |
-| `UD-Q4_K_XL/*` (four shards) | Text |
+| `UD-Q4_K_XL/*` (four shards) | Text (`flash-next-q4`) |
+| `UD-IQ4_XS/*` (four shards) | Text (`flash-next-iq4-xs`) |
 | `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` | MTP |
 | `mmproj-BF16.gguf` | Images |
 
 ```sh
-gufo model install flash-next-q4
+gufo model install flash-next-q4      # or flash-next-iq4-xs
 ```
 
 It installs all three and prints the MTP head's path.

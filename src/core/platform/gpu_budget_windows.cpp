@@ -55,4 +55,9 @@ std::optional<GpuLocalBudget> QueryGpuLocalBudget(
                         .usage_bytes = info.CurrentUsage};
 }
 
+std::uint32_t PreferredPrefillChunkTokens(
+    std::uint32_t default_tokens) noexcept {
+  return default_tokens < 2048U ? default_tokens : 2048U;
+}
+
 }  // namespace gufo::platform

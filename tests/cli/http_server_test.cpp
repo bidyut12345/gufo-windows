@@ -327,7 +327,8 @@ void TestFramingAndMetrics() {
   // succeed (#957).
   const auto root = server.Send("GET / HTTP/1.1\r\n\r\n");
   ExpectStatus(root, 200);
-  assert(root.find("\"status\":\"ok\"") != std::string::npos);
+  assert(root.find("\"status\":\"ok\"") != std::string::npos ||
+         root.find("<!DOCTYPE html>") != std::string::npos);
   for (const std::string header :
        {"Content-Length: nope", "Content-Length: -1", "Content-Length: 4junk",
         "Content-Length: 18446744073709551616",
@@ -934,7 +935,7 @@ void TestLlamaSlotsAndMetrics() {
           .budget_bytes = 4096,
           .used_bytes = 1024,
           .available_bytes = 3072,
-      };
+  };
   const auto budget_metrics = get("/metrics");
   assert(budget_metrics.find("gufo_prompt_state_budget_bytes 4096\n") !=
          std::string::npos);
@@ -1602,11 +1603,11 @@ void TestCompatibilityRequests() {
            std::size_t{16});
   }
   for (const auto* invalid : {"2147483648", "18446744073709551616", "1e30"}) {
-    const auto rejected =
-        server.Post("/v1/messages",
-                    std::string(R"({"messages":[{"role":"user","content":"hi"}],
+    const auto rejected = server.Post(
+        "/v1/messages",
+        std::string(R"({"messages":[{"role":"user","content":"hi"}],
         "thinking":{"type":"enabled","budget_tokens":)") +
-                        invalid + "}}");
+            invalid + "}}");
     ExpectStatus(rejected, 400);
     assert(rejected.find("thinking.budget_tokens") != std::string::npos);
   }

@@ -230,7 +230,8 @@ void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
                       int* port, std::size_t* session_count,
                       std::size_t* max_connections,
                       std::size_t* max_request_body_bytes,
-                      ServerLogOptions* log) {
+                      ServerLogOptions* log, bool* no_webui = nullptr,
+                      std::optional<bool>* tools_enabled = nullptr) {
   parser.AddOption("-i", "--host", "IP", "Bind address", "Server", host);
   parser.AddOption("-p", "--port", "N", "Port to listen on", "Server", port);
   if (session_count != nullptr)
@@ -255,6 +256,17 @@ void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
         return true;
       });
   parser.AddFlag("-v", "--verbose", kVerboseHelp, "Logging", &log->verbose);
+  if (no_webui != nullptr)
+    parser.AddFlag("", "--no-webui", "Disable the built-in WebUI chat portal",
+                   "Server", no_webui);
+  if (tools_enabled != nullptr)
+    parser.AddCustomFlag(
+        "", "--no-tools", "Disable all built-in tools in the WebUI chat portal",
+        "Server",
+        [tools_enabled](std::string_view, std::string_view, std::string*) {
+          *tools_enabled = false;
+          return true;
+        });
 }
 
 // Help-only sinks for AddServerOptions, so subcommand help can list the
@@ -267,6 +279,8 @@ struct ServerOptionHelpTargets {
   std::size_t max_request_body_bytes =
       static_cast<std::size_t>(8) * 1024 * 1024;
   ServerLogOptions log;
+  bool no_webui = false;
+  std::optional<bool> tools_enabled;
 };
 
 void AddServerOptionsForHelp(gufo::cli::ArgParser& parser,
@@ -275,7 +289,7 @@ void AddServerOptionsForHelp(gufo::cli::ArgParser& parser,
   AddServerOptions(parser, &targets->host, &targets->port,
                    include_sessions ? &targets->session_count : nullptr,
                    &targets->max_connections, &targets->max_request_body_bytes,
-                   &targets->log);
+                   &targets->log, &targets->no_webui, &targets->tools_enabled);
 }
 
 // Split a `NAME=VALUE` CLI spec. Returns false when either side is empty.
@@ -924,6 +938,9 @@ void PrintServeHelp(std::string_view program_name,
       << "      --max-request-bytes <N>\n"
       << "                         Maximum HTTP request body bytes (default: "
          "8388608)\n"
+      << "      --no-webui         Disable the built-in WebUI chat portal\n"
+      << "      --no-tools         Disable all built-in tools in the WebUI "
+         "chat portal\n"
       << "\nLogging:\n"
       << "      --log-level <LEVEL>\n"
       << "                         " << kLogLevelHelp << "\n"
@@ -982,6 +999,8 @@ int RunServe(std::span<const char* const> args) {
   std::size_t max_request_body_bytes =
       static_cast<std::size_t>(8) * 1024 * 1024;
   ServerLogOptions log_options;
+  bool no_webui = false;
+  std::optional<bool> tools_enabled;
 
   // Identify the modality only after leading server options. The selected
   // parser consumes every option together, so --served-model-name -v and
@@ -991,7 +1010,8 @@ int RunServe(std::span<const char* const> args) {
                                       bool include_sessions = true) {
     AddServerOptions(parser, &host, &port,
                      include_sessions ? &session_count : nullptr,
-                     &max_connections, &max_request_body_bytes, &log_options);
+                     &max_connections, &max_request_body_bytes, &log_options,
+                     &no_webui, &tools_enabled);
   };
   add_server_options(server_parser);
   std::string subcommand = "llm";
@@ -1897,6 +1917,8 @@ int RunServe(std::span<const char* const> args) {
                 device_lost.store(true);
                 ShutdownAfterDeviceLoss();
               },
+          .enable_webui = !no_webui,
+          .tools_enabled = tools_enabled,
       },
       images, embeddings, decisions);
   std::string err;

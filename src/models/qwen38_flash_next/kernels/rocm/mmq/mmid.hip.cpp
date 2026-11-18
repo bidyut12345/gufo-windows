@@ -144,9 +144,9 @@ static void launch_mm_ids_helper_scan(
     const size_t lds = (size_t)(n_experts + 1) * kIdsWaves * sizeof(int32_t);
     GGML_ASSERT(n_rows > 0 && lds <= 48 * 1024 && "routed id maps: shape");
     if (need > g_ids_scratch_elems) {
-        // Grown only while the previous buffer may still be in flight, so
-        // the old allocation is left to the process (it happens once per
-        // widest shape).
+        // Drain in-flight work before growing device scratch on ROCm 10.1,
+        // matching qfn_stack_pool::add_block.
+        (void)hipDeviceSynchronize();
         int32_t * grown = nullptr;
         HIP_CHECK(gufo::hip::AllocateDevice(&grown, need * sizeof(int32_t)));
         g_ids_scratch = grown;

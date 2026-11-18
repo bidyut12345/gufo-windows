@@ -338,6 +338,7 @@
               pkgsSys.libjpeg
               pkgsSys.libwebp
               pkgsSys.libopus
+              pkgsSys.sqlite
               rustToolchain
               pkgsSys.ffmpeg-headless
               pkgsSys.openssl
@@ -462,6 +463,7 @@
               pkgsSys.libjpeg
               pkgsSys.libwebp
               pkgsSys.libopus
+              pkgsSys.sqlite
               rustToolchain
               pkgsSys.ffmpeg-headless
               pkgsSys.openssl

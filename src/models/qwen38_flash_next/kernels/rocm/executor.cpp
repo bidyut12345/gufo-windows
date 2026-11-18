@@ -2212,6 +2212,30 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
       case GgmlType::kQ8_0:
         rc = qfn_mmq_q8_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
         break;
+      case GgmlType::kQ2_0:
+        rc = qfn_mmq_q2_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kQ5_0:
+        rc = qfn_mmq_q5_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kIQ2_S:
+        rc = qfn_mmq_iq2_s_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kIQ3_XXS:
+        rc = qfn_mmq_iq3_xxs_moe_raw(w.data, x, ids, out, M, K, T, E, U,
+                                     stream_);
+        break;
+      case GgmlType::kIQ3_S:
+        rc = qfn_mmq_iq3_s_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kIQ4_NL:
+        rc =
+            qfn_mmq_iq4_nl_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kIQ4_XS:
+        rc =
+            qfn_mmq_iq4_xs_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
       default:
         break;
     }
@@ -2231,7 +2255,9 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                           a.cols == b.cols && a.experts == b.experts;
   if (!MatrixRows(n_tokens) && n_used <= 32 && same_shape &&
       (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K ||
-       a.type == GgmlType::kQ8_0)) {
+       a.type == GgmlType::kQ8_0 || a.type == GgmlType::kIQ2_S ||
+       a.type == GgmlType::kIQ3_XXS || a.type == GgmlType::kIQ3_S ||
+       a.type == GgmlType::kIQ4_XS)) {
     // The shared expert quantized the same rows (or their producer did).
     const void* ready = ReadyQ8(x, n_tokens, a.cols);
     if ((ready != nullptr
@@ -2259,14 +2285,43 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
       AssignError(error_msg, "expert vector pair GEMM failed");
       return false;
     }
-  } else if (same_shape && a.type == GgmlType::kQ4_K) {
-    // The wide Q4_K path shares its gather and tiled quantization as well.
+  } else if (same_shape &&
+             (a.type == GgmlType::kQ4_K || a.type == GgmlType::kIQ2_S ||
+              a.type == GgmlType::kIQ3_XXS || a.type == GgmlType::kIQ3_S ||
+              a.type == GgmlType::kIQ4_XS)) {
+    // The wide Q4_K and IQ paths share their gather and tiled quantization.
     RoutedHints(a, n_tokens);
-    if (qfn_mmq_q4_K_moe_pair_unique(
-            a.data, b.data, x, ids, out, s_.up_e, static_cast<int>(a.rows),
-            static_cast<int>(a.cols), static_cast<int>(n_tokens),
-            static_cast<int>(a.experts), static_cast<int>(n_used),
-            stream_) != 0) {
+    int rc = -1;
+    const auto M = static_cast<int>(a.rows);
+    const auto K = static_cast<int>(a.cols);
+    const auto T = static_cast<int>(n_tokens);
+    const auto E = static_cast<int>(a.experts);
+    const auto U = static_cast<int>(n_used);
+    switch (a.type) {
+      case GgmlType::kQ4_K:
+        rc = qfn_mmq_q4_K_moe_pair_unique(a.data, b.data, x, ids, out, s_.up_e,
+                                          M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kIQ2_S:
+        rc = qfn_mmq_iq2_s_moe_pair_unique(a.data, b.data, x, ids, out, s_.up_e,
+                                           M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kIQ3_XXS:
+        rc = qfn_mmq_iq3_xxs_moe_pair_unique(a.data, b.data, x, ids, out,
+                                             s_.up_e, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kIQ3_S:
+        rc = qfn_mmq_iq3_s_moe_pair_unique(a.data, b.data, x, ids, out, s_.up_e,
+                                           M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kIQ4_XS:
+        rc = qfn_mmq_iq4_xs_moe_pair_unique(a.data, b.data, x, ids, out,
+                                            s_.up_e, M, K, T, E, U, stream_);
+        break;
+      default:
+        break;
+    }
+    if (rc != 0) {
       AssignError(error_msg, "expert pair GEMM failed");
       return false;
     }
@@ -3271,13 +3326,26 @@ bool Executor::JoinSide(std::string* error_msg) const {
 
 bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
   const Config& c = config();
-  return ExpertMatrixRows(n_tokens) &&
-         (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
-          l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
-         l.ffn_up_exps.type == l.ffn_gate_exps.type &&
-         (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
-          l.ffn_down_exps.type == GgmlType::kQ8_0) &&
-         c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
+  const bool q_gate_up = l.ffn_gate_exps.type == GgmlType::kQ4_K ||
+                         l.ffn_gate_exps.type == GgmlType::kQ5_K;
+  const bool iq_gate_up = l.ffn_gate_exps.type == GgmlType::kIQ2_S ||
+                          l.ffn_gate_exps.type == GgmlType::kIQ3_XXS ||
+                          l.ffn_gate_exps.type == GgmlType::kIQ4_XS;
+  const bool q_down = l.ffn_down_exps.type == GgmlType::kQ5_1 ||
+                      l.ffn_down_exps.type == GgmlType::kQ8_0;
+  const bool iq_down = l.ffn_down_exps.type == GgmlType::kQ5_0 ||
+                       l.ffn_down_exps.type == GgmlType::kIQ4_NL ||
+                       l.ffn_down_exps.type == GgmlType::kQ2_0;
+  if (!(ExpertMatrixRows(n_tokens) &&
+        l.ffn_up_exps.type == l.ffn_gate_exps.type &&
+        c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0)) {
+    return false;
+  }
+  if (q_gate_up && q_down) {
+    return true;
+  }
+  return WidePrefill(n_tokens) && (q_gate_up || iq_gate_up) &&
+         (q_down || iq_down);
 }
 
 bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
@@ -3313,9 +3381,21 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     // Prefill pairs the gate/up projections and applies SwiGLU without
     // materializing the gate; decode-time batches keep separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
-    const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
-                                     ? WeightType::kQ5_K
-                                     : WeightType::kQ4_K;
+    const auto to_gate_weight_type = [](GgmlType type) -> WeightType {
+      switch (type) {
+        case GgmlType::kQ5_K:
+          return WeightType::kQ5_K;
+        case GgmlType::kIQ2_S:
+          return WeightType::kIQ2_S;
+        case GgmlType::kIQ3_XXS:
+          return WeightType::kIQ3_XXS;
+        case GgmlType::kIQ4_XS:
+          return WeightType::kIQ4_XS;
+        default:
+          return WeightType::kQ4_K;
+      }
+    };
+    const WeightType gate_type = to_gate_weight_type(l.ffn_gate_exps.type);
     const bool gated_ok =
         routed_wide_tiles_ != 0
             ? RoutedGatedF16Gemm(l.ffn_gate_exps.data, l.ffn_up_exps.data,
@@ -3337,9 +3417,21 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
     }
-    const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
-                                     ? WeightType::kQ8_0
-                                     : WeightType::kQ5_1;
+    const auto to_down_weight_type = [](GgmlType type) -> WeightType {
+      switch (type) {
+        case GgmlType::kQ8_0:
+          return WeightType::kQ8_0;
+        case GgmlType::kQ5_0:
+          return WeightType::kQ5_0;
+        case GgmlType::kIQ4_NL:
+          return WeightType::kIQ4_NL;
+        case GgmlType::kQ2_0:
+          return WeightType::kQ2_0;
+        default:
+          return WeightType::kQ5_1;
+      }
+    };
+    const WeightType down_type = to_down_weight_type(l.ffn_down_exps.type);
     // Prefill takes the gate/up map's 128-token tiles: each wave decodes its
     // rows' weights once for up to 128 tokens.
     const bool wide_down = routed_wide_tiles_ != 0;

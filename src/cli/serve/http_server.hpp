@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -100,6 +101,8 @@ struct HttpServerOptions {
   /// generation answer 503 `device_lost` from then on; the hook decides how the
   /// process exits.
   std::function<void()> on_device_lost{};
+  bool enable_webui{true};
+  std::optional<bool> tools_enabled{};
 };
 
 /// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names

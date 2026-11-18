@@ -127,6 +127,23 @@ public:
     return *this;
   }
 
+  /// Register a boolean flag with a custom callback.
+  ArgParser& AddCustomFlag(
+      std::string_view short_name, std::string_view long_name,
+      std::string_view description, std::string_view group,
+      std::function<bool(std::string_view, std::string_view, std::string*)>
+          custom_parser) {
+    Option opt;
+    opt.short_name = std::string(short_name);
+    opt.long_name = std::string(long_name);
+    opt.description = std::string(description);
+    opt.group = std::string(group);
+    opt.is_flag = true;
+    opt.parse_fn = std::move(custom_parser);
+    options_.push_back(std::move(opt));
+    return *this;
+  }
+
   /// Register a flag that also accepts an inline value (`--name` or
   /// `--name=value`). The callback receives an empty value for `--name`.
   ArgParser& AddValueFlag(

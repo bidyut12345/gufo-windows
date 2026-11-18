@@ -49,6 +49,56 @@ void TestIq4NlExact() {
   }
 }
 
+void TestQ2_0Exact() {
+  // Block layout: 2-byte fp16 scale `d` + 16 packed 2-bit bytes (`QK2_0 = 64`).
+  // Elements [j + 16*k] read bits [2k+1:2k] minus 1 ({-1, 0, +1, +2}).
+  for (std::uint32_t scale = 0; scale < 65536; ++scale) {
+    std::array<std::uint8_t, 18> bytes{};
+    const auto half = static_cast<std::uint16_t>(scale);
+    std::memcpy(bytes.data(), &half, 2);
+    for (std::size_t i = 0; i < 16; ++i) {
+      const std::uint8_t c0 = static_cast<std::uint8_t>(i & 3U);
+      const std::uint8_t c1 = static_cast<std::uint8_t>((i + 1) & 3U);
+      const std::uint8_t c2 = static_cast<std::uint8_t>((i + 2) & 3U);
+      const std::uint8_t c3 = static_cast<std::uint8_t>((i + 3) & 3U);
+      bytes[2 + i] =
+          static_cast<std::uint8_t>(c0 | (c1 << 2U) | (c2 << 4U) | (c3 << 6U));
+    }
+    std::array<float, 66> out{};
+    out.front() = out.back() = 123.0F;
+    if (!gufo::quant::DequantizeRow(gufo::core::GgmlType::kQ2_0, bytes.data(),
+                                    out.data() + 1, 64)) {
+      std::cerr << "DequantizeRow rejected Q2_0\n";
+      std::exit(1);
+    }
+    for (std::size_t k = 0; k < 4; ++k) {
+      for (std::size_t j = 0; j < 16; ++j) {
+        const int code = static_cast<int>((j + k) & 3U) - 1;
+        const float expected =
+            gufo::quant::Fp16ToFloat(half) * static_cast<float>(code);
+        const float actual = out[1 + j + 16 * k];
+        const auto a_bits = std::bit_cast<std::uint32_t>(actual);
+        const auto e_bits = std::bit_cast<std::uint32_t>(expected);
+        const bool both_nan = std::isnan(actual) && std::isnan(expected);
+        if (!both_nan && a_bits != e_bits) {
+          std::cerr << "Q2_0 exact mismatch at scale " << scale << " k=" << k
+                    << " j=" << j << '\n';
+          std::exit(1);
+        }
+      }
+    }
+    if (out.front() != 123.0F || out.back() != 123.0F)
+      std::exit(1);
+  }
+  std::array<std::uint8_t, 18> dummy{};
+  std::array<float, 65> ragged{};
+  if (gufo::quant::DequantizeRow(gufo::core::GgmlType::kQ2_0, dummy.data(),
+                                 ragged.data(), 65)) {
+    std::cerr << "DequantizeRow accepted a ragged Q2_0 row\n";
+    std::exit(1);
+  }
+}
+
 constexpr std::size_t kBlockElements = 256;
 
 void ExpectNear(float actual, float expected, std::string_view message,
@@ -585,6 +635,7 @@ void TestDequantizeRowMatchesGgufPy() {
 
 int main() {
   TestIq4NlExact();
+  TestQ2_0Exact();
   TestQ4();
   TestQ6();
   TestQ3();

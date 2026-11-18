@@ -3,10 +3,16 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
+#include <cmath>
 #include <cstring>
+#include <gufo/ext/experimental/ggml_dequant.hpp>
 #include <gufo/ext/experimental/managed_alloc.hpp>
 #include <gufo/ext/experimental/weight_upload.hpp>
+#include <gufo/ext/platform/fs.hpp>
+#include <gufo/ext/platform/mapped_file.hpp>
+#include <gufo/ext/platform/prefault.hpp>
 #include <initializer_list>
 #include <utility>
 #include <vector>
@@ -23,6 +29,208 @@ namespace {
 /// over-read stays inside the allocation (the extra bytes meet zeroed
 /// activation padding and contribute nothing).
 constexpr std::size_t kTailMargin = 4096;
+
+[[nodiscard]] constexpr bool NeedsQ8Reencode(const TensorRef& t) noexcept {
+  return (t.type == core::GgmlType::kQ6_K ||
+          t.type == core::GgmlType::kIQ4_XS) &&
+         t.experts == 1 && (t.cols % 32) == 0;
+}
+
+[[nodiscard]] inline std::size_t DeviceBytesOf(const TensorRef& t) noexcept {
+  if (NeedsQ8Reencode(t)) {
+    return t.rows * (t.cols / 32) * 34;
+  }
+  return t.SizeBytes();
+}
+
+[[nodiscard]] inline std::uint16_t FloatToHalfBits(float value) noexcept {
+  const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+  const std::uint32_t sign = (bits >> 16) & 0x8000u;
+  const std::uint32_t abs_bits = bits & 0x7fffffffu;
+  if (abs_bits > 0x7f800000u) {
+    return static_cast<std::uint16_t>(sign | 0x7e00u |
+                                      ((abs_bits >> 13) & 0x01ffu));
+  }
+  if (abs_bits >= 0x47800000u) {
+    return static_cast<std::uint16_t>(sign | 0x7c00u);
+  }
+  if (abs_bits < 0x38800000u) {
+    if (abs_bits < 0x33000000u) {
+      return static_cast<std::uint16_t>(sign);
+    }
+    const std::uint32_t shift = 126u - (abs_bits >> 23);
+    const std::uint32_t mant = (abs_bits & 0x007fffffu) | 0x00800000u;
+    const std::uint32_t rounded =
+        mant + (1u << (shift - 1u)) - 1u + ((mant >> shift) & 1u);
+    return static_cast<std::uint16_t>(sign | (rounded >> shift));
+  }
+  const std::uint32_t rounded =
+      abs_bits + 0x00000fffu + ((abs_bits >> 13) & 1u);
+  if (rounded >= 0x47800000u) {
+    return static_cast<std::uint16_t>(sign | 0x7c00u);
+  }
+  const std::uint32_t half_exp = ((rounded >> 23) - 112u) << 10;
+  const std::uint32_t half_mant = (rounded >> 13) & 0x03ffu;
+  return static_cast<std::uint16_t>(sign | half_exp | half_mant);
+}
+
+inline void QuantizeRowQ8_0(const float* src, std::uint8_t* dst,
+                            std::size_t cols) noexcept {
+  for (std::size_t offset = 0; offset < cols; offset += 32) {
+    float amax = 0.0f;
+    for (std::size_t j = 0; j < 32; ++j) {
+      amax = std::max(amax, std::abs(src[offset + j]));
+    }
+    const float d = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    const std::uint16_t d_half = FloatToHalfBits(d);
+    std::memcpy(dst, &d_half, sizeof(d_half));
+    auto* qs = reinterpret_cast<std::int8_t*>(dst + 2);
+    for (std::size_t j = 0; j < 32; ++j) {
+      const long v = std::clamp(std::lround(src[offset + j] * id), -127L, 127L);
+      qs[j] = static_cast<std::int8_t>(v);
+    }
+    dst += 34;
+  }
+}
+
+struct ReencodeScratch {
+  std::vector<platform::PlatformFile> direct_shards;
+  std::vector<float> row_f32;
+  std::vector<std::uint8_t> chunk_src;
+  std::vector<std::uint8_t> chunk_q8;
+
+  explicit ReencodeScratch(std::size_t shard_count)
+      : direct_shards(shard_count, platform::kInvalidFile) {}
+
+  ~ReencodeScratch() {
+    for (platform::PlatformFile f : direct_shards) {
+      platform::CloseFile(f);
+    }
+  }
+};
+
+[[nodiscard]] bool ReadTensorSlice(platform::PlatformFile fd,
+                                   platform::PlatformFile direct_fd,
+                                   std::uint64_t offset, std::size_t bytes,
+                                   std::vector<std::uint8_t>& buffer,
+                                   const std::uint8_t*& out_ptr) {
+  constexpr std::size_t kReadAlign = 4096;
+  const std::uint64_t aligned_begin = offset & ~(std::uint64_t{kReadAlign - 1});
+  const auto skip = static_cast<std::size_t>(offset - aligned_begin);
+  const std::size_t aligned_len =
+      (skip + bytes + kReadAlign - 1) & ~(kReadAlign - 1);
+  if (buffer.size() < aligned_len + kReadAlign) {
+    buffer.resize(aligned_len + kReadAlign);
+  }
+  const auto addr = reinterpret_cast<std::uintptr_t>(buffer.data());
+  const std::size_t align_pad = (kReadAlign - (addr % kReadAlign)) % kReadAlign;
+  auto* aligned_buf = buffer.data() + align_pad;
+
+  auto read_loop = [&](platform::PlatformFile handle, std::uint64_t pos,
+                       std::size_t req_len, std::size_t min_bytes) -> bool {
+    std::size_t got = 0;
+    while (got < min_bytes) {
+      const std::size_t n = platform::ReadFileAt(handle, aligned_buf + got,
+                                                 req_len - got, pos + got);
+      if (n == 0) {
+        return false;
+      }
+      got += n;
+    }
+    return true;
+  };
+
+  if (platform::FileValid(direct_fd) &&
+      read_loop(direct_fd, aligned_begin, aligned_len, skip + bytes)) {
+    out_ptr = aligned_buf + skip;
+    return true;
+  }
+  if (read_loop(fd, offset, bytes, bytes)) {
+    out_ptr = aligned_buf;
+    return true;
+  }
+  return false;
+}
+
+[[nodiscard]] bool UploadReencodedQ8_0(
+    const TensorRef& t, void* device_dst,
+    std::span<const core::GgufMappedRegion> shards, std::uint32_t shard_idx,
+    ReencodeScratch& scratch, std::string* error) {
+  const bool has_fd = shard_idx < shards.size() &&
+                      platform::FileValid(shards[shard_idx].file_descriptor);
+  if (!has_fd && t.data == nullptr) {
+    if (error != nullptr) {
+      *error = "missing mapped host pointer for " + std::string(t.name);
+    }
+    return false;
+  }
+  const std::size_t cols = t.cols;
+  const std::size_t src_row_bytes = t.SizeBytes() / t.rows;
+  const std::size_t dst_row_bytes = (cols / 32) * 34;
+  // Cap host scratch around 16 MiB regardless of vocabulary row count.
+  const std::size_t chunk_rows =
+      std::max<std::size_t>(1, (std::size_t{16} << 20) / dst_row_bytes);
+  if (scratch.row_f32.size() < cols) {
+    scratch.row_f32.resize(cols);
+  }
+  const std::size_t max_q8_bytes =
+      std::min<std::size_t>(chunk_rows, t.rows) * dst_row_bytes;
+  if (scratch.chunk_q8.size() < max_q8_bytes) {
+    scratch.chunk_q8.resize(max_q8_bytes);
+  }
+  platform::PlatformFile fd = platform::kInvalidFile;
+  platform::PlatformFile direct_fd = platform::kInvalidFile;
+  if (has_fd) {
+    fd = shards[shard_idx].file_descriptor;
+    if (!platform::FileValid(scratch.direct_shards[shard_idx])) {
+      scratch.direct_shards[shard_idx] = platform::ReopenUnbuffered(fd);
+    }
+    direct_fd = scratch.direct_shards[shard_idx];
+  }
+  const auto* src_base = static_cast<const std::uint8_t*>(t.data);
+  auto* dst_base = static_cast<std::uint8_t*>(device_dst);
+  for (std::size_t row = 0; row < t.rows; row += chunk_rows) {
+    const std::size_t count = std::min<std::size_t>(chunk_rows, t.rows - row);
+    const std::uint8_t* chunk_ptr = nullptr;
+    if (has_fd) {
+      const std::uint64_t slice_offset =
+          t.file_offset + static_cast<std::uint64_t>(row) * src_row_bytes;
+      const std::size_t slice_bytes = count * src_row_bytes;
+      if (!ReadTensorSlice(fd, direct_fd, slice_offset, slice_bytes,
+                           scratch.chunk_src, chunk_ptr)) {
+        if (error != nullptr) {
+          *error = "unbuffered host read failed for " + std::string(t.name);
+        }
+        return false;
+      }
+    } else {
+      chunk_ptr = src_base + row * src_row_bytes;
+    }
+    for (std::size_t r = 0; r < count; ++r) {
+      if (!gufo::quant::DequantizeRow(t.type, chunk_ptr + r * src_row_bytes,
+                                      scratch.row_f32.data(), cols)) {
+        if (error != nullptr) {
+          *error = "unsupported host dequantization for " + std::string(t.name);
+        }
+        return false;
+      }
+      QuantizeRowQ8_0(scratch.row_f32.data(),
+                      scratch.chunk_q8.data() + r * dst_row_bytes, cols);
+    }
+    const hipError_t rc =
+        hipMemcpy(dst_base + row * dst_row_bytes, scratch.chunk_q8.data(),
+                  count * dst_row_bytes, hipMemcpyHostToDevice);
+    if (rc != hipSuccess) {
+      if (error != nullptr) {
+        *error = "HIP upload failed for " + std::string(t.name) + ": " +
+                 hipGetErrorString(rc);
+      }
+      return false;
+    }
+  }
+  return true;
+}
 
 struct Conversion {
   void* source;
@@ -47,6 +255,8 @@ struct Uploaded {
 /// no device work, so the weight placement can be decided from the tensors.
 struct Uploader {
   hip::WeightUpload& stager;
+  std::span<const core::GgufMappedRegion> shards;
+  ReencodeScratch& reencode_scratch;
   const hip::WeightAllocator* weights;
   std::vector<Conversion>& conversions;
   std::vector<void*>& allocations;
@@ -80,7 +290,8 @@ struct Uploader {
     if (t.empty() || !ok) {
       return d;
     }
-    const std::size_t size = t.SizeBytes();
+    const bool reencode_q8 = NeedsQ8Reencode(t);
+    const std::size_t size = DeviceBytesOf(t);
     void* ptr = nullptr;
     if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
       Fail("device allocation failed for " + std::string(t.name) + " (" +
@@ -92,7 +303,16 @@ struct Uploader {
     }
     allocations.push_back(ptr);
     bytes += size + kTailMargin;
-    if (!stager.Copy(shard_base + t.shard, t.file_offset, size, ptr, error)) {
+    if (reencode_q8) {
+      if (!UploadReencodedQ8_0(t, ptr, shards, shard_base + t.shard,
+                               reencode_scratch, error)) {
+        Fail(error != nullptr && !error->empty()
+                 ? *error
+                 : ("upload failed for " + std::string(t.name)));
+        return d;
+      }
+    } else if (!stager.Copy(shard_base + t.shard, t.file_offset, size, ptr,
+                            error)) {
       Fail("upload failed for " + std::string(t.name) +
            (error != nullptr ? ": " + *error : std::string()));
       return d;
@@ -100,14 +320,14 @@ struct Uploader {
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
                          nullptr);
     d.data = ptr;
-    d.type = t.type;
+    d.type = reencode_q8 ? core::GgmlType::kQ8_0 : t.type;
     d.cols = static_cast<std::uint32_t>(t.cols);
     d.rows = static_cast<std::uint32_t>(t.rows);
     d.experts = static_cast<std::uint32_t>(t.experts);
-    if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16) {
+    if (d.type == core::GgmlType::kBF16 || d.type == core::GgmlType::kF16) {
       max_half_cols = std::max<std::size_t>(max_half_cols, t.cols);
     }
-    if (t.type == core::GgmlType::kQ8_0 && t.experts == 1) {
+    if (d.type == core::GgmlType::kQ8_0 && t.experts == 1) {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
     }
     return d;
@@ -192,7 +412,8 @@ struct Uploader {
       Fail("MTP projection upload failed");
       return;
     }
-    const std::size_t row_bytes = t.SizeBytes() / t.rows / 2;
+    const std::size_t total_bytes = DeviceBytesOf(t);
+    const std::size_t row_bytes = total_bytes / t.rows / 2;
     const std::size_t part_bytes = row_bytes * t.rows;
     for (std::uint32_t part = 0; part < 2; ++part) {
       auto& dst = part == 0 ? embedding : hidden;
@@ -222,7 +443,7 @@ struct Uploader {
     }
     std::erase(allocations, combined.data);
     (void)hipFree(combined.data);
-    bytes -= t.SizeBytes() + kTailMargin;
+    bytes -= total_bytes + kTailMargin;
   }
 
   /// Uploads matrices of one type stacked along rows; every input shares
@@ -237,17 +458,24 @@ struct Uploader {
     if (!ok) {
       return d;
     }
+    const auto is_q8_like = [](const TensorRef* t) noexcept {
+      return t->type == core::GgmlType::kQ8_0 || NeedsQ8Reencode(*t);
+    };
     std::size_t rows = 0;
     std::size_t size = 0;
-    const core::GgmlType type = (*parts.begin())->type;
+    const core::GgmlType first_type = (*parts.begin())->type;
+    const bool all_f32 = first_type == core::GgmlType::kF32;
+    const core::GgmlType type =
+        all_f32 ? core::GgmlType::kF32 : core::GgmlType::kQ8_0;
     for (const TensorRef* t : parts) {
-      if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
-          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0)) {
+      const bool valid_type =
+          all_f32 ? (t->type == core::GgmlType::kF32) : is_q8_like(t);
+      if (t->empty() || !valid_type || t->cols != (*parts.begin())->cols) {
         Fail("stacked upload needs F32 or Q8_0 tensors of one shape");
         return d;
       }
       rows += t->rows;
-      size += t->SizeBytes();
+      size += DeviceBytesOf(*t);
     }
     void* ptr = nullptr;
     if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
@@ -259,12 +487,22 @@ struct Uploader {
       bytes += size + kTailMargin;
       std::size_t offset = 0;
       for (const TensorRef* t : parts) {
-        if (!stager.Copy(shard_base + t->shard, t->file_offset, t->SizeBytes(),
-                         static_cast<std::uint8_t*>(ptr) + offset, error)) {
+        auto* dst = static_cast<std::uint8_t*>(ptr) + offset;
+        const std::size_t part_bytes = DeviceBytesOf(*t);
+        if (NeedsQ8Reencode(*t)) {
+          if (!UploadReencodedQ8_0(*t, dst, shards, shard_base + t->shard,
+                                   reencode_scratch, error)) {
+            Fail(error != nullptr && !error->empty()
+                     ? *error
+                     : ("upload failed for " + std::string(t->name)));
+            return d;
+          }
+        } else if (!stager.Copy(shard_base + t->shard, t->file_offset,
+                                part_bytes, dst, error)) {
           Fail("upload failed for " + std::string(t->name));
           return d;
         }
-        offset += t->SizeBytes();
+        offset += part_bytes;
       }
     }
     if (type == core::GgmlType::kQ8_0 && !expand_q8) {
@@ -333,7 +571,8 @@ struct Uploader {
     // quantization allows; otherwise they stay separate.
     const auto stackable = [](std::initializer_list<const TensorRef*> parts) {
       for (const TensorRef* t : parts) {
-        if (t->empty() || t->type != core::GgmlType::kQ8_0 ||
+        if (t->empty() ||
+            (t->type != core::GgmlType::kQ8_0 && !NeedsQ8Reencode(*t)) ||
             t->cols != (*parts.begin())->cols) {
           return false;
         }
@@ -474,10 +713,11 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
     std::string* error_msg) {
-  // The CPU reference also reads Q6_K, but the production embedding, dense
-  // and routed kernels do not. Reject it before allocating device weights.
+  // One-expert Q6_K/IQ4_XS matrices (dense, embedding, output) are re-encoded
+  // to Q8_0 on upload; routed experts reject Q6_K because only the tuned MMQ
+  // and IQ expert kernels are implemented for multi-expert tensors.
   const auto supported = [&](const TensorRef& t) {
-    if (t.type != core::GgmlType::kQ6_K)
+    if (t.type != core::GgmlType::kQ6_K || t.experts <= 1)
       return true;
     if (error_msg != nullptr)
       *error_msg = "unsupported HIP tensor format Q6_K: " + std::string(t.name);
@@ -514,13 +754,15 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   // will request of the device heap.
   std::uint64_t measured = 0;
   {
+    ReencodeScratch measure_scratch(0);
     std::vector<Conversion> conversions;
     std::vector<void*> allocations;
     std::size_t bytes = 0;
     std::size_t max_half_cols = 1;
     std::size_t max_q8_cols = 32;
-    Uploader measure{*stager, nullptr,       conversions, allocations,
-                     bytes,   max_half_cols, max_q8_cols, error_msg};
+    Uploader measure{*stager,     shards,      measure_scratch, nullptr,
+                     conversions, allocations, bytes,           max_half_cols,
+                     max_q8_cols, error_msg};
     (void)measure.Model(w, mtp, shard_count);
     if (!measure.ok) {
       return nullptr;
@@ -528,9 +770,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     measured = measure.requested;
   }
   const hip::WeightAllocator weights(measured);
+  ReencodeScratch reencode_scratch(shards.size());
   std::vector<Conversion> conversions;
-  Uploader up{*stager,   &weights,          conversions,     m->allocations_,
-              m->bytes_, m->max_half_cols_, m->max_q8_cols_, error_msg};
+  Uploader up{
+      *stager,         shards,          reencode_scratch, &weights,
+      conversions,     m->allocations_, m->bytes_,        m->max_half_cols_,
+      m->max_q8_cols_, error_msg};
   Uploaded uploaded = up.Model(w, mtp, shard_count);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;
@@ -538,7 +783,10 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   assert(up.requested == measured);
   m->token_embd_ = uploaded.token_embd;
   m->output_ = uploaded.output;
-  m->output_bytes_ = w.output.SizeBytes();
+  m->output_bytes_ = m->output_.type == core::GgmlType::kQ8_0
+                         ? static_cast<std::size_t>(m->output_.rows) *
+                               (m->output_.cols / 32) * 34
+                         : w.output.SizeBytes();
   m->hc_head_ = uploaded.hc_head;
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;
@@ -564,6 +812,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::erase(m->allocations_, c.source);
     (void)hipFree(c.source);
     m->bytes_ -= c.source_bytes + kTailMargin;
+  }
+  for (const auto& region : shards) {
+    platform::ReleaseMappedPages(region.data, region.size);
   }
   return m;
 }

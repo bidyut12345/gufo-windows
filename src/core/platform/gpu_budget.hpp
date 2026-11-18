@@ -23,6 +23,11 @@ struct GpuLocalBudget {
 std::optional<GpuLocalBudget> QueryGpuLocalBudget(
     std::span<const std::uint8_t, 8> luid, unsigned node) noexcept;
 
+/// Caps prefill chunk size on platforms with interactive display timeouts
+/// (Windows WDDM) so single compute bursts remain responsive.
+std::uint32_t PreferredPrefillChunkTokens(
+    std::uint32_t default_tokens) noexcept;
+
 }  // namespace gufo::platform
 
 #endif  // GUFO_CORE_PLATFORM_GPU_BUDGET_HPP_

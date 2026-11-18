@@ -10,6 +10,7 @@
     "libjpeg-turbo",
     "libwebp",
     "opus",
+    "sqlite3",
     {"name": "ffmpeg", "default-features": false, "features": ["avcodec", "avformat", "swscale"]},
     "pkgconf"
   ],

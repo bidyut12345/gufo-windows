@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <limits>
+#include <thread>
 #include <utility>
 
 #if defined(_WIN32)
@@ -506,6 +507,16 @@ PlatformFile ReopenRandomReadFile(PlatformFile file, bool& direct) noexcept {
   const auto reopened = ReopenUnbuffered(file);
   direct = FileValid(reopened);
   return reopened;
+#endif
+}
+
+std::size_t RandomReadWorkerCount(std::size_t default_workers) noexcept {
+#if defined(_WIN32)
+  const std::size_t hw = std::thread::hardware_concurrency();
+  const std::size_t cap = std::max<std::size_t>(8, hw > 0 ? hw : 16);
+  return std::min(default_workers, cap);
+#else
+  return default_workers;
 #endif
 }
 

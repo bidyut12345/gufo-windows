@@ -9,4 +9,9 @@ std::optional<GpuLocalBudget> QueryGpuLocalBudget(
   return std::nullopt;
 }
 
+std::uint32_t PreferredPrefillChunkTokens(
+    std::uint32_t default_tokens) noexcept {
+  return default_tokens;
+}
+
 }  // namespace gufo::platform

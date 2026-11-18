@@ -75,6 +75,13 @@ if (WIN32)
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
+find_package(unofficial-sqlite3 CONFIG QUIET)
+if (unofficial-sqlite3_FOUND)
+  set(SQLITE3_TARGET unofficial::sqlite3::sqlite3)
+else()
+  find_package(SQLite3 REQUIRED)
+  set(SQLITE3_TARGET SQLite::SQLite3)
+endif()
 # Extension-only libraries come from each selected extension's manifest
 # `packages` (gufo_build_discovered_extensions).
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
@@ -126,6 +133,11 @@ set(GUFO_FFPROBE_EXECUTABLE "ffprobe" CACHE STRING
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
     AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
   set(GUFO_CLANG_OPTION "/clang:")
+  # clang-cl passes /O2 only to the host cc1 pass and ignores bare -O3 for
+  # amdgcn-amd-amdhsa, compiling HIP device code at -O0 unless /clang:-O3 is
+  # forwarded explicitly.
+  add_compile_options(
+    "$<$<AND:$<COMPILE_LANGUAGE:HIP>,$<NOT:$<CONFIG:Debug>>>:/clang:-O3>")
 else()
   set(GUFO_CLANG_OPTION "")
 endif()
@@ -482,8 +494,11 @@ add_library(gufo_http STATIC
   src/cli/serve/decision_service.cpp
   src/cli/serve/tts_websocket.cpp
   src/cli/serve/openai_chat.cpp
+  src/cli/serve/chat_portal_db.cpp
+  src/cli/serve/chat_portal_tools.cpp
+  src/cli/serve/chat_portal_service.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_ext_runtime gufo_core gufo_qwen_text PNG::PNG)
+target_link_libraries(gufo_http PUBLIC gufo_logging gufo_ext_runtime gufo_core gufo_qwen_text PNG::PNG CURL::libcurl ${SQLITE3_TARGET})
 
 add_executable(gufo
   src/cli/main.cpp
@@ -969,6 +984,12 @@ endfunction()
   add_test(NAME multipart_test COMMAND multipart_test)
   set_tests_properties(multipart_test PROPERTIES
     LABELS "cpu;server;http;correctness")
+
+  add_executable(chat_portal_test tests/cli/chat_portal_test.cpp)
+  target_link_libraries(chat_portal_test PRIVATE gufo_http)
+  add_test(NAME chat_portal_test COMMAND chat_portal_test)
+  set_tests_properties(chat_portal_test PROPERTIES
+    LABELS "cpu;server;chat_portal")
 
   # These HTTP/WebSocket suites drive raw POSIX sockets or fork() directly.
   if (NOT WIN32)

@@ -124,10 +124,15 @@ PlatformFile DuplicateFile(PlatformFile file) noexcept;
 /// callers then fall back to buffered reads.
 PlatformFile ReopenUnbuffered(PlatformFile file) noexcept;
 
-/// Reopens a retained file for concurrent random reads. Windows uses cached
-/// overlapped I/O; Linux attempts direct I/O. Sets `direct` when the returned
-/// handle requires aligned reads. Returns kInvalidFile on failure.
+/// Reopens a retained file for concurrent random reads. Attempts direct
+/// (unbuffered) I/O first so large random-read tables do not pollute the OS
+/// page cache; Windows falls back to cached overlapped I/O if unbuffered reopen
+/// fails. Sets `direct` when the returned handle requires aligned reads.
+/// Returns kInvalidFile on failure.
 PlatformFile ReopenRandomReadFile(PlatformFile file, bool& direct) noexcept;
+
+/// Caps concurrent random-read worker threads to a platform-appropriate limit.
+std::size_t RandomReadWorkerCount(std::size_t default_workers) noexcept;
 
 }  // namespace gufo::platform
 

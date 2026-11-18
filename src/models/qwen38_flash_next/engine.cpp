@@ -10,6 +10,7 @@
 #include <optional>
 #include <type_traits>
 
+#include "src/core/platform/gpu_budget.hpp"
 #include "src/families/qwen/draft_vocab/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
@@ -243,11 +244,13 @@ std::uint32_t Model::VocabSize() const noexcept {
 }
 
 std::uint32_t Model::PrefillCapacity() const noexcept {
-  return std::min(kPrefillChunkTokens, options_.max_context);
+  return std::min(platform::PreferredPrefillChunkTokens(kPrefillChunkTokens),
+                  options_.max_context);
 }
 
 std::uint32_t Model::PrefillThroughCapacity() const noexcept {
-  return std::min(kPrefillChunkTokens + kPrefillTailTokens,
+  return std::min(platform::PreferredPrefillChunkTokens(kPrefillChunkTokens) +
+                      kPrefillTailTokens,
                   options_.max_context);
 }
 

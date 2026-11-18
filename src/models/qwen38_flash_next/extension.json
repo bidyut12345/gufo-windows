@@ -18,7 +18,8 @@
         "gguf:qwen4exp"
       ],
       "model_ids": [
-        "flash-next-q4"
+        "flash-next-q4",
+        "flash-next-iq4-xs"
       ],
       "speculative": [
         "mtp"
@@ -51,6 +52,51 @@
             "UD-Q4_K_XL/*"
           ],
           "entry": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        },
+        {
+          "role": "mtp",
+          "option": "--mtp-model",
+          "install": "default",
+          "source": {
+            "hf": "unsloth/Qwen3.8-Flash-Next-GGUF",
+            "revision": "d96201194f103c906994f283f504209dc8d2a10c"
+          },
+          "include": [
+            "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+          ]
+        },
+        {
+          "role": "mmproj",
+          "option": "--mmproj",
+          "install": "default",
+          "source": {
+            "hf": "unsloth/Qwen3.8-Flash-Next-GGUF",
+            "revision": "d96201194f103c906994f283f504209dc8d2a10c"
+          },
+          "include": [
+            "mmproj-BF16.gguf"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "flash-next-iq4-xs",
+      "provider": "flash-next-q4",
+      "license": "qwen-community-1.0",
+      "description": "Qwen3.8 Flash-Next, UD-IQ4_XS GGUF",
+      "components": [
+        {
+          "role": "weights",
+          "option": "--model",
+          "install": "required",
+          "source": {
+            "hf": "unsloth/Qwen3.8-Flash-Next-GGUF",
+            "revision": "d96201194f103c906994f283f504209dc8d2a10c"
+          },
+          "include": [
+            "UD-IQ4_XS/*"
+          ],
+          "entry": "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf"
         },
         {
           "role": "mtp",
@@ -125,7 +171,7 @@
   ],
   "docs": {
     "title": "Qwen3.8 Flash-Next",
-    "inputs": "Sharded Q4 GGUF; text/images",
+    "inputs": "Sharded GGUF (`UD-Q4_K_XL` / `UD-IQ4_XS`); text/images",
     "guide": "docs/models/qwen3.8-flash-next.md"
   },
   "tests": [

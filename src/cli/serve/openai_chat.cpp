@@ -861,7 +861,8 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                  "invalid_model");
   }
   output->model = body.member_str("model");
-  if (output->model.empty() && !require_model) {
+  if ((output->model.empty() && !require_model) || output->model == "default" ||
+      output->model == "loading model...") {
     output->model = backend.model_id();
   }
   if (output->model.empty()) {
@@ -974,6 +975,14 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                    "invalid_return_progress");
     }
     output->chat.return_progress = progress->as_bool();
+  }
+  if (const json::Value* include_usage = body.find("include_usage");
+      include_usage != nullptr && !include_usage->is_null()) {
+    if (!include_usage->is_bool()) {
+      return Error(400, "Bad Request", "'include_usage' must be a boolean",
+                   "invalid_stream_options");
+    }
+    output->include_usage = include_usage->as_bool();
   }
   if (const json::Value* options = body.find("stream_options");
       options != nullptr && !options->is_null()) {
@@ -2211,6 +2220,8 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   usage["cached_tokens"] = result.cached_prompt_tokens;
   usage["prompt_tokens_per_second"] = prompt_per_second;
   usage["completion_tokens_per_second"] = predicted_per_second;
+  usage["prompt_per_second"] = prompt_per_second;
+  usage["predicted_per_second"] = predicted_per_second;
   usage["draft_tokens"] = result.draft_tokens;
   usage["draft_tokens_accepted"] = result.draft_accepted_tokens;
 

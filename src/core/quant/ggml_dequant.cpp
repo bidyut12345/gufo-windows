@@ -235,6 +235,9 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
     case core::GgmlType::kIQ3_S:
       block_bytes = sizeof(block_iq3_s);
       break;
+    case core::GgmlType::kQ2_0:
+      block_bytes = sizeof(block_q2_0);
+      break;
     default:
       return 0;
   }
@@ -834,6 +837,25 @@ void DequantizeQ5_0(const void* src, float* dst, std::size_t k) {
   }
 }
 
+void DequantizeQ2_0(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_q2_0*>(src);
+  for (std::size_t b = 0; b < k / 64; ++b) {
+    const float d = Fp16ToFloat(blocks[b].d);
+    const std::uint8_t* qs = blocks[b].qs;
+    float* y = dst + b * 64;
+    for (int j = 0; j < 16; ++j) {
+      const int x0 = (qs[j] >> 0) & 3;
+      const int x1 = (qs[j] >> 2) & 3;
+      const int x2 = (qs[j] >> 4) & 3;
+      const int x3 = (qs[j] >> 6) & 3;
+      y[j + 0] = static_cast<float>(x0 - 1) * d;
+      y[j + 16] = static_cast<float>(x1 - 1) * d;
+      y[j + 32] = static_cast<float>(x2 - 1) * d;
+      y[j + 48] = static_cast<float>(x3 - 1) * d;
+    }
+  }
+}
+
 void DequantizeQ2_K(const void* src, float* dst, std::size_t k) {
   // scales[16] (low nibble scale, high nibble minimum), qs[64], d, dmin.
   const auto* bytes = static_cast<const std::uint8_t*>(src);
@@ -1078,6 +1100,9 @@ bool DequantizeRow(core::GgmlType type, const void* src, float* dst,
       return true;
     case core::GgmlType::kQ5_0:
       DequantizeQ5_0(src, dst, k);
+      return true;
+    case core::GgmlType::kQ2_0:
+      DequantizeQ2_0(src, dst, k);
       return true;
     case core::GgmlType::kQ5_1:
       DequantizeQ5_1(src, dst, k);

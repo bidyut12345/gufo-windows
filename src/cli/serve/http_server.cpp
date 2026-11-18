@@ -32,6 +32,8 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
+#include "src/cli/serve/chat_portal_db.hpp"
+#include "src/cli/serve/chat_portal_service.hpp"
 #include "src/cli/serve/decision_service.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/embeddings_api.hpp"
@@ -257,7 +259,7 @@ std::string BuildResponseHead(const HttpResponse& resp,
     out += "Content-Length: " + std::to_string(*content_length) + "\r\n";
   }
   out += "Access-Control-Allow-Origin: *\r\n";
-  out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
+  out += "Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS\r\n";
   // Authorization is accepted (and ignored) so browser SDKs that always send
   // it still pass their CORS preflight.
   out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
@@ -605,7 +607,8 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
   if (const auto* model = body.find("model"); model != nullptr) {
     if (!model->is_string())
       return InvalidCompatibilityRequest("'model' must be a string");
-    if (!backend.serves_model(model->str()))
+    if (model->str() != "default" && model->str() != "loading model..." &&
+        !backend.serves_model(model->str()))
       return Err(404, "Not Found", "requested model is not loaded",
                  "invalid_request_error", "model_not_found");
   }
@@ -2107,6 +2110,13 @@ void HttpServer::run(bool handle_signals) {
           ":" + std::to_string(port_) +
           " max_connections=" + std::to_string(options_.max_connections) +
           " max_body_bytes=" + std::to_string(options_.max_request_body_bytes));
+  Logger::Info("server",
+               std::string("event=chat_portal web_ui=") +
+                   (options_.enable_webui ? "enabled" : "disabled") +
+                   " tools=" +
+                   (!options_.tools_enabled.has_value()
+                        ? "default"
+                        : (*options_.tools_enabled ? "enabled" : "disabled")));
   while (!stopped_.load(std::memory_order_acquire)) {
     (void)device_lost();
     if (handle_signals) {
@@ -2212,6 +2222,22 @@ void HttpServer::reap_workers() {
 }
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
+  if (req.path == "/" && device_lost()) {
+    return DeviceLost();
+  }
+  if (ChatPortalService::IsPortalRoute(req)) {
+    if (!options_.enable_webui) {
+      if (req.method == "GET" && req.path == "/") {
+        // Fall through to /health compatibility check.
+      } else {
+        return Err(404, "Not Found", "chat web ui is disabled",
+                   "invalid_request_error", "webui_disabled");
+      }
+    } else {
+      return ChatPortalService::Handle(req, ChatDatabase::Instance(), backend_,
+                                       options_.tools_enabled);
+    }
+  }
   // The voice page holds no data; it opens its WebSocket when the user
   // connects.
   if (req.method == "GET" && req.path == "/voice" && asr_ &&

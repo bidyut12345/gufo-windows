@@ -72,6 +72,14 @@ inline std::atomic<double>& LastGenSpeed() {
   static std::atomic<double> val{0.0};
   return val;
 }
+inline std::atomic<std::uint64_t>& LastPromptTokens() {
+  static std::atomic<std::uint64_t> val{0};
+  return val;
+}
+inline std::atomic<std::uint64_t>& LastGenTokens() {
+  static std::atomic<std::uint64_t> val{0};
+  return val;
+}
 // Schedulers add their own deltas, so a draining scheduler and its
 // replacement can both contribute during a model reload.
 inline std::atomic<std::int64_t>& RequestsProcessing() {
@@ -137,6 +145,14 @@ inline void RecordRequestMetrics(const TextGenerationBackend::Result& result) {
   }
   if (tok_per_sec > 0.0) {
     detail::LastGenSpeed().store(tok_per_sec, std::memory_order_relaxed);
+  }
+  if (result.prompt_tokens > 0) {
+    detail::LastPromptTokens().store(result.prompt_tokens,
+                                     std::memory_order_relaxed);
+  }
+  if (result.completion_tokens > 0) {
+    detail::LastGenTokens().store(result.completion_tokens,
+                                  std::memory_order_relaxed);
   }
 }
 
@@ -214,17 +230,21 @@ inline json::Value GenerationTimings(
       result.prefill_tokens > 0
           ? result.prefill_ms / static_cast<double>(result.prefill_tokens)
           : 0.0;
-  timings["prompt_per_second"] = PrefillTokensPerSecond(result);
+  const double prompt_per_second = PrefillTokensPerSecond(result);
+  timings["prompt_per_second"] = prompt_per_second;
+  timings["prompt_tokens_per_second"] = prompt_per_second;
   timings["predicted_n"] = result.completion_tokens;
   timings["predicted_ms"] = result.decode_ms;
   timings["predicted_per_token_ms"] =
       result.completion_tokens > 0
           ? result.decode_ms / static_cast<double>(result.completion_tokens)
           : 0.0;
-  timings["predicted_per_second"] =
+  const double predicted_per_second =
       result.decode_ms > 0.0 ? static_cast<double>(result.completion_tokens) *
                                    1000.0 / result.decode_ms
                              : 0.0;
+  timings["predicted_per_second"] = predicted_per_second;
+  timings["completion_tokens_per_second"] = predicted_per_second;
   timings["cache_n"] = result.cached_prompt_tokens;
   timings["cache_restore_ms"] = result.cache_restore_ms;
   timings["cache_snapshot_ms"] = result.cache_snapshot_ms;

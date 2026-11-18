@@ -154,7 +154,8 @@ std::unique_ptr<NgramTable> NgramTable::Open(
     }
     return nullptr;
   }
-  for (std::size_t i = 0; i < kWorkers; ++i) {
+  const std::size_t workers = platform::RandomReadWorkerCount(kWorkers);
+  for (std::size_t i = 0; i < workers; ++i) {
     t->workers_.emplace_back([raw = t.get()] { raw->Worker(); });
   }
   return t;

@@ -12,6 +12,7 @@
   libjpeg,
   libwebp,
   libopus,
+  sqlite,
   libsndfile,
   soxr,
   openssl,
@@ -160,6 +161,7 @@ stdenv.mkDerivation {
     libjpeg
     libwebp
     libopus
+    sqlite
     openssl
     ffmpeg-headless
     rocmPackages.clr

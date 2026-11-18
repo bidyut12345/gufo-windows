@@ -33,11 +33,10 @@ __launch_bounds__(32 * token_waves, 1) static __global__
     for (int j = 0; j < ncols_dst; ++j) {
       // The last wave may contain fewer than eight inputs. Its inactive
       // columns reuse a valid row; their results are never stored.
-      const int token =
-          ragged ? min(first_token + j, int(valid_tokens) - 1) : first_token + j;
-      sum[j] += vec_dot_q8_0_q8_1(
-          weights, input + token * stride_col_y + kbx,
-          row_offset + kbx, kqs);
+      const int token = ragged ? min(first_token + j, int(valid_tokens) - 1)
+                               : first_token + j;
+      sum[j] += vec_dot_q8_0_q8_1(weights, input + token * stride_col_y + kbx,
+                                  row_offset + kbx, kqs);
       if constexpr (has_gate) {
         gate_sum[j] += vec_dot_q8_0_q8_1(gate, input + j * stride_col_y + kbx,
                                          row_offset + kbx, kqs);
@@ -138,10 +137,11 @@ __launch_bounds__(32, 1) static __global__
 // Keep four separate K8 sums per wave: merging them into a K32 integer sum
 // would change the scalar kernel's rounded products, FMA chain and reduction.
 template<int token_tiles, bool ragged, bool grouped = false>
-__launch_bounds__(256) static __global__ void mul_mat_q8_decode_batch(
-    const block_q8_0* __restrict__ weights,
-    const block_q8_1* __restrict__ input, float* __restrict__ output,
-    int k, int rows, int input_stride, int tokens) {
+__launch_bounds__(256) static __global__
+    void mul_mat_q8_decode_batch(const block_q8_0* __restrict__ weights,
+                                 const block_q8_1* __restrict__ input,
+                                 float* __restrict__ output, int k, int rows,
+                                 int input_stride, int tokens) {
   if constexpr (grouped) {
     input += std::size_t{blockIdx.y} * token_tiles * 16 * input_stride;
     output += std::size_t{blockIdx.y} * token_tiles * 16 * rows;
@@ -178,7 +178,7 @@ __launch_bounds__(256) static __global__ void mul_mat_q8_decode_batch(
 #pragma unroll
       for (int part = 0; part < 4; ++part) {
         const Int4 values = {get_int_b4(x->qs, 2 * part),
-                              get_int_b4(x->qs, 2 * part + 1), 0, 0};
+                             get_int_b4(x->qs, 2 * part + 1), 0, 0};
         Int8 dots{};
         dots = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
             true, codes[part], true, values, dots, false);
@@ -224,26 +224,66 @@ __launch_bounds__(256) static __global__ void mul_mat_q8_decode_batch(
   }
 }
 
-typedef float (*vec_dot_q_hip_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+typedef float (*vec_dot_q_hip_t)(const void* __restrict__ vbq,
+                                 const block_q8_1* __restrict__ bq8_1,
+                                 const int& kbx, const int& iqs);
 
 static constexpr __device__ vec_dot_q_hip_t get_vec_dot_q_hip(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
-        case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
-        case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
-        case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
-        default:                return nullptr;
-    }
+  switch (type) {
+    case GGML_TYPE_Q2_0:
+      return vec_dot_q2_0_q8_1;
+    case GGML_TYPE_Q5_0:
+      return vec_dot_q5_0_q8_1;
+    case GGML_TYPE_Q5_1:
+      return vec_dot_q5_1_q8_1;
+    case GGML_TYPE_Q8_0:
+      return vec_dot_q8_0_q8_1;
+    case GGML_TYPE_Q4_K:
+      return vec_dot_q4_K_q8_1;
+    case GGML_TYPE_Q5_K:
+      return vec_dot_q5_K_q8_1;
+    case GGML_TYPE_IQ2_S:
+      return vec_dot_iq2_s_q8_1;
+    case GGML_TYPE_IQ3_XXS:
+      return vec_dot_iq3_xxs_q8_1;
+    case GGML_TYPE_IQ3_S:
+      return vec_dot_iq3_s_q8_1;
+    case GGML_TYPE_IQ4_NL:
+      return vec_dot_iq4_nl_q8_1;
+    case GGML_TYPE_IQ4_XS:
+      return vec_dot_iq4_xs_q8_1;
+    default:
+      return nullptr;
+  }
 }
 
 static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
-        case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q5_K:    return VDR_Q5_K_Q8_1_MMVQ;
-        default:                return 1;
-    }
+  switch (type) {
+    case GGML_TYPE_Q2_0:
+      return VDR_Q2_0_Q8_1_MMVQ;
+    case GGML_TYPE_Q5_0:
+      return VDR_Q5_0_Q8_1_MMVQ;
+    case GGML_TYPE_Q5_1:
+      return VDR_Q5_1_Q8_1_MMVQ;
+    case GGML_TYPE_Q8_0:
+      return VDR_Q8_0_Q8_1_MMVQ;
+    case GGML_TYPE_Q4_K:
+      return VDR_Q4_K_Q8_1_MMVQ;
+    case GGML_TYPE_Q5_K:
+      return VDR_Q5_K_Q8_1_MMVQ;
+    case GGML_TYPE_IQ2_S:
+      return VDR_IQ2_S_Q8_1_MMVQ;
+    case GGML_TYPE_IQ3_XXS:
+      return VDR_IQ3_XXS_Q8_1_MMVQ;
+    case GGML_TYPE_IQ3_S:
+      return VDR_IQ3_S_Q8_1_MMVQ;
+    case GGML_TYPE_IQ4_NL:
+      return VDR_IQ4_NL_Q8_1_MMVQ;
+    case GGML_TYPE_IQ4_XS:
+      return VDR_IQ4_XS_Q8_1_MMVQ;
+    default:
+      return 1;
+  }
 }
 
 template<ggml_type type, int c_rows_per_block, bool gated = false>
@@ -269,8 +309,7 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
   constexpr vec_dot_q_hip_t vec_dot_q_hip = get_vec_dot_q_hip(type);
 
   const bool is_up = gated && threadIdx.y != 0;
-  const uint32_t token_idx =
-      gated ? 0 : blockIdx.z * blockDim.y + threadIdx.y;
+  const uint32_t token_idx = gated ? 0 : blockIdx.z * blockDim.y + threadIdx.y;
   const void* vx = is_up ? up_weights : weights;
   const int row0 = c_rows_per_block * blockIdx.x;
   const int blocks_per_row_x = ncols_x / qk;
@@ -294,58 +333,60 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
   const block_q8_1* y = ((const block_q8_1*)vy) + token_idx * stride_col_y;
   uint32_t row_offsets[c_rows_per_block];
 #pragma unroll
-    for (int i = 0; i < c_rows_per_block; ++i) {
-        // A ragged tile reads the last valid row again for its unused lane.
-        // Keep the bounds check out of the quantized dot-product loop.
-        const uint32_t row = min(uint32_t(row0 + i), nrows_x - 1);
-        row_offsets[i] = channel_x*stride_channel_x + row*stride_row_x;
-    }
+  for (int i = 0; i < c_rows_per_block; ++i) {
+    // A ragged tile reads the last valid row again for its unused lane.
+    // Keep the bounds check out of the quantized dot-product loop.
+    const uint32_t row = min(uint32_t(row0 + i), nrows_x - 1);
+    row_offsets[i] = channel_x * stride_channel_x + row * stride_row_x;
+  }
 
-    // partial sum for each thread
-    float tmp[c_rows_per_block] = {0.0f};
+  // partial sum for each thread
+  float tmp[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); !invalid_id && kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+  for (int kbx = threadIdx.x / (qi / vdr);
+       !invalid_id && kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+    const int kqs = vdr * (threadIdx.x % (qi / vdr));
 
 #pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_hip(vx, &y[kby], row_offsets[i] + kbx, kqs);
-        }
-    }
-
-    // Warp-level reduction only - no shared memory needed
-#pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
-        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+      tmp[i] += vec_dot_q_hip(vx, &y[kby], row_offsets[i] + kbx, kqs);
     }
+  }
 
-    if constexpr (gated) {
-      // Separate waves preserve each projection's original dot-product
-      // grouping. Combining two accumulators in one wave lets fast-math
-      // reassociate their shared input scales.
-      __shared__ float values[2][c_rows_per_block];
-      if (threadIdx.x < c_rows_per_block) {
-        const float value = tmp[threadIdx.x];
-        values[is_up][threadIdx.x] = isfinite(value) ? value : 0.0f;
-      }
-      __syncthreads();
-      if (!is_up && threadIdx.x < c_rows_per_block &&
-          uint32_t(row0 + threadIdx.x) < nrows_x) {
-        const float g = values[0][threadIdx.x];
-        const float u = values[1][threadIdx.x];
-        dst[channel_dst * stride_channel_dst + row0 + threadIdx.x] =
-            (g * (1.0f / (1.0f + __expf(-g)))) * u;
-      }
-      return;
-    }
+  // Warp-level reduction only - no shared memory needed
+#pragma unroll
+  for (int i = 0; i < c_rows_per_block; ++i) {
+    tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+  }
 
-    // Write results
-    if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
-        const float value = tmp[threadIdx.x];
-        dst[channel_dst*stride_channel_dst + dst_token*stride_col_dst + row0 + threadIdx.x] =
-            isfinite(value) ? value : 0.0f;
+  if constexpr (gated) {
+    // Separate waves preserve each projection's original dot-product
+    // grouping. Combining two accumulators in one wave lets fast-math
+    // reassociate their shared input scales.
+    __shared__ float values[2][c_rows_per_block];
+    if (threadIdx.x < c_rows_per_block) {
+      const float value = tmp[threadIdx.x];
+      values[is_up][threadIdx.x] = isfinite(value) ? value : 0.0f;
     }
+    __syncthreads();
+    if (!is_up && threadIdx.x < c_rows_per_block &&
+        uint32_t(row0 + threadIdx.x) < nrows_x) {
+      const float g = values[0][threadIdx.x];
+      const float u = values[1][threadIdx.x];
+      dst[channel_dst * stride_channel_dst + row0 + threadIdx.x] =
+          (g * (1.0f / (1.0f + __expf(-g)))) * u;
+    }
+    return;
+  }
+
+  // Write results
+  if (threadIdx.x < c_rows_per_block &&
+      (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+    const float value = tmp[threadIdx.x];
+    dst[channel_dst * stride_channel_dst + dst_token * stride_col_dst + row0 +
+        threadIdx.x] = isfinite(value) ? value : 0.0f;
+  }
 }
 
 // Keep one anchor per expert and a slot mask for each token. Duplicate
@@ -426,7 +467,6 @@ static __global__ void group_moe_slots(const int32_t* ids, int32_t* groups,
   lists[list * (anchors + 1) + 1 + rank] = anchor;
 }
 
-
 template<ggml_type type, int tokens, bool single_request = false>
 __launch_bounds__(64) static __global__
     void mul_mat_vec_moe_grouped(const void* __restrict__ gate,
@@ -447,103 +487,104 @@ __launch_bounds__(64) static __global__
   const int row0 = blockIdx.x * 2;
   const int listed = list != nullptr ? list[0] : static_cast<int>(gridDim.y);
   for (int entry = blockIdx.y; entry < listed; entry += gridDim.y) {
-  const int anchor = list != nullptr ? list[1 + entry] : entry;
-  const int32_t* group = groups + anchor * (tokens + 1);
-  const int expert = group[0];
-  if (expert < 0) {
-    if (!single_request && expert == -2 && tid < 2 && row0 + tid < rows)
-      output[anchor * rows + row0 + tid] = 0.0f;
-    continue;
-  }
+    const int anchor = list != nullptr ? list[1 + entry] : entry;
+    const int32_t* group = groups + anchor * (tokens + 1);
+    const int expert = group[0];
+    if (expert < 0) {
+      if (!single_request && expert == -2 && tid < 2 && row0 + tid < rows)
+        output[anchor * rows + row0 + tid] = 0.0f;
+      continue;
+    }
 
-  constexpr bool split = type == GGML_TYPE_Q4_K && tokens >= 3;
-  constexpr int columns = single_request ? 1 : tokens;
-  int token = 0;
-  if constexpr (split) {
-    int active = 0;
+    constexpr bool split = type == GGML_TYPE_Q4_K && tokens >= 3;
+    constexpr int columns = single_request ? 1 : tokens;
+    int token = 0;
+    if constexpr (split) {
+      int active = 0;
 #pragma unroll
-    for (int t = 0; t < tokens; ++t) {
-      if (group[t + 1] != 0) {
-        ++active;
-        token = t;
+      for (int t = 0; t < tokens; ++t) {
+        if (group[t + 1] != 0) {
+          ++active;
+          token = t;
+        }
+      }
+      if (single_request ? active != 1 : active <= 1)
+        continue;
+    }
+    const void* weights = is_up ? up : gate;
+    const int blocks_per_row = k / qk;
+    uint32_t slots[columns];
+#pragma unroll
+    for (int t = 0; t < columns; ++t)
+      slots[t] = static_cast<uint32_t>(group[(single_request ? token : t) + 1]);
+    float sum[columns][2] = {};
+    for (int kb = lane / (qi / vdr); kb < blocks_per_row;
+         kb += blocks_per_iter) {
+      const int kqs = vdr * (lane % (qi / vdr));
+      if constexpr (split && !single_request) {
+        const Q4MoeFragment w0(
+            weights, (expert * rows + row0) * blocks_per_row + kb, kqs);
+        const Q4MoeFragment w1(
+            weights,
+            (expert * rows + min(row0 + 1, rows - 1)) * blocks_per_row + kb,
+            kqs);
+#pragma unroll
+        for (int t = 0; t < columns; ++t) {
+          if (slots[t] == 0)
+            continue;
+          const auto* x = input + t * input_stride + kb * (qk / QK8_1);
+          sum[t][0] += w0.Dot(x, kqs);
+          sum[t][1] += w1.Dot(x, kqs);
+        }
+      } else {
+#pragma unroll
+        for (int t = 0; t < columns; ++t) {
+          if (slots[t] == 0)
+            continue;
+#pragma unroll
+          for (int r = 0; r < 2; ++r)
+            sum[t][r] += dot(
+                weights,
+                input + (single_request ? token : t) * input_stride +
+                    kb * (qk / QK8_1),
+                (expert * rows + min(row0 + r, rows - 1)) * blocks_per_row + kb,
+                kqs);
+        }
       }
     }
-    if (single_request ? active != 1 : active <= 1)
-      continue;
-  }
-  const void* weights = is_up ? up : gate;
-  const int blocks_per_row = k / qk;
-  uint32_t slots[columns];
-#pragma unroll
-  for (int t = 0; t < columns; ++t)
-    slots[t] = static_cast<uint32_t>(group[(single_request ? token : t) + 1]);
-  float sum[columns][2] = {};
-  for (int kb = lane / (qi / vdr); kb < blocks_per_row; kb += blocks_per_iter) {
-    const int kqs = vdr * (lane % (qi / vdr));
-    if constexpr (split && !single_request) {
-      const Q4MoeFragment w0(
-          weights, (expert * rows + row0) * blocks_per_row + kb, kqs);
-      const Q4MoeFragment w1(
-          weights, (expert * rows + min(row0 + 1, rows - 1)) * blocks_per_row + kb,
-          kqs);
-#pragma unroll
-      for (int t = 0; t < columns; ++t) {
-        if (slots[t] == 0)
-          continue;
-        const auto* x = input + t * input_stride + kb * (qk / QK8_1);
-        sum[t][0] += w0.Dot(x, kqs);
-        sum[t][1] += w1.Dot(x, kqs);
-      }
-    } else {
-#pragma unroll
-      for (int t = 0; t < columns; ++t) {
-        if (slots[t] == 0)
-          continue;
-#pragma unroll
-        for (int r = 0; r < 2; ++r)
-          sum[t][r] += dot(
-              weights,
-              input + (single_request ? token : t) * input_stride +
-                  kb * (qk / QK8_1),
-              (expert * rows + min(row0 + r, rows - 1)) * blocks_per_row + kb,
-              kqs);
-      }
-    }
-  }
 
-  // Gate and up stay in separate waves to retain the scalar projection's
-  // sum order, including the treatment of nonfinite quantization scales.
-  __shared__ float values[columns][2][2];
-#pragma unroll
-  for (int t = 0; t < columns; ++t) {
-    if (slots[t] == 0)
-      continue;
-#pragma unroll
-    for (int r = 0; r < 2; ++r)
-      sum[t][r] = warp_reduce_sum<32>(sum[t][r]);
-    if (lane < 2)
-      values[t][is_up][lane] = isfinite(sum[t][lane]) ? sum[t][lane] : 0.0f;
-  }
-  __syncthreads();
-  if (!is_up && lane < 2 && row0 + lane < rows) {
+    // Gate and up stay in separate waves to retain the scalar projection's
+    // sum order, including the treatment of nonfinite quantization scales.
+    __shared__ float values[columns][2][2];
 #pragma unroll
     for (int t = 0; t < columns; ++t) {
       if (slots[t] == 0)
         continue;
-      const float g = values[t][0][lane];
-      const float u = values[t][1][lane];
-      uint32_t bits = slots[t];
-      while (bits) {
-        const int slot = __ffs(static_cast<int>(bits)) - 1;
-        output[((single_request ? token : t) * experts_used + slot) * rows +
-               row0 + lane] =
-            (g * (1.0f / (1.0f + __expf(-g)))) * u;
-        bits &= bits - 1;
+#pragma unroll
+      for (int r = 0; r < 2; ++r)
+        sum[t][r] = warp_reduce_sum<32>(sum[t][r]);
+      if (lane < 2)
+        values[t][is_up][lane] = isfinite(sum[t][lane]) ? sum[t][lane] : 0.0f;
+    }
+    __syncthreads();
+    if (!is_up && lane < 2 && row0 + lane < rows) {
+#pragma unroll
+      for (int t = 0; t < columns; ++t) {
+        if (slots[t] == 0)
+          continue;
+        const float g = values[t][0][lane];
+        const float u = values[t][1][lane];
+        uint32_t bits = slots[t];
+        while (bits) {
+          const int slot = __ffs(static_cast<int>(bits)) - 1;
+          output[((single_request ? token : t) * experts_used + slot) * rows +
+                 row0 + lane] = (g * (1.0f / (1.0f + __expf(-g)))) * u;
+          bits &= bits - 1;
+        }
       }
     }
-  }
-  // The next listed group rewrites values.
-  __syncthreads();
+    // The next listed group rewrites values.
+    __syncthreads();
   }
 }
 
@@ -596,7 +637,6 @@ static __global__ void group_moe_batch(const int32_t* ids, int32_t* storage,
   }
 }
 
-
 template<ggml_type type, int tokens = 2>
 static void launch_moe_grouped(const void* gate, const void* up,
                                const block_q8_1* input, const int32_t* groups,
@@ -614,9 +654,9 @@ static void launch_moe_grouped(const void* gate, const void* up,
     const int32_t* lists = split ? groups + anchors * (tokens + 1) : nullptr;
     const dim3 grid((rows + 1) / 2,
                     split ? std::min(kListRows, anchors) : anchors);
-    mul_mat_vec_moe_grouped<type, tokens><<<grid, 64, 0, stream>>>(
-        gate, up, input, groups, lists, output, k, rows, experts_used,
-        input_stride);
+    mul_mat_vec_moe_grouped<type, tokens>
+        <<<grid, 64, 0, stream>>>(gate, up, input, groups, lists, output, k,
+                                  rows, experts_used, input_stride);
     if constexpr (split) {
       mul_mat_vec_moe_grouped<type, tokens, true><<<grid, 64, 0, stream>>>(
           gate, up, input, groups, lists + anchors + 1, output, k, rows,
@@ -631,26 +671,27 @@ static void launch_moe_grouped(const void* gate, const void* up,
   }
 }
 
-template <int tokens>
-static void launch_q8(const void* weights, const void* gate, const block_q8_1* input,
-                      float* output, int k, int rows, int input_stride, hipStream_t stream) {
-    if (gate && tokens > 1) {
-        mul_mat_vec_q8<tokens, true, 1, false, true><<<rows, 32, 0, stream>>>(
-            weights, gate, input, output, k, rows, input_stride);
-    } else if (gate) {
-        mul_mat_vec_q8<tokens, true><<<rows, 32, 0, stream>>>(
-            weights, gate, input, output, k, rows, input_stride);
-    } else if (tokens == 1 && rows <= 64 && k % (32 * 8 * 20) == 0) {
-        // Few rows cannot hide a lane's load latency behind other waves.
-        mul_mat_vec_q8_ahead<20><<<rows, 32, 0, stream>>>(weights, input,
-                                                          output, k);
-    } else if (tokens > 1) {
-        mul_mat_vec_q8<tokens, false, 1, false, true><<<rows, 32, 0, stream>>>(
-            weights, nullptr, input, output, k, rows, input_stride);
-    } else {
-        mul_mat_vec_q8<tokens, false><<<rows, 32, 0, stream>>>(
-            weights, nullptr, input, output, k, rows, input_stride);
-    }
+template<int tokens>
+static void launch_q8(const void* weights, const void* gate,
+                      const block_q8_1* input, float* output, int k, int rows,
+                      int input_stride, hipStream_t stream) {
+  if (gate && tokens > 1) {
+    mul_mat_vec_q8<tokens, true, 1, false, true><<<rows, 32, 0, stream>>>(
+        weights, gate, input, output, k, rows, input_stride);
+  } else if (gate) {
+    mul_mat_vec_q8<tokens, true><<<rows, 32, 0, stream>>>(
+        weights, gate, input, output, k, rows, input_stride);
+  } else if (tokens == 1 && rows <= 64 && k % (32 * 8 * 20) == 0) {
+    // Few rows cannot hide a lane's load latency behind other waves.
+    mul_mat_vec_q8_ahead<20>
+        <<<rows, 32, 0, stream>>>(weights, input, output, k);
+  } else if (tokens > 1) {
+    mul_mat_vec_q8<tokens, false, 1, false, true><<<rows, 32, 0, stream>>>(
+        weights, nullptr, input, output, k, rows, input_stride);
+  } else {
+    mul_mat_vec_q8<tokens, false><<<rows, 32, 0, stream>>>(
+        weights, nullptr, input, output, k, rows, input_stride);
+  }
 }
 
 template<int waves>
@@ -684,9 +725,8 @@ static void launch_q8_matrix(const void* weights, const block_q8_1* input,
 
 int prepare_q8_decode() {
   hipFuncAttributes attributes{};
-  return hipFuncGetAttributes(
-             &attributes,
-             reinterpret_cast<const void*>(mul_mat_vec_q8<1, false>)) ==
+  return hipFuncGetAttributes(&attributes, reinterpret_cast<const void*>(
+                                               mul_mat_vec_q8<1, false>)) ==
                  hipSuccess
              ? 0
              : -2;
@@ -710,13 +750,13 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
   if (!gate && matrix_shape && tokens >= 9 && tokens <= 48) {
     if (tokens <= 16)
       launch_q8_matrix<1>(weights, input, output, k, rows, tokens, input_stride,
-                           stream);
+                          stream);
     else if (tokens <= 32)
       launch_q8_matrix<2>(weights, input, output, k, rows, tokens, input_stride,
-                           stream);
+                          stream);
     else
       launch_q8_matrix<3>(weights, input, output, k, rows, tokens, input_stride,
-                           stream);
+                          stream);
     return;
   }
   GGML_ASSERT(k % QK8_0 == 0 && rows > 0);
@@ -726,13 +766,13 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
     // on the same weight row, reusing cache lines across requests.
     if (tokens <= 16) {
       launch_q8_batch<2>(weights, input, output, k, rows, tokens, input_stride,
-                          stream);
+                         stream);
     } else if (tokens <= 24) {
       launch_q8_batch<3>(weights, input, output, k, rows, tokens, input_stride,
-                          stream);
+                         stream);
     } else {
       launch_q8_batch<4>(weights, input, output, k, rows, tokens, input_stride,
-                          stream);
+                         stream);
     }
     return;
   }
@@ -770,8 +810,7 @@ template<ggml_type type, int rows_per_wave = 2>
 static void launch_moe(const void* weights, const block_q8_1* input,
                        const int32_t* ids, float* output, int k, int rows,
                        int tokens, int experts_used, int input_stride,
-                       hipStream_t stream,
-                       const int32_t* dst_slots = nullptr) {
+                       hipStream_t stream, const int32_t* dst_slots = nullptr) {
   GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0);
   GGML_ASSERT(tokens > 0);
   const int block_tokens = std::min(tokens, mmvq_moe_max_batch(type));
@@ -786,55 +825,90 @@ static void launch_moe(const void* weights, const block_q8_1* input,
 }
 
 void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
-                             const block_q8_1* input, const int32_t* ids, float* output,
-                             int k, int rows, int tokens, int experts_used,
-                             int input_stride, hipStream_t stream,
-                             const int32_t* dst_slots) {
-    // dst_slots (expert-ordered slot rows) is only used by the down view.
-    GGML_ASSERT(!dst_slots || (k == 640 && experts_used == 1 && tokens > 1 &&
-                               (type == GGML_TYPE_Q5_1 ||
-                                type == GGML_TYPE_Q8_0)));
-    switch (type) {
-        case GGML_TYPE_Q5_1:
-          // Down projection slots have independent inputs. Wider row tiles
-          // reuse each short input without changing its dot-product sum.
-          if (k == 640 && experts_used == 1 && tokens > 1) {
-            if (tokens > 20) {
-              launch_moe<GGML_TYPE_Q5_1, 8>(
-                  weights, input, ids, output, k, rows, tokens, experts_used,
-                  input_stride, stream, dst_slots);
-            } else {
-              launch_moe<GGML_TYPE_Q5_1, 4>(
-                  weights, input, ids, output, k, rows, tokens, experts_used,
-                  input_stride, stream, dst_slots);
-            }
-            break;
-          }
-            launch_moe<GGML_TYPE_Q5_1>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
-            break;
-        case GGML_TYPE_Q8_0:
-          // Down projection slots have independent inputs. Four rows reuse
-          // each short input across more weights without changing its sum.
-          if (k == 640 && experts_used == 1 && tokens > 1) {
-            launch_moe<GGML_TYPE_Q8_0, 4>(weights, input, ids, output, k, rows,
-                                          tokens, experts_used, input_stride,
-                                          stream, dst_slots);
-            break;
-          }
-            launch_moe<GGML_TYPE_Q8_0>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
-            break;
-        case GGML_TYPE_Q4_K:
-            launch_moe<GGML_TYPE_Q4_K>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
-            break;
-        case GGML_TYPE_Q5_K:
-            launch_moe<GGML_TYPE_Q5_K>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
-            break;
-        default: GGML_ABORT("unsupported vector weight format");
+                              const block_q8_1* input, const int32_t* ids,
+                              float* output, int k, int rows, int tokens,
+                              int experts_used, int input_stride,
+                              hipStream_t stream, const int32_t* dst_slots) {
+  // dst_slots (expert-ordered slot rows) is only used by the down view.
+  GGML_ASSERT(!dst_slots ||
+              (k == 640 && experts_used == 1 && tokens > 1 &&
+               (type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0 ||
+                type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q5_0 ||
+                type == GGML_TYPE_Q2_0)));
+  const auto launch_down_or_default = [&](auto tag) {
+    constexpr ggml_type T = decltype(tag)::value;
+    if (k == 640 && experts_used == 1 && tokens > 1) {
+      launch_moe<T, 4>(weights, input, ids, output, k, rows, tokens,
+                       experts_used, input_stride, stream, dst_slots);
+    } else {
+      launch_moe<T>(weights, input, ids, output, k, rows, tokens, experts_used,
+                    input_stride, stream);
     }
+  };
+  switch (type) {
+    case GGML_TYPE_Q5_1:
+      // Down projection slots have independent inputs. Wider row tiles
+      // reuse each short input without changing its dot-product sum.
+      if (k == 640 && experts_used == 1 && tokens > 1) {
+        if (tokens > 20) {
+          launch_moe<GGML_TYPE_Q5_1, 8>(weights, input, ids, output, k, rows,
+                                        tokens, experts_used, input_stride,
+                                        stream, dst_slots);
+        } else {
+          launch_moe<GGML_TYPE_Q5_1, 4>(weights, input, ids, output, k, rows,
+                                        tokens, experts_used, input_stride,
+                                        stream, dst_slots);
+        }
+        break;
+      }
+      launch_moe<GGML_TYPE_Q5_1>(weights, input, ids, output, k, rows, tokens,
+                                 experts_used, input_stride, stream);
+      break;
+    case GGML_TYPE_Q8_0:
+      // Down projection slots have independent inputs. Four rows reuse
+      // each short input across more weights without changing its sum.
+      launch_down_or_default(
+          std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
+      break;
+    case GGML_TYPE_IQ4_NL:
+      launch_down_or_default(
+          std::integral_constant<ggml_type, GGML_TYPE_IQ4_NL>{});
+      break;
+    case GGML_TYPE_Q5_0:
+      launch_down_or_default(
+          std::integral_constant<ggml_type, GGML_TYPE_Q5_0>{});
+      break;
+    case GGML_TYPE_Q2_0:
+      launch_down_or_default(
+          std::integral_constant<ggml_type, GGML_TYPE_Q2_0>{});
+      break;
+    case GGML_TYPE_Q4_K:
+      launch_moe<GGML_TYPE_Q4_K>(weights, input, ids, output, k, rows, tokens,
+                                 experts_used, input_stride, stream);
+      break;
+    case GGML_TYPE_Q5_K:
+      launch_moe<GGML_TYPE_Q5_K>(weights, input, ids, output, k, rows, tokens,
+                                 experts_used, input_stride, stream);
+      break;
+    case GGML_TYPE_IQ2_S:
+      launch_moe<GGML_TYPE_IQ2_S>(weights, input, ids, output, k, rows, tokens,
+                                  experts_used, input_stride, stream);
+      break;
+    case GGML_TYPE_IQ3_XXS:
+      launch_moe<GGML_TYPE_IQ3_XXS>(weights, input, ids, output, k, rows,
+                                    tokens, experts_used, input_stride, stream);
+      break;
+    case GGML_TYPE_IQ3_S:
+      launch_moe<GGML_TYPE_IQ3_S>(weights, input, ids, output, k, rows, tokens,
+                                  experts_used, input_stride, stream);
+      break;
+    case GGML_TYPE_IQ4_XS:
+      launch_moe<GGML_TYPE_IQ4_XS>(weights, input, ids, output, k, rows, tokens,
+                                   experts_used, input_stride, stream);
+      break;
+    default:
+      GGML_ABORT("unsupported vector weight format");
+  }
 }
 
 void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
@@ -851,6 +925,33 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
                                  experts_used, input_stride, stream);
     return;
   }
+  const auto dispatch_gated = [&](auto fn) {
+    switch (type) {
+      case GGML_TYPE_Q4_K:
+        fn(std::integral_constant<ggml_type, GGML_TYPE_Q4_K>{});
+        break;
+      case GGML_TYPE_Q5_K:
+        fn(std::integral_constant<ggml_type, GGML_TYPE_Q5_K>{});
+        break;
+      case GGML_TYPE_Q8_0:
+        fn(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
+        break;
+      case GGML_TYPE_IQ2_S:
+        fn(std::integral_constant<ggml_type, GGML_TYPE_IQ2_S>{});
+        break;
+      case GGML_TYPE_IQ3_XXS:
+        fn(std::integral_constant<ggml_type, GGML_TYPE_IQ3_XXS>{});
+        break;
+      case GGML_TYPE_IQ3_S:
+        fn(std::integral_constant<ggml_type, GGML_TYPE_IQ3_S>{});
+        break;
+      case GGML_TYPE_IQ4_XS:
+        fn(std::integral_constant<ggml_type, GGML_TYPE_IQ4_XS>{});
+        break;
+      default:
+        GGML_ABORT("unsupported gated vector weight format");
+    }
+  };
   if (tokens > 1) {
     GGML_ASSERT(groups && experts_used <= 32);
     const int anchors = tokens * experts_used;
@@ -858,39 +959,22 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
     group_moe_slots<<<1, (anchors + 31) / 32 * 32, 0, stream>>>(
         ids, groups, tokens, experts_used,
         type == GGML_TYPE_Q4_K && tokens >= 3);
-    if (type == GGML_TYPE_Q4_K) {
-      launch_moe_grouped<GGML_TYPE_Q4_K>(gate, up, input, groups, output, k,
-                                         rows, tokens, experts_used,
-                                         input_stride, stream);
-    } else if (type == GGML_TYPE_Q8_0) {
-      launch_moe_grouped<GGML_TYPE_Q8_0>(gate, up, input, groups, output, k,
-                                         rows, tokens, experts_used,
-                                         input_stride, stream);
-    } else {
-      GGML_ASSERT(type == GGML_TYPE_Q5_K);
-      launch_moe_grouped<GGML_TYPE_Q5_K>(gate, up, input, groups, output, k,
-                                         rows, tokens, experts_used,
-                                         input_stride, stream);
-    }
+    dispatch_gated([&](auto tag) {
+      launch_moe_grouped<decltype(tag)::value>(gate, up, input, groups, output,
+                                               k, rows, tokens, experts_used,
+                                               input_stride, stream);
+    });
     return;
   }
   const int row_stride = k / ggml_blck_size(type);
   const dim3 grid((rows + 1) / 2, experts_used);
   const dim3 block(32, 2);
-  if (type == GGML_TYPE_Q4_K) {
-    mul_mat_vec_q_moe<GGML_TYPE_Q4_K, 2, true><<<grid, block, 0, stream>>>(
-        gate, input, ids, output, k, rows, row_stride, input_stride,
-        rows * experts_used, rows * row_stride, rows, 1, experts_used, up);
-  } else if (type == GGML_TYPE_Q8_0) {
-    mul_mat_vec_q_moe<GGML_TYPE_Q8_0, 2, true><<<grid, block, 0, stream>>>(
-        gate, input, ids, output, k, rows, row_stride, input_stride,
-        rows * experts_used, rows * row_stride, rows, 1, experts_used, up);
-  } else {
-    GGML_ASSERT(type == GGML_TYPE_Q5_K);
-    mul_mat_vec_q_moe<GGML_TYPE_Q5_K, 2, true><<<grid, block, 0, stream>>>(
-        gate, input, ids, output, k, rows, row_stride, input_stride,
-        rows * experts_used, rows * row_stride, rows, 1, experts_used, up);
-  }
+  dispatch_gated([&](auto tag) {
+    mul_mat_vec_q_moe<decltype(tag)::value, 2, true>
+        <<<grid, block, 0, stream>>>(
+            gate, input, ids, output, k, rows, row_stride, input_stride,
+            rows * experts_used, rows * row_stride, rows, 1, experts_used, up);
+  });
 }
 
 }  // namespace qfn_mmq
