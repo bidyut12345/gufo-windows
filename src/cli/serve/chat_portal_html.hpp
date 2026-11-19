@@ -337,6 +337,7 @@ inline constexpr std::string_view kChatPortalHtml = R"rawhtml(<!DOCTYPE html>
       cursor: pointer;
       user-select: none;
       transition: all 0.15s;
+      min-eight: 37px;
     }
     .chat-item:hover {
       background: var(--bg-card);
