@@ -13,65 +13,83 @@ SCHEMA = "gufo.minimax-h3-source.v1"
 REPOSITORY = "MiniMaxAI/MiniMax-H3"
 REVISION = "42ed227ee7df40d41602854ae760620d6eb651fe"
 MODEL_KIND = "minimax-h3-fl2va-bf16"
+REF2VA_MODEL_KIND = "minimax-h3-ref2va-bf16"
 REFERENCE_REPOSITORY = "antirez/h3.c"
 REFERENCE_REVISION = "8974cc055ea9c02fcd14cc27dfda3e1027c05153"
 LICENSE_SHA256 = (
     "59b99642b95ea21630e311198ddbfffbfe05aadba0c2f5d884cbdf4efcc90f44"
 )
 
-REQUIRED_FILES = {
-    "LICENSE",
-    "README.md",
-    "model_index.json",
-    "FL2VA/model_index.json",
-    "FL2VA/transformer/config.json",
-    "FL2VA/transformer/model.safetensors.index.json",
-    "FL2VA/text_encoder/config.json",
-    "FL2VA/text_encoder/model.safetensors.index.json",
-    "FL2VA/tokenizer/merges.txt",
-    "FL2VA/tokenizer/tokenizer_config.json",
-    "FL2VA/tokenizer/tokenizer.json",
-    "FL2VA/tokenizer/vocab.json",
-    "FL2VA/processor/chat_template.json",
-    "FL2VA/processor/preprocessor_config.json",
-    "FL2VA/processor/tokenizer_config.json",
-    "FL2VA/processor/tokenizer.json",
-    "FL2VA/processor/video_preprocessor_config.json",
-    "FL2VA/processor/vocab.json",
-    "FL2VA/video_vae/config.json",
-    "FL2VA/video_vae/source/config.json",
-    "FL2VA/video_vae/source/model.safetensors",
-    "FL2VA/audio_vae/config.json",
-    "FL2VA/audio_vae/metadata.json",
-    "FL2VA/audio_vae/model.safetensors",
-}
+def _variant_dir(variant: str) -> str:
+    if variant == "fl2va":
+        return "FL2VA"
+    if variant == "ref2va":
+        return "Ref2VA"
+    raise H3ManifestError(f"unsupported MiniMax H3 variant: {variant!r}")
 
-COMPONENTS = (
-    {
-        "name": "text_encoder",
-        "directory": "FL2VA/text_encoder",
-        "index": "model.safetensors.index.json",
-        "allowed_dtypes": {"BF16"},
-    },
-    {
-        "name": "transformer",
-        "directory": "FL2VA/transformer",
-        "index": "model.safetensors.index.json",
-        "allowed_dtypes": {"BF16", "F32"},
-    },
-    {
-        "name": "video_vae",
-        "directory": "FL2VA/video_vae/source",
-        "index": None,
-        "allowed_dtypes": {"F32"},
-    },
-    {
-        "name": "audio_vae",
-        "directory": "FL2VA/audio_vae",
-        "index": None,
-        "allowed_dtypes": {"F32"},
-    },
-)
+
+def _required_files(variant: str) -> set[str]:
+    v = _variant_dir(variant)
+    return {
+        "LICENSE",
+        "README.md",
+        "model_index.json",
+        f"{v}/model_index.json",
+        f"{v}/transformer/config.json",
+        f"{v}/transformer/model.safetensors.index.json",
+        f"{v}/text_encoder/config.json",
+        f"{v}/text_encoder/model.safetensors.index.json",
+        f"{v}/tokenizer/merges.txt",
+        f"{v}/tokenizer/tokenizer_config.json",
+        f"{v}/tokenizer/tokenizer.json",
+        f"{v}/tokenizer/vocab.json",
+        f"{v}/processor/chat_template.json",
+        f"{v}/processor/preprocessor_config.json",
+        f"{v}/processor/tokenizer_config.json",
+        f"{v}/processor/tokenizer.json",
+        f"{v}/processor/video_preprocessor_config.json",
+        f"{v}/processor/vocab.json",
+        f"{v}/video_vae/config.json",
+        f"{v}/video_vae/source/config.json",
+        f"{v}/video_vae/source/model.safetensors",
+        f"{v}/audio_vae/config.json",
+        f"{v}/audio_vae/metadata.json",
+        f"{v}/audio_vae/model.safetensors",
+    }
+
+
+def _components(variant: str) -> tuple[dict, ...]:
+    v = _variant_dir(variant)
+    return (
+        {
+            "name": "text_encoder",
+            "directory": f"{v}/text_encoder",
+            "index": "model.safetensors.index.json",
+            "allowed_dtypes": {"BF16"},
+        },
+        {
+            "name": "transformer",
+            "directory": f"{v}/transformer",
+            "index": "model.safetensors.index.json",
+            "allowed_dtypes": {"BF16", "F32"},
+        },
+        {
+            "name": "video_vae",
+            "directory": f"{v}/video_vae/source",
+            "index": None,
+            "allowed_dtypes": {"F32"},
+        },
+        {
+            "name": "audio_vae",
+            "directory": f"{v}/audio_vae",
+            "index": None,
+            "allowed_dtypes": {"F32"},
+        },
+    )
+
+
+REQUIRED_FILES = _required_files("fl2va")
+COMPONENTS = _components("fl2va")
 
 
 class H3ManifestError(Exception):
@@ -117,20 +135,27 @@ def _artifact_files(root: Path) -> list[Path]:
     return sorted(files, key=lambda path: path.relative_to(root).as_posix())
 
 
-def _validate_selected_tree(root: Path, files: list[Path]) -> None:
+def _validate_selected_tree(
+    root: Path, files: list[Path], variant: str = "fl2va"
+) -> None:
+    v = _variant_dir(variant)
     relative_files = {path.relative_to(root).as_posix() for path in files}
-    missing = REQUIRED_FILES - relative_files
+    missing = _required_files(variant) - relative_files
     if missing:
         raise H3ManifestError(f"required files missing: {sorted(missing)}")
 
-    unsupported_roots = ("Ref2VA", "H3-Regenerate-2K", "Regenerate-2K")
+    disallowed_variant = "Ref2VA" if variant == "fl2va" else "FL2VA"
+    unsupported_roots = (disallowed_variant, "H3-Regenerate-2K", "Regenerate-2K")
     for name in unsupported_roots:
         if (root / name).exists():
             raise H3ManifestError(f"unsupported H3 artifact is present: {name}")
 
     for relative in sorted(relative_files):
         lowered = relative.lower()
-        if "regenerate-2k" in lowered or "/ref2va/" in f"/{lowered}/":
+        if (
+            "regenerate-2k" in lowered
+            or f"/{disallowed_variant.lower()}/" in f"/{lowered}/"
+        ):
             raise H3ManifestError(f"unsupported H3 artifact file: {relative}")
         if Path(relative).suffix.lower() in {".bin", ".pt", ".pth", ".ckpt"}:
             raise H3ManifestError(
@@ -154,16 +179,19 @@ def _metadata_for(root: Path, relative: str) -> tuple[str, str]:
     return revision, upstream_blob
 
 
-def _validate_indexes_and_configs(root: Path) -> dict:
+def _validate_indexes_and_configs(
+    root: Path, variant: str = "fl2va"
+) -> dict:
+    v = _variant_dir(variant)
     repository_index = _load_json(root / "model_index.json")
-    fl2va_index = _load_json(root / "FL2VA" / "model_index.json")
-    transformer = _load_json(root / "FL2VA" / "transformer" / "config.json")
-    text_encoder = _load_json(root / "FL2VA" / "text_encoder" / "config.json")
+    variant_index = _load_json(root / v / "model_index.json")
+    transformer = _load_json(root / v / "transformer" / "config.json")
+    text_encoder = _load_json(root / v / "text_encoder" / "config.json")
     tokenizer = _load_json(
-        root / "FL2VA" / "tokenizer" / "tokenizer_config.json"
+        root / v / "tokenizer" / "tokenizer_config.json"
     )
     audio_metadata = _load_json(
-        root / "FL2VA" / "audio_vae" / "metadata.json"
+        root / v / "audio_vae" / "metadata.json"
     )
 
     _require_equal(
@@ -172,23 +200,24 @@ def _validate_indexes_and_configs(root: Path) -> dict:
         "repository model class",
     )
     _require_equal(
-        fl2va_index.get("_class_name"),
+        variant_index.get("_class_name"),
         "MiniMaxH3Pipeline",
-        "FL2VA model class",
+        f"{v} model class",
     )
-    minimax = fl2va_index.get("_minimax_h3")
+    minimax = variant_index.get("_minimax_h3")
     if not isinstance(minimax, dict):
-        raise H3ManifestError("FL2VA model index lacks _minimax_h3 metadata")
-    _require_equal(minimax.get("schema_version"), 1, "FL2VA schema version")
-    _require_equal(minimax.get("partition"), "fl2va", "FL2VA partition")
+        raise H3ManifestError(f"{v} model index lacks _minimax_h3 metadata")
+    _require_equal(minimax.get("schema_version"), 1, f"{v} schema version")
+    _require_equal(minimax.get("partition"), variant, f"{v} partition")
     _require_equal(
         minimax.get("sigma_shift_scales"),
         {"video": 12.0, "audio": 3.0},
-        "FL2VA sigma shift scales",
+        f"{v} sigma shift scales",
     )
     tasks = minimax.get("tasks")
-    if not isinstance(tasks, list) or "t2va" not in tasks:
-        raise H3ManifestError("FL2VA model index does not declare t2va")
+    expected_task = "t2va" if variant == "fl2va" else "ref2va"
+    if not isinstance(tasks, list) or expected_task not in tasks:
+        raise H3ManifestError(f"{v} model index does not declare {expected_task}")
 
     expected_transformer = {
         "_class_name": "MiniMaxH3DiTModel",
@@ -248,9 +277,13 @@ def _validate_indexes_and_configs(root: Path) -> dict:
 
     return {
         "repository_model_class": repository_index["_class_name"],
-        "fl2va_model_class": fl2va_index["_class_name"],
+        f"{variant}_model_class": variant_index["_class_name"],
         "upstream_declared_tasks": tasks,
-        "runtime_capabilities": ["text-to-audio-video"],
+        "runtime_capabilities": (
+            ["text-to-audio-video"]
+            if variant == "fl2va"
+            else ["reference-to-audio-video"]
+        ),
         "text_encoder": {
             "architecture": "Qwen3-VL-32B",
             "source_layers": text_config["num_hidden_layers"],
@@ -274,10 +307,12 @@ def _validate_indexes_and_configs(root: Path) -> dict:
     }
 
 
-def _component_inventory(root: Path) -> tuple[list[dict], list[dict]]:
+def _component_inventory(
+    root: Path, variant: str = "fl2va"
+) -> tuple[list[dict], list[dict]]:
     components = []
     tensors = []
-    for component in COMPONENTS:
+    for component in _components(variant):
         directory = root / component["directory"]
         index_path = (
             directory / component["index"] if component["index"] else None
@@ -334,15 +369,17 @@ def _component_inventory(root: Path) -> tuple[list[dict], list[dict]]:
     return components, tensors
 
 
-def build_manifest(root: Path, *, progress: bool = False) -> dict:
+def build_manifest(
+    root: Path, *, variant: str = "fl2va", progress: bool = False
+) -> dict:
     root = Path(root).resolve()
     if not root.is_dir():
         raise H3ManifestError(f"model root is not a directory: {root}")
 
     files = _artifact_files(root)
-    _validate_selected_tree(root, files)
-    contract = _validate_indexes_and_configs(root)
-    components, tensors = _component_inventory(root)
+    _validate_selected_tree(root, files, variant=variant)
+    contract = _validate_indexes_and_configs(root, variant=variant)
+    components, tensors = _component_inventory(root, variant=variant)
 
     file_inventory = []
     total_bytes = 0
@@ -374,9 +411,11 @@ def build_manifest(root: Path, *, progress: bool = False) -> dict:
         license_entry["sha256"], LICENSE_SHA256, "MiniMax H3 license hash"
     )
 
+    model_kind = MODEL_KIND if variant == "fl2va" else REF2VA_MODEL_KIND
+    other_variant = "Ref2VA" if variant == "fl2va" else "FL2VA"
     return {
         "schema": SCHEMA,
-        "model_kind": MODEL_KIND,
+        "model_kind": model_kind,
         "repository": REPOSITORY,
         "revision": REVISION,
         "source_storage": "mixed BF16/F32 safetensors",
@@ -400,7 +439,7 @@ def build_manifest(root: Path, *, progress: bool = False) -> dict:
         "tensor_count": len(tensors),
         "tensors": tensors,
         "unsupported": [
-            "Ref2VA",
+            other_variant,
             "H3-Regenerate-2K",
             "arbitrary revisions",
             "pickle checkpoints",
@@ -415,9 +454,17 @@ def write_manifest(path: Path, manifest: dict) -> None:
     path.write_bytes(_canonical_bytes(manifest))
 
 
-def verify_manifest(root: Path, manifest_path: Path, *, progress: bool = False):
+def verify_manifest(
+    root: Path, manifest_path: Path, *, variant: str | None = None, progress: bool = False
+):
     expected = _load_json(Path(manifest_path))
-    actual = build_manifest(root, progress=progress)
+    if variant is None:
+        variant = (
+            "ref2va"
+            if expected.get("model_kind") == REF2VA_MODEL_KIND
+            else "fl2va"
+        )
+    actual = build_manifest(root, variant=variant, progress=progress)
     expected_bytes = _canonical_bytes(expected)
     actual_bytes = _canonical_bytes(actual)
     if expected_bytes != actual_bytes:

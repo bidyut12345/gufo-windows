@@ -73,6 +73,18 @@ struct KeyframePresentation {
   std::vector<std::int32_t> rope_positions;  // [rows][3] (t, h, w)
 };
 
+struct MultimodalBlock {
+  std::string prefix_label;
+  bool is_video{false};
+  int grid_h{0};
+  int grid_w{0};
+};
+
+[[nodiscard]] bool BuildMultimodalPresentation(
+    const Tokenizer& tokenizer, std::string_view prompt,
+    std::span<const MultimodalBlock> blocks, KeyframePresentation* output,
+    std::string* error = nullptr);
+
 // `grids` are the per-keyframe vision patch grids in packed order (the same
 // order as KeyframeVision grid_h/grid_w): rows = grid_h * grid_w, merged
 // half-grids define the marker expansion count (grid_h * grid_w / 4).
@@ -98,6 +110,13 @@ struct KeyframePresentation {
 [[nodiscard]] bool EncodePromptMultimodal(
     const ModelInventory& inventory, const Tokenizer& tokenizer,
     std::string_view prompt, const std::vector<KeyframeVision>& keyframes,
+    const CancellationToken* cancellation, PromptEmbedding* output,
+    PromptEncoderTelemetry* telemetry, std::string* error = nullptr);
+
+[[nodiscard]] bool EncodePromptWithVisions(
+    const ModelInventory& inventory, const Tokenizer& tokenizer,
+    std::string_view prompt, std::span<const MultimodalBlock> blocks,
+    const std::vector<KeyframeVision>& visions,
     const CancellationToken* cancellation, PromptEmbedding* output,
     PromptEncoderTelemetry* telemetry, std::string* error = nullptr);
 

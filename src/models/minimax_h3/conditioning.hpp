@@ -60,6 +60,15 @@ struct PreparedKeyframe {
                                         VideoVaeTelemetry* telemetry,
                                         std::string* error);
 
+// Encodes a decoded 24 fps reference video (snapped down to 17*n + 5 frames)
+// through the causal 3D VisualVAE encoder, posterior-sampled with seed 42,
+// fp16-rounded, and channel-normalized.
+[[nodiscard]] bool EncodeVideoReferenceLatent(
+    const ModelInventory& inventory, std::span<const std::uint8_t> rgb24,
+    int num_frames, int width, int height,
+    const CancellationToken* cancellation, VideoVaeTelemetry* telemetry,
+    std::vector<float>* latent, int* out_latent_frames, std::string* error);
+
 // mixed = t * latent + (1 - t) * augmentation evaluated in float32 with the
 // reference's separate multiply/add rounding (no fused contraction) and
 // t = kH3KeyframeConditionTimestep. `augmentation` must cover the latent.

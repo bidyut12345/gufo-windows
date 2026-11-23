@@ -672,31 +672,76 @@ bool GenerateTextVideo(const GenerationRequest& request,
     }
     return false;
   }
-  const bool conditioned =
+  const bool has_keyframes =
       !request.first_frame_path.empty() || !request.last_frame_path.empty();
+  const bool has_references = !request.reference_images.empty();
+  const bool has_videos = !request.reference_videos.empty();
+  const bool has_ref2va = has_references || has_videos;
+  if (request.reference_images.size() > 9U) {
+    SetError(error, "MiniMax H3 Ref2VA accepts at most 9 reference images");
+    return false;
+  }
+  if (request.reference_videos.size() > 3U) {
+    SetError(error, "MiniMax H3 Ref2VA accepts at most 3 reference videos");
+    return false;
+  }
+  if (request.reference_images.size() + request.reference_videos.size() > 12U) {
+    SetError(error, "MiniMax H3 Ref2VA accepts at most 12 references in total");
+    return false;
+  }
   // The geometry anchor (packed index 0: the first keyframe, or a lone last
-  // one) selects the canvas before any model work, as the released resize
-  // step does; the text-only path keeps the preset canvas untouched.
+  // one) selects the canvas before any model work unless
+  // lock_canvas_to_preset is set or Ref2VA references are present; Ref2VA
+  // references never bind the output canvas.
   GenerationParameters parameters = request.parameters;
   core::Image first_image;
   core::Image last_image;
-  if (conditioned) {
+  if (has_keyframes) {
     if ((!request.first_frame_path.empty() &&
          !DecodeKeyframe(request.first_frame_path, &first_image, error)) ||
         (!request.last_frame_path.empty() &&
          !DecodeKeyframe(request.last_frame_path, &last_image, error))) {
       return false;
     }
-    const core::Image& anchor =
-        request.first_frame_path.empty() ? last_image : first_image;
-    auto resolved = ResolveKeyframeParameters(
-        request.parameters, static_cast<int>(anchor.width),
-        static_cast<int>(anchor.height), error);
-    if (!resolved.has_value() ||
-        !ValidateGenerationParameters(*resolved, error)) {
-      return false;
+    if (!request.lock_canvas_to_preset && !has_ref2va) {
+      const core::Image& anchor =
+          request.first_frame_path.empty() ? last_image : first_image;
+      auto resolved = ResolveKeyframeParameters(
+          request.parameters, static_cast<int>(anchor.width),
+          static_cast<int>(anchor.height), error);
+      if (!resolved.has_value() ||
+          !ValidateGenerationParameters(*resolved, error)) {
+        return false;
+      }
+      parameters = std::move(*resolved);
     }
-    parameters = std::move(*resolved);
+  }
+  std::vector<core::Image> ref_images;
+  if (has_references) {
+    ref_images.resize(request.reference_images.size());
+    for (std::size_t i = 0; i < request.reference_images.size(); ++i) {
+      if (!DecodeKeyframe(request.reference_images[i], &ref_images[i], error)) {
+        return false;
+      }
+      const std::uint64_t w = ref_images[i].width;
+      const std::uint64_t h = ref_images[i].height;
+      if (w > 4U * h || h > 4U * w) {
+        SetError(error,
+                 "MiniMax H3 reference image aspect ratio must be within 1:4 "
+                 "to 4:1");
+        return false;
+      }
+    }
+  }
+  std::vector<DecodedReferenceVideo> ref_videos;
+  if (has_videos) {
+    ref_videos.resize(request.reference_videos.size());
+    for (std::size_t i = 0; i < request.reference_videos.size(); ++i) {
+      if (!DecodeReferenceVideo(request.reference_videos[i], parameters.frames,
+                                &ref_videos[i], error)) {
+        return false;
+      }
+    }
   }
   GenerationTelemetry local;
   local.internal_width = parameters.internal_width;
@@ -712,14 +757,22 @@ bool GenerateTextVideo(const GenerationRequest& request,
   if (!inventory.has_value()) {
     return false;
   }
+  if (has_ref2va && !inventory->is_ref2va()) {
+    SetError(
+        error,
+        "MiniMax H3 reference images/videos require the Ref2VA model checkpoint");
+    return false;
+  }
   local.inventory = inventory->telemetry();
   Report(progress, progress_opaque, "inventory", 1, 1);
 
   begin = Clock::now();
   Tokenizer tokenizer;
   std::vector<std::uint32_t> tokens;
-  if (!Tokenizer::Load(request.model_root / "FL2VA/tokenizer/tokenizer.json",
-                       &tokenizer, error) ||
+  if (!Tokenizer::Load(
+          request.model_root / inventory->variant_dir() /
+              "tokenizer/tokenizer.json",
+          &tokenizer, error) ||
       !tokenizer.EncodePrompt(request.prompt, &tokens, error) ||
       tokens.empty()) {
     return false;
@@ -729,25 +782,50 @@ bool GenerateTextVideo(const GenerationRequest& request,
 
   Report(progress, progress_opaque, "prompt", 0, 1);
   // Reference workflow order (modular_blocks_minimax_h3.py): resize onto the
-  // canvas by the index rule, present keyframes to the prompt encoder, then
-  // VisualVAE-encode. Anchor latents depend only on pixels (fixed posterior
-  // seed), so their order against the prompt stream is numerically neutral.
+  // canvas by the index rule, present keyframes/references to the prompt
+  // encoder, then VisualVAE-encode. Anchor latents depend only on pixels (fixed
+  // posterior seed), so their order against the prompt stream is numerically
+  // neutral.
   std::vector<PreparedKeyframe> keyframes;
-  if (conditioned) {
+  if (has_references) {
+    constexpr double kReferenceImageShortEdge = 2048.0;
+    for (const core::Image& ref : ref_images) {
+      const double w = static_cast<double>(ref.width);
+      const double h = static_cast<double>(ref.height);
+      const double scale = kReferenceImageShortEdge / std::min(w, h);
+      const int target_h = std::max(
+          kH3CanvasMultiple,
+          static_cast<int>(std::llround(
+              std::nearbyint(h * scale / kH3CanvasMultiple))) *
+              kH3CanvasMultiple);
+      const int target_w = std::max(
+          kH3CanvasMultiple,
+          static_cast<int>(std::llround(
+              std::nearbyint(w * scale / kH3CanvasMultiple))) *
+              kH3CanvasMultiple);
+      keyframes.emplace_back();
+      if (!PrepareKeyframe(ref, target_w, target_h, false, &keyframes.back(),
+                           error)) {
+        return false;
+      }
+    }
+  }
+  if (has_keyframes) {
     const int canvas_width = parameters.internal_width;
     const int canvas_height = parameters.internal_height;
+    const bool lock_fit = request.lock_canvas_to_preset || has_ref2va;
     if (!request.first_frame_path.empty()) {
       keyframes.emplace_back();
-      if (!PrepareKeyframe(first_image, canvas_width, canvas_height, false,
-                           &keyframes.back(), error)) {
+      if (!PrepareKeyframe(first_image, canvas_width, canvas_height,
+                           lock_fit, &keyframes.back(), error)) {
         return false;
       }
     }
     if (!request.last_frame_path.empty()) {
       // A lone last keyframe is packed index 0: the released geometry
       // anchor stretches it (before_encoder.py), while a follower beside a
-      // first keyframe takes the aspect-cover crop.
-      const bool follower = !keyframes.empty();
+      // first keyframe (or a locked canvas / Ref2VA combined) takes cover-crop.
+      const bool follower = lock_fit || !request.first_frame_path.empty();
       keyframes.emplace_back();
       if (!PrepareKeyframe(last_image, canvas_width, canvas_height, follower,
                            &keyframes.back(), error)) {
@@ -757,25 +835,95 @@ bool GenerateTextVideo(const GenerationRequest& request,
   }
   begin = Clock::now();
   PromptEmbedding embedding;
-  if (keyframes.empty()) {
+  if (keyframes.empty() && ref_videos.empty()) {
     if (!EncodePromptLayer50(*inventory, tokens, {}, cancellation, &embedding,
                              &local.prompt_encoder, error)) {
       return false;
     }
   } else {
-    std::vector<KeyframeVision> keyframe_visions;
-    keyframe_visions.reserve(keyframes.size());
-    for (const PreparedKeyframe& keyframe : keyframes) {
+    std::vector<MultimodalBlock> vision_blocks;
+    std::vector<KeyframeVision> visions;
+    for (std::size_t i = 0; i < keyframes.size(); ++i) {
       KeyframeVision vision;
       if (!image_processor::BuildKeyframeVision(
-              keyframe.rgb, keyframe.width, keyframe.height, &vision, error)) {
+              keyframes[i].rgb, keyframes[i].width, keyframes[i].height,
+              &vision, error)) {
         return false;
       }
-      keyframe_visions.push_back(std::move(vision));
+      vision_blocks.push_back(
+          {.prefix_label = "<Picture " + std::to_string(i + 1) + ">: ",
+           .is_video = false,
+           .grid_h = vision.grid_h,
+           .grid_w = vision.grid_w});
+      visions.push_back(std::move(vision));
     }
-    if (!EncodePromptMultimodal(*inventory, tokenizer, request.prompt,
-                                keyframe_visions, cancellation, &embedding,
-                                &local.prompt_encoder, error)) {
+    for (std::size_t v = 0; v < ref_videos.size(); ++v) {
+      const DecodedReferenceVideo& vid = ref_videos[v];
+      // Sample at 2 fps from 24 fps (stride = 12.0), merge in pairs.
+      constexpr double kSampleFps = 2.0;
+      constexpr double kStride = 24.0 / kSampleFps;
+      std::vector<int> indices;
+      double cursor = 0.0;
+      while (static_cast<int>(std::llround(cursor)) < vid.frame_count) {
+        const int idx = static_cast<int>(std::llround(cursor));
+        if (indices.empty() || idx > indices.back()) {
+          indices.push_back(idx);
+        }
+        cursor += kStride;
+      }
+      if (indices.size() < 2U) {
+        SetError(error,
+                 "MiniMax H3 reference video is too short for 2 fps sampling");
+        return false;
+      }
+      std::vector<double> timestamps;
+      timestamps.reserve(indices.size() + 1U);
+      for (std::size_t k = 0; k < indices.size(); ++k) {
+        timestamps.push_back(static_cast<double>(k) / kSampleFps);
+      }
+      if (timestamps.size() % 2U != 0U) {
+        indices.push_back(indices.back());
+        timestamps.push_back(timestamps.back());
+      }
+      const std::size_t frame_bytes =
+          static_cast<std::size_t>(vid.width) * vid.height * 3U;
+      for (std::size_t p = 0; p < indices.size(); p += 2U) {
+        KeyframeVision vision;
+        const std::uint8_t* f0 =
+            vid.rgb24.data() + static_cast<std::size_t>(indices[p]) * frame_bytes;
+        const std::uint8_t* f1 =
+            vid.rgb24.data() +
+            static_cast<std::size_t>(indices[p + 1U]) * frame_bytes;
+        if (!image_processor::BuildVideoPairVision(
+                f0, f1, vid.width, vid.height, &vision, error)) {
+          if (error != nullptr && error->empty()) {
+            SetError(error, "MiniMax H3 BuildVideoPairVision failed (" +
+                                std::to_string(vid.width) + "x" +
+                                std::to_string(vid.height) + ", frames=" +
+                                std::to_string(vid.frame_count) + ")");
+          }
+          return false;
+        }
+        const double mean_ts = (timestamps[p] + timestamps[p + 1U]) * 0.5;
+        std::ostringstream label;
+        if (p == 0U) {
+          label << "<Video " << (v + 1) << ">: ";
+        }
+        label << "<" << std::fixed << std::setprecision(1) << mean_ts
+              << " seconds>";
+        vision_blocks.push_back({.prefix_label = label.str(),
+                                 .is_video = true,
+                                 .grid_h = vision.grid_h,
+                                 .grid_w = vision.grid_w});
+        visions.push_back(std::move(vision));
+      }
+    }
+    if (!EncodePromptWithVisions(*inventory, tokenizer, request.prompt,
+                                 vision_blocks, visions, cancellation,
+                                 &embedding, &local.prompt_encoder, error)) {
+      if (error != nullptr && error->empty()) {
+        SetError(error, "MiniMax H3 EncodePromptWithVisions failed");
+      }
       return false;
     }
   }
@@ -795,8 +943,10 @@ bool GenerateTextVideo(const GenerationRequest& request,
       static_cast<std::size_t>(geometry->latent_width);
   std::vector<float> condition_rows;
   std::vector<double> anchor_temporal;
+  std::vector<ConditionBlock> condition_blocks;
+  double target_temporal_origin = 0.0;
   std::optional<InitialNoise> noise;
-  if (!conditioned) {
+  if (!has_keyframes && !has_references && !has_videos) {
     noise =
         BuildInitialNoise(request.seed, video_elements, kH3AudioLatentChannels,
                           geometry->temporal.audio_latent_frames, error);
@@ -804,52 +954,174 @@ bool GenerateTextVideo(const GenerationRequest& request,
       return false;
     }
   } else {
-    const std::size_t latent_elements =
-        kH3VideoVaeLatentChannels *
-        static_cast<std::size_t>(geometry->latent_height) *
-        static_cast<std::size_t>(geometry->latent_width);
-    for (PreparedKeyframe& keyframe : keyframes) {
-      if (!EncodeKeyframeLatent(*inventory, keyframe, cancellation, nullptr,
+    const std::size_t ref_count = ref_images.size();
+    std::vector<std::size_t> cond_latent_sizes;
+    cond_latent_sizes.reserve(keyframes.size() + ref_videos.size());
+    for (std::size_t i = 0; i < ref_count; ++i) {
+      if (!EncodeKeyframeLatent(*inventory, keyframes[i], cancellation, nullptr,
                                 error)) {
         return false;
       }
+      const std::size_t lh =
+          static_cast<std::size_t>(keyframes[i].height / kH3VaeSpatialRatio);
+      const std::size_t lw =
+          static_cast<std::size_t>(keyframes[i].width / kH3VaeSpatialRatio);
+      cond_latent_sizes.push_back(kH3VideoVaeLatentChannels * lh * lw);
+    }
+    struct EncodedVideoRef {
+      std::vector<float> latent;
+      int latent_frames{0};
+      int latent_height{0};
+      int latent_width{0};
+    };
+    std::vector<EncodedVideoRef> encoded_videos(ref_videos.size());
+    for (std::size_t v = 0; v < ref_videos.size(); ++v) {
+      Report(progress, progress_opaque, "video_ref_vae", static_cast<int>(v),
+             static_cast<int>(ref_videos.size()));
+      const DecodedReferenceVideo& vid = ref_videos[v];
+      if (!EncodeVideoReferenceLatent(
+              *inventory, vid.rgb24, vid.frame_count, vid.width, vid.height,
+              cancellation, nullptr, &encoded_videos[v].latent,
+              &encoded_videos[v].latent_frames, error)) {
+        return false;
+      }
+      Report(progress, progress_opaque, "video_ref_vae",
+             static_cast<int>(v + 1), static_cast<int>(ref_videos.size()));
+      encoded_videos[v].latent_height = vid.height / kH3VaeSpatialRatio;
+      encoded_videos[v].latent_width = vid.width / kH3VaeSpatialRatio;
+      cond_latent_sizes.push_back(encoded_videos[v].latent.size());
+    }
+    for (std::size_t i = ref_count; i < keyframes.size(); ++i) {
+      if (!EncodeKeyframeLatent(*inventory, keyframes[i], cancellation, nullptr,
+                                error)) {
+        return false;
+      }
+      const std::size_t lh =
+          static_cast<std::size_t>(keyframes[i].height / kH3VaeSpatialRatio);
+      const std::size_t lw =
+          static_cast<std::size_t>(keyframes[i].width / kH3VaeSpatialRatio);
+      cond_latent_sizes.push_back(kH3VideoVaeLatentChannels * lh * lw);
     }
     // Request-stream consumption order (before_denoise.py): one augmentation
-    // tensor per keyframe in packed order, then video, then audio.
+    // tensor per condition in packed order, then video, then audio.
     noise = BuildInitialNoise(
-        request.seed,
-        std::vector<std::size_t>(keyframes.size(), latent_elements),
-        video_elements, kH3AudioLatentChannels,
-        geometry->temporal.audio_latent_frames, error);
+        request.seed, cond_latent_sizes, video_elements,
+        kH3AudioLatentChannels, geometry->temporal.audio_latent_frames, error);
     if (!noise.has_value()) {
       return false;
     }
-    const std::size_t rows_per_keyframe =
-        static_cast<std::size_t>(geometry->latent_height / 2) *
-        static_cast<std::size_t>(geometry->latent_width / 2);
-    for (std::size_t index = 0; index < keyframes.size(); ++index) {
+    std::size_t noise_idx = 0;
+    double rotary_time = static_cast<double>(embedding.tokens);
+    // 1. Image references
+    for (std::size_t i = 0; i < ref_count; ++i, ++noise_idx) {
       std::vector<float> mixed;
-      if (!MixKeyframeNoise(keyframes[index], noise->conditions[index], &mixed,
+      if (!MixKeyframeNoise(keyframes[i], noise->conditions[noise_idx], &mixed,
                             error)) {
         return false;
       }
+      const int lh = keyframes[i].height / kH3VaeSpatialRatio;
+      const int lw = keyframes[i].width / kH3VaeSpatialRatio;
+      const std::size_t rows_for_cond =
+          static_cast<std::size_t>(lh / 2) * static_cast<std::size_t>(lw / 2);
       const std::size_t offset = condition_rows.size();
-      condition_rows.resize(offset + rows_per_keyframe * kH3VideoPatchWidth);
-      if (!PatchifyVideo(mixed, kH3VideoLatentChannels, 1,
-                         geometry->latent_height, geometry->latent_width,
+      condition_rows.resize(offset + rows_for_cond * kH3VideoPatchWidth);
+      if (!PatchifyVideo(mixed, kH3VideoLatentChannels, 1, lh, lw,
                          std::span<float>(condition_rows).subspan(offset),
                          error)) {
         return false;
       }
+      condition_blocks.push_back({lh, lw, rotary_time, 1});
+      rotary_time += 1.0;
     }
-    auto anchors = KeyframeAnchorTimes(embedding.tokens,
-                                       geometry->temporal.video_latent_frames,
-                                       !request.first_frame_path.empty(),
-                                       !request.last_frame_path.empty(), error);
-    if (!anchors.has_value()) {
-      return false;
+    // 2. Video references
+    for (std::size_t v = 0; v < encoded_videos.size(); ++v, ++noise_idx) {
+      const EncodedVideoRef& ev = encoded_videos[v];
+      PreparedKeyframe tmp;
+      tmp.latent = ev.latent;
+      std::vector<float> mixed;
+      if (!MixKeyframeNoise(tmp, noise->conditions[noise_idx], &mixed, error)) {
+        return false;
+      }
+      const std::size_t rows_for_cond =
+          static_cast<std::size_t>(ev.latent_frames) *
+          static_cast<std::size_t>(ev.latent_height / 2) *
+          static_cast<std::size_t>(ev.latent_width / 2);
+      const std::size_t offset = condition_rows.size();
+      condition_rows.resize(offset + rows_for_cond * kH3VideoPatchWidth);
+      if (!PatchifyVideo(mixed, kH3VideoLatentChannels, ev.latent_frames,
+                         ev.latent_height, ev.latent_width,
+                         std::span<float>(condition_rows).subspan(offset),
+                         error)) {
+        return false;
+      }
+      condition_blocks.push_back(
+          {ev.latent_height, ev.latent_width, rotary_time, ev.latent_frames});
+      rotary_time += VideoConditionRotarySpan(ev.latent_frames);
     }
-    anchor_temporal = std::move(*anchors);
+    // 3. Keyframes (FL2VA or combined with Ref2VA)
+    if (has_ref2va) {
+      target_temporal_origin = rotary_time;
+      for (std::size_t i = ref_count; i < keyframes.size(); ++i, ++noise_idx) {
+        std::vector<float> mixed;
+        if (!MixKeyframeNoise(keyframes[i], noise->conditions[noise_idx],
+                              &mixed, error)) {
+          return false;
+        }
+        const int lh = keyframes[i].height / kH3VaeSpatialRatio;
+        const int lw = keyframes[i].width / kH3VaeSpatialRatio;
+        const std::size_t rows_for_cond =
+            static_cast<std::size_t>(lh / 2) * static_cast<std::size_t>(lw / 2);
+        const std::size_t offset = condition_rows.size();
+        condition_rows.resize(offset + rows_for_cond * kH3VideoPatchWidth);
+        if (!PatchifyVideo(mixed, kH3VideoLatentChannels, 1, lh, lw,
+                           std::span<float>(condition_rows).subspan(offset),
+                           error)) {
+          return false;
+        }
+      }
+      if (has_keyframes) {
+        const std::size_t base_tokens =
+            static_cast<std::size_t>(std::llround(target_temporal_origin));
+        auto anchors = KeyframeAnchorTimes(
+            base_tokens, geometry->temporal.video_latent_frames,
+            !request.first_frame_path.empty(), !request.last_frame_path.empty(),
+            error);
+        if (!anchors.has_value()) {
+          return false;
+        }
+        for (const double anchor_time : *anchors) {
+          condition_blocks.push_back(
+              {geometry->latent_height, geometry->latent_width, anchor_time, 1});
+        }
+      }
+    } else if (has_keyframes) {
+      for (std::size_t i = 0; i < keyframes.size(); ++i, ++noise_idx) {
+        std::vector<float> mixed;
+        if (!MixKeyframeNoise(keyframes[i], noise->conditions[noise_idx],
+                              &mixed, error)) {
+          return false;
+        }
+        const int lh = keyframes[i].height / kH3VaeSpatialRatio;
+        const int lw = keyframes[i].width / kH3VaeSpatialRatio;
+        const std::size_t rows_for_cond =
+            static_cast<std::size_t>(lh / 2) * static_cast<std::size_t>(lw / 2);
+        const std::size_t offset = condition_rows.size();
+        condition_rows.resize(offset + rows_for_cond * kH3VideoPatchWidth);
+        if (!PatchifyVideo(mixed, kH3VideoLatentChannels, 1, lh, lw,
+                           std::span<float>(condition_rows).subspan(offset),
+                           error)) {
+          return false;
+        }
+      }
+      auto anchors = KeyframeAnchorTimes(
+          embedding.tokens, geometry->temporal.video_latent_frames,
+          !request.first_frame_path.empty(), !request.last_frame_path.empty(),
+          error);
+      if (!anchors.has_value()) {
+        return false;
+      }
+      anchor_temporal = std::move(*anchors);
+    }
   }
   std::vector<std::uint8_t> tags =
       !embedding.tags.empty() ? embedding.tags
@@ -866,7 +1138,9 @@ bool GenerateTextVideo(const GenerationRequest& request,
       {.layer50 = embedding.values,
        .tags = tags,
        .condition_rows = condition_rows,
-       .anchor_temporal = anchor_temporal},
+       .anchor_temporal = anchor_temporal,
+       .condition_blocks = condition_blocks,
+       .target_temporal_origin = target_temporal_origin},
       cancellation, &local.denoiser, error);
   if (denoiser == nullptr) {
     return false;

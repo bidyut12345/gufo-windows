@@ -20,6 +20,9 @@ bool ProbeMinimaxH3(std::string_view model_root) {
     if (std::filesystem::exists(root / "FL2VA" / "transformer" /
                                 "config.json") ||
         std::filesystem::exists(root / "FL2VA" / "model_index.json") ||
+        std::filesystem::exists(root / "Ref2VA" / "transformer" /
+                                "config.json") ||
+        std::filesystem::exists(root / "Ref2VA" / "model_index.json") ||
         std::filesystem::exists(root / "model_index.json")) {
       return true;
     }

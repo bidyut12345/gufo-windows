@@ -607,6 +607,36 @@ inline void LaunchClipAndReorder(const float* input, float* channel_major,
                      0, stream, input, channel_major, samples);
 }
 
+static __global__ void SingleOutputConvGemmKernel(const float* weight,
+                                                  const float* columns,
+                                                  float* output,
+                                                  std::size_t batch_rows,
+                                                  std::size_t reduction) {
+  const std::size_t row =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row >= batch_rows) {
+    return;
+  }
+  const float* col_row = columns + row * reduction;
+  float sum = 0.0F;
+  for (std::size_t k = 0; k < reduction; ++k) {
+    sum = fmaf(weight[k], col_row[k], sum);
+  }
+  output[row] = sum;
+}
+
+inline void LaunchSingleOutputConvGemm(const float* weight,
+                                       const float* columns, float* output,
+                                       std::size_t batch_rows,
+                                       std::size_t reduction,
+                                       hipStream_t stream) {
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(SingleOutputConvGemmKernel,
+                     dim3((batch_rows + kThreads - 1U) / kThreads),
+                     dim3(kThreads), 0, stream, weight, columns, output,
+                     batch_rows, reduction);
+}
+
 }  // namespace gufo::minimax_h3::audio_vae_ops
 
 #endif  // GUFO_MODELS_MINIMAX_H3_AUDIO_VAE_OPS_HIP_HPP_

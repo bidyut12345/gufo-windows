@@ -12,6 +12,7 @@
 #include <gufo/ext/experimental/weight_upload.hpp>
 #include <gufo/ext/platform/fs.hpp>
 #include <gufo/ext/platform/mapped_file.hpp>
+#include <gufo/ext/platform/pages.hpp>
 #include <gufo/ext/platform/prefault.hpp>
 #include <initializer_list>
 #include <utility>
@@ -259,6 +260,7 @@ struct Uploader {
   ReencodeScratch& reencode_scratch;
   const hip::WeightAllocator* weights;
   std::vector<Conversion>& conversions;
+  std::vector<void*>& tail_zeros;
   std::vector<void*>& allocations;
   std::size_t& bytes;
   std::size_t& max_half_cols;
@@ -293,9 +295,10 @@ struct Uploader {
     const bool reencode_q8 = NeedsQ8Reencode(t);
     const std::size_t size = DeviceBytesOf(t);
     void* ptr = nullptr;
-    if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
+    if (const hipError_t alloc_err = Allocate(&ptr, size + kTailMargin);
+        alloc_err != hipSuccess) {
       Fail("device allocation failed for " + std::string(t.name) + " (" +
-           std::to_string(size) + " bytes)");
+           std::to_string(size) + " bytes): " + hipGetErrorString(alloc_err));
       return d;
     }
     if (Measuring()) {
@@ -304,7 +307,10 @@ struct Uploader {
     allocations.push_back(ptr);
     bytes += size + kTailMargin;
     if (reencode_q8) {
-      if (!UploadReencodedQ8_0(t, ptr, shards, shard_base + t.shard,
+      // Drain queued async staging copies before synchronous pageable-host
+      // hipMemcpy in UploadReencodedQ8_0 to avoid concurrent stream/paging faults.
+      if (!stager.Finish(error) ||
+          !UploadReencodedQ8_0(t, ptr, shards, shard_base + t.shard,
                                reencode_scratch, error)) {
         Fail(error != nullptr && !error->empty()
                  ? *error
@@ -317,8 +323,7 @@ struct Uploader {
            (error != nullptr ? ": " + *error : std::string()));
       return d;
     }
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
-                         nullptr);
+    tail_zeros.push_back(static_cast<std::uint8_t*>(ptr) + size);
     d.data = ptr;
     d.type = reencode_q8 ? core::GgmlType::kQ8_0 : t.type;
     d.cols = static_cast<std::uint32_t>(t.cols);
@@ -364,8 +369,7 @@ struct Uploader {
     allocations.push_back(f32);
     bytes += count * sizeof(float) + kTailMargin;
     conversions.push_back({d.data, f32, count, true, t.SizeBytes()});
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(f32) + count * 4, 0,
-                         kTailMargin, nullptr);
+    tail_zeros.push_back(static_cast<std::uint8_t*>(f32) + count * 4);
     d.data = f32;
     d.type = core::GgmlType::kF32;
     return d;
@@ -442,6 +446,8 @@ struct Uploader {
       return;
     }
     std::erase(allocations, combined.data);
+    std::erase(tail_zeros,
+               static_cast<std::uint8_t*>(combined.data) + total_bytes);
     (void)hipFree(combined.data);
     bytes -= total_bytes + kTailMargin;
   }
@@ -490,7 +496,8 @@ struct Uploader {
         auto* dst = static_cast<std::uint8_t*>(ptr) + offset;
         const std::size_t part_bytes = DeviceBytesOf(*t);
         if (NeedsQ8Reencode(*t)) {
-          if (!UploadReencodedQ8_0(*t, dst, shards, shard_base + t->shard,
+          if (!stager.Finish(error) ||
+              !UploadReencodedQ8_0(*t, dst, shards, shard_base + t->shard,
                                    reencode_scratch, error)) {
             Fail(error != nullptr && !error->empty()
                      ? *error
@@ -509,8 +516,7 @@ struct Uploader {
       if (Measuring()) {
         return d;
       }
-      (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0,
-                           kTailMargin, nullptr);
+      tail_zeros.push_back(static_cast<std::uint8_t*>(ptr) + size);
       d.data = ptr;
       d.type = type;
       d.cols = static_cast<std::uint32_t>((*parts.begin())->cols);
@@ -548,8 +554,7 @@ struct Uploader {
     // Keep the small F32 stacks until the disk pipeline drains. Converting
     // each router immediately would serialize every layer's uploads.
     conversions.push_back({f32, half, count, false, f32_bytes});
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(half) + count * 2, 0,
-                         kTailMargin, nullptr);
+    tail_zeros.push_back(static_cast<std::uint8_t*>(half) + count * 2);
     d.data = half;
     d.type = core::GgmlType::kF16;
     d.cols = static_cast<std::uint32_t>((*parts.begin())->cols);
@@ -640,6 +645,9 @@ struct Uploader {
       u.layers.push_back(Layer(l));
       if (!ok) {
         return u;
+      }
+      if (!Measuring() && bytes >= (std::size_t{30} << 30)) {
+        platform::TrimWorkingSet();
       }
     }
     if (mtp != nullptr) {
@@ -756,13 +764,14 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   {
     ReencodeScratch measure_scratch(0);
     std::vector<Conversion> conversions;
+    std::vector<void*> tail_zeros;
     std::vector<void*> allocations;
     std::size_t bytes = 0;
     std::size_t max_half_cols = 1;
     std::size_t max_q8_cols = 32;
     Uploader measure{*stager,     shards,      measure_scratch, nullptr,
-                     conversions, allocations, bytes,           max_half_cols,
-                     max_q8_cols, error_msg};
+                     conversions, tail_zeros,  allocations,     bytes,
+                     max_half_cols, max_q8_cols, error_msg};
     (void)measure.Model(w, mtp, shard_count);
     if (!measure.ok) {
       return nullptr;
@@ -772,13 +781,26 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   const hip::WeightAllocator weights(measured);
   ReencodeScratch reencode_scratch(shards.size());
   std::vector<Conversion> conversions;
+  std::vector<void*> tail_zeros;
   Uploader up{
-      *stager,         shards,          reencode_scratch, &weights,
-      conversions,     m->allocations_, m->bytes_,        m->max_half_cols_,
-      m->max_q8_cols_, error_msg};
+      *stager,      shards,           reencode_scratch, &weights,
+      conversions,  tail_zeros,       m->allocations_,  m->bytes_,
+      m->max_half_cols_, m->max_q8_cols_, error_msg};
   Uploaded uploaded = up.Model(w, mtp, shard_count);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;
+  }
+  static constexpr std::uint8_t kZeroTail[kTailMargin]{};
+  for (void* tail : tail_zeros) {
+    const hipError_t tail_rc =
+        hipMemcpy(tail, kZeroTail, kTailMargin, hipMemcpyHostToDevice);
+    if (tail_rc != hipSuccess) {
+      if (error_msg != nullptr) {
+        *error_msg =
+            "tail zero copy failed: " + std::string(hipGetErrorString(tail_rc));
+      }
+      return nullptr;
+    }
   }
   assert(up.requested == measured);
   m->token_embd_ = uploaded.token_embd;

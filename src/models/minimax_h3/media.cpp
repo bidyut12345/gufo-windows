@@ -2,9 +2,14 @@
 
 #include <charconv>
 #include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <gufo/ext/platform/process.hpp>
 #include <string_view>
 #include <vector>
+
+#include "src/models/minimax_h3/sampling.hpp"
 
 namespace gufo::minimax_h3 {
 namespace {
@@ -203,6 +208,108 @@ bool WriteSynchronizedMp4(const std::filesystem::path& path,
                                .fps = fps},
                               channel_major_pcm, samples, channels, sample_rate,
                               cancellation, telemetry, error);
+}
+
+bool DecodeReferenceVideo(const std::filesystem::path& path, int max_frames,
+                          DecodedReferenceVideo* out, std::string* error) {
+  if (path.empty() || max_frames < 5 || out == nullptr) {
+    return SetError(error, "invalid MiniMax H3 reference video decode arguments");
+  }
+  *out = {};
+  const std::string path_text = path.string();
+  std::string probe_output;
+  std::vector<std::string> probe_args = {
+      "ffprobe",
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-show_entries",
+      "stream=width,height",
+      "-of",
+      "default=noprint_wrappers=1",
+      path_text,
+  };
+  if (!gufo::platform::RunCapture(gufo::platform::FfprobeProgram(), probe_args,
+                                  &probe_output, error)) {
+    return false;
+  }
+  const KeyValues kv = ParseKeyValues(probe_output);
+  const std::string* w_str = FindValue(kv, "width");
+  const std::string* h_str = FindValue(kv, "height");
+  int src_w = 0;
+  int src_h = 0;
+  if (w_str == nullptr || h_str == nullptr || !ParseInteger(*w_str, &src_w) ||
+      !ParseInteger(*h_str, &src_h) || src_w <= 0 || src_h <= 0) {
+    return SetError(error,
+                    "FFprobe could not determine reference video dimensions");
+  }
+  const auto canvas =
+      ResolveCanvasSize(src_w, src_h, kH3CanvasShortEdge, kH3CanvasPixelBudget,
+                        error);
+  if (!canvas.has_value()) {
+    return false;
+  }
+  std::error_code fs_err;
+  const std::filesystem::path raw_path =
+      std::filesystem::temp_directory_path(fs_err) /
+      ("gufo-ref-vid-" + std::to_string(std::hash<std::string>{}(path_text)) +
+       ".rgb24");
+  std::string ffmpeg_out;
+  std::vector<std::string> ffmpeg_args = {
+      "ffmpeg",
+      "-y",
+      "-v",
+      "error",
+      "-i",
+      path_text,
+      "-vf",
+      "fps=24,scale=" + std::to_string(canvas->width) + ":" +
+          std::to_string(canvas->height) + ":flags=lanczos",
+      "-frames:v",
+      std::to_string(max_frames),
+      "-f",
+      "rawvideo",
+      "-pix_fmt",
+      "rgb24",
+      raw_path.string(),
+  };
+  const bool ran = gufo::platform::RunCapture(
+      gufo::platform::FfmpegProgram(), ffmpeg_args, &ffmpeg_out, error);
+  if (!ran) {
+    std::filesystem::remove(raw_path, fs_err);
+    return false;
+  }
+  const std::uintmax_t raw_size = std::filesystem::file_size(raw_path, fs_err);
+  const std::size_t frame_bytes =
+      static_cast<std::size_t>(canvas->width) * canvas->height * 3U;
+  if (fs_err || raw_size == 0 || raw_size % frame_bytes != 0) {
+    std::filesystem::remove(raw_path, fs_err);
+    return SetError(error,
+                    "FFmpeg reference video decode returned truncated frames");
+  }
+  const int decoded_frames = static_cast<int>(raw_size / frame_bytes);
+  if (decoded_frames < 5) {
+    std::filesystem::remove(raw_path, fs_err);
+    return SetError(error,
+                    "MiniMax H3 reference video must have at least 5 frames "
+                    "at 24 fps");
+  }
+  out->width = canvas->width;
+  out->height = canvas->height;
+  out->frame_count = decoded_frames;
+  out->rgb24.resize(static_cast<std::size_t>(raw_size));
+  {
+    std::ifstream in(raw_path, std::ios::binary);
+    in.read(reinterpret_cast<char*>(out->rgb24.data()),
+            static_cast<std::streamsize>(raw_size));
+    if (!in) {
+      std::filesystem::remove(raw_path, fs_err);
+      return SetError(error, "cannot read decoded reference video frames");
+    }
+  }
+  std::filesystem::remove(raw_path, fs_err);
+  return true;
 }
 
 bool ProbeMediaFile(const std::filesystem::path& path, MediaProbe* probe,

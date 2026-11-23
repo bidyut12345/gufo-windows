@@ -290,6 +290,18 @@ public:
       SetError(error, "invalid MiniMax H3 AudioVAE F32 convolution GEMM");
       return false;
     }
+    if (output_channels == 1) {
+      audio_vae_ops::LaunchSingleOutputConvGemm(
+          weight, columns, output, batch_rows, reduction, stream);
+      const hipError_t launch_status = hipGetLastError();
+      if (launch_status != hipSuccess) {
+        SetError(error,
+                 HipError("MiniMax H3 AudioVAE single-output GEMM",
+                          launch_status));
+        return false;
+      }
+      return true;
+    }
     constexpr float alpha = 1.0F;
     constexpr float beta = 0.0F;
     const rocblas_status status = rocblas_gemm_ex(
@@ -603,7 +615,9 @@ struct AudioVaeDecoder::Impl {
       std::string* error) {
     try {
       const json::Value config = json::ParseFile(
-          inventory->model_root() / "FL2VA/audio_vae/config.json", 1U << 20U);
+          inventory->model_root() / inventory->variant_dir() /
+              "audio_vae/config.json",
+          1U << 20U);
       const json::Value* mean_value = config.Find("latents_mean");
       const json::Value* std_value = config.Find("latents_std");
       if (mean_value == nullptr || std_value == nullptr ||

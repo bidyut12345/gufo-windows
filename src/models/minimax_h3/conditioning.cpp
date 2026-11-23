@@ -98,7 +98,9 @@ bool ReadKeyframeNormalization(const ModelInventory& inventory,
   }
   try {
     const json::Value config = json::ParseFile(
-        inventory.model_root() / "FL2VA/video_vae/config.json", 1U << 20U);
+        inventory.model_root() / inventory.variant_dir() /
+            "video_vae/config.json",
+        1U << 20U);
     const json::Value* mean_value = config.Find("latents_mean");
     const json::Value* deviation_value = config.Find("latents_std");
     if (mean_value == nullptr || deviation_value == nullptr ||
@@ -175,11 +177,6 @@ bool EncodeKeyframeLatent(const ModelInventory& inventory,
              "moment count");
     return false;
   }
-  // Posterior sample (DiagonalGaussianDistribution.sample in fp32):
-  // z = mean + exp(0.5 * clamp(logvar, -30, 20)) * epsilon. A fresh fixed-
-  // seed stream per keyframe reproduces the reference contract that anchors
-  // depend only on pixels (diffusers: Generator().manual_seed(42),
-  // encoders.py:131; identical shapes draw identical epsilon, as upstream).
   std::vector<float>& latent = keyframe.latent;
   latent.resize(latent_elements);
   NormalRng posterior(kH3KeyframePosteriorSeed);
@@ -189,18 +186,95 @@ bool EncodeKeyframeLatent(const ModelInventory& inventory,
     const float logvar =
         std::clamp(moments[latent_elements + element], -30.0F, 20.0F);
     const float sigma = std::exp(0.5F * logvar);
-    // Elements run channel-major over (1, lh, lw); torch.chunk(dim=1) puts
-    // mean in channels 0..23 and logvar in 24..47 of the same layout, so
-    // the logvar of `element` sits exactly latent_elements positions later.
     latent[element] = moments[element] + sigma * posterior.NextNormal();
   }
-  // Explicit fp16 round-trip before normalization (encoders.py:132).
   for (std::size_t element = 0; element < latent_elements; ++element) {
     latent[element] =
         static_cast<float>(static_cast<_Float16>(latent[element]));
     const std::size_t channel = element / spatial;
     latent[element] = (latent[element] - mean[channel]) / deviation[channel];
   }
+  return true;
+}
+
+bool EncodeVideoReferenceLatent(
+    const ModelInventory& inventory, std::span<const std::uint8_t> rgb24,
+    int num_frames, int width, int height,
+    const CancellationToken* cancellation, VideoVaeTelemetry* telemetry,
+    std::vector<float>* latent, int* out_latent_frames, std::string* error) {
+  if (latent == nullptr || out_latent_frames == nullptr || num_frames < 5 ||
+      width % kH3VideoVaeSpatialRatio != 0 ||
+      height % kH3VideoVaeSpatialRatio != 0 ||
+      rgb24.size() !=
+          static_cast<std::size_t>(num_frames) * width * height * 3U) {
+    SetError(error, "invalid MiniMax H3 video reference encode arguments");
+    return false;
+  }
+  // Snap down to 17 * n + 5 (encoders.py:744-746).
+  const int aligned_frames = ((num_frames - 5) / 17) * 17 + 5;
+  const int latent_frames = ((aligned_frames - 5) / 17) * 5 + 2;
+  const int latent_height = height / kH3VideoVaeSpatialRatio;
+  const int latent_width = width / kH3VideoVaeSpatialRatio;
+  if (latent_height < 2 || latent_width < 2) {
+    SetError(error, "MiniMax H3 video reference canvas is too small");
+    return false;
+  }
+  KeyframeLatentNormalization mean{};
+  KeyframeLatentNormalization deviation{};
+  if (!ReadKeyframeNormalization(inventory, &mean, &deviation, error)) {
+    return false;
+  }
+  std::unique_ptr<VideoVaeEncoder> encoder =
+      VideoVaeEncoder::Create(inventory, cancellation, telemetry, error);
+  if (encoder == nullptr) {
+    return false;
+  }
+  const std::size_t plane = static_cast<std::size_t>(width) * height;
+  std::vector<float> pixels(static_cast<std::size_t>(aligned_frames) * 3U *
+                            plane);
+  for (int f = 0; f < aligned_frames; ++f) {
+    const std::uint8_t* src_frame =
+        rgb24.data() + static_cast<std::size_t>(f) * plane * 3U;
+    float* dst_frame = pixels.data() + static_cast<std::size_t>(f) * 3U * plane;
+    for (std::size_t index = 0; index < plane; ++index) {
+      for (std::size_t channel = 0; channel < 3U; ++channel) {
+        const float scaled =
+            static_cast<float>(src_frame[index * 3U + channel]) / 255.0F;
+        dst_frame[channel * plane + index] =
+            (scaled - kPixelMean[channel]) / kPixelStd[channel];
+      }
+    }
+  }
+  std::vector<float> moments;
+  if (!encoder->EncodeVideoMoments(pixels.data(), aligned_frames, height, width,
+                                   cancellation, &moments, error)) {
+    return false;
+  }
+  const std::size_t per_channel =
+      static_cast<std::size_t>(latent_frames) * latent_height * latent_width;
+  const std::size_t latent_elements =
+      static_cast<std::size_t>(kH3VideoVaeLatentChannels) * per_channel;
+  if (moments.size() != latent_elements * 2U) {
+    SetError(error,
+             "MiniMax H3 video reference encoder returned unexpected moments");
+    return false;
+  }
+  latent->resize(latent_elements);
+  NormalRng posterior(kH3KeyframePosteriorSeed);
+  for (std::size_t element = 0; element < latent_elements; ++element) {
+    const float logvar =
+        std::clamp(moments[latent_elements + element], -30.0F, 20.0F);
+    const float sigma = std::exp(0.5F * logvar);
+    (*latent)[element] = moments[element] + sigma * posterior.NextNormal();
+  }
+  for (std::size_t element = 0; element < latent_elements; ++element) {
+    (*latent)[element] =
+        static_cast<float>(static_cast<_Float16>((*latent)[element]));
+    const std::size_t channel = element / per_channel;
+    (*latent)[element] =
+        ((*latent)[element] - mean[channel]) / deviation[channel];
+  }
+  *out_latent_frames = latent_frames;
   return true;
 }
 

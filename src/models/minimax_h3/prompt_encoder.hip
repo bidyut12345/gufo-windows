@@ -38,7 +38,7 @@ using Clock = std::chrono::steady_clock;
 
 constexpr float kRmsEpsilon = 1.0e-6F;
 constexpr float kRopeTheta = 5'000'000.0F;
-constexpr std::size_t kMaximumPromptTokens = 4096;
+constexpr std::size_t kMaximumPromptTokens = 32768;
 constexpr std::size_t kGemmWorkspaceBytes = 64ULL << 20U;
 constexpr std::size_t kMaximumGemmAlgorithms = 16;
 
@@ -1242,34 +1242,32 @@ bool EncodePromptCore(const ModelInventory& inventory,
 
 }  // namespace
 
-bool EncodePromptMultimodal(const ModelInventory& inventory,
-                            const Tokenizer& tokenizer,
-                            std::string_view prompt,
-                            const std::vector<KeyframeVision>& keyframes,
-                            const CancellationToken* cancellation,
-                            PromptEmbedding* output,
-                            PromptEncoderTelemetry* telemetry,
-                            std::string* error) {
+bool EncodePromptWithVisions(const ModelInventory& inventory,
+                             const Tokenizer& tokenizer,
+                             std::string_view prompt,
+                             std::span<const MultimodalBlock> blocks,
+                             const std::vector<KeyframeVision>& visions,
+                             const CancellationToken* cancellation,
+                             PromptEmbedding* output,
+                             PromptEncoderTelemetry* telemetry,
+                             std::string* error) {
   if (output != nullptr) {
     *output = {};
   }
   if (telemetry != nullptr) {
     *telemetry = {};
   }
-  if (output == nullptr || telemetry == nullptr || keyframes.empty()) {
-    SetError(error, "MiniMax H3 multimodal prompt requires keyframes");
+  if (output == nullptr || telemetry == nullptr || blocks.empty() ||
+      blocks.size() != visions.size()) {
+    SetError(error, "MiniMax H3 multimodal prompt requires matching blocks");
     return false;
   }
-  // Presentation (host builder in prompt_encoder.cpp: "<Picture i>: " +
-  // vision_start / image_pad x N / vision_end, then the raw prompt).
-  std::vector<std::pair<int, int>> grids;
-  grids.reserve(keyframes.size());
-  for (const KeyframeVision& vision : keyframes) {
-    grids.emplace_back(vision.grid_h, vision.grid_w);
-  }
   KeyframePresentation presentation;
-  if (!BuildKeyframePresentation(tokenizer, prompt, grids, &presentation,
-                                 error)) {
+  if (!BuildMultimodalPresentation(tokenizer, prompt, blocks, &presentation,
+                                   error)) {
+    if (error != nullptr && error->empty()) {
+      SetError(error, "MiniMax H3 multimodal presentation failed");
+    }
     return false;
   }
 
@@ -1281,7 +1279,7 @@ bool EncodePromptMultimodal(const ModelInventory& inventory,
   std::vector<std::uint16_t> all_deep;
   all_deep.reserve(3U * total_rows * kPromptEncoderHiddenSize);
   std::vector<std::vector<std::uint16_t>> tap_buffers(3);
-  for (const KeyframeVision& vision : keyframes) {
+  for (const KeyframeVision& vision : visions) {
     if (IsCancelled(cancellation)) {
       SetError(error, "MiniMax H3 multimodal prompt cancelled");
       return false;
@@ -1290,6 +1288,9 @@ bool EncodePromptMultimodal(const ModelInventory& inventory,
     std::vector<std::uint16_t> deep;
     if (!EncodeVision(inventory, vision, cancellation, &embedded, &deep,
                       error)) {
+      if (error != nullptr && error->empty()) {
+        SetError(error, "MiniMax H3 vision tower failed");
+      }
       return false;
     }
     const std::size_t rows =
@@ -1393,10 +1394,34 @@ bool EncodePromptMultimodal(const ModelInventory& inventory,
                                    &data, cancellation,
                                    output, telemetry, error);
   free_all();
+  if (!ok && error != nullptr && error->empty()) {
+    SetError(error, "MiniMax H3 prompt encoder core failed");
+  }
   if (ok) {
     output->tags = std::move(tags);
   }
   return ok;
+}
+
+bool EncodePromptMultimodal(const ModelInventory& inventory,
+                            const Tokenizer& tokenizer,
+                            std::string_view prompt,
+                            const std::vector<KeyframeVision>& keyframes,
+                            const CancellationToken* cancellation,
+                            PromptEmbedding* output,
+                            PromptEncoderTelemetry* telemetry,
+                            std::string* error) {
+  std::vector<MultimodalBlock> blocks;
+  blocks.reserve(keyframes.size());
+  for (std::size_t i = 0; i < keyframes.size(); ++i) {
+    blocks.push_back({.prefix_label = "<Picture " + std::to_string(i + 1) + ">: ",
+                      .is_video = false,
+                      .grid_h = keyframes[i].grid_h,
+                      .grid_w = keyframes[i].grid_w});
+  }
+  return EncodePromptWithVisions(inventory, tokenizer, prompt, blocks,
+                                 keyframes, cancellation, output, telemetry,
+                                 error);
 }
 
 }  // namespace gufo::minimax_h3

@@ -199,11 +199,16 @@ bool PrepareKeyframe(const core::Image& image, int canvas_width,
   return true;
 }
 
-bool BuildKeyframeVision(const std::vector<std::uint8_t>& rgb, int width,
-                         int height, KeyframeVision* output,
-                         std::string* error) {
-  if (output == nullptr) {
-    SetError(error, "MiniMax H3 keyframe vision output is missing");
+// TheRock Clang -O2/-O3 on Windows miscompiles this nested pixel-repacking loop,
+// returning false without setting an error; optnone keeps it reliable (~1 ms).
+#if defined(__clang__)
+__attribute__((optnone))
+#endif
+bool BuildVideoPairVision(const std::uint8_t* rgb_t0,
+                          const std::uint8_t* rgb_t1, int width, int height,
+                          KeyframeVision* output, std::string* error) {
+  if (output == nullptr || rgb_t0 == nullptr || rgb_t1 == nullptr) {
+    SetError(error, "MiniMax H3 vision input or output is missing");
     return false;
   }
   *output = {};
@@ -211,10 +216,6 @@ bool BuildKeyframeVision(const std::vector<std::uint8_t>& rgb, int width,
     SetError(error,
              "MiniMax H3 keyframe size must be a positive multiple "
              "of 32 for vision patching");
-    return false;
-  }
-  if (rgb.size() != static_cast<std::size_t>(width) * height * 3U) {
-    SetError(error, "MiniMax H3 keyframe pixels do not cover the canvas");
     return false;
   }
   if (static_cast<std::int64_t>(width) * height < kVisionMinimumPixels) {
@@ -228,9 +229,8 @@ bool BuildKeyframeVision(const std::vector<std::uint8_t>& rgb, int width,
   output->grid_h = grid_h;
   output->grid_w = grid_w;
   output->pixel_values.assign(rows * kRowWidth, 0.0F);
+  const std::uint8_t* frames[2] = {rgb_t0, rgb_t1};
   for (std::size_t token = 0; token < rows; ++token) {
-    // Merge-block-major token order: four consecutive rows form the 2x2
-    // block (Qwen2VLImageProcessorFast patchify).
     const int py =
         static_cast<int>(token / 4 / static_cast<std::size_t>(grid_w / 2)) * 2 +
         static_cast<int>(token / 2) % 2;
@@ -240,10 +240,10 @@ bool BuildKeyframeVision(const std::vector<std::uint8_t>& rgb, int width,
         static_cast<int>(token % 2);
     float* row = output->pixel_values.data() + token * kRowWidth;
     for (int c = 0; c < 3; ++c) {
-      for (int t = 0; t < 2; ++t) {  // Temporal duplication of one frame.
+      for (int t = 0; t < 2; ++t) {
         for (int y = 0; y < 16; ++y) {
           const std::uint8_t* source =
-              rgb.data() +
+              frames[t] +
               (static_cast<std::size_t>(py * 16 + y) * width + px * 16) * 3 + c;
           float* destination =
               row + (static_cast<std::size_t>(c * 2 + t) * 16 + y) * 16;
@@ -259,6 +259,18 @@ bool BuildKeyframeVision(const std::vector<std::uint8_t>& rgb, int width,
     }
   }
   return true;
+}
+
+bool BuildKeyframeVision(const std::vector<std::uint8_t>& rgb, int width,
+                         int height, KeyframeVision* output,
+                         std::string* error) {
+  if (width <= 0 || height <= 0 ||
+      rgb.size() != static_cast<std::size_t>(width) * height * 3U) {
+    SetError(error, "MiniMax H3 keyframe pixels do not cover the canvas");
+    return false;
+  }
+  return BuildVideoPairVision(rgb.data(), rgb.data(), width, height, output,
+                              error);
 }
 
 }  // namespace gufo::minimax_h3::image_processor

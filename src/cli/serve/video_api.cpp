@@ -59,7 +59,37 @@ bool ValidateGenerationParameters(const ext::VideoParameters& parameters,
 
 constexpr std::string_view kVideosPath = "/v1/videos";
 constexpr double kMaximumExactJsonInteger = 9007199254740991.0;
-constexpr std::size_t kMaximumMultipartFields = 16;
+constexpr std::size_t kMaximumMultipartFields = 32;
+
+bool IsReferenceMultipartField(std::string_view name) {
+  return name.size() == 11 && name.starts_with("reference_") &&
+         name[10] >= '0' && name[10] <= '8';
+}
+
+bool IsReferenceVideoMultipartField(std::string_view name) {
+  return name.size() == 17 && name.starts_with("reference_video_") &&
+         name[16] >= '0' && name[16] <= '2';
+}
+
+bool ParseSizeString(std::string_view size, int* width, int* height) {
+  const std::size_t sep = size.find('x');
+  if (sep == std::string_view::npos || sep == 0 || sep + 1 >= size.size()) {
+    return false;
+  }
+  int w = 0;
+  int h = 0;
+  const auto [w_end, w_ec] = std::from_chars(size.data(), size.data() + sep, w);
+  const auto [h_end, h_ec] = std::from_chars(
+      size.data() + sep + 1, size.data() + size.size(), h);
+  if (w_ec != std::errc{} || w_end != size.data() + sep ||
+      h_ec != std::errc{} || h_end != size.data() + size.size() ||
+      w <= 0 || h <= 0) {
+    return false;
+  }
+  *width = w;
+  *height = h;
+  return true;
+}
 
 HttpResponse Error(int status, std::string reason, std::string message,
                    std::string code) {
@@ -185,9 +215,11 @@ std::optional<json::Value> ParseMultipartBody(
           }
         } else if (field.has_filename && binary_fields != nullptr &&
                    (field_name == "first_frame" ||
-                    field_name == "last_frame")) {
-          // Keyframe anchors keep their raw bytes out of the JSON value; the
-          // empty sentinel only marks presence for CreateVideo.
+                    field_name == "last_frame" ||
+                    IsReferenceMultipartField(field_name) ||
+                    IsReferenceVideoMultipartField(field_name))) {
+          // Keyframe/reference images keep their raw bytes out of the JSON
+          // value; the empty sentinel only marks presence for CreateVideo.
           (*binary_fields)[field_name] = std::string(content);
           result[field_name] = std::string();
         } else {
@@ -242,11 +274,7 @@ std::optional<int> JsonFrame(const json::Value* value) {
 }
 
 bool IsUnsupportedConditioning(const json::Value& body) {
-  static constexpr std::string_view kUnsupported[] = {"input_reference",
-                                                      "references"};
-  return std::ranges::any_of(kUnsupported, [&](std::string_view key) {
-    return body.contains(std::string(key));
-  });
+  return body.contains("input_reference");
 }
 
 HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
@@ -347,11 +375,16 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   std::uint64_t seed = 42;
   std::optional<int> frames;
   std::optional<int> selected_frame;
+  std::optional<int> steps_evaluations;
+  bool lock_resolution = false;
+  bool step_reuse = false;
   bool preset_explicit = false;
   if (const json::Value* extension = body.find("gufo")) {
     if (!extension->is_object() ||
         !HasOnlyMembers(*extension, {"preset", "seed", "frames",
-                                     "output_format", "selected_frame"})) {
+                                     "output_format", "selected_frame",
+                                     "steps", "lock_resolution",
+                                     "step_reuse"})) {
       return Error(400, "Bad Request",
                    "'gufo' must contain only supported video options",
                    "invalid_strix_options");
@@ -395,6 +428,34 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                      "invalid_selected_frame");
       }
     }
+    if (extension->contains("steps")) {
+      const auto parsed_steps = JsonFrame(extension->find("steps"));
+      if (!parsed_steps.has_value() || *parsed_steps < 3 ||
+          *parsed_steps > 1001) {
+        return Error(400, "Bad Request",
+                     "'gufo.steps' must be an integer between 3 and 1001",
+                     "invalid_steps");
+      }
+      steps_evaluations = *parsed_steps - 1;
+    }
+    if (extension->contains("lock_resolution")) {
+      const json::Value* lock_val = extension->find("lock_resolution");
+      if (!lock_val->is_bool()) {
+        return Error(400, "Bad Request",
+                     "'gufo.lock_resolution' must be a boolean",
+                     "invalid_lock_resolution");
+      }
+      lock_resolution = lock_val->as_bool();
+    }
+    if (extension->contains("step_reuse")) {
+      const json::Value* reuse_val = extension->find("step_reuse");
+      if (!reuse_val->is_bool()) {
+        return Error(400, "Bad Request",
+                     "'gufo.step_reuse' must be a boolean",
+                     "invalid_step_reuse");
+      }
+      step_reuse = reuse_val->as_bool();
+    }
   }
   if (preset_explicit && !model_preset.empty() && preset != model_preset) {
     return Error(400, "Bad Request",
@@ -406,6 +467,28 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   auto parameters = ResolveGenerationPreset(preset, &preset_error);
   if (!parameters.has_value()) {
     return Error(400, "Bad Request", preset_error, "invalid_preset");
+  }
+  if (steps_evaluations.has_value()) {
+    parameters->evaluations = *steps_evaluations;
+  }
+  if (step_reuse) {
+    parameters->reuse_interval = 2;
+    parameters->active_blocks = 45;
+  }
+  if (size_value != nullptr && output_format == "mp4" &&
+      model == "minimax-h3" &&
+      (parameters->preset == "exact-512" ||
+       parameters->preset == "exact-1344x768")) {
+    int custom_w = 0;
+    int custom_h = 0;
+    if (!ParseSizeString(size, &custom_w, &custom_h)) {
+      return Error(400, "Bad Request",
+                   "'size' must be formatted as WIDTHxHEIGHT", "invalid_size");
+    }
+    parameters->internal_width = custom_w;
+    parameters->internal_height = custom_h;
+    parameters->output_width = custom_w;
+    parameters->output_height = custom_h;
   }
   parameters->frames = frames.value_or(*duration_frames);
   if (output_format == "ppm") {
@@ -500,6 +583,78 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                  "invalid_frame_image");
   }
 
+  std::vector<std::vector<std::uint8_t>> reference_images;
+  for (int i = 0; i < 9; ++i) {
+    const std::string field = "reference_" + std::to_string(i);
+    if (body.find(field) != nullptr || binary_fields.contains(field)) {
+      std::vector<std::uint8_t> ref_bytes;
+      const std::optional<std::string> ref_err =
+          load_keyframe(field, &ref_bytes);
+      if (ref_err.has_value()) {
+        return Error(400, "Bad Request", *ref_err, "invalid_reference_image");
+      }
+      if (!ref_bytes.empty()) {
+        reference_images.push_back(std::move(ref_bytes));
+      }
+    }
+  }
+  if (const json::Value* refs_value = body.find("references")) {
+    if (!refs_value->is_array()) {
+      return Error(400, "Bad Request",
+                   "'references' must be an array of base64 image data URLs",
+                   "invalid_reference_image");
+    }
+    if (!reference_images.empty()) {
+      return Error(400, "Bad Request",
+                   "cannot mix multipart 'reference_i' and JSON 'references'",
+                   "invalid_reference_image");
+    }
+    if (refs_value->items().size() > 9U) {
+      return Error(400, "Bad Request",
+                   "'references' accepts at most 9 images",
+                   "invalid_reference_image");
+    }
+    for (const json::Value& item : refs_value->items()) {
+      if (!item.is_string() || !item.str().starts_with("data:")) {
+        return Error(400, "Bad Request",
+                     "each 'references' entry must be a base64 image data URL",
+                     "invalid_reference_image");
+      }
+      std::vector<std::uint8_t> ref_bytes;
+      try {
+        core::ImageReadBudget budget;
+        ref_bytes = core::ReadImageUrl(item.str(), budget);
+        const core::Image decoded =
+            core::DecodeImage(std::span<const std::uint8_t>(ref_bytes));
+        if (decoded.width == 0 || decoded.height == 0) {
+          throw std::invalid_argument("empty decode");
+        }
+      } catch (const std::exception&) {
+        return Error(400, "Bad Request",
+                     "each 'references' entry must be a decodable PNG, JPEG, "
+                     "or WebP image",
+                     "invalid_reference_image");
+      }
+      reference_images.push_back(std::move(ref_bytes));
+    }
+  }
+
+  std::vector<std::vector<std::uint8_t>> reference_videos;
+  for (int i = 0; i < 3; ++i) {
+    const std::string field = "reference_video_" + std::to_string(i);
+    const auto uploaded = binary_fields.find(field);
+    if (uploaded != binary_fields.end()) {
+      if (uploaded->second.empty() ||
+          uploaded->second.size() > (256ULL << 20U)) {
+        return Error(400, "Bad Request",
+                     "'" + field + "' is empty or exceeds 256 MiB",
+                     "invalid_reference_video");
+      }
+      reference_videos.emplace_back(uploaded->second.begin(),
+                                    uploaded->second.end());
+    }
+  }
+
   const VideoJobCreateResult created = service.Create({
       .model = model,
       .prompt = prompt,
@@ -510,6 +665,9 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       .seed = seed,
       .first_frame_bytes = std::move(first_frame),
       .last_frame_bytes = std::move(last_frame),
+      .reference_image_bytes = std::move(reference_images),
+      .reference_video_bytes = std::move(reference_videos),
+      .lock_canvas_to_preset = lock_resolution,
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =

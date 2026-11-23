@@ -40,7 +40,13 @@ enum class ResidencyMode : std::uint8_t {
   kMappedReadOnly,
 };
 
+enum class ModelVariant : std::uint8_t {
+  kFl2va,
+  kRef2va,
+};
+
 [[nodiscard]] std::string_view ToString(ResidencyMode mode) noexcept;
+[[nodiscard]] std::string_view ToString(ModelVariant variant) noexcept;
 
 struct TensorDescriptor {
   std::string component;
@@ -88,6 +94,13 @@ public:
   [[nodiscard]] const std::filesystem::path& model_root() const noexcept {
     return model_root_;
   }
+  [[nodiscard]] ModelVariant variant() const noexcept { return variant_; }
+  [[nodiscard]] std::string_view variant_dir() const noexcept {
+    return variant_ == ModelVariant::kRef2va ? "Ref2VA" : "FL2VA";
+  }
+  [[nodiscard]] bool is_ref2va() const noexcept {
+    return variant_ == ModelVariant::kRef2va;
+  }
   [[nodiscard]] std::span<const TensorDescriptor> tensors() const noexcept {
     return tensors_;
   }
@@ -105,6 +118,7 @@ public:
 
 private:
   std::filesystem::path model_root_;
+  ModelVariant variant_{ModelVariant::kFl2va};
   std::vector<TensorDescriptor> tensors_;
   std::vector<ShardDescriptor> shards_;
   std::unordered_map<std::string, std::size_t> tensor_index_;

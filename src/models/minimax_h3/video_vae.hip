@@ -425,7 +425,9 @@ bool ReadLatentNormalization(const ModelInventory& inventory,
                              std::string* error) {
   try {
     const json::Value config = json::ParseFile(
-        inventory.model_root() / "FL2VA/video_vae/config.json", 1U << 20U);
+        inventory.model_root() / inventory.variant_dir() /
+            "video_vae/config.json",
+        1U << 20U);
     const json::Value* mean_value = config.Find("latents_mean");
     const json::Value* std_value = config.Find("latents_std");
     if (mean_value == nullptr || std_value == nullptr ||

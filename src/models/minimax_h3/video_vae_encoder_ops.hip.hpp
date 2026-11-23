@@ -119,6 +119,69 @@ inline void LaunchIm2ColReflect(const float* input, float* columns,
       channels, stride, pad_top, pad_left, base, count);
 }
 
+// 3D causal im2col over [in_time, in_height, in_width, channels].
+// Causal temporal padding prepends 2 zero frames (pad_t_left = 2, kernel_t = 3);
+// spatial axes use reflect padding. Output columns are [in_channel][kt][kh][kw].
+static __global__ void Im2Col3DReflectKernel(
+    const float* input, float* columns, std::uint32_t in_time,
+    std::uint32_t in_height, std::uint32_t in_width, std::uint32_t out_height,
+    std::uint32_t out_width, std::uint32_t channels, std::uint32_t stride_t,
+    std::uint32_t stride_s, std::int32_t pad_s, std::uint32_t base,
+    std::uint32_t count) {
+  const std::size_t elements = static_cast<std::size_t>(count) * channels * 27U;
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= elements) {
+    return;
+  }
+  const std::uint32_t tap = static_cast<std::uint32_t>(index % 27U);
+  const std::size_t identity = index / 27U;
+  const std::uint32_t channel = static_cast<std::uint32_t>(identity % channels);
+  const std::uint32_t position =
+      base + static_cast<std::uint32_t>(identity / channels);
+  const std::uint32_t spatial_out = out_height * out_width;
+  const std::uint32_t t_out = position / spatial_out;
+  const std::uint32_t hw_out = position % spatial_out;
+  const std::uint32_t y = hw_out / out_width;
+  const std::uint32_t x = hw_out % out_width;
+
+  const std::uint32_t kt = tap / 9U;
+  const std::uint32_t spatial_tap = tap % 9U;
+  const std::int32_t t_in =
+      static_cast<std::int32_t>(t_out * stride_t + kt) - 2;
+  if (t_in < 0 || t_in >= static_cast<std::int32_t>(in_time)) {
+    columns[index] = 0.0F;
+    return;
+  }
+  const std::int32_t source_y = ReflectIndex(
+      static_cast<std::int32_t>(y * stride_s) +
+          static_cast<std::int32_t>(spatial_tap / 3U) - pad_s,
+      static_cast<std::int32_t>(in_height));
+  const std::int32_t source_x = ReflectIndex(
+      static_cast<std::int32_t>(x * stride_s) +
+          static_cast<std::int32_t>(spatial_tap % 3U) - pad_s,
+      static_cast<std::int32_t>(in_width));
+  const std::size_t in_pos =
+      (static_cast<std::size_t>(t_in) * in_height + source_y) * in_width +
+      source_x;
+  columns[index] = input[in_pos * channels + channel];
+}
+
+inline void LaunchIm2Col3DReflect(
+    const float* input, float* columns, std::uint32_t in_time,
+    std::uint32_t in_height, std::uint32_t in_width, std::uint32_t out_height,
+    std::uint32_t out_width, std::uint32_t channels, std::uint32_t stride_t,
+    std::uint32_t stride_s, std::int32_t pad_s, std::uint32_t base,
+    std::uint32_t count, hipStream_t stream) {
+  const std::size_t elements = static_cast<std::size_t>(count) * channels * 27U;
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(
+      Im2Col3DReflectKernel,
+      dim3(static_cast<std::uint32_t>((elements + kThreads - 1U) / kThreads)),
+      dim3(kThreads), 0, stream, input, columns, in_time, in_height, in_width,
+      out_height, out_width, channels, stride_t, stride_s, pad_s, base, count);
+}
+
 // GroupNorm(32, eps 1e-6, affine) over one plane. Statistics never mix
 // frames (norm.py:_merge_time_to_batch), so with T=1 the reference set is the
 // group's channels across every position of the tile. Partial sums are

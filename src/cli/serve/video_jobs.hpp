@@ -51,6 +51,9 @@ struct VideoJobRequest {
   /// reclaim the uploaded imagery together with the generated output.
   std::vector<std::uint8_t> first_frame_bytes;
   std::vector<std::uint8_t> last_frame_bytes;
+  std::vector<std::vector<std::uint8_t>> reference_image_bytes;
+  std::vector<std::vector<std::uint8_t>> reference_video_bytes;
+  bool lock_canvas_to_preset{false};
 };
 
 struct VideoJobSnapshot {

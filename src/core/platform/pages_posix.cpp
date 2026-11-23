@@ -289,4 +289,10 @@ void ReleaseSharedTempMapping(SharedTempMapping& mapping) noexcept {
   mapping = {};
 }
 
+void TrimWorkingSet() noexcept {}
+
+bool UsePinnedUploadStaging() noexcept {
+  return true;
+}
+
 }  // namespace gufo::platform

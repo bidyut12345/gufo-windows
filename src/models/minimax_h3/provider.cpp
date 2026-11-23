@@ -55,6 +55,9 @@ public:
             },
         .first_frame_path = request.first_frame_path,
         .last_frame_path = request.last_frame_path,
+        .reference_images = request.reference_images,
+        .reference_videos = request.reference_videos,
+        .lock_canvas_to_preset = request.lock_canvas_to_preset,
     };
     gufo::minimax_h3::CancellationToken token;
     std::jthread watcher;

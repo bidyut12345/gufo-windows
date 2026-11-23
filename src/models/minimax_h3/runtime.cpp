@@ -19,10 +19,12 @@ namespace {
 
 constexpr std::string_view kManifestSchema = "gufo.minimax-h3-source.v1";
 constexpr std::string_view kModelKind = "minimax-h3-fl2va-bf16";
+constexpr std::string_view kRef2vaModelKind = "minimax-h3-ref2va-bf16";
 constexpr std::string_view kRevision =
     "42ed227ee7df40d41602854ae760620d6eb651fe";
 constexpr std::string_view kSourceManifestSha256 =
     "00a83367b87017f1f3d5547a963b20567a46d7aea44f0aac495c816147720d89";
+constexpr std::string_view kRef2vaSourceManifestSha256 = "";
 constexpr std::size_t kMaximumJsonBytes = 64U << 20U;
 constexpr std::uint64_t kMaximumHeaderBytes = 64U << 20U;
 constexpr std::size_t kDeviceAlignment = 256;
@@ -363,6 +365,16 @@ std::string_view ToString(ResidencyMode mode) noexcept {
   return "unknown";
 }
 
+std::string_view ToString(ModelVariant variant) noexcept {
+  switch (variant) {
+    case ModelVariant::kFl2va:
+      return "fl2va";
+    case ModelVariant::kRef2va:
+      return "ref2va";
+  }
+  return "unknown";
+}
+
 std::optional<ModelInventory> ModelInventory::Inspect(
     const std::filesystem::path& model_root,
     const std::filesystem::path& source_manifest, std::string* error) {
@@ -386,17 +398,25 @@ std::optional<ModelInventory> ModelInventory::Inspect(
       throw json::Error("cannot stat source manifest");
     }
     inventory.telemetry_.json_bytes_read += manifest_size;
-    if (options.require_pinned_manifest &&
-        Sha256File(source_manifest) != kSourceManifestSha256) {
-      throw json::Error(
-          "source manifest SHA-256 does not match the compiled contract");
-    }
     const json::Value manifest =
         json::ParseFile(source_manifest, kMaximumJsonBytes);
+    const std::string model_kind =
+        RequireField(manifest, "model_kind").AsString();
     if (RequireField(manifest, "schema").AsString() != kManifestSchema ||
-        RequireField(manifest, "model_kind").AsString() != kModelKind ||
-        RequireField(manifest, "revision").AsString() != kRevision) {
+        RequireField(manifest, "revision").AsString() != kRevision ||
+        (model_kind != kModelKind && model_kind != kRef2vaModelKind)) {
       throw json::Error("source manifest identity does not match MiniMax H3");
+    }
+    inventory.variant_ = model_kind == kRef2vaModelKind ? ModelVariant::kRef2va
+                                                       : ModelVariant::kFl2va;
+    if (options.require_pinned_manifest) {
+      const std::string_view expected_sha =
+          inventory.is_ref2va() ? kRef2vaSourceManifestSha256
+                                : kSourceManifestSha256;
+      if (!expected_sha.empty() && Sha256File(source_manifest) != expected_sha) {
+        throw json::Error(
+            "source manifest SHA-256 does not match the compiled contract");
+      }
     }
 
     std::map<std::filesystem::path, std::uint64_t> expected_file_sizes;
@@ -443,12 +463,15 @@ std::optional<ModelInventory> ModelInventory::Inspect(
     }
 
     std::map<std::string, std::string, std::less<>> indexed;
+    const std::string variant_prefix(inventory.variant_dir());
+    const std::string text_index =
+        variant_prefix + "/text_encoder/model.safetensors.index.json";
+    const std::string dit_index =
+        variant_prefix + "/transformer/model.safetensors.index.json";
     for (const auto& [component, relative_index] :
          std::array<std::pair<std::string_view, std::string_view>, 2>{
-             std::pair{"text_encoder",
-                       "FL2VA/text_encoder/model.safetensors.index.json"},
-             std::pair{"transformer",
-                       "FL2VA/transformer/model.safetensors.index.json"}}) {
+             std::pair{"text_encoder", std::string_view{text_index}},
+             std::pair{"transformer", std::string_view{dit_index}}}) {
       const auto index_path = inventory.model_root_ / relative_index;
       auto weight_map = ParseWeightMap(index_path, &inventory.telemetry_);
       for (auto& [name, shard] : weight_map) {

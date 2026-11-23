@@ -134,6 +134,15 @@ public:
       void* progress_opaque, VideoVaeTelemetry* telemetry,
       std::string* error = nullptr);
 
+  // Multi-frame causal 3D VisualVAE encode for Ref2VA video references.
+  // `rgb_imagenet_f32` is frame-major planar (num_frames, 3, height, width)
+  // float32 already mapped uint8/255 -> ImageNet, with num_frames = 17*n + 5.
+  // `moments` receives planar (48, 5*n + 2, height/16, width/16).
+  [[nodiscard]] bool EncodeVideoMoments(
+      const float* rgb_imagenet_f32, int num_frames, int height, int width,
+      const CancellationToken* cancellation, std::vector<float>* moments,
+      std::string* error = nullptr);
+
   [[nodiscard]] std::uint64_t weight_bytes() const noexcept;
 
 private:

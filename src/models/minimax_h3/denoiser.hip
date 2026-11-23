@@ -1450,7 +1450,7 @@ struct DenoiserSession::Impl {
         layout.video_condition_rows * kH3VideoPatchWidth;
     const std::size_t hidden_elements = layout.rows() * kDitHiddenSize;
     const std::size_t maximum_projection_rows =
-        std::max(video_rows, audio_rows);
+        std::max({video_rows, audio_rows, layout.video_condition_rows});
     const auto bf16 = [](std::size_t elements) {
       return elements * sizeof(std::uint16_t);
     };
@@ -1740,6 +1740,9 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
     std::string* error) {
   const auto setup_begin = Clock::now();
   const Faults faults_before = ReadFaults();
+  const bool has_anchors = !conditioning.anchor_temporal.empty();
+  const bool has_blocks = !conditioning.condition_blocks.empty();
+  const bool conditioned = has_anchors || has_blocks;
   if (options.evaluations < 2 || options.evaluations > kH3MaximumEvaluations ||
       options.active_blocks < 3 ||
       options.active_blocks > static_cast<int>(kDitBlocks) ||
@@ -1749,20 +1752,28 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
           options.text_rows * kH3TextConditionWidth ||
       (!conditioning.tags.empty() &&
        conditioning.tags.size() != options.text_rows) ||
-      (!conditioning.anchor_temporal.empty()) !=
-          (options.condition_video_rows != 0) ||
+      (has_anchors && has_blocks) ||
+      (conditioned != (options.condition_video_rows != 0)) ||
       conditioning.condition_rows.size() !=
           options.condition_video_rows * kH3VideoPatchWidth ||
       IsCancelled(cancellation)) {
     SetError(error, "invalid MiniMax H3 denoiser creation arguments");
     return nullptr;
   }
-  const bool conditioned = !conditioning.anchor_temporal.empty();
+  const double target_origin =
+      conditioning.target_temporal_origin > 0.0
+          ? conditioning.target_temporal_origin
+          : static_cast<double>(options.text_rows);
   auto layout =
-      conditioned ? BuildKeyframeLayout(options.text_rows, options.geometry,
-                                        conditioning.anchor_temporal, error)
-                  : BuildTextOnlyLayout(options.text_rows, options.geometry,
-                                        error);
+      has_blocks
+          ? BuildReferenceLayout(options.text_rows, options.geometry,
+                                 conditioning.condition_blocks, target_origin,
+                                 error)
+          : (has_anchors
+                 ? BuildKeyframeLayout(options.text_rows, options.geometry,
+                                       conditioning.anchor_temporal, error)
+                 : BuildTextOnlyLayout(options.text_rows, options.geometry,
+                                       error));
   auto schedule = BuildServingSchedule(options.evaluations, error);
   if (!layout || !schedule) {
     return nullptr;

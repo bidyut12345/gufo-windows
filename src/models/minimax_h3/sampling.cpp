@@ -371,10 +371,10 @@ std::string_view ToString(SegmentKind kind) noexcept {
   return "unknown";
 }
 
-std::optional<PackedLayout> BuildLayout(std::size_t text_rows,
-                                        const GenerationGeometry& geometry,
-                                        std::span<const double> anchor_temporal,
-                                        std::string* error) {
+std::optional<PackedLayout> BuildReferenceLayout(
+    std::size_t text_rows, const GenerationGeometry& geometry,
+    std::span<const ConditionBlock> conditions, double target_temporal_origin,
+    std::string* error) {
   if (text_rows == 0 || text_rows > std::numeric_limits<std::uint32_t>::max() ||
       geometry.width < kH3CanvasMultiple ||
       geometry.height < kH3CanvasMultiple ||
@@ -408,9 +408,26 @@ std::optional<PackedLayout> BuildLayout(std::size_t text_rows,
     return std::nullopt;
   }
   std::size_t condition_rows = 0;
-  if (!CheckedMultiply(anchor_temporal.size(), frame_rows, &condition_rows)) {
-    SetError(error, "MiniMax H3 condition row count overflows");
-    return std::nullopt;
+  for (const ConditionBlock& cond : conditions) {
+    if (cond.latent_height < 2 || cond.latent_width < 2 ||
+        cond.latent_height % 2 != 0 || cond.latent_width % 2 != 0 ||
+        cond.latent_frames < 1) {
+      SetError(error, "invalid MiniMax H3 condition block geometry");
+      return std::nullopt;
+    }
+    std::size_t block_frame_rows = 0;
+    std::size_t block_rows = 0;
+    if (!CheckedMultiply(static_cast<std::size_t>(cond.latent_height / 2),
+                         static_cast<std::size_t>(cond.latent_width / 2),
+                         &block_frame_rows) ||
+        !CheckedMultiply(block_frame_rows,
+                         static_cast<std::size_t>(cond.latent_frames),
+                         &block_rows) ||
+        condition_rows > std::numeric_limits<std::size_t>::max() - block_rows) {
+      SetError(error, "MiniMax H3 condition row count overflows");
+      return std::nullopt;
+    }
+    condition_rows += block_rows;
   }
   std::size_t video_rows = 0;
   std::size_t audio_rows = 0;
@@ -452,11 +469,25 @@ std::optional<PackedLayout> BuildLayout(std::size_t text_rows,
 
     const std::vector<Position3D> frame =
         FrameGrid(geometry.latent_height, geometry.latent_width);
-    if (!anchor_temporal.empty()) {
-      for (const double anchor_time : anchor_temporal) {
-        for (const Position3D& position : frame) {
-          layout.positions.push_back(
-              {anchor_time, position.height, position.width});
+    if (!conditions.empty()) {
+      for (const ConditionBlock& cond : conditions) {
+        const std::vector<Position3D> cond_frame =
+            (cond.latent_height == geometry.latent_height &&
+             cond.latent_width == geometry.latent_width)
+                ? frame
+                : FrameGrid(cond.latent_height, cond.latent_width);
+        double cond_time = cond.temporal;
+        for (int f = 0; f < cond.latent_frames; ++f) {
+          for (const Position3D& position : cond_frame) {
+            layout.positions.push_back(
+                {cond_time, position.height, position.width});
+          }
+          if (cond.latent_frames > 1) {
+            cond_time +=
+                kFrameRescale *
+                kFramesPerToken[static_cast<std::size_t>(f) %
+                                kFramesPerToken.size()];
+          }
         }
       }
       layout.segments.push_back({text_rows, text_rows + condition_rows,
@@ -465,7 +496,7 @@ std::optional<PackedLayout> BuildLayout(std::size_t text_rows,
     const double low_width = frame.front().width;
     const double high_width =
         frame[static_cast<std::size_t>(geometry.latent_width / 2) - 1].width;
-    const double cursor = static_cast<double>(text_rows);
+    const double cursor = target_temporal_origin;
     for (int index = 0; index < geometry.temporal.audio_latent_frames;
          ++index) {
       layout.positions.push_back({cursor + index, 0.0, low_width});
@@ -498,10 +529,21 @@ std::optional<PackedLayout> BuildLayout(std::size_t text_rows,
   return layout;
 }
 
+double VideoConditionRotarySpan(int latent_frames) noexcept {
+  double span = 0.0;
+  for (int index = 0; index < latent_frames; ++index) {
+    span += kFrameRescale *
+            kFramesPerToken[static_cast<std::size_t>(index) %
+                            kFramesPerToken.size()];
+  }
+  return span;
+}
+
 std::optional<PackedLayout> BuildTextOnlyLayout(
     std::size_t text_rows, const GenerationGeometry& geometry,
     std::string* error) {
-  return BuildLayout(text_rows, geometry, {}, error);
+  return BuildReferenceLayout(text_rows, geometry, {},
+                              static_cast<double>(text_rows), error);
 }
 
 std::optional<PackedLayout> BuildKeyframeLayout(
@@ -511,7 +553,14 @@ std::optional<PackedLayout> BuildKeyframeLayout(
     SetError(error, "MiniMax H3 keyframe layout requires an anchor");
     return std::nullopt;
   }
-  return BuildLayout(text_rows, geometry, anchor_temporal, error);
+  std::vector<ConditionBlock> blocks;
+  blocks.reserve(anchor_temporal.size());
+  for (const double temporal : anchor_temporal) {
+    blocks.push_back(
+        {geometry.latent_height, geometry.latent_width, temporal});
+  }
+  return BuildReferenceLayout(text_rows, geometry, blocks,
+                              static_cast<double>(text_rows), error);
 }
 
 namespace {

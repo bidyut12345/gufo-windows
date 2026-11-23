@@ -390,9 +390,12 @@ bool RunCapture(const char* program, std::span<const std::string> arguments_in,
     return false;
   }
   std::vector<std::wstring> arguments;
-  arguments.reserve(arguments_in.size());
-  for (const std::string& arg : arguments_in) {
-    arguments.push_back(Widen(arg));
+  // POSIX RunCapture passes arguments_in straight to posix_spawnp (including
+  // argv[0]); Spawn() prepends `program`, so skip argv[0] here.
+  const std::size_t first_arg = arguments_in.empty() ? 0U : 1U;
+  arguments.reserve(arguments_in.size() - first_arg);
+  for (std::size_t i = first_arg; i < arguments_in.size(); ++i) {
+    arguments.push_back(Widen(arguments_in[i]));
   }
   Handle child;
   if (!Spawn(program, program, arguments, write_pipe.get(), &child, error)) {

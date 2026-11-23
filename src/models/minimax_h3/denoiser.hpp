@@ -40,6 +40,10 @@ struct DenoiserConditioning {
   std::span<const float> condition_rows;
   // fp64 rotary time per anchor, same packed order; empty for text-only.
   std::span<const double> anchor_temporal;
+  // Ref2VA condition blocks (per-reference latent grid + rotary time).
+  // Mutually exclusive with anchor_temporal.
+  std::span<const ConditionBlock> condition_blocks;
+  double target_temporal_origin{0.0};
 };
 
 struct DenoiserVelocity {

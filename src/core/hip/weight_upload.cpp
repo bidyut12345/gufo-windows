@@ -15,6 +15,7 @@
 
 #include "src/core/hip/host_allocations.hpp"
 #include "src/core/platform/fs.hpp"
+#include "src/core/platform/pages.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -70,9 +71,11 @@ struct WeightUpload::State {
 
   std::vector<Shard> shards;
   HostAllocations host_allocations;
+  bool use_pinned_staging{platform::UsePinnedUploadStaging()};
   std::array<Slot, kReaders> slots{};
   std::vector<std::jthread> readers;
   std::mutex mutex;
+  std::mutex transfer_mutex;
   std::condition_variable changed;
   std::deque<Task> queue;
   std::size_t pending{0};
@@ -90,6 +93,9 @@ struct WeightUpload::State {
     readers.clear();
     for (auto& slot : slots) {
       platform::CloseFile(slot.direct);
+      if (!use_pinned_staging && slot.buffer != nullptr) {
+        platform::ReleaseCommittedPages(slot.buffer, kChunkBytes + kAlignment);
+      }
       if (slot.stream != nullptr) {
         (void)hipStreamDestroy(slot.stream);
       }
@@ -155,10 +161,20 @@ struct WeightUpload::State {
       platform::Advise(shard.fd, platform::AdviseHint::kDontNeed, task.offset,
                        task.size);
     }
-    auto status = hipMemcpyAsync(task.destination, payload, task.size,
-                                 hipMemcpyHostToDevice, slot.stream);
-    if (status == hipSuccess) {
-      status = hipStreamSynchronize(slot.stream);
+    hipError_t status = hipSuccess;
+    if (use_pinned_staging) {
+      std::lock_guard transfer_lock(transfer_mutex);
+      status = hipMemcpyAsync(task.destination, payload, task.size,
+                              hipMemcpyHostToDevice, slot.stream);
+      if (status == hipSuccess) {
+        status = hipStreamSynchronize(slot.stream);
+      }
+    } else {
+      // Serialize synchronous host-to-device copies across reader threads so
+      // disk I/O stays parallel without tripping WDDM paging faults.
+      std::lock_guard transfer_lock(transfer_mutex);
+      status = hipMemcpy(task.destination, payload, task.size,
+                         hipMemcpyHostToDevice);
     }
     if (status != hipSuccess) {
       return "weight upload failed: " + std::string(hipGetErrorString(status));
@@ -215,13 +231,22 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
     shard.mapping = region.data;
   }
   for (auto& slot : s.slots) {
-    if (s.host_allocations.Allocate(&slot.buffer, kChunkBytes + kAlignment) !=
-            hipSuccess ||
-        hipStreamCreateWithFlags(&slot.stream, hipStreamNonBlocking) !=
-            hipSuccess) {
-      s.Fail("weight upload staging allocation failed");
-      s.Status(error);
-      return nullptr;
+    if (s.use_pinned_staging) {
+      if (s.host_allocations.Allocate(&slot.buffer, kChunkBytes + kAlignment) !=
+              hipSuccess ||
+          hipStreamCreateWithFlags(&slot.stream, hipStreamNonBlocking) !=
+              hipSuccess) {
+        s.Fail("weight upload staging allocation failed");
+        s.Status(error);
+        return nullptr;
+      }
+    } else {
+      slot.buffer = platform::CommitZeroedPages(kChunkBytes + kAlignment);
+      if (slot.buffer == nullptr) {
+        s.Fail("weight upload staging allocation failed");
+        s.Status(error);
+        return nullptr;
+      }
     }
   }
   try {

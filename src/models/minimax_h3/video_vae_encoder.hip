@@ -162,16 +162,22 @@ struct FlatConv {
 
 struct LevelWeights {
   std::array<FlatConv, 4> convs{};  // b0c0 b0c1 b1c0 b1c1
+  std::array<FlatConv, 4> convs3d{};
   std::array<EncDeviceBuffer, 4> norm_weights{};
   std::array<EncDeviceBuffer, 4> norm_biases{};
   std::array<FlatConv, 2> shortcut{};  // 1x1, block 0/1
   std::array<bool, 2> has_shortcut{};
   FlatConv downsample;
+  FlatConv downsample3d;
   bool has_downsample{false};
+  std::uint32_t time_stride{1};
   // Channel bookkeeping for the tile loop.
   std::array<std::uint32_t, 2> block_in{};
   std::array<std::uint32_t, 2> block_out{};
 };
+
+constexpr std::array<std::uint32_t, kH3VaeEncoderLevels>
+    kH3VaeEncoderTimeDownsample{1, 2, 2, 1, 1, 1};
 
 bool LoadTensorHost(const ModelInventory& inventory, std::string_view name,
                     std::vector<float>& out, std::string* error) {
@@ -281,11 +287,14 @@ struct VideoVaeEncoder::Impl {
   hipStream_t stream{nullptr};
 
   FlatConv conv_in;                                   // 128 x 27
+  FlatConv conv_in3d;                                 // 128 x 81
   std::array<LevelWeights, kH3VaeEncoderLevels> levels{};
   EncDeviceBuffer norm_out_weight;
   EncDeviceBuffer norm_out_bias;
   FlatConv conv_out;  // 48 x 9216
+  FlatConv conv_out3d;
   FlatConv quant;     // 48 x 48
+  bool loaded_3d_{false};
   std::uint64_t weight_bytes{0};
 
   EncDeviceBuffer buffer_a;
@@ -359,6 +368,7 @@ struct VideoVaeEncoder::Impl {
       }
       weights.has_downsample =
           kH3VaeEncoderSpatialDownsample[l] > 1;
+      weights.time_stride = kH3VaeEncoderTimeDownsample[l];
       if (weights.has_downsample &&
           !LoadConv3x3(base + ".downsample.conv", static_cast<int>(out),
                        static_cast<int>(out), &weights.downsample, error)) {
@@ -428,6 +438,83 @@ struct VideoVaeEncoder::Impl {
       return false;
     }
     weight_bytes += conv->weight.bytes() + conv->bias.bytes();
+    return true;
+  }
+
+  bool LoadConv3x3x3(const std::string& base, int out_channels, int in_channels,
+                     FlatConv* conv, std::string* error) {
+    std::vector<float> source;
+    std::vector<float> bias;
+    if (!LoadTensorHost(*inventory, base + ".weight", source, error) ||
+        !LoadTensorHost(*inventory, base + ".bias", bias, error)) {
+      return false;
+    }
+    if (source.size() !=
+        static_cast<std::size_t>(out_channels) * in_channels * 27U) {
+      EncSetError(error, "MiniMax H3 VisualVAE encoder 3d conv contract: " +
+                             base);
+      return false;
+    }
+    conv->out_channels = static_cast<std::uint32_t>(out_channels);
+    conv->columns = static_cast<std::uint32_t>(in_channels) * 27U;
+    if (!conv->weight.Allocate(source.size() * sizeof(float), error) ||
+        !conv->bias.Allocate(bias.size() * sizeof(float), error) ||
+        !UploadBuffer(stream, conv->weight, source, error) ||
+        !UploadBuffer(stream, conv->bias, bias, error)) {
+      return false;
+    }
+    weight_bytes += conv->weight.bytes() + conv->bias.bytes();
+    return true;
+  }
+
+  bool Ensure3DLoaded(std::string* error) {
+    if (loaded_3d_) {
+      return true;
+    }
+    if (!LoadConv3x3x3("encoder.conv_in", 128, 3, &conv_in3d, error)) {
+      return false;
+    }
+    for (int level = 0; level < kH3VaeEncoderLevels; ++level) {
+      LevelWeights& w = levels[static_cast<std::size_t>(level)];
+      const std::string base = "encoder.down." + std::to_string(level);
+      for (int block = 0; block < kH3VaeEncoderResidualBlocks; ++block) {
+        const std::size_t b = static_cast<std::size_t>(block);
+        const int cin = static_cast<int>(w.block_in[b]);
+        const int cout = static_cast<int>(w.block_out[b]);
+        const std::string block_base = base + ".block." + std::to_string(block);
+        if (!LoadConv3x3x3(block_base + ".conv1", cout, cin,
+                           &w.convs3d[b * 2U], error) ||
+            !LoadConv3x3x3(block_base + ".conv2", cout, cout,
+                           &w.convs3d[b * 2U + 1U], error)) {
+          return false;
+        }
+      }
+      if (w.has_downsample) {
+        const int out = static_cast<int>(w.block_out[1]);
+        if (!LoadConv3x3x3(base + ".downsample.conv", out, out,
+                           &w.downsample3d, error)) {
+          return false;
+        }
+      }
+    }
+    if (!LoadConv3x3x3("encoder.conv_out", kH3VaeEncoderMomentChannels, 1024,
+                       &conv_out3d, error)) {
+      return false;
+    }
+    const std::size_t max_positions_3d =
+        17ULL * kH3VaeEncoderTilePixels * kH3VaeEncoderTilePixels;
+    const std::size_t max_activation_3d =
+        max_positions_3d * 128U * sizeof(float);
+    const std::size_t max_columns_3d =
+        static_cast<std::size_t>(kIm2ColChunk) * 1024U * 27U * sizeof(float);
+    if (!buffer_a.Allocate(max_activation_3d, error) ||
+        !buffer_b.Allocate(max_activation_3d, error) ||
+        !buffer_s.Allocate(max_activation_3d, error) ||
+        !columns.Allocate(max_columns_3d, error) ||
+        !input_tile.Allocate(max_positions_3d * 3U * sizeof(float), error)) {
+      return false;
+    }
+    loaded_3d_ = true;
     return true;
   }
 
@@ -584,6 +671,171 @@ struct VideoVaeEncoder::Impl {
                 output + base * conv.out_channels, count, error)) {
         return false;
       }
+    }
+    return true;
+  }
+
+  bool Conv3x3x3(const float* input, std::uint32_t in_time,
+                 std::uint32_t in_height, std::uint32_t in_width,
+                 std::uint32_t channels, const FlatConv& conv,
+                 std::uint32_t stride_t, std::uint32_t stride_s,
+                 std::int32_t pad_s, float* output, std::string* error) {
+    const std::uint32_t out_time = (in_time + 2U - 3U) / stride_t + 1U;
+    std::uint32_t out_height = 0;
+    std::uint32_t out_width = 0;
+    if (pad_s == 0 && stride_s == 2U) {
+      out_height = in_height / 2U;
+      out_width = in_width / 2U;
+    } else {
+      out_height = (in_height + 2U * static_cast<std::uint32_t>(pad_s) - 3U) /
+                       stride_s +
+                   1U;
+      out_width = (in_width + 2U * static_cast<std::uint32_t>(pad_s) - 3U) /
+                      stride_s +
+                  1U;
+    }
+    const std::size_t positions =
+        static_cast<std::size_t>(out_time) * out_height * out_width;
+    for (std::size_t base = 0; base < positions; base += kIm2ColChunk) {
+      const std::uint32_t count = static_cast<std::uint32_t>(
+          positions - base < kIm2ColChunk ? positions - base : kIm2ColChunk);
+      enc_ops::LaunchIm2Col3DReflect(
+          input, columns.As<float>(), in_time, in_height, in_width, out_height,
+          out_width, channels, stride_t, stride_s, pad_s,
+          static_cast<std::uint32_t>(base), count, stream);
+      if (!EncCheckLaunch("im2col3d", error)) {
+        return false;
+      }
+      if (!Gemm(conv, columns.As<float>(),
+                output + base * conv.out_channels, count, error)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool GroupNormSilu3D(float* volume, const EncDeviceBuffer& weight,
+                       const EncDeviceBuffer& bias, std::uint32_t time,
+                       std::uint32_t hw, std::uint32_t channels,
+                       std::string* error) {
+    for (std::uint32_t t = 0; t < time; ++t) {
+      if (!GroupNormSilu(volume + static_cast<std::size_t>(t) * hw * channels,
+                         weight, bias, hw, channels, error)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Runs the causal 3D encoder on a 17-frame position-major tile in input_tile;
+  // writes 5 planar (48, lh, lw) frames (5 * 48 * lh * lw floats).
+  bool EncodeTile3D(std::uint32_t in_time, std::uint32_t height,
+                    std::uint32_t width, const CancellationToken* cancellation,
+                    std::vector<std::vector<float>>* planar_frames,
+                    std::string* error) {
+    float* a = buffer_a.As<float>();
+    float* b = buffer_b.As<float>();
+    float* s = buffer_s.As<float>();
+    std::uint32_t time = in_time;
+
+    if (!Conv3x3x3(input_tile.As<float>(), time, height, width, 3, conv_in3d, 1,
+                   1, 1, b, error)) {
+      return false;
+    }
+    std::swap(a, b);
+    std::uint32_t channels = 128;
+    for (int level = 0; level < kH3VaeEncoderLevels; ++level) {
+      const LevelWeights& w = levels[static_cast<std::size_t>(level)];
+      for (int block = 0; block < kH3VaeEncoderResidualBlocks; ++block) {
+        if (IsCancelled(cancellation)) {
+          EncSetError(error, "MiniMax H3 VisualVAE encoder cancelled");
+          return false;
+        }
+        const std::size_t bi = static_cast<std::size_t>(block);
+        const std::uint32_t cin = w.block_in[bi];
+        const std::uint32_t cout = w.block_out[bi];
+        const std::size_t hw = static_cast<std::size_t>(height) * width;
+        const std::size_t elements =
+            static_cast<std::size_t>(time) * hw * cin;
+        if (!CopyDevice(a, s, elements * sizeof(float), "residual3d", error)) {
+          return false;
+        }
+        if (!GroupNormSilu3D(a, w.norm_weights[bi * 2U],
+                             w.norm_biases[bi * 2U], time,
+                             static_cast<std::uint32_t>(hw), cin, error)) {
+          return false;
+        }
+        if (!Conv3x3x3(a, time, height, width, cin, w.convs3d[bi * 2U], 1, 1,
+                       1, b, error)) {
+          return false;
+        }
+        std::swap(a, b);
+        if (!GroupNormSilu3D(a, w.norm_weights[bi * 2U + 1U],
+                             w.norm_biases[bi * 2U + 1U], time,
+                             static_cast<std::uint32_t>(hw), cout, error)) {
+          return false;
+        }
+        if (!Conv3x3x3(a, time, height, width, cout, w.convs3d[bi * 2U + 1U],
+                       1, 1, 1, b, error)) {
+          return false;
+        }
+        std::swap(a, b);
+        if (w.has_shortcut[bi]) {
+          if (!Conv1x1(s, static_cast<std::size_t>(time) * hw, w.shortcut[bi],
+                       b, error)) {
+            return false;
+          }
+          enc_ops::LaunchAddInPlace(
+              a, b, static_cast<std::size_t>(time) * hw * cout, stream);
+        } else {
+          enc_ops::LaunchAddInPlace(a, s, elements, stream);
+        }
+        if (!EncCheckLaunch("residual3d add", error)) {
+          return false;
+        }
+        channels = cout;
+      }
+      if (w.has_downsample) {
+        if (!Conv3x3x3(a, time, height, width, channels, w.downsample3d,
+                       w.time_stride, 2, 0, b, error)) {
+          return false;
+        }
+        std::swap(a, b);
+        time = (time + 2U - 3U) / w.time_stride + 1U;
+        height = height / 2U;
+        width = width / 2U;
+      }
+    }
+    const std::uint32_t hw = height * width;
+    if (!GroupNormSilu3D(a, norm_out_weight, norm_out_bias, time, hw, 1024,
+                         error)) {
+      return false;
+    }
+    if (!Conv3x3x3(a, time, height, width, 1024, conv_out3d, 1, 1, 1, b,
+                   error)) {
+      return false;
+    }
+    std::swap(a, b);
+    if (!Conv1x1(a, static_cast<std::size_t>(time) * hw, quant, b, error)) {
+      return false;
+    }
+    std::swap(a, b);
+    std::vector<float> host(static_cast<std::size_t>(time) * hw * 48U);
+    if (hipMemcpyAsync(host.data(), a, host.size() * sizeof(float),
+                       hipMemcpyDeviceToHost, stream) != hipSuccess ||
+        !EncSync(stream, "readback3d", error)) {
+      if (error != nullptr && error->empty()) {
+        EncSetError(error, "MiniMax H3 VisualVAE 3D encoder readback failed");
+      }
+      return false;
+    }
+    planar_frames->resize(time);
+    for (std::uint32_t t = 0; t < time; ++t) {
+      std::vector<float> frame_pos(
+          host.begin() + static_cast<std::ptrdiff_t>(t) * hw * 48U,
+          host.begin() + static_cast<std::ptrdiff_t>(t + 1U) * hw * 48U);
+      TransposeToPlanar(frame_pos, 48, static_cast<int>(height),
+                        static_cast<int>(width), (*planar_frames)[t]);
     }
     return true;
   }
@@ -903,6 +1155,136 @@ bool VideoVaeEncoder::EncodeKeyframeMoments(
       }
       EncSetError(error, "MiniMax H3 VisualVAE encoder produced non-finite "
                          "moments");
+      return false;
+    }
+  }
+  return true;
+}
+
+bool VideoVaeEncoder::EncodeVideoMoments(const float* rgb_imagenet_f32,
+                                         int num_frames, int height, int width,
+                                         const CancellationToken* cancellation,
+                                         std::vector<float>* moments,
+                                         std::string* error) {
+  if (moments == nullptr || impl_ == nullptr || rgb_imagenet_f32 == nullptr ||
+      num_frames < 5 || (num_frames - 5) % 17 != 0) {
+    EncSetError(error, "invalid MiniMax H3 multi-frame VisualVAE encoder request");
+    return false;
+  }
+  auto plan = ResolveVideoVaeEncoderTilePlan(height, width, error);
+  if (!plan) {
+    return false;
+  }
+  if (!impl_->Ensure3DLoaded(error)) {
+    return false;
+  }
+  const int num_chunks = (num_frames - 5) / 17 + 1;
+  const int out_latent_frames = (num_chunks - 1) * 5 + 2;
+  const std::size_t frame_plane = static_cast<std::size_t>(height) * width;
+  const std::size_t frame_elems = 3U * frame_plane;
+  const int rows = static_cast<int>(plan->vertical.starts.size());
+  const int columns_count = static_cast<int>(plan->horizontal.starts.size());
+  const std::size_t lh = static_cast<std::size_t>(plan->latent_height);
+  const std::size_t lw = static_cast<std::size_t>(plan->latent_width);
+  const std::size_t out_plane = lh * lw;
+
+  moments->assign(
+      static_cast<std::size_t>(kH3VaeEncoderMomentChannels) *
+          out_latent_frames * out_plane,
+      0.0F);
+
+  for (int chunk = 0; chunk < num_chunks; ++chunk) {
+    // 5 output latent frames per 17-frame chunk, each with `tiles` spatial tiles.
+    std::array<std::vector<std::vector<float>>, 5> chunk_tiles;
+    for (int t = 0; t < 5; ++t) {
+      chunk_tiles[static_cast<std::size_t>(t)].resize(
+          static_cast<std::size_t>(plan->tiles));
+    }
+    for (int row = 0; row < rows; ++row) {
+      for (int column = 0; column < columns_count; ++column) {
+        if (IsCancelled(cancellation)) {
+          EncSetError(error, "MiniMax H3 VisualVAE encoder cancelled");
+          return false;
+        }
+        const int top = plan->vertical.starts[static_cast<std::size_t>(row)];
+        const int left =
+            plan->horizontal.starts[static_cast<std::size_t>(column)];
+        const int tile_height =
+            row + 1 < rows ? plan->vertical.length : height - top;
+        const int tile_width =
+            column + 1 < columns_count ? plan->horizontal.length : width - left;
+        std::vector<float> gathered(17ULL * tile_height * tile_width * 3U);
+        for (int f = 0; f < 17; ++f) {
+          const int src_frame =
+              std::min(chunk * 17 + f, num_frames - 1);
+          const float* src_base =
+              rgb_imagenet_f32 + static_cast<std::size_t>(src_frame) * frame_elems;
+          float* dst_base =
+              gathered.data() +
+              static_cast<std::size_t>(f) * tile_height * tile_width * 3U;
+          for (int y = 0; y < tile_height; ++y) {
+            for (int x = 0; x < tile_width; ++x) {
+              const std::size_t src_pos =
+                  static_cast<std::size_t>(top + y) * width + (left + x);
+              const std::size_t dst_pos =
+                  (static_cast<std::size_t>(y) * tile_width + x) * 3U;
+              dst_base[dst_pos] = src_base[src_pos];
+              dst_base[dst_pos + 1U] = src_base[frame_plane + src_pos];
+              dst_base[dst_pos + 2U] = src_base[2U * frame_plane + src_pos];
+            }
+          }
+        }
+        const hipError_t status = hipMemcpyAsync(
+            impl_->input_tile.data(), gathered.data(),
+            gathered.size() * sizeof(float), hipMemcpyHostToDevice,
+            impl_->stream);
+        if (status != hipSuccess ||
+            !EncSync(impl_->stream, "tile3d upload", error)) {
+          if (status != hipSuccess && error != nullptr && error->empty()) {
+            EncSetError(error, "MiniMax H3 VisualVAE 3D tile upload failed");
+          }
+          return false;
+        }
+        std::vector<std::vector<float>> tile_frames;
+        if (!impl_->EncodeTile3D(17, static_cast<std::uint32_t>(tile_height),
+                                 static_cast<std::uint32_t>(tile_width),
+                                 cancellation, &tile_frames, error) ||
+            tile_frames.size() != 5U) {
+          return false;
+        }
+        const std::size_t tile_idx =
+            static_cast<std::size_t>(row * columns_count + column);
+        for (std::size_t t = 0; t < 5U; ++t) {
+          chunk_tiles[t][tile_idx] = std::move(tile_frames[t]);
+        }
+      }
+    }
+    // Stitch each of the 5 frames and copy into moments (dropping last 3 of last chunk).
+    for (int t = 0; t < 5; ++t) {
+      const int out_t = chunk * 5 + t;
+      if (out_t >= out_latent_frames) {
+        break;
+      }
+      std::vector<float> stitched;
+      if (!StitchVideoVaeEncoderTiles(
+              *plan, chunk_tiles[static_cast<std::size_t>(t)], &stitched,
+              error)) {
+        return false;
+      }
+      for (int c = 0; c < kH3VaeEncoderMomentChannels; ++c) {
+        const float* src =
+            stitched.data() + static_cast<std::size_t>(c) * out_plane;
+        float* dst = moments->data() +
+                     (static_cast<std::size_t>(c) * out_latent_frames + out_t) *
+                         out_plane;
+        std::copy(src, src + out_plane, dst);
+      }
+    }
+  }
+  for (const float value : *moments) {
+    if (!std::isfinite(value)) {
+      EncSetError(error,
+                  "MiniMax H3 VisualVAE 3D encoder produced non-finite moments");
       return false;
     }
   }

@@ -63,6 +63,13 @@ inline constexpr std::int64_t kVisionMinimumPixels = 65536;
                                        KeyframeVision* output,
                                        std::string* error);
 
+// Builds vision-tower rows from two consecutive video frames (rgb_t0, rgb_t1),
+// each width * height * 3 RGB8 bytes.
+[[nodiscard]] bool BuildVideoPairVision(const std::uint8_t* rgb_t0,
+                                        const std::uint8_t* rgb_t1, int width,
+                                        int height, KeyframeVision* output,
+                                        std::string* error);
+
 }  // namespace gufo::minimax_h3::image_processor
 
 #endif  // GUFO_MODELS_MINIMAX_H3_IMAGE_PROCESSOR_HPP_

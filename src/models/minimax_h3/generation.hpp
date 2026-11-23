@@ -86,6 +86,13 @@ struct GenerationRequest {
   // rounding, and a follower is cover-cropped (the released index rule).
   std::filesystem::path first_frame_path;
   std::filesystem::path last_frame_path;
+  // Ref2VA image references (up to 9, in packed order).
+  std::vector<std::filesystem::path> reference_images;
+  // Ref2VA video references (up to 3, in packed order).
+  std::vector<std::filesystem::path> reference_videos;
+  // When true, FL2VA keyframes cover-crop onto the requested canvas rather
+  // than overriding the video aspect ratio via ResolveKeyframeParameters.
+  bool lock_canvas_to_preset{false};
 };
 
 struct GenerationTelemetry {

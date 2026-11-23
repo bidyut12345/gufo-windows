@@ -125,6 +125,15 @@ struct PackedLayout {
   [[nodiscard]] std::size_t rows() const noexcept { return positions.size(); }
 };
 
+struct ConditionBlock {
+  int latent_height{0};
+  int latent_width{0};
+  double temporal{0.0};
+  int latent_frames{1};
+};
+
+[[nodiscard]] double VideoConditionRotarySpan(int latent_frames) noexcept;
+
 [[nodiscard]] std::optional<PackedLayout> BuildTextOnlyLayout(
     std::size_t text_rows, const GenerationGeometry& geometry,
     std::string* error = nullptr);
@@ -135,6 +144,13 @@ struct PackedLayout {
 [[nodiscard]] std::optional<PackedLayout> BuildKeyframeLayout(
     std::size_t text_rows, const GenerationGeometry& geometry,
     std::span<const double> anchor_temporal, std::string* error = nullptr);
+// Ref2VA image-reference blocks: each condition block carries its own latent
+// grid and fp64 rotary time, and target audio/video start at
+// `target_temporal_origin` (text_rows + reference count for image-only Ref2VA).
+[[nodiscard]] std::optional<PackedLayout> BuildReferenceLayout(
+    std::size_t text_rows, const GenerationGeometry& geometry,
+    std::span<const ConditionBlock> conditions, double target_temporal_origin,
+    std::string* error = nullptr);
 // Anchors hold per-row timestep max(video timestep, 0.999) for the whole
 // trajectory (reference keyframe_noise_aug level).
 inline constexpr float kH3KeyframeConditionTimestep = 0.999F;

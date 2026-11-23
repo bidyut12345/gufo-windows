@@ -86,6 +86,35 @@ void RegisterVideoOptions(ArgParser& parser, VideoCliOptions& options,
                    "FL2VA last-frame anchor; with --first-frame the first "
                    "stretches to the canvas and the last is cover-cropped",
                    "Model & Output", &request.last_frame_path);
+  parser.AddCustomOption(
+      "", "--reference", "FILE",
+      "Ref2VA reference image (up to 9, repeatable in packed order)",
+      "Model & Output",
+      [&request](std::string_view, std::string_view value, std::string* error) {
+        if (request.reference_images.size() >= 9U) {
+          SetError(error, "MiniMax H3 accepts at most 9 --reference images");
+          return false;
+        }
+        request.reference_images.emplace_back(value);
+        return true;
+      });
+  parser.AddCustomOption(
+      "", "--reference-video", "FILE",
+      "Ref2VA reference video (up to 3, repeatable in packed order)",
+      "Model & Output",
+      [&request](std::string_view, std::string_view value, std::string* error) {
+        if (request.reference_videos.size() >= 3U) {
+          SetError(error,
+                   "MiniMax H3 accepts at most 3 --reference-video clips");
+          return false;
+        }
+        request.reference_videos.emplace_back(value);
+        return true;
+      });
+  parser.AddFlag("", "--lock-resolution",
+                 "Keep selected resolution when --first-frame or --last-frame "
+                 "is set (cover-crop instead of matching image aspect)",
+                 "Model & Output", &request.lock_canvas_to_preset);
   parser.AddOption("", "--seed", "N", "Noise RNG seed (default: 42)",
                    "Denoising", &request.seed);
   const auto integer_override = [&](std::string_view name,

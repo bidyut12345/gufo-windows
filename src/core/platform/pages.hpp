@@ -67,6 +67,15 @@ SharedTempMapping CreateSharedTempMapping(std::size_t bytes) noexcept;
 /// Releases a mapping created by CreateSharedTempMapping().
 void ReleaseSharedTempMapping(SharedTempMapping& mapping) noexcept;
 
+/// Hints the OS to trim idle pages from the process working set.
+void TrimWorkingSet() noexcept;
+
+/// True when weight upload staging buffers should be pinned and registered
+/// with HIP (`hipHostRegisterMapped`). On Windows WDDM, copying from
+/// registered host buffers into device allocations that have spilled past the
+/// local aperture fails with `unspecified launch failure`.
+bool UsePinnedUploadStaging() noexcept;
+
 }  // namespace gufo::platform
 
 #endif  // GUFO_CORE_PLATFORM_PAGES_HPP_

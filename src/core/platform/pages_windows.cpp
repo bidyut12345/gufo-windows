@@ -105,4 +105,13 @@ void ReleaseSharedTempMapping(SharedTempMapping& mapping) noexcept {
   mapping = {};
 }
 
+void TrimWorkingSet() noexcept {
+  (void)SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1),
+                                 static_cast<SIZE_T>(-1));
+}
+
+bool UsePinnedUploadStaging() noexcept {
+  return false;
+}
+
 }  // namespace gufo::platform

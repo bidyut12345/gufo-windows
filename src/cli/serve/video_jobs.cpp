@@ -93,17 +93,20 @@ bool MatchesOutputContract(const VideoJobRequest& request) {
     return false;
   }
   if (request.output_format == "mp4") {
-    const bool square =
+    const std::string expected_size =
+        std::to_string(parameters.output_width) + "x" +
+        std::to_string(parameters.output_height);
+    const bool custom_exact =
+        request.size == expected_size && parameters.output_width >= 32 &&
+        parameters.output_height >= 32 &&
+        (parameters.preset == "exact-512" ||
+         parameters.preset == "exact-1344x768");
+    const bool preset_512 =
         request.size == "512x512" && parameters.output_width == 512 &&
         parameters.output_height == 512 &&
-        (parameters.preset == "exact-512" || parameters.preset == "fast-384" ||
+        (parameters.preset == "fast-384" ||
          parameters.preset == "aggressive-320");
-    const bool released_full_resolution =
-        request.size == "1344x768" && parameters.preset == "exact-1344x768" &&
-        parameters.internal_width == 1344 &&
-        parameters.internal_height == 768 && parameters.output_width == 1344 &&
-        parameters.output_height == 768;
-    return (square || released_full_resolution) && parameters.mux &&
+    return (custom_exact || preset_512) && parameters.mux &&
            parameters.decode_audio && parameters.selected_frames.empty();
   }
   return request.output_format == "ppm" && request.size == "256x256" &&
@@ -376,6 +379,8 @@ struct VideoJobService::Impl {
     /// cancellation, and TTL expiry reclaim uploaded imagery with the output.
     std::filesystem::path first_frame_path;
     std::filesystem::path last_frame_path;
+    std::vector<std::filesystem::path> reference_image_paths;
+    std::vector<std::filesystem::path> reference_video_paths;
     std::filesystem::path content_path;
     std::string media_type;
     std::atomic<bool> cancelled{false};
@@ -551,8 +556,8 @@ struct VideoJobService::Impl {
         const double expires_at = value.member_double("expires_at", -1);
         job->directory = entry.path();
         const bool valid_output = (job->snapshot.output_format == "mp4" &&
-                                   (job->snapshot.size == "512x512" ||
-                                    job->snapshot.size == "1344x768")) ||
+                                   job->snapshot.size.find('x') !=
+                                       std::string::npos) ||
                                   (job->snapshot.output_format == "ppm" &&
                                    job->snapshot.size == "256x256");
         const bool valid_numbers =
@@ -732,6 +737,9 @@ struct VideoJobService::Impl {
           .parameters = job->request.parameters,
           .first_frame_path = job->first_frame_path,
           .last_frame_path = job->last_frame_path,
+          .reference_images = job->reference_image_paths,
+          .reference_videos = job->reference_video_paths,
+          .lock_canvas_to_preset = job->request.lock_canvas_to_preset,
       };
       {
         // Delete can clear a queued/active prompt concurrently with admission.
@@ -1028,12 +1036,38 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
           std::span<const std::uint8_t>(png.data(), png.size()));
       return true;
     };
-    if (!stage_keyframe(request.first_frame_bytes, kFirstFrameFileName,
-                        &job->first_frame_path,
-                        &job->snapshot.first_frame_sha256) ||
-        !stage_keyframe(request.last_frame_bytes, kLastFrameFileName,
-                        &job->last_frame_path,
-                        &job->snapshot.last_frame_sha256)) {
+    bool staged_ok =
+        stage_keyframe(request.first_frame_bytes, kFirstFrameFileName,
+                       &job->first_frame_path,
+                       &job->snapshot.first_frame_sha256) &&
+        stage_keyframe(request.last_frame_bytes, kLastFrameFileName,
+                       &job->last_frame_path,
+                       &job->snapshot.last_frame_sha256);
+    if (staged_ok && !request.reference_image_bytes.empty()) {
+      job->reference_image_paths.resize(request.reference_image_bytes.size());
+      for (std::size_t i = 0; i < request.reference_image_bytes.size(); ++i) {
+        std::string unused_sha;
+        if (!stage_keyframe(request.reference_image_bytes[i],
+                            "reference_" + std::to_string(i) + ".img",
+                            &job->reference_image_paths[i], &unused_sha)) {
+          staged_ok = false;
+          break;
+        }
+      }
+    }
+    if (staged_ok && !request.reference_video_bytes.empty()) {
+      job->reference_video_paths.resize(request.reference_video_bytes.size());
+      for (std::size_t i = 0; i < request.reference_video_bytes.size(); ++i) {
+        std::string unused_sha;
+        if (!stage_keyframe(request.reference_video_bytes[i],
+                            "reference_video_" + std::to_string(i) + ".mp4",
+                            &job->reference_video_paths[i], &unused_sha)) {
+          staged_ok = false;
+          break;
+        }
+      }
+    }
+    if (!staged_ok) {
       std::error_code ignored;
       std::filesystem::remove_all(job->directory, ignored);
       WipeString(&job->request.prompt);

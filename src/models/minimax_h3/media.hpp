@@ -59,6 +59,18 @@ struct MediaVideoOptions {
     int sample_rate, const CancellationToken* cancellation,
     MediaMuxTelemetry* telemetry, std::string* error = nullptr);
 
+struct DecodedReferenceVideo {
+  int width{0};
+  int height{0};
+  int frame_count{0};
+  std::vector<std::uint8_t> rgb24;  // frame-major RGB24 at 24 fps
+};
+
+[[nodiscard]] bool DecodeReferenceVideo(const std::filesystem::path& path,
+                                        int max_frames,
+                                        DecodedReferenceVideo* out,
+                                        std::string* error = nullptr);
+
 [[nodiscard]] bool ProbeMediaFile(const std::filesystem::path& path,
                                   MediaProbe* probe,
                                   std::string* error = nullptr);

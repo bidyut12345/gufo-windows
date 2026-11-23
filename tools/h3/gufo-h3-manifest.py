@@ -24,6 +24,12 @@ def main() -> int:
         )
     )
     parser.add_argument("--model-root", required=True, type=Path)
+    parser.add_argument(
+        "--variant",
+        choices=("fl2va", "ref2va"),
+        default="fl2va",
+        help="MiniMax H3 variant to inventory (default: fl2va)",
+    )
     operation = parser.add_mutually_exclusive_group(required=True)
     operation.add_argument("--output", type=Path)
     operation.add_argument("--verify", type=Path)
@@ -39,7 +45,7 @@ def main() -> int:
             action = "verified"
         else:
             manifest = build_manifest(
-                args.model_root, progress=not args.quiet
+                args.model_root, variant=args.variant, progress=not args.quiet
             )
             write_manifest(args.output, manifest)
             action = "written"

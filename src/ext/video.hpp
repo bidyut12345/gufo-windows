@@ -51,6 +51,13 @@ struct VideoRequest {
   /// silently ignore these anchors.
   std::filesystem::path first_frame_path;
   std::filesystem::path last_frame_path;
+  /// Optional Ref2VA image references (up to 9, in packed order).
+  std::vector<std::filesystem::path> reference_images;
+  /// Optional Ref2VA video references (up to 3, in packed order).
+  std::vector<std::filesystem::path> reference_videos;
+  /// When true, FL2VA keyframes center-crop onto the requested canvas instead
+  /// of letting the anchor image override the video aspect ratio.
+  bool lock_canvas_to_preset{false};
 };
 
 struct VideoTelemetry {
