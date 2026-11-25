@@ -171,7 +171,12 @@ private:
 
 bool HasShape(const TensorDescriptor& descriptor, DType dtype,
               std::initializer_list<std::uint64_t> shape) {
-  return descriptor.dtype == dtype &&
+  const bool dtype_ok =
+      descriptor.dtype == dtype ||
+      (dtype == DType::kBFloat16 &&
+       (descriptor.dtype == DType::kInt8 ||
+        descriptor.dtype == DType::kFloat8E4M3));
+  return dtype_ok &&
          descriptor.shape ==
              std::vector<std::uint64_t>(shape.begin(), shape.end());
 }
@@ -193,16 +198,105 @@ const TensorDescriptor* RequireTensor(
   return descriptor;
 }
 
+__device__ __forceinline__ std::uint16_t DenFloatToBf16(float value) {
+  const std::uint32_t bits = __float_as_uint(value);
+  if ((bits & 0x7F800000U) == 0x7F800000U) {
+    return static_cast<std::uint16_t>((bits | 0x0040U) >> 16U);
+  }
+  const std::uint32_t rounding = 0x7FFFU + ((bits >> 16U) & 1U);
+  return static_cast<std::uint16_t>((bits + rounding) >> 16U);
+}
+
+__device__ __forceinline__ float DenDecodeFp8E4M3(std::uint8_t bits) {
+  const std::uint32_t sign = (bits >> 7U) & 1U;
+  const std::uint32_t exp = (bits >> 3U) & 0xFU;
+  const std::uint32_t mant = bits & 0x7U;
+  if (exp == 15U && mant == 7U) {
+    return 0.0F;
+  }
+  const float mag =
+      exp == 0U ? ldexpf(static_cast<float>(mant), -9)
+                : ldexpf(static_cast<float>(8U + mant),
+                         static_cast<int>(exp) - 10);
+  return sign != 0U ? -mag : mag;
+}
+
+__global__ void DenDequantInt8ToBf16Kernel(const std::int8_t* src,
+                                           const float* scale,
+                                           std::uint16_t* dst, std::size_t n,
+                                           std::size_t cols,
+                                           std::size_t scale_count,
+                                           bool repack_qkv) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float s = 1.0F;
+    if (scale != nullptr && scale_count != 0U) {
+      s = scale_count == 1U ? scale[0] : scale[i / cols];
+    }
+    std::size_t dst_i = i;
+    if (repack_qkv) {
+      const std::size_t row = i / cols;
+      const std::size_t col = i % cols;
+      const std::size_t qkv = row / 7168U;
+      const std::size_t rem = row % 7168U;
+      const std::size_t head = rem / 128U;
+      const std::size_t d = rem % 128U;
+      dst_i = ((head * 3U + qkv) * 128U + d) * cols + col;
+    }
+    dst[dst_i] = DenFloatToBf16(static_cast<float>(src[i]) * s);
+  }
+}
+
+__global__ void DenDequantFp8ToBf16Kernel(const std::uint8_t* src,
+                                          const float* scale,
+                                          std::uint16_t* dst, std::size_t n,
+                                          std::size_t cols,
+                                          std::size_t scale_count,
+                                          bool repack_qkv) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float s = 1.0F;
+    if (scale != nullptr && scale_count != 0U) {
+      s = scale_count == 1U ? scale[0] : scale[i / cols];
+    }
+    std::size_t dst_i = i;
+    if (repack_qkv) {
+      const std::size_t row = i / cols;
+      const std::size_t col = i % cols;
+      const std::size_t qkv = row / 7168U;
+      const std::size_t rem = row % 7168U;
+      const std::size_t head = rem / 128U;
+      const std::size_t d = rem % 128U;
+      dst_i = ((head * 3U + qkv) * 128U + d) * cols + col;
+    }
+    dst[dst_i] = DenFloatToBf16(DenDecodeFp8E4M3(src[i]) * s);
+  }
+}
+
 bool LoadTensor(const ModelInventory& inventory,
                 const TensorDescriptor& descriptor, int device,
                 hipStream_t stream, void* staging, std::size_t staging_bytes,
                 const CancellationToken* cancellation, DeviceBuffer* output,
                 std::string* error) {
-  if (descriptor.payload_bytes > std::numeric_limits<std::size_t>::max() ||
-      !output->Allocate(static_cast<std::size_t>(descriptor.payload_bytes),
-                        error)) {
+  const bool quantized = descriptor.dtype == DType::kInt8 ||
+                         descriptor.dtype == DType::kFloat8E4M3;
+  if (descriptor.payload_bytes > std::numeric_limits<std::size_t>::max()) {
+    SetError(error, "MiniMax H3 tensor exceeds addressable memory");
     return false;
   }
+  const std::size_t bytes = static_cast<std::size_t>(descriptor.payload_bytes);
+  DeviceBuffer raw_buffer;
+  if (quantized) {
+    if (!raw_buffer.Allocate(bytes, error) ||
+        !output->Allocate(bytes * 2U, error)) {
+      return false;
+    }
+  } else if (!output->Allocate(bytes, error)) {
+    return false;
+  }
+  void* upload_dst = quantized ? raw_buffer.data() : output->data();
   const std::filesystem::path path = inventory.model_root() / descriptor.shard;
   std::string open_error;
   const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
@@ -212,7 +306,6 @@ bool LoadTensor(const ModelInventory& inventory,
     output->Reset();
     return false;
   }
-  const std::size_t bytes = output->bytes();
   std::size_t copied = 0;
   bool success = true;
   while (copied < bytes) {
@@ -240,7 +333,7 @@ bool LoadTensor(const ModelInventory& inventory,
     }
     hipError_t status = hipSetDevice(device);
     if (status == hipSuccess) {
-      status = hipMemcpyAsync(static_cast<std::byte*>(output->data()) + copied,
+      status = hipMemcpyAsync(static_cast<std::byte*>(upload_dst) + copied,
                               staging, chunk, hipMemcpyHostToDevice, stream);
     }
     if (status == hipSuccess) {
@@ -256,8 +349,92 @@ bool LoadTensor(const ModelInventory& inventory,
   platform::CloseFile(file);
   if (!success) {
     output->Reset();
+    return false;
   }
-  return success;
+  if (quantized) {
+    DeviceBuffer scale_dev;
+    std::size_t scale_count = 0;
+    const std::size_t cols =
+        descriptor.shape.size() == 2
+            ? static_cast<std::size_t>(descriptor.shape[1])
+            : bytes;
+    const std::size_t rows =
+        descriptor.shape.size() == 2
+            ? static_cast<std::size_t>(descriptor.shape[0])
+            : 1U;
+    if (descriptor.name.ends_with(".weight")) {
+      const std::string base =
+          descriptor.name.substr(0, descriptor.name.size() - 7U);
+      const TensorDescriptor* scale_desc =
+          inventory.FindTensor(base + "._weight_scale");
+      if (scale_desc == nullptr) {
+        scale_desc = inventory.FindTensor(base + ".weight_scale");
+      }
+      if (scale_desc != nullptr && scale_desc->dtype == DType::kFloat32 &&
+          scale_desc->payload_bytes >= 4U) {
+        const std::size_t sc =
+            static_cast<std::size_t>(scale_desc->payload_bytes / 4U);
+        if (sc == 1U || sc == rows) {
+          std::vector<float> host_scale(sc);
+          const std::filesystem::path spath =
+              inventory.model_root() / scale_desc->shard;
+          const platform::PlatformFile sfile =
+              platform::OpenReadFile(spath, nullptr);
+          if (platform::FileValid(sfile)) {
+            std::size_t sread = 0;
+            while (sread < scale_desc->payload_bytes) {
+              const std::size_t r = platform::ReadFileAt(
+                  sfile, reinterpret_cast<std::byte*>(host_scale.data()) + sread,
+                  scale_desc->payload_bytes - sread,
+                  scale_desc->file_offset + sread);
+              if (r == 0) {
+                break;
+              }
+              sread += r;
+            }
+            platform::CloseFile(sfile);
+            if (sread == scale_desc->payload_bytes &&
+                scale_dev.Allocate(scale_desc->payload_bytes, error) &&
+                hipMemcpyAsync(scale_dev.data(), host_scale.data(),
+                               scale_desc->payload_bytes, hipMemcpyHostToDevice,
+                               stream) == hipSuccess) {
+              scale_count = sc;
+            }
+          }
+        }
+      }
+    }
+    const unsigned threads = 256U;
+    const unsigned blocks = static_cast<unsigned>((bytes + threads - 1U) / threads);
+    const float* scale_ptr =
+        scale_count != 0U ? scale_dev.As<float>() : nullptr;
+    const bool repack_qkv =
+        descriptor.name.ends_with("attn.qkv_proj.weight") && rows == 21504U &&
+        cols != 0U;
+    if (descriptor.dtype == DType::kInt8) {
+      DenDequantInt8ToBf16Kernel<<<blocks, threads, 0, stream>>>(
+          raw_buffer.As<std::int8_t>(), scale_ptr,
+          output->As<std::uint16_t>(), bytes, cols, scale_count, repack_qkv);
+    } else {
+      DenDequantFp8ToBf16Kernel<<<blocks, threads, 0, stream>>>(
+          raw_buffer.As<std::uint8_t>(), scale_ptr,
+          output->As<std::uint16_t>(), bytes, cols, scale_count, repack_qkv);
+    }
+    const hipError_t launch_status = hipGetLastError();
+    if (launch_status != hipSuccess) {
+      SetError(error, HipError("launch dequantize MiniMax H3 tensor",
+                               launch_status));
+      output->Reset();
+      return false;
+    }
+    const hipError_t sync_status = hipStreamSynchronize(stream);
+    if (sync_status != hipSuccess) {
+      SetError(error, HipError("dequantize MiniMax H3 tensor", sync_status));
+      output->Reset();
+      return false;
+    }
+  }
+  return true;
 }
 
 bool ReadTensorHost(const ModelInventory& inventory,
@@ -1906,14 +2083,85 @@ bool DenoiserSession::DenoiseWithProgress(
     std::span<float> video_latent, std::span<float> audio_latent,
     const CancellationToken* cancellation, DenoiserProgress progress,
     void* progress_opaque, DenoiserTelemetry* telemetry, std::string* error) {
+  return DenoiseWithCheckpoints(video_latent, audio_latent, 0, nullptr,
+                                cancellation, progress, progress_opaque,
+                                nullptr, nullptr, telemetry, error);
+}
+
+bool DenoiserSession::DenoiseWithCheckpoints(
+    std::span<float> video_latent, std::span<float> audio_latent,
+    int start_step, const DenoiserCheckpointState* initial_state,
+    const CancellationToken* cancellation, DenoiserProgress progress,
+    void* progress_opaque, DenoiserStepCheckpoint step_checkpoint,
+    void* step_checkpoint_opaque, DenoiserTelemetry* telemetry,
+    std::string* error) {
   const Faults faults_before = ReadFaults();
-  if (impl_ == nullptr ||
-      !impl_->UploadLatents(video_latent, audio_latent, error)) {
+  if (impl_ == nullptr || start_step < 0 ||
+      start_step > impl_->schedule.evaluations()) {
+    SetError(error, "invalid MiniMax H3 denoiser start step");
+    return false;
+  }
+  const std::span<const float> upload_video =
+      (start_step > 0 && initial_state != nullptr &&
+       !initial_state->video_latent.empty())
+          ? std::span<const float>(initial_state->video_latent)
+          : std::span<const float>(video_latent);
+  const std::span<const float> upload_audio =
+      (start_step > 0 && initial_state != nullptr &&
+       !initial_state->audio_latent.empty())
+          ? std::span<const float>(initial_state->audio_latent)
+          : std::span<const float>(audio_latent);
+  if (!impl_->UploadLatents(upload_video, upload_audio, error)) {
     return false;
   }
   double sampler_ms = 0.0;
   bool have_velocity = false;
-  for (int step = 0; step < impl_->schedule.evaluations(); ++step) {
+  if (start_step > 0 && initial_state != nullptr) {
+    have_velocity = initial_state->have_velocity;
+    if (!initial_state->video_velocity.empty()) {
+      if (initial_state->video_velocity.size() * sizeof(float) !=
+              impl_->video_velocity_f32.bytes() ||
+          initial_state->audio_velocity.size() * sizeof(float) !=
+              impl_->audio_velocity_f32.bytes() ||
+          !impl_->CopyAsync(impl_->video_velocity_f32.data(),
+                            initial_state->video_velocity.data(),
+                            impl_->video_velocity_f32.bytes(),
+                            hipMemcpyHostToDevice,
+                            "restore H3 video velocity", error) ||
+          !impl_->CopyAsync(impl_->audio_velocity_f32.data(),
+                            initial_state->audio_velocity.data(),
+                            impl_->audio_velocity_f32.bytes(),
+                            hipMemcpyHostToDevice,
+                            "restore H3 audio velocity", error)) {
+        return false;
+      }
+    }
+    if (impl_->reuse_interval > 1 &&
+        !initial_state->previous_video_velocity.empty()) {
+      if (initial_state->previous_video_velocity.size() * sizeof(float) !=
+              impl_->previous_video_velocity_f32.bytes() ||
+          initial_state->previous_audio_velocity.size() * sizeof(float) !=
+              impl_->previous_audio_velocity_f32.bytes() ||
+          !impl_->CopyAsync(impl_->previous_video_velocity_f32.data(),
+                            initial_state->previous_video_velocity.data(),
+                            impl_->previous_video_velocity_f32.bytes(),
+                            hipMemcpyHostToDevice,
+                            "restore H3 previous video velocity", error) ||
+          !impl_->CopyAsync(impl_->previous_audio_velocity_f32.data(),
+                            initial_state->previous_audio_velocity.data(),
+                            impl_->previous_audio_velocity_f32.bytes(),
+                            hipMemcpyHostToDevice,
+                            "restore H3 previous audio velocity", error)) {
+        return false;
+      }
+    }
+    const hipError_t restore_sync = hipStreamSynchronize(impl_->stream);
+    if (restore_sync != hipSuccess) {
+      SetError(error, HipError("synchronize H3 velocity restore", restore_sync));
+      return false;
+    }
+  }
+  for (int step = start_step; step < impl_->schedule.evaluations(); ++step) {
     const EulerStepPlan& plan =
         impl_->euler_plan[static_cast<std::size_t>(step)];
     if (plan.evaluate) {
@@ -1978,6 +2226,81 @@ bool DenoiserSession::DenoiseWithProgress(
     impl_->base_telemetry.dispatches += 2;
     if (progress != nullptr) {
       progress(step + 1, impl_->schedule.evaluations(), progress_opaque);
+    }
+    if (step_checkpoint != nullptr) {
+      DenoiserCheckpointState cp_state;
+      cp_state.completed_steps = step + 1;
+      cp_state.have_velocity = have_velocity;
+      cp_state.video_latent.resize(video_latent.size());
+      cp_state.audio_latent.resize(audio_latent.size());
+      if (!impl_->CopyAsync(impl_->video_rows_host.data(),
+                            impl_->video_sample.data(),
+                            impl_->video_sample.bytes(), hipMemcpyDeviceToHost,
+                            "checkpoint H3 video latent", error) ||
+          !impl_->CopyAsync(impl_->audio_rows_host.data(),
+                            impl_->audio_sample.data(),
+                            impl_->audio_sample.bytes(), hipMemcpyDeviceToHost,
+                            "checkpoint H3 audio latent", error)) {
+        return false;
+      }
+      const bool save_velocity =
+          have_velocity &&
+          (impl_->reuse_interval > 1 ||
+           (step + 1 < impl_->schedule.evaluations() &&
+            !impl_->euler_plan[static_cast<std::size_t>(step + 1)].evaluate));
+      if (save_velocity) {
+        cp_state.video_velocity.resize(impl_->video_velocity_f32.bytes() /
+                                       sizeof(float));
+        cp_state.audio_velocity.resize(impl_->audio_velocity_f32.bytes() /
+                                       sizeof(float));
+        if (!impl_->CopyAsync(cp_state.video_velocity.data(),
+                              impl_->video_velocity_f32.data(),
+                              impl_->video_velocity_f32.bytes(),
+                              hipMemcpyDeviceToHost,
+                              "checkpoint H3 video velocity", error) ||
+            !impl_->CopyAsync(cp_state.audio_velocity.data(),
+                              impl_->audio_velocity_f32.data(),
+                              impl_->audio_velocity_f32.bytes(),
+                              hipMemcpyDeviceToHost,
+                              "checkpoint H3 audio velocity", error)) {
+          return false;
+        }
+        if (impl_->reuse_interval > 1 &&
+            impl_->previous_video_velocity_f32.bytes() != 0U) {
+          cp_state.previous_video_velocity.resize(
+              impl_->previous_video_velocity_f32.bytes() / sizeof(float));
+          cp_state.previous_audio_velocity.resize(
+              impl_->previous_audio_velocity_f32.bytes() / sizeof(float));
+          if (!impl_->CopyAsync(cp_state.previous_video_velocity.data(),
+                                impl_->previous_video_velocity_f32.data(),
+                                impl_->previous_video_velocity_f32.bytes(),
+                                hipMemcpyDeviceToHost,
+                                "checkpoint H3 previous video velocity", error) ||
+              !impl_->CopyAsync(cp_state.previous_audio_velocity.data(),
+                                impl_->previous_audio_velocity_f32.data(),
+                                impl_->previous_audio_velocity_f32.bytes(),
+                                hipMemcpyDeviceToHost,
+                                "checkpoint H3 previous audio velocity", error)) {
+            return false;
+          }
+        }
+      }
+      const hipError_t cp_sync = hipStreamSynchronize(impl_->stream);
+      if (cp_sync != hipSuccess) {
+        SetError(error, HipError("synchronize H3 step checkpoint", cp_sync));
+        return false;
+      }
+      if (!UnpatchifyVideo(impl_->video_rows_host, kH3VideoLatentChannels,
+                           impl_->geometry.temporal.video_latent_frames,
+                           impl_->geometry.latent_height,
+                           impl_->geometry.latent_width, cp_state.video_latent,
+                           error) ||
+          !UnpackAudio(impl_->audio_rows_host, kH3AudioLatentChannels,
+                       impl_->geometry.temporal.audio_latent_frames,
+                       cp_state.audio_latent, error) ||
+          !step_checkpoint(cp_state, step_checkpoint_opaque, error)) {
+        return false;
+      }
     }
     if (IsCancelled(cancellation)) {
       SetError(error, "MiniMax H3 denoiser cancelled after step " +

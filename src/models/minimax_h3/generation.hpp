@@ -93,6 +93,9 @@ struct GenerationRequest {
   // When true, FL2VA keyframes cover-crop onto the requested canvas rather
   // than overriding the video aspect ratio via ResolveKeyframeParameters.
   bool lock_canvas_to_preset{false};
+  // Optional directory for stage/step checkpoints and resume.
+  std::filesystem::path checkpoint_directory;
+  bool resume_from_checkpoint{false};
 };
 
 struct GenerationTelemetry {

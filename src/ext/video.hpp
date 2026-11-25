@@ -58,6 +58,9 @@ struct VideoRequest {
   /// When true, FL2VA keyframes center-crop onto the requested canvas instead
   /// of letting the anchor image override the video aspect ratio.
   bool lock_canvas_to_preset{false};
+  /// Optional directory for stage/step checkpoints and resume.
+  std::filesystem::path checkpoint_directory;
+  bool resume_from_checkpoint{false};
 };
 
 struct VideoTelemetry {

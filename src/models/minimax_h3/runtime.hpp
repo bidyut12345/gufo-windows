@@ -20,6 +20,9 @@ enum class DType : std::uint8_t {
   kBFloat16,
   kFloat32,
   kInt32,
+  kInt8,
+  kFloat8E4M3,
+  kUint8,
 };
 
 [[nodiscard]] std::string_view ToString(DType dtype) noexcept;

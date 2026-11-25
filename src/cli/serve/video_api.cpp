@@ -118,6 +118,11 @@ json::Value SnapshotValue(const VideoJobSnapshot& snapshot) {
   root["progress"] = snapshot.progress;
   root["model"] = snapshot.model;
   root["size"] = snapshot.size;
+  if (!snapshot.checkpoint_stage.empty()) {
+    root["checkpoint_stage"] = snapshot.checkpoint_stage;
+    root["checkpoint_step"] = snapshot.checkpoint_step;
+    root["checkpoint_total"] = snapshot.checkpoint_total;
+  }
   root["seconds"] = snapshot.seconds;
   root["output_format"] = snapshot.output_format;
   if (snapshot.completed_at > 0) {
@@ -838,23 +843,64 @@ HttpResponse DeleteVideo(std::string_view id, VideoJobService& service) {
   };
 }
 
-std::optional<std::pair<std::string_view, bool>> ParseVideoPath(
+enum class VideoSubresource : std::uint8_t {
+  kNone,
+  kContent,
+  kPause,
+  kResume,
+};
+
+std::optional<std::pair<std::string_view, VideoSubresource>> ParseVideoPath(
     std::string_view path) {
   constexpr std::string_view prefix = "/v1/videos/";
   if (!path.starts_with(prefix)) {
     return std::nullopt;
   }
   std::string_view remainder = path.substr(prefix.size());
-  bool content = false;
+  VideoSubresource sub = VideoSubresource::kNone;
   constexpr std::string_view kContentSuffix = "/content";
+  constexpr std::string_view kPauseSuffix = "/pause";
+  constexpr std::string_view kResumeSuffix = "/resume";
   if (remainder.ends_with(kContentSuffix)) {
     remainder.remove_suffix(kContentSuffix.size());
-    content = true;
+    sub = VideoSubresource::kContent;
+  } else if (remainder.ends_with(kPauseSuffix)) {
+    remainder.remove_suffix(kPauseSuffix.size());
+    sub = VideoSubresource::kPause;
+  } else if (remainder.ends_with(kResumeSuffix)) {
+    remainder.remove_suffix(kResumeSuffix.size());
+    sub = VideoSubresource::kResume;
   }
   if (remainder.empty() || remainder.find('/') != std::string_view::npos) {
     return std::nullopt;
   }
-  return std::pair{remainder, content};
+  return std::pair{remainder, sub};
+}
+
+HttpResponse PauseVideo(std::string_view id, VideoJobService& service) {
+  const VideoJobLookupResult paused = service.Pause(id);
+  if (paused.result == VideoJobResult::kNotFound) {
+    return Error(404, "Not Found", "video job not found", "video_not_found");
+  }
+  if (paused.result != VideoJobResult::kOk || !paused.job.has_value()) {
+    return Error(409, "Conflict", paused.error, "video_cannot_pause");
+  }
+  return SnapshotResponse(200, "OK", *paused.job);
+}
+
+HttpResponse ResumeVideo(std::string_view id, VideoJobService& service) {
+  const VideoJobLookupResult resumed = service.Resume(id);
+  if (resumed.result == VideoJobResult::kNotFound) {
+    return Error(404, "Not Found", "video job not found", "video_not_found");
+  }
+  if (resumed.result == VideoJobResult::kQueueFull) {
+    return Error(503, "Service Unavailable", resumed.error,
+                 "video_service_unavailable");
+  }
+  if (resumed.result != VideoJobResult::kOk || !resumed.job.has_value()) {
+    return Error(409, "Conflict", resumed.error, "video_cannot_resume");
+  }
+  return SnapshotResponse(200, "OK", *resumed.job);
 }
 
 }  // namespace
@@ -877,10 +923,24 @@ HttpResponse HandleVideoApiRequest(const HttpRequest& request,
   if (!parsed.has_value()) {
     return Error(404, "Not Found", "video job not found", "video_not_found");
   }
-  const auto [id, content] = *parsed;
-  if (content) {
+  const auto [id, sub] = *parsed;
+  if (sub == VideoSubresource::kContent) {
     if (request.method == "GET") {
       return VideoContent(id, request, service);
+    }
+    return Error(405, "Method Not Allowed", "method is not allowed",
+                 "method_not_allowed");
+  }
+  if (sub == VideoSubresource::kPause) {
+    if (request.method == "POST") {
+      return PauseVideo(id, service);
+    }
+    return Error(405, "Method Not Allowed", "method is not allowed",
+                 "method_not_allowed");
+  }
+  if (sub == VideoSubresource::kResume) {
+    if (request.method == "POST") {
+      return ResumeVideo(id, service);
     }
     return Error(405, "Method Not Allowed", "method is not allowed",
                  "method_not_allowed");

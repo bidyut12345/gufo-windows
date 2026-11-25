@@ -371,6 +371,8 @@ textarea { min-height: 104px; resize: vertical; }
 
       <div class="actions">
         <button class="btn" id="runBtn" type="submit">Generate Video</button>
+        <button class="btn secondary" id="pauseBtn" type="button" style="display:none;">Pause</button>
+        <button class="btn" id="resumeBtn" type="button" style="display:none;">Resume</button>
         <button class="btn danger" id="cancelBtn" type="button" style="display:none;">Cancel</button>
       </div>
       <div class="progress-wrap" id="progressWrap"><div class="progress-bar" id="progressBar"></div></div>
@@ -555,11 +557,13 @@ async function pollHealth() {
 pollHealth();
 setInterval(pollHealth, 3000);
 
-function setBusy(isBusy) {
-  $("runBtn").disabled = isBusy;
-  $("runBtn").textContent = isBusy ? "Generating..." : "Generate Video";
-  $("cancelBtn").style.display = isBusy ? "inline-block" : "none";
-  $("progressWrap").style.display = isBusy ? "block" : "none";
+function setBusy(isBusy, isPaused = false) {
+  $("runBtn").disabled = isBusy || isPaused;
+  $("runBtn").textContent = isPaused ? "Paused" : (isBusy ? "Generating..." : "Generate Video");
+  $("pauseBtn").style.display = (isBusy && !isPaused) ? "inline-block" : "none";
+  $("resumeBtn").style.display = isPaused ? "inline-block" : "none";
+  $("cancelBtn").style.display = (isBusy || isPaused) ? "inline-block" : "none";
+  $("progressWrap").style.display = (isBusy || isPaused) ? "block" : "none";
 }
 
 function addVideoResult(job, promptText, preset) {
@@ -609,6 +613,38 @@ $("clearBtn").onclick = () => {
   $("emptyState").style.display = "block";
 };
 
+let currentPollFn = null;
+
+$("pauseBtn").onclick = async () => {
+  if (!activeJobId) return;
+  try {
+    $("pauseBtn").disabled = true;
+    await fetch(`/v1/videos/${encodeURIComponent(activeJobId)}/pause`, { method: "POST" });
+    $("statusBar").textContent = "Pausing at next checkpoint...";
+  } catch (_) {
+    $("pauseBtn").disabled = false;
+  }
+};
+
+$("resumeBtn").onclick = async () => {
+  if (!activeJobId) return;
+  try {
+    $("resumeBtn").disabled = true;
+    const resp = await fetch(`/v1/videos/${encodeURIComponent(activeJobId)}/resume`, { method: "POST" });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error((data && data.error && data.error.message) || `HTTP ${resp.status}`);
+    $("pauseBtn").disabled = false;
+    $("resumeBtn").disabled = false;
+    setBusy(true, false);
+    startElapsedTimer();
+    if (currentPollFn) currentPollFn();
+  } catch (err) {
+    $("resumeBtn").disabled = false;
+    $("statusBar").className = "status-bar error";
+    $("statusBar").textContent = `Resume error: ${err.message}`;
+  }
+};
+
 $("cancelBtn").onclick = async () => {
   if (!activeJobId) return;
   try {
@@ -618,7 +654,10 @@ $("cancelBtn").onclick = async () => {
   if (pollTimer) clearTimeout(pollTimer);
   stopElapsedTimer();
   activeJobId = null;
-  setBusy(false);
+  currentPollFn = null;
+  $("pauseBtn").disabled = false;
+  $("resumeBtn").disabled = false;
+  setBusy(false, false);
 };
 
 $("videoForm").onsubmit = async (e) => {
@@ -696,16 +735,27 @@ $("videoForm").onsubmit = async (e) => {
         const pct = typeof sj.progress === "number" ? sj.progress : 0;
         lastProgress = pct;
         $("progressBar").style.width = `${pct}%`;
+        const stageInfo = sj.checkpoint_stage
+          ? ` [${sj.checkpoint_stage}${sj.checkpoint_total ? ` ${sj.checkpoint_step}/${sj.checkpoint_total}` : ""}]`
+          : "";
         lastStatusText = pct === 0 && sj.status === "in_progress"
           ? `Job ${sj.id}: in_progress (0%) — encoding prompt & loading weights`
-          : `Job ${sj.id}: ${sj.status} (${pct}%)`;
+          : `Job ${sj.id}: ${sj.status} (${pct}%)${stageInfo}`;
         updateTimingStatus();
 
+        if (sj.status === "paused") {
+          stopElapsedTimer();
+          $("pauseBtn").disabled = false;
+          setBusy(false, true);
+          $("statusBar").textContent = `Paused${stageInfo} (${pct}%). Click Resume to continue.`;
+          return;
+        }
         if (sj.status === "completed") {
           const totalElapsed = formatDuration(Date.now() - jobStartMs);
           stopElapsedTimer();
           activeJobId = null;
-          setBusy(false);
+          currentPollFn = null;
+          setBusy(false, false);
           $("statusBar").textContent = `Completed (${sj.size}, ${sj.seconds}s) in ${totalElapsed}.`;
           addVideoResult(sj, prompt, `${size} / ${steps} steps${stepReuse ? " / reuse" : ""}`);
           return;
@@ -718,11 +768,13 @@ $("videoForm").onsubmit = async (e) => {
       } catch (err) {
         stopElapsedTimer();
         activeJobId = null;
+        currentPollFn = null;
         setBusy(false);
         $("statusBar").className = "status-bar error";
         $("statusBar").textContent = `Error: ${err.message}`;
       }
     };
+    currentPollFn = poll;
     poll();
   } catch (err) {
     stopElapsedTimer();

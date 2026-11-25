@@ -788,7 +788,7 @@ def make_handler(backend_url: str, default_model: str):
                 forward_headers[k] = v
             forward_headers["Connection"] = "close"
 
-            conn = http.client.HTTPConnection(backend_host, backend_port, timeout=600)
+            conn = http.client.HTTPConnection(backend_host, backend_port, timeout=3600)
             try:
                 conn.request(self.command, self.path, body=body, headers=forward_headers)
                 resp = conn.getresponse()

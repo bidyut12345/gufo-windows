@@ -310,6 +310,11 @@ std::string SnapshotJson(const VideoJobSnapshot& snapshot) {
   root["size"] = snapshot.size;
   root["seconds"] = snapshot.seconds;
   root["output_format"] = snapshot.output_format;
+  if (!snapshot.checkpoint_stage.empty()) {
+    root["checkpoint_stage"] = snapshot.checkpoint_stage;
+    root["checkpoint_step"] = snapshot.checkpoint_step;
+    root["checkpoint_total"] = snapshot.checkpoint_total;
+  }
   if (!snapshot.error_code.empty()) {
     json::Value error = json::Value::object();
     error["code"] = snapshot.error_code;
@@ -359,6 +364,8 @@ std::string_view ToString(VideoJobStatus status) noexcept {
       return "queued";
     case VideoJobStatus::kInProgress:
       return "in_progress";
+    case VideoJobStatus::kPaused:
+      return "paused";
     case VideoJobStatus::kCompleted:
       return "completed";
     case VideoJobStatus::kFailed:
@@ -384,6 +391,8 @@ struct VideoJobService::Impl {
     std::filesystem::path content_path;
     std::string media_type;
     std::atomic<bool> cancelled{false};
+    bool pause_requested{false};
+    bool resume_from_checkpoint{false};
     bool deleted{false};
     std::string logged_phase;
     int logged_bucket{-1};
@@ -648,6 +657,9 @@ struct VideoJobService::Impl {
     if (job->deleted || job->snapshot.status != VideoJobStatus::kInProgress) {
       return;
     }
+    job->snapshot.checkpoint_stage = std::string(phase);
+    job->snapshot.checkpoint_step = completed;
+    job->snapshot.checkpoint_total = total;
     job->snapshot.progress =
         std::max(job->snapshot.progress,
                  std::clamp(ProgressPercent(phase, completed, total), 1, 99));
@@ -740,12 +752,13 @@ struct VideoJobService::Impl {
           .reference_images = job->reference_image_paths,
           .reference_videos = job->reference_video_paths,
           .lock_canvas_to_preset = job->request.lock_canvas_to_preset,
+          .checkpoint_directory = job->directory / "checkpoint",
+          .resume_from_checkpoint = job->resume_from_checkpoint,
       };
       {
         // Delete can clear a queued/active prompt concurrently with admission.
         const std::lock_guard<std::mutex> lock(mutex);
-        generation.prompt = std::move(job->request.prompt);
-        WipeString(&job->request.prompt);
+        generation.prompt = job->request.prompt;
       }
       const std::string prompt_hash =
           crypto::Sha256Hex(std::span<const std::uint8_t>(
@@ -841,18 +854,30 @@ struct VideoJobService::Impl {
           if (output_ready) {
             snapshot.status = VideoJobStatus::kCompleted;
             snapshot.progress = 100;
+            snapshot.error_code.clear();
+            snapshot.error_message.clear();
+            WipeString(&job->request.prompt);
+          } else if (job->pause_requested) {
+            snapshot.status = VideoJobStatus::kPaused;
+            snapshot.completed_at = 0;
+            snapshot.expires_at = 0;
+            snapshot.error_code.clear();
+            snapshot.error_message.clear();
           } else if (job->cancelled.load(std::memory_order_relaxed)) {
             snapshot.status = VideoJobStatus::kCancelled;
             snapshot.error_code = "cancelled";
             snapshot.error_message = "video generation was cancelled";
+            WipeString(&job->request.prompt);
           } else if (storage_failure) {
             snapshot.status = VideoJobStatus::kFailed;
             snapshot.error_code = "storage_error";
             snapshot.error_message = "cannot persist video job telemetry";
+            WipeString(&job->request.prompt);
           } else {
             snapshot.status = VideoJobStatus::kFailed;
             snapshot.error_code = "generation_failed";
             snapshot.error_message = "video generation failed";
+            WipeString(&job->request.prompt);
           }
           std::string persist_error;
           if (!Persist(snapshot, &persist_error)) {
@@ -1149,6 +1174,88 @@ VideoJobContentResult VideoJobService::Content(std::string_view id) {
                   .bytes = bytes,
               },
           .error = {}};
+}
+
+VideoJobLookupResult VideoJobService::Pause(std::string_view id) {
+  if (!IsVideoId(id)) {
+    return {.result = VideoJobResult::kNotFound,
+            .job = std::nullopt,
+            .error = "video job not found"};
+  }
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->SweepExpiredLocked();
+  const auto iterator = impl_->jobs.find(id);
+  if (iterator == impl_->jobs.end()) {
+    return {.result = VideoJobResult::kNotFound,
+            .job = std::nullopt,
+            .error = "video job not found"};
+  }
+  const std::shared_ptr<Impl::Job>& job = iterator->second;
+  if (job->snapshot.status == VideoJobStatus::kPaused) {
+    return {.result = VideoJobResult::kOk,
+            .job = impl_->Snapshot(*job),
+            .error = {}};
+  }
+  if (job->snapshot.status == VideoJobStatus::kQueued) {
+    std::erase(impl_->queue, job);
+    job->snapshot.status = VideoJobStatus::kPaused;
+    (void)impl_->Persist(job->snapshot);
+    impl_->condition.notify_all();
+    return {.result = VideoJobResult::kOk,
+            .job = impl_->Snapshot(*job),
+            .error = {}};
+  }
+  if (job->snapshot.status != VideoJobStatus::kInProgress) {
+    return {.result = VideoJobResult::kInvalid,
+            .job = std::nullopt,
+            .error = "video job is not running"};
+  }
+  job->pause_requested = true;
+  job->cancelled.store(true, std::memory_order_relaxed);
+  return {.result = VideoJobResult::kOk,
+          .job = impl_->Snapshot(*job),
+          .error = {}};
+}
+
+VideoJobLookupResult VideoJobService::Resume(std::string_view id) {
+  if (!IsVideoId(id)) {
+    return {.result = VideoJobResult::kNotFound,
+            .job = std::nullopt,
+            .error = "video job not found"};
+  }
+  VideoJobSnapshot snapshot;
+  {
+    const std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->SweepExpiredLocked();
+    const auto iterator = impl_->jobs.find(id);
+    if (iterator == impl_->jobs.end()) {
+      return {.result = VideoJobResult::kNotFound,
+              .job = std::nullopt,
+              .error = "video job not found"};
+    }
+    const std::shared_ptr<Impl::Job>& job = iterator->second;
+    if (job->snapshot.status != VideoJobStatus::kPaused) {
+      return {.result = VideoJobResult::kInvalid,
+              .job = std::nullopt,
+              .error = "video job is not paused"};
+    }
+    if (impl_->queue.size() >= impl_->options.queue_capacity) {
+      return {.result = VideoJobResult::kQueueFull,
+              .job = std::nullopt,
+              .error = "video generation queue is full"};
+    }
+    job->pause_requested = false;
+    job->cancelled.store(false, std::memory_order_relaxed);
+    job->resume_from_checkpoint = true;
+    job->snapshot.status = VideoJobStatus::kQueued;
+    job->snapshot.error_code.clear();
+    job->snapshot.error_message.clear();
+    (void)impl_->Persist(job->snapshot);
+    impl_->queue.push_back(job);
+    snapshot = impl_->Snapshot(*job);
+  }
+  impl_->condition.notify_one();
+  return {.result = VideoJobResult::kOk, .job = std::move(snapshot), .error = {}};
 }
 
 VideoJobLookupResult VideoJobService::Delete(std::string_view id) {

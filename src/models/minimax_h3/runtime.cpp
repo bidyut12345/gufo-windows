@@ -76,6 +76,15 @@ DType ParseDType(std::string_view value) {
   if (value == "I32") {
     return DType::kInt32;
   }
+  if (value == "I8") {
+    return DType::kInt8;
+  }
+  if (value == "F8_E4M3") {
+    return DType::kFloat8E4M3;
+  }
+  if (value == "U8") {
+    return DType::kUint8;
+  }
   throw json::Error("unsupported H3 tensor dtype " + std::string(value));
 }
 
@@ -324,6 +333,12 @@ std::string_view ToString(DType dtype) noexcept {
       return "F32";
     case DType::kInt32:
       return "I32";
+    case DType::kInt8:
+      return "I8";
+    case DType::kFloat8E4M3:
+      return "F8_E4M3";
+    case DType::kUint8:
+      return "U8";
   }
   return "unknown";
 }
@@ -335,6 +350,10 @@ std::size_t DTypeSize(DType dtype) noexcept {
     case DType::kFloat32:
     case DType::kInt32:
       return 4;
+    case DType::kInt8:
+    case DType::kFloat8E4M3:
+    case DType::kUint8:
+      return 1;
   }
   return 0;
 }
@@ -402,13 +421,19 @@ std::optional<ModelInventory> ModelInventory::Inspect(
         json::ParseFile(source_manifest, kMaximumJsonBytes);
     const std::string model_kind =
         RequireField(manifest, "model_kind").AsString();
+    const bool is_ref2va = model_kind == kRef2vaModelKind ||
+                           model_kind == "minimax-h3-ref2va-fp8" ||
+                           model_kind == "minimax-h3-ref2va-int8";
+    const bool is_fl2va = model_kind == kModelKind ||
+                          model_kind == "minimax-h3-fl2va-fp8" ||
+                          model_kind == "minimax-h3-fl2va-int8";
     if (RequireField(manifest, "schema").AsString() != kManifestSchema ||
         RequireField(manifest, "revision").AsString() != kRevision ||
-        (model_kind != kModelKind && model_kind != kRef2vaModelKind)) {
+        (!is_ref2va && !is_fl2va)) {
       throw json::Error("source manifest identity does not match MiniMax H3");
     }
-    inventory.variant_ = model_kind == kRef2vaModelKind ? ModelVariant::kRef2va
-                                                       : ModelVariant::kFl2va;
+    inventory.variant_ = is_ref2va ? ModelVariant::kRef2va
+                                   : ModelVariant::kFl2va;
     if (options.require_pinned_manifest) {
       const std::string_view expected_sha =
           inventory.is_ref2va() ? kRef2vaSourceManifestSha256

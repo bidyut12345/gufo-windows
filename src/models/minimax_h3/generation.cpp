@@ -415,6 +415,351 @@ void Report(GenerationProgress progress, void* opaque, std::string_view phase,
     progress(phase, completed, total, opaque);
   }
 }
+
+enum class CheckpointStage : std::uint8_t {
+  kNone = 0,
+  kPrompt = 1,
+  kDenoise = 2,
+  kVideoVae = 3,
+  kAudioVae = 4,
+};
+
+std::string_view CheckpointStageName(CheckpointStage stage) noexcept {
+  switch (stage) {
+    case CheckpointStage::kNone:
+      return "none";
+    case CheckpointStage::kPrompt:
+      return "prompt";
+    case CheckpointStage::kDenoise:
+      return "denoise";
+    case CheckpointStage::kVideoVae:
+      return "video_vae";
+    case CheckpointStage::kAudioVae:
+      return "audio_vae";
+  }
+  return "none";
+}
+
+struct CheckpointMeta {
+  char magic[8]{'G', 'U', 'F', 'O', 'H', '3', 'C', 'P'};
+  std::uint32_t version{1};
+  std::uint8_t stage{0};
+  std::uint8_t decode_audio{0};
+  std::uint8_t mux{0};
+  std::uint8_t row_parallel_attention{1};
+  std::int32_t completed_steps{0};
+  std::int32_t evaluations{0};
+  std::int32_t internal_width{0};
+  std::int32_t internal_height{0};
+  std::int32_t output_width{0};
+  std::int32_t output_height{0};
+  std::int32_t frames{0};
+  std::int32_t active_blocks{0};
+  std::int32_t reuse_interval{0};
+  std::uint64_t seed{0};
+  char prompt_sha256[64]{};
+};
+
+CheckpointMeta MakeCheckpointMeta(const GenerationParameters& parameters,
+                                  std::uint64_t seed,
+                                  std::string_view prompt_sha256,
+                                  CheckpointStage stage,
+                                  int completed_steps) {
+  CheckpointMeta meta;
+  meta.stage = static_cast<std::uint8_t>(stage);
+  meta.decode_audio = parameters.decode_audio ? 1U : 0U;
+  meta.mux = parameters.mux ? 1U : 0U;
+  meta.row_parallel_attention = parameters.row_parallel_attention ? 1U : 0U;
+  meta.completed_steps = completed_steps;
+  meta.evaluations = parameters.evaluations;
+  meta.internal_width = parameters.internal_width;
+  meta.internal_height = parameters.internal_height;
+  meta.output_width = parameters.output_width;
+  meta.output_height = parameters.output_height;
+  meta.frames = parameters.frames;
+  meta.active_blocks = parameters.active_blocks;
+  meta.reuse_interval = parameters.reuse_interval;
+  meta.seed = seed;
+  const std::size_t n = std::min(prompt_sha256.size(), sizeof(meta.prompt_sha256));
+  std::copy_n(prompt_sha256.data(), n, meta.prompt_sha256);
+  return meta;
+}
+
+bool CheckpointMetaMatches(const CheckpointMeta& meta,
+                           const GenerationParameters& parameters,
+                           std::uint64_t seed,
+                           std::string_view prompt_sha256) {
+  constexpr char kMagic[8]{'G', 'U', 'F', 'O', 'H', '3', 'C', 'P'};
+  if (!std::equal(std::begin(meta.magic), std::end(meta.magic),
+                  std::begin(kMagic)) ||
+      meta.version != 1U) {
+    return false;
+  }
+  const std::size_t n = std::min(prompt_sha256.size(), sizeof(meta.prompt_sha256));
+  return meta.decode_audio == (parameters.decode_audio ? 1U : 0U) &&
+         meta.mux == (parameters.mux ? 1U : 0U) &&
+         meta.row_parallel_attention ==
+             (parameters.row_parallel_attention ? 1U : 0U) &&
+         meta.evaluations == parameters.evaluations &&
+         meta.internal_width == parameters.internal_width &&
+         meta.internal_height == parameters.internal_height &&
+         meta.output_width == parameters.output_width &&
+         meta.output_height == parameters.output_height &&
+         meta.frames == parameters.frames &&
+         meta.active_blocks == parameters.active_blocks &&
+         meta.reuse_interval == parameters.reuse_interval &&
+         meta.seed == seed &&
+         std::equal(meta.prompt_sha256, meta.prompt_sha256 + n,
+                    prompt_sha256.begin());
+}
+
+template <typename Fn>
+bool WriteBinaryFileAtomic(const std::filesystem::path& path, Fn&& writer,
+                           std::string* error) {
+  std::error_code fs_err;
+  if (!path.parent_path().empty()) {
+    std::filesystem::create_directories(path.parent_path(), fs_err);
+    if (fs_err) {
+      SetError(error, "cannot create checkpoint directory: " + fs_err.message());
+      return false;
+    }
+  }
+  const std::filesystem::path partial =
+      path.parent_path() /
+      (path.filename().string() + ".gufo-partial-" +
+       std::to_string(platform::ProcessId()) + "-" +
+       std::to_string(NextOutputNonce()));
+  {
+    std::ofstream out(partial, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+      SetError(error, "cannot open checkpoint file " + partial.string());
+      return false;
+    }
+    writer(out);
+    out.flush();
+    if (!out.good()) {
+      out.close();
+      std::filesystem::remove(partial, fs_err);
+      SetError(error, "cannot write checkpoint file " + partial.string());
+      return false;
+    }
+  }
+  std::filesystem::rename(partial, path, fs_err);
+  if (fs_err) {
+    std::filesystem::remove(partial, fs_err);
+    SetError(error, "cannot publish checkpoint file: " + fs_err.message());
+    return false;
+  }
+  return true;
+}
+
+template <typename T>
+void WritePod(std::ostream& out, const T& value) {
+  out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+template <typename T>
+void WriteVec(std::ostream& out, const std::vector<T>& vec) {
+  const std::uint64_t count = static_cast<std::uint64_t>(vec.size());
+  WritePod(out, count);
+  if (!vec.empty()) {
+    out.write(reinterpret_cast<const char*>(vec.data()),
+              static_cast<std::streamsize>(vec.size() * sizeof(T)));
+  }
+}
+
+template <typename T>
+bool ReadPod(std::istream& in, T* value) {
+  return static_cast<bool>(
+      in.read(reinterpret_cast<char*>(value), sizeof(T)));
+}
+
+template <typename T>
+bool ReadVec(std::istream& in, std::vector<T>* vec) {
+  std::uint64_t count = 0;
+  if (!ReadPod(in, &count)) {
+    return false;
+  }
+  vec->resize(static_cast<std::size_t>(count));
+  if (count == 0U) {
+    return true;
+  }
+  return static_cast<bool>(
+      in.read(reinterpret_cast<char*>(vec->data()),
+              static_cast<std::streamsize>(vec->size() * sizeof(T))));
+}
+
+bool SaveCheckpointMeta(const std::filesystem::path& dir,
+                        const CheckpointMeta& meta, std::string* error) {
+  if (!WriteBinaryFileAtomic(
+          dir / "meta.bin", [&](std::ostream& out) { WritePod(out, meta); },
+          error)) {
+    return false;
+  }
+  std::ostringstream json;
+  json << "{\n"
+       << "  \"schema\": \"gufo.minimax-h3-checkpoint.v1\",\n"
+       << "  \"stage\": \""
+       << CheckpointStageName(static_cast<CheckpointStage>(meta.stage))
+       << "\",\n"
+       << "  \"step\": " << meta.completed_steps << ",\n"
+       << "  \"total_steps\": " << meta.evaluations << "\n"
+       << "}\n";
+  return WriteAtomic(dir / "checkpoint.json", json.str(), error);
+}
+
+bool SavePromptCheckpoint(const std::filesystem::path& dir,
+                          const PromptEmbedding& embedding,
+                          const std::vector<float>& condition_rows,
+                          const std::vector<ConditionBlock>& condition_blocks,
+                          const std::vector<double>& anchor_temporal,
+                          double target_temporal_origin,
+                          const InitialNoise& noise, std::string* error) {
+  return WriteBinaryFileAtomic(
+      dir / "prompt.bin",
+      [&](std::ostream& out) {
+        WritePod(out, embedding.tokens);
+        WriteVec(out, embedding.values);
+        WriteVec(out, embedding.tags);
+        WriteVec(out, condition_rows);
+        WriteVec(out, condition_blocks);
+        WriteVec(out, anchor_temporal);
+        WritePod(out, target_temporal_origin);
+        WriteVec(out, noise.video);
+        WriteVec(out, noise.audio);
+      },
+      error);
+}
+
+bool LoadPromptCheckpoint(const std::filesystem::path& dir,
+                          PromptEmbedding* embedding,
+                          std::vector<float>* condition_rows,
+                          std::vector<ConditionBlock>* condition_blocks,
+                          std::vector<double>* anchor_temporal,
+                          double* target_temporal_origin,
+                          InitialNoise* noise, std::string* error) {
+  std::ifstream in(dir / "prompt.bin", std::ios::binary);
+  if (!in.is_open() || !ReadPod(in, &embedding->tokens) ||
+      !ReadVec(in, &embedding->values) || !ReadVec(in, &embedding->tags) ||
+      !ReadVec(in, condition_rows) || !ReadVec(in, condition_blocks) ||
+      !ReadVec(in, anchor_temporal) ||
+      !ReadPod(in, target_temporal_origin) || !ReadVec(in, &noise->video) ||
+      !ReadVec(in, &noise->audio)) {
+    SetError(error, "cannot read MiniMax H3 prompt checkpoint");
+    return false;
+  }
+  return true;
+}
+
+bool SaveDenoiseCheckpoint(const std::filesystem::path& dir,
+                           const DenoiserCheckpointState& state,
+                           std::string* error) {
+  return WriteBinaryFileAtomic(
+      dir / "denoise.bin",
+      [&](std::ostream& out) {
+        const std::uint8_t hv = state.have_velocity ? 1U : 0U;
+        WritePod(out, state.completed_steps);
+        WritePod(out, hv);
+        WriteVec(out, state.video_latent);
+        WriteVec(out, state.audio_latent);
+        WriteVec(out, state.video_velocity);
+        WriteVec(out, state.audio_velocity);
+        WriteVec(out, state.previous_video_velocity);
+        WriteVec(out, state.previous_audio_velocity);
+      },
+      error);
+}
+
+bool LoadDenoiseCheckpoint(const std::filesystem::path& dir,
+                           DenoiserCheckpointState* state, std::string* error) {
+  std::ifstream in(dir / "denoise.bin", std::ios::binary);
+  std::uint8_t hv = 0;
+  if (!in.is_open() || !ReadPod(in, &state->completed_steps) ||
+      !ReadPod(in, &hv) || !ReadVec(in, &state->video_latent) ||
+      !ReadVec(in, &state->audio_latent) ||
+      !ReadVec(in, &state->video_velocity) ||
+      !ReadVec(in, &state->audio_velocity) ||
+      !ReadVec(in, &state->previous_video_velocity) ||
+      !ReadVec(in, &state->previous_audio_velocity)) {
+    SetError(error, "cannot read MiniMax H3 denoise checkpoint");
+    return false;
+  }
+  state->have_velocity = hv != 0U;
+  return true;
+}
+
+bool SaveVideoVaeCheckpoint(const std::filesystem::path& dir,
+                            const VideoFrames& frames, std::string* error) {
+  return WriteBinaryFileAtomic(
+      dir / "video_vae.bin",
+      [&](std::ostream& out) {
+        WritePod(out, frames.width);
+        WritePod(out, frames.height);
+        WriteVec(out, frames.frame_indices);
+        WriteVec(out, frames.rgb);
+      },
+      error);
+}
+
+bool LoadVideoVaeCheckpoint(const std::filesystem::path& dir,
+                            VideoFrames* frames, std::string* error) {
+  std::ifstream in(dir / "video_vae.bin", std::ios::binary);
+  if (!in.is_open() || !ReadPod(in, &frames->width) ||
+      !ReadPod(in, &frames->height) || !ReadVec(in, &frames->frame_indices) ||
+      !ReadVec(in, &frames->rgb)) {
+    SetError(error, "cannot read MiniMax H3 video VAE checkpoint");
+    return false;
+  }
+  return true;
+}
+
+bool SaveAudioVaeCheckpoint(const std::filesystem::path& dir,
+                            const AudioWaveform& waveform, std::string* error) {
+  return WriteBinaryFileAtomic(
+      dir / "audio_vae.bin",
+      [&](std::ostream& out) {
+        WritePod(out, waveform.sample_rate);
+        WritePod(out, waveform.channels);
+        WritePod(out, waveform.samples);
+        WriteVec(out, waveform.pcm);
+      },
+      error);
+}
+
+bool LoadAudioVaeCheckpoint(const std::filesystem::path& dir,
+                            AudioWaveform* waveform, std::string* error) {
+  std::ifstream in(dir / "audio_vae.bin", std::ios::binary);
+  if (!in.is_open() || !ReadPod(in, &waveform->sample_rate) ||
+      !ReadPod(in, &waveform->channels) || !ReadPod(in, &waveform->samples) ||
+      !ReadVec(in, &waveform->pcm)) {
+    SetError(error, "cannot read MiniMax H3 audio VAE checkpoint");
+    return false;
+  }
+  return true;
+}
+
+struct DenoiseCheckpointContext {
+  std::filesystem::path dir;
+  GenerationParameters parameters;
+  std::uint64_t seed{0};
+  std::string prompt_sha256;
+};
+
+bool OnDenoiseStepCheckpoint(const DenoiserCheckpointState& state,
+                             void* opaque, std::string* error) {
+  auto* ctx = static_cast<DenoiseCheckpointContext*>(opaque);
+  if (ctx == nullptr || ctx->dir.empty()) {
+    return true;
+  }
+  if (!SaveDenoiseCheckpoint(ctx->dir, state, error)) {
+    return false;
+  }
+  return SaveCheckpointMeta(
+      ctx->dir,
+      MakeCheckpointMeta(ctx->parameters, ctx->seed, ctx->prompt_sha256,
+                         CheckpointStage::kDenoise, state.completed_steps),
+      error);
+}
 #endif
 
 }  // namespace
@@ -766,21 +1111,68 @@ bool GenerateTextVideo(const GenerationRequest& request,
   local.inventory = inventory->telemetry();
   Report(progress, progress_opaque, "inventory", 1, 1);
 
-  begin = Clock::now();
-  Tokenizer tokenizer;
-  std::vector<std::uint32_t> tokens;
-  if (!Tokenizer::Load(
-          request.model_root / inventory->variant_dir() /
-              "tokenizer/tokenizer.json",
-          &tokenizer, error) ||
-      !tokenizer.EncodePrompt(request.prompt, &tokens, error) ||
-      tokens.empty()) {
+  const std::string prompt_sha256 = Sha256(std::span<const unsigned char>(
+      reinterpret_cast<const unsigned char*>(request.prompt.data()),
+      request.prompt.size()));
+  const bool has_checkpoint = !request.checkpoint_directory.empty();
+  CheckpointStage resumed_stage = CheckpointStage::kNone;
+  DenoiserCheckpointState denoise_cp;
+  if (has_checkpoint && request.resume_from_checkpoint) {
+    std::ifstream meta_in(request.checkpoint_directory / "meta.bin",
+                          std::ios::binary);
+    CheckpointMeta meta;
+    if (meta_in.is_open() && ReadPod(meta_in, &meta) &&
+        CheckpointMetaMatches(meta, parameters, request.seed, prompt_sha256)) {
+      resumed_stage = static_cast<CheckpointStage>(meta.stage);
+    }
+  }
+
+  const auto geometry = ResolveGenerationGeometry(parameters.internal_width,
+                                                  parameters.internal_height,
+                                                  parameters.frames, error);
+  if (!geometry.has_value()) {
     return false;
   }
-  local.tokenizer_ms = Milliseconds(begin, Clock::now());
-  local.prompt_tokens = tokens.size();
+  const std::size_t video_elements =
+      kH3VideoLatentChannels *
+      static_cast<std::size_t>(geometry->temporal.video_latent_frames) *
+      static_cast<std::size_t>(geometry->latent_height) *
+      static_cast<std::size_t>(geometry->latent_width);
 
-  Report(progress, progress_opaque, "prompt", 0, 1);
+  PromptEmbedding embedding;
+  std::vector<float> condition_rows;
+  std::vector<double> anchor_temporal;
+  std::vector<ConditionBlock> condition_blocks;
+  double target_temporal_origin = 0.0;
+  std::optional<InitialNoise> noise;
+
+  if (resumed_stage >= CheckpointStage::kPrompt) {
+    InitialNoise loaded_noise;
+    if (!LoadPromptCheckpoint(request.checkpoint_directory, &embedding,
+                              &condition_rows, &condition_blocks,
+                              &anchor_temporal, &target_temporal_origin,
+                              &loaded_noise, error)) {
+      return false;
+    }
+    noise = std::move(loaded_noise);
+    local.prompt_tokens = embedding.tokens;
+    Report(progress, progress_opaque, "prompt", 1, 1);
+  } else {
+    begin = Clock::now();
+    Tokenizer tokenizer;
+    std::vector<std::uint32_t> tokens;
+    if (!Tokenizer::Load(
+            request.model_root / inventory->variant_dir() /
+                "tokenizer/tokenizer.json",
+            &tokenizer, error) ||
+        !tokenizer.EncodePrompt(request.prompt, &tokens, error) ||
+        tokens.empty()) {
+      return false;
+    }
+    local.tokenizer_ms = Milliseconds(begin, Clock::now());
+    local.prompt_tokens = tokens.size();
+
+    Report(progress, progress_opaque, "prompt", 0, 1);
   // Reference workflow order (modular_blocks_minimax_h3.py): resize onto the
   // canvas by the index rule, present keyframes/references to the prompt
   // encoder, then VisualVAE-encode. Anchor latents depend only on pixels (fixed
@@ -834,7 +1226,6 @@ bool GenerateTextVideo(const GenerationRequest& request,
     }
   }
   begin = Clock::now();
-  PromptEmbedding embedding;
   if (keyframes.empty() && ref_videos.empty()) {
     if (!EncodePromptLayer50(*inventory, tokens, {}, cancellation, &embedding,
                              &local.prompt_encoder, error)) {
@@ -930,22 +1321,6 @@ bool GenerateTextVideo(const GenerationRequest& request,
   local.prompt_ms = Milliseconds(begin, Clock::now());
   Report(progress, progress_opaque, "prompt", 1, 1);
 
-  const auto geometry = ResolveGenerationGeometry(parameters.internal_width,
-                                                  parameters.internal_height,
-                                                  parameters.frames, error);
-  if (!geometry.has_value()) {
-    return false;
-  }
-  const std::size_t video_elements =
-      kH3VideoLatentChannels *
-      static_cast<std::size_t>(geometry->temporal.video_latent_frames) *
-      static_cast<std::size_t>(geometry->latent_height) *
-      static_cast<std::size_t>(geometry->latent_width);
-  std::vector<float> condition_rows;
-  std::vector<double> anchor_temporal;
-  std::vector<ConditionBlock> condition_blocks;
-  double target_temporal_origin = 0.0;
-  std::optional<InitialNoise> noise;
   if (!has_keyframes && !has_references && !has_videos) {
     noise =
         BuildInitialNoise(request.seed, video_elements, kH3AudioLatentChannels,
@@ -1122,83 +1497,150 @@ bool GenerateTextVideo(const GenerationRequest& request,
       }
       anchor_temporal = std::move(*anchors);
     }
-  }
-  std::vector<std::uint8_t> tags =
-      !embedding.tags.empty() ? embedding.tags
-                              : std::vector<std::uint8_t>(embedding.tokens, 1);
-  auto denoiser = DenoiserSession::Create(
-      *inventory,
-      {.geometry = *geometry,
-       .evaluations = parameters.evaluations,
-       .text_rows = embedding.tokens,
-       .active_blocks = parameters.active_blocks,
-       .reuse_interval = parameters.reuse_interval,
-       .row_parallel_attention = parameters.row_parallel_attention,
-       .condition_video_rows = condition_rows.size() / kH3VideoPatchWidth},
-      {.layer50 = embedding.values,
-       .tags = tags,
-       .condition_rows = condition_rows,
-       .anchor_temporal = anchor_temporal,
-       .condition_blocks = condition_blocks,
-       .target_temporal_origin = target_temporal_origin},
-      cancellation, &local.denoiser, error);
-  if (denoiser == nullptr) {
-    return false;
-  }
-  ProgressBridge denoiser_progress{progress, progress_opaque, "denoiser"};
-  begin = Clock::now();
-  if (!denoiser->DenoiseWithProgress(
-          noise->video, noise->audio, cancellation, ForwardDenoiserProgress,
-          &denoiser_progress, &local.denoiser, error)) {
-    return false;
-  }
-  local.denoiser_ms = Milliseconds(begin, Clock::now());
-  denoiser.reset();
-  if (!request.latents_directory.empty()) {
-    Report(progress, progress_opaque, "latents", 0, 1);
-    const std::span<const unsigned char> prompt_bytes(
-        reinterpret_cast<const unsigned char*>(request.prompt.data()),
-        request.prompt.size());
-    const std::span<const unsigned char> conditioning_bytes(
-        reinterpret_cast<const unsigned char*>(embedding.values.data()),
-        embedding.values.size() * sizeof(std::uint16_t));
-    const LatentManifestContext context{
-        .parameters = &parameters,
-        .seed = request.seed,
-        .prompt_sha256 = Sha256(prompt_bytes),
-        .conditioning_sha256 = Sha256(conditioning_bytes),
-    };
-    if (!WriteLatentsAtomic(request.latents_directory, *geometry, noise->video,
-                            noise->audio, &context, cancellation, error)) {
-      return false;
     }
-    Report(progress, progress_opaque, "latents", 1, 1);
+    if (has_checkpoint) {
+      if (!SavePromptCheckpoint(request.checkpoint_directory, embedding,
+                                condition_rows, condition_blocks,
+                                anchor_temporal, target_temporal_origin,
+                                *noise, error) ||
+          !SaveCheckpointMeta(
+              request.checkpoint_directory,
+              MakeCheckpointMeta(parameters, request.seed, prompt_sha256,
+                                 CheckpointStage::kPrompt, 0),
+              error)) {
+        return false;
+      }
+    }
   }
 
-  begin = Clock::now();
-  auto video_decoder =
-      VideoVaeDecoder::Create(*inventory, {.geometry = *geometry}, cancellation,
-                              &local.video_vae, error);
-  if (video_decoder == nullptr) {
-    return false;
-  }
-  ProgressBridge video_progress{progress, progress_opaque, "video_vae"};
   VideoFrames frames;
-  const bool video_ok =
-      parameters.selected_frames.empty()
-          ? video_decoder->Decode(noise->video, cancellation,
-                                  ForwardVideoProgress, &video_progress,
-                                  &frames, &local.video_vae, error)
-          : video_decoder->DecodeSelected(
-                noise->video, parameters.selected_frames, cancellation,
-                ForwardVideoProgress, &video_progress, &frames,
-                &local.video_vae, error);
-  if (!video_ok) {
-    return false;
+  if (resumed_stage >= CheckpointStage::kVideoVae) {
+    if (!LoadVideoVaeCheckpoint(request.checkpoint_directory, &frames, error)) {
+      return false;
+    }
+    if (resumed_stage == CheckpointStage::kVideoVae &&
+        has_checkpoint &&
+        std::filesystem::exists(request.checkpoint_directory / "denoise.bin")) {
+      if (LoadDenoiseCheckpoint(request.checkpoint_directory, &denoise_cp,
+                                error)) {
+        noise->video = denoise_cp.video_latent;
+        noise->audio = denoise_cp.audio_latent;
+      } else {
+        return false;
+      }
+    }
+    Report(progress, progress_opaque, "denoiser", parameters.evaluations,
+           parameters.evaluations);
+    Report(progress, progress_opaque, "video_vae", 1, 1);
+  } else {
+    int start_step = 0;
+    if (resumed_stage == CheckpointStage::kDenoise &&
+        LoadDenoiseCheckpoint(request.checkpoint_directory, &denoise_cp, error)) {
+      start_step = std::clamp(denoise_cp.completed_steps, 0,
+                              parameters.evaluations);
+      if (start_step > 0) {
+        noise->video = denoise_cp.video_latent;
+        noise->audio = denoise_cp.audio_latent;
+      }
+    }
+    if (start_step < parameters.evaluations) {
+      std::vector<std::uint8_t> tags =
+          !embedding.tags.empty()
+              ? embedding.tags
+              : std::vector<std::uint8_t>(embedding.tokens, 1);
+      auto denoiser = DenoiserSession::Create(
+          *inventory,
+          {.geometry = *geometry,
+           .evaluations = parameters.evaluations,
+           .text_rows = embedding.tokens,
+           .active_blocks = parameters.active_blocks,
+           .reuse_interval = parameters.reuse_interval,
+           .row_parallel_attention = parameters.row_parallel_attention,
+           .condition_video_rows = condition_rows.size() / kH3VideoPatchWidth},
+          {.layer50 = embedding.values,
+           .tags = tags,
+           .condition_rows = condition_rows,
+           .anchor_temporal = anchor_temporal,
+           .condition_blocks = condition_blocks,
+           .target_temporal_origin = target_temporal_origin},
+          cancellation, &local.denoiser, error);
+      if (denoiser == nullptr) {
+        return false;
+      }
+      ProgressBridge denoiser_progress{progress, progress_opaque, "denoiser"};
+      DenoiseCheckpointContext cp_ctx{request.checkpoint_directory, parameters,
+                                      request.seed, prompt_sha256};
+      begin = Clock::now();
+      if (!denoiser->DenoiseWithCheckpoints(
+              noise->video, noise->audio, start_step,
+              start_step > 0 ? &denoise_cp : nullptr, cancellation,
+              ForwardDenoiserProgress, &denoiser_progress,
+              has_checkpoint ? OnDenoiseStepCheckpoint : nullptr, &cp_ctx,
+              &local.denoiser, error)) {
+        return false;
+      }
+      local.denoiser_ms = Milliseconds(begin, Clock::now());
+      denoiser.reset();
+    } else {
+      Report(progress, progress_opaque, "denoiser", parameters.evaluations,
+             parameters.evaluations);
+    }
+    if (!request.latents_directory.empty()) {
+      Report(progress, progress_opaque, "latents", 0, 1);
+      const std::span<const unsigned char> prompt_bytes(
+          reinterpret_cast<const unsigned char*>(request.prompt.data()),
+          request.prompt.size());
+      const std::span<const unsigned char> conditioning_bytes(
+          reinterpret_cast<const unsigned char*>(embedding.values.data()),
+          embedding.values.size() * sizeof(std::uint16_t));
+      const LatentManifestContext context{
+          .parameters = &parameters,
+          .seed = request.seed,
+          .prompt_sha256 = Sha256(prompt_bytes),
+          .conditioning_sha256 = Sha256(conditioning_bytes),
+      };
+      if (!WriteLatentsAtomic(request.latents_directory, *geometry, noise->video,
+                              noise->audio, &context, cancellation, error)) {
+        return false;
+      }
+      Report(progress, progress_opaque, "latents", 1, 1);
+    }
+
+    begin = Clock::now();
+    auto video_decoder =
+        VideoVaeDecoder::Create(*inventory, {.geometry = *geometry},
+                                cancellation, &local.video_vae, error);
+    if (video_decoder == nullptr) {
+      return false;
+    }
+    ProgressBridge video_progress{progress, progress_opaque, "video_vae"};
+    const bool video_ok =
+        parameters.selected_frames.empty()
+            ? video_decoder->Decode(noise->video, cancellation,
+                                    ForwardVideoProgress, &video_progress,
+                                    &frames, &local.video_vae, error)
+            : video_decoder->DecodeSelected(
+                  noise->video, parameters.selected_frames, cancellation,
+                  ForwardVideoProgress, &video_progress, &frames,
+                  &local.video_vae, error);
+    if (!video_ok) {
+      return false;
+    }
+    local.video_vae_ms = Milliseconds(begin, Clock::now());
+    local.first_preview_ms = Milliseconds(total_begin, Clock::now());
+    video_decoder.reset();
+    if (has_checkpoint) {
+      if (!SaveVideoVaeCheckpoint(request.checkpoint_directory, frames, error) ||
+          !SaveCheckpointMeta(
+              request.checkpoint_directory,
+              MakeCheckpointMeta(parameters, request.seed, prompt_sha256,
+                                 CheckpointStage::kVideoVae,
+                                 parameters.evaluations),
+              error)) {
+        return false;
+      }
+    }
   }
-  local.video_vae_ms = Milliseconds(begin, Clock::now());
-  local.first_preview_ms = Milliseconds(total_begin, Clock::now());
-  video_decoder.reset();
 
   if (!request.frames_directory.empty() &&
       !WriteDiagnosticFrames(request.frames_directory, frames, cancellation,
@@ -1207,22 +1649,42 @@ bool GenerateTextVideo(const GenerationRequest& request,
   }
 
   if (parameters.decode_audio) {
-    begin = Clock::now();
-    auto audio_decoder = AudioVaeDecoder::Create(
-        *inventory, geometry->temporal.audio_latent_frames, cancellation,
-        &local.audio_vae, error);
-    if (audio_decoder == nullptr) {
-      return false;
-    }
-    ProgressBridge audio_progress{progress, progress_opaque, "audio_vae"};
     AudioWaveform waveform;
-    if (!audio_decoder->Decode(noise->audio, cancellation, ForwardAudioProgress,
-                               &audio_progress, &waveform, &local.audio_vae,
-                               error)) {
-      return false;
+    if (resumed_stage >= CheckpointStage::kAudioVae) {
+      if (!LoadAudioVaeCheckpoint(request.checkpoint_directory, &waveform,
+                                  error)) {
+        return false;
+      }
+      Report(progress, progress_opaque, "audio_vae", 1, 1);
+    } else {
+      begin = Clock::now();
+      auto audio_decoder = AudioVaeDecoder::Create(
+          *inventory, geometry->temporal.audio_latent_frames, cancellation,
+          &local.audio_vae, error);
+      if (audio_decoder == nullptr) {
+        return false;
+      }
+      ProgressBridge audio_progress{progress, progress_opaque, "audio_vae"};
+      if (!audio_decoder->Decode(noise->audio, cancellation,
+                                 ForwardAudioProgress, &audio_progress,
+                                 &waveform, &local.audio_vae, error)) {
+        return false;
+      }
+      local.audio_vae_ms = Milliseconds(begin, Clock::now());
+      audio_decoder.reset();
+      if (has_checkpoint) {
+        if (!SaveAudioVaeCheckpoint(request.checkpoint_directory, waveform,
+                                    error) ||
+            !SaveCheckpointMeta(
+                request.checkpoint_directory,
+                MakeCheckpointMeta(parameters, request.seed, prompt_sha256,
+                                   CheckpointStage::kAudioVae,
+                                   parameters.evaluations),
+                error)) {
+          return false;
+        }
+      }
     }
-    local.audio_vae_ms = Milliseconds(begin, Clock::now());
-    audio_decoder.reset();
     if (parameters.mux) {
       begin = Clock::now();
       const std::vector<std::uint8_t> rgb24 = ToRgb24(frames);
@@ -1240,6 +1702,10 @@ bool GenerateTextVideo(const GenerationRequest& request,
       }
       local.media_ms = Milliseconds(begin, Clock::now());
     }
+  }
+  if (has_checkpoint) {
+    std::error_code ignored;
+    std::filesystem::remove_all(request.checkpoint_directory, ignored);
   }
   local.total_ms = Milliseconds(total_begin, Clock::now());
   if (telemetry != nullptr) {

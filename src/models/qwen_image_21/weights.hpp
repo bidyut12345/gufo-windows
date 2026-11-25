@@ -16,11 +16,20 @@
 
 namespace gufo::models::qwen_image_21 {
 
+enum class WeightDType : std::uint8_t {
+  kBf16,
+  kF32,
+  kI8,
+  kF8E4M3,
+  kU8,
+};
+
 struct Weight {
   std::vector<int> shape;
   const void* data{nullptr};
   std::size_t bytes{0};
   bool bf16{true};
+  WeightDType dtype{WeightDType::kBf16};
   /// Index into Weights::Files() and byte offset of `data` in that file.
   std::uint32_t file{0};
   std::uint64_t offset{0};

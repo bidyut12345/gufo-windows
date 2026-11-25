@@ -58,6 +58,8 @@ public:
         .reference_images = request.reference_images,
         .reference_videos = request.reference_videos,
         .lock_canvas_to_preset = request.lock_canvas_to_preset,
+        .checkpoint_directory = request.checkpoint_directory,
+        .resume_from_checkpoint = request.resume_from_checkpoint,
     };
     gufo::minimax_h3::CancellationToken token;
     std::jthread watcher;

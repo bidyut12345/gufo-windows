@@ -230,7 +230,9 @@ SharedWorkspaceLayout MakeSharedWorkspaceLayout(std::size_t rows,
 
 bool HasShape(const TensorDescriptor& descriptor,
               std::initializer_list<std::uint64_t> shape) {
-  return descriptor.dtype == DType::kBFloat16 &&
+  return (descriptor.dtype == DType::kBFloat16 ||
+          descriptor.dtype == DType::kInt8 ||
+          descriptor.dtype == DType::kFloat8E4M3) &&
          descriptor.shape ==
              std::vector<std::uint64_t>(shape.begin(), shape.end());
 }
@@ -256,6 +258,83 @@ struct LoadedWeight {
   DeviceBuffer storage;
 };
 
+__device__ __forceinline__ std::uint16_t DitFloatToBf16(float value) {
+  const std::uint32_t bits = __float_as_uint(value);
+  if ((bits & 0x7F800000U) == 0x7F800000U) {
+    return static_cast<std::uint16_t>((bits | 0x0040U) >> 16U);
+  }
+  const std::uint32_t rounding = 0x7FFFU + ((bits >> 16U) & 1U);
+  return static_cast<std::uint16_t>((bits + rounding) >> 16U);
+}
+
+__device__ __forceinline__ float DitDecodeFp8E4M3(std::uint8_t bits) {
+  const std::uint32_t sign = (bits >> 7U) & 1U;
+  const std::uint32_t exp = (bits >> 3U) & 0xFU;
+  const std::uint32_t mant = bits & 0x7U;
+  if (exp == 15U && mant == 7U) {
+    return 0.0F;
+  }
+  const float mag =
+      exp == 0U ? ldexpf(static_cast<float>(mant), -9)
+                : ldexpf(static_cast<float>(8U + mant),
+                         static_cast<int>(exp) - 10);
+  return sign != 0U ? -mag : mag;
+}
+
+__global__ void DitDequantInt8ToBf16Kernel(const std::int8_t* src,
+                                           const float* scale,
+                                           std::uint16_t* dst, std::size_t n,
+                                           std::size_t cols,
+                                           std::size_t scale_count,
+                                           bool repack_qkv) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float s = 1.0F;
+    if (scale != nullptr && scale_count != 0U) {
+      s = scale_count == 1U ? scale[0] : scale[i / cols];
+    }
+    std::size_t dst_i = i;
+    if (repack_qkv) {
+      const std::size_t row = i / cols;
+      const std::size_t col = i % cols;
+      const std::size_t qkv = row / 7168U;
+      const std::size_t rem = row % 7168U;
+      const std::size_t head = rem / 128U;
+      const std::size_t d = rem % 128U;
+      dst_i = ((head * 3U + qkv) * 128U + d) * cols + col;
+    }
+    dst[dst_i] = DitFloatToBf16(static_cast<float>(src[i]) * s);
+  }
+}
+
+__global__ void DitDequantFp8ToBf16Kernel(const std::uint8_t* src,
+                                          const float* scale,
+                                          std::uint16_t* dst, std::size_t n,
+                                          std::size_t cols,
+                                          std::size_t scale_count,
+                                          bool repack_qkv) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float s = 1.0F;
+    if (scale != nullptr && scale_count != 0U) {
+      s = scale_count == 1U ? scale[0] : scale[i / cols];
+    }
+    std::size_t dst_i = i;
+    if (repack_qkv) {
+      const std::size_t row = i / cols;
+      const std::size_t col = i % cols;
+      const std::size_t qkv = row / 7168U;
+      const std::size_t rem = row % 7168U;
+      const std::size_t head = rem / 128U;
+      const std::size_t d = rem % 128U;
+      dst_i = ((head * 3U + qkv) * 128U + d) * cols + col;
+    }
+    dst[dst_i] = DitFloatToBf16(DitDecodeFp8E4M3(src[i]) * s);
+  }
+}
+
 bool LoadWeight(const ModelInventory& inventory,
                 const TensorDescriptor& descriptor, int device,
                 hipStream_t stream, void* staging, std::size_t staging_bytes,
@@ -265,10 +344,19 @@ bool LoadWeight(const ModelInventory& inventory,
     SetError(error, "MiniMax H3 DiT weight exceeds addressable memory");
     return false;
   }
+  const bool quantized = descriptor.dtype == DType::kInt8 ||
+                         descriptor.dtype == DType::kFloat8E4M3;
   const auto bytes = static_cast<std::size_t>(descriptor.payload_bytes);
-  if (!output->storage.Allocate(bytes, error)) {
+  DeviceBuffer raw_buffer;
+  if (quantized) {
+    if (!raw_buffer.Allocate(bytes, error) ||
+        !output->storage.Allocate(bytes * 2U, error)) {
+      return false;
+    }
+  } else if (!output->storage.Allocate(bytes, error)) {
     return false;
   }
+  void* upload_dst = quantized ? raw_buffer.data() : output->storage.data();
   const std::filesystem::path path = inventory.model_root() / descriptor.shard;
   std::string open_error;
   const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
@@ -305,7 +393,7 @@ bool LoadWeight(const ModelInventory& inventory,
     hipError_t status = hipSetDevice(device);
     if (status == hipSuccess) {
       status = hipMemcpyAsync(
-          static_cast<std::byte*>(output->storage.data()) + copied, staging,
+          static_cast<std::byte*>(upload_dst) + copied, staging,
           chunk, hipMemcpyHostToDevice, stream);
     }
     if (status == hipSuccess) {
@@ -322,6 +410,91 @@ bool LoadWeight(const ModelInventory& inventory,
   if (!success) {
     output->storage.Reset();
     return false;
+  }
+  if (quantized) {
+    DeviceBuffer scale_dev;
+    std::size_t scale_count = 0;
+    const std::size_t cols =
+        descriptor.shape.size() == 2
+            ? static_cast<std::size_t>(descriptor.shape[1])
+            : bytes;
+    const std::size_t rows =
+        descriptor.shape.size() == 2
+            ? static_cast<std::size_t>(descriptor.shape[0])
+            : 1U;
+    if (descriptor.name.ends_with(".weight")) {
+      const std::string base =
+          descriptor.name.substr(0, descriptor.name.size() - 7U);
+      const TensorDescriptor* scale_desc =
+          inventory.FindTensor(base + "._weight_scale");
+      if (scale_desc == nullptr) {
+        scale_desc = inventory.FindTensor(base + ".weight_scale");
+      }
+      if (scale_desc != nullptr && scale_desc->dtype == DType::kFloat32 &&
+          scale_desc->payload_bytes >= 4U) {
+        const std::size_t sc =
+            static_cast<std::size_t>(scale_desc->payload_bytes / 4U);
+        if (sc == 1U || sc == rows) {
+          std::vector<float> host_scale(sc);
+          const std::filesystem::path spath =
+              inventory.model_root() / scale_desc->shard;
+          const platform::PlatformFile sfile =
+              platform::OpenReadFile(spath, nullptr);
+          if (platform::FileValid(sfile)) {
+            std::size_t sread = 0;
+            while (sread < scale_desc->payload_bytes) {
+              const std::size_t r = platform::ReadFileAt(
+                  sfile, reinterpret_cast<std::byte*>(host_scale.data()) + sread,
+                  scale_desc->payload_bytes - sread,
+                  scale_desc->file_offset + sread);
+              if (r == 0) {
+                break;
+              }
+              sread += r;
+            }
+            platform::CloseFile(sfile);
+            if (sread == scale_desc->payload_bytes &&
+                scale_dev.Allocate(scale_desc->payload_bytes, error) &&
+                hipMemcpyAsync(scale_dev.data(), host_scale.data(),
+                               scale_desc->payload_bytes, hipMemcpyHostToDevice,
+                               stream) == hipSuccess) {
+              scale_count = sc;
+            }
+          }
+        }
+      }
+    }
+    const unsigned threads = 256U;
+    const unsigned blocks = static_cast<unsigned>((bytes + threads - 1U) / threads);
+    const float* scale_ptr =
+        scale_count != 0U ? scale_dev.As<float>() : nullptr;
+    const bool repack_qkv =
+        descriptor.name.ends_with("attn.qkv_proj.weight") && rows == 21504U &&
+        cols != 0U;
+    if (descriptor.dtype == DType::kInt8) {
+      DitDequantInt8ToBf16Kernel<<<blocks, threads, 0, stream>>>(
+          raw_buffer.As<std::int8_t>(), scale_ptr,
+          output->storage.As<std::uint16_t>(), bytes, cols, scale_count,
+          repack_qkv);
+    } else {
+      DitDequantFp8ToBf16Kernel<<<blocks, threads, 0, stream>>>(
+          raw_buffer.As<std::uint8_t>(), scale_ptr,
+          output->storage.As<std::uint16_t>(), bytes, cols, scale_count,
+          repack_qkv);
+    }
+    const hipError_t launch_status = hipGetLastError();
+    if (launch_status != hipSuccess) {
+      SetError(error, HipError("launch dequantize MiniMax H3 DiT weight",
+                               launch_status));
+      output->storage.Reset();
+      return false;
+    }
+    const hipError_t sync_status = hipStreamSynchronize(stream);
+    if (sync_status != hipSuccess) {
+      SetError(error, HipError("dequantize MiniMax H3 DiT weight", sync_status));
+      output->storage.Reset();
+      return false;
+    }
   }
   output->descriptor = &descriptor;
   return true;

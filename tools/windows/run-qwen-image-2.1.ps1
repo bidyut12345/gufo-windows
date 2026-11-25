@@ -4,7 +4,7 @@
 #   powershell -ExecutionPolicy Bypass -File tools\windows\run-qwen-image-2.1.ps1
 #   powershell -ExecutionPolicy Bypass -File tools\windows\run-qwen-image-2.1.ps1 -NoWebUi
 param(
-  [string]$ModelLocation = "D:\gufo-image-models",
+  [string]$ModelLocation = "C:\AI\gufo-image-models",
   [string]$ModelName = "qwen-image-2.1",
   [string]$BindHost = "127.0.0.1",
   [int]$Port = 8080,

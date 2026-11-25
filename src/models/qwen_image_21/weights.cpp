@@ -290,16 +290,37 @@ void Weights::Load(const std::filesystem::path& path,
     if (name == "__metadata__")
       continue;
     const auto dtype = entry.member_str("dtype");
-    if (dtype != "BF16" && dtype != "F32")
+    Weight weight;
+    std::size_t elem_bytes = 0;
+    if (dtype == "BF16") {
+      weight.dtype = WeightDType::kBf16;
+      weight.bf16 = true;
+      elem_bytes = 2;
+    } else if (dtype == "F32") {
+      weight.dtype = WeightDType::kF32;
+      weight.bf16 = false;
+      elem_bytes = 4;
+    } else if (dtype == "I8") {
+      weight.dtype = WeightDType::kI8;
+      weight.bf16 = false;
+      elem_bytes = 1;
+    } else if (dtype == "F8_E4M3") {
+      weight.dtype = WeightDType::kF8E4M3;
+      weight.bf16 = false;
+      elem_bytes = 1;
+    } else if (dtype == "U8") {
+      weight.dtype = WeightDType::kU8;
+      weight.bf16 = false;
+      elem_bytes = 1;
+    } else {
       throw std::runtime_error("unsupported Qwen-Image weight dtype " + dtype);
+    }
     const auto* shape = entry.find("shape");
     const auto* offsets = entry.find("data_offsets");
     if (!shape || !shape->is_array() || shape->size() > 5 || !offsets ||
         !offsets->is_array() || offsets->size() != 2)
       throw std::runtime_error("invalid tensor layout " + name);
-    Weight weight;
-    weight.bf16 = dtype == "BF16";
-    std::size_t bytes = weight.bf16 ? 2 : 4;
+    std::size_t bytes = elem_bytes;
     for (const auto& dim : shape->items()) {
       const auto value = Integer(dim);
       if (!value || value > std::numeric_limits<int>::max() ||
@@ -317,7 +338,11 @@ void Weights::Load(const std::filesystem::path& path,
     weight.file = static_cast<std::uint32_t>(files_.size());
     weight.offset = 8 + header_size + begin;
     ranges.emplace_back(begin, end);
-    if (!weights_.emplace(prefix + name, std::move(weight)).second)
+    std::string key = prefix + name;
+    if (key.ends_with("._weight_qdata")) {
+      key.replace(key.size() - 14U, 14U, ".weight");
+    }
+    if (!weights_.emplace(std::move(key), std::move(weight)).second)
       throw std::runtime_error("duplicate tensor " + name);
   }
   std::sort(ranges.begin(), ranges.end());

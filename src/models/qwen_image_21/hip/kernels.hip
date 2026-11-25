@@ -66,6 +66,48 @@ __global__ void FloatToBf16(const float* x, B* y, std::size_t n) {
     y[i] = Bf16(x[i]);
 }
 
+__device__ __forceinline__ float DecodeFp8E4M3(std::uint8_t bits) {
+  const std::uint32_t sign = (bits >> 7U) & 1U;
+  const std::uint32_t exp = (bits >> 3U) & 0xFU;
+  const std::uint32_t mant = bits & 0x7U;
+  if (exp == 15U && mant == 7U)
+    return 0.0F;
+  float mag = 0.0F;
+  if (exp == 0U) {
+    mag = ldexpf(static_cast<float>(mant), -9);
+  } else {
+    mag = ldexpf(static_cast<float>(8U + mant), static_cast<int>(exp) - 10);
+  }
+  return sign ? -mag : mag;
+}
+
+__global__ void Int8ToBf16(const std::int8_t* x, const float* scale, B* y,
+                           std::size_t n, int cols, std::size_t scale_count) {
+  const auto i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float s = 1.0F;
+    if (scale != nullptr && scale_count != 0U) {
+      s = scale_count == 1U ? scale[0] : scale[i / static_cast<std::size_t>(cols)];
+    }
+    y[i] = Bf16(static_cast<float>(x[i]) * s);
+  }
+}
+
+__global__ void Fp8E4M3ToBf16(const std::uint8_t* x, const float* scale, B* y,
+                              std::size_t n, int cols,
+                              std::size_t scale_count) {
+  const auto i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float s = 1.0F;
+    if (scale != nullptr && scale_count != 0U) {
+      s = scale_count == 1U ? scale[0] : scale[i / static_cast<std::size_t>(cols)];
+    }
+    y[i] = Bf16(DecodeFp8E4M3(x[i]) * s);
+  }
+}
+
 __global__ void Bf16ToFloat(const B* x, float* y, std::size_t n) {
   const auto i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -892,11 +934,17 @@ Matrix Runtime::Weight(std::string_view name) {
 
 Runtime::StagedWeight Runtime::Stage(const qwen_image_21::Weight& w) {
   const int rows = w.shape.empty() ? 1 : w.shape[0];
-  const auto count = w.bytes / (w.bf16 ? 2 : 4);
+  std::size_t elem_size = 2;
+  if (w.dtype == WeightDType::kF32)
+    elem_size = 4;
+  else if (w.dtype == WeightDType::kI8 || w.dtype == WeightDType::kF8E4M3 ||
+           w.dtype == WeightDType::kU8)
+    elem_size = 1;
+  const auto count = w.bytes / elem_size;
   if (count / rows > static_cast<std::size_t>(std::numeric_limits<int>::max()))
     throw std::runtime_error("Qwen-Image weight exceeds matrix dimensions");
   StagedWeight target{.m = New(rows, static_cast<int>(count / rows))};
-  if (!w.bf16)
+  if (w.dtype != WeightDType::kBf16)
     target.raw = Raw(w.bytes);
   return target;
 }
@@ -933,7 +981,13 @@ bool Runtime::UploadGroup(std::string_view prefix) {
   for (const auto& [name, w] : weights_.Group(prefix)) {
     if (device_weights_.contains(name))
       continue;
-    const auto bytes = w->bf16 ? w->bytes : w->bytes + w->bytes / 2;
+    if (w->dtype == WeightDType::kU8 || name.ends_with("._weight_scale") ||
+        name.ends_with("._weight_zero_point") ||
+        name.ends_with(".weight_scale") || name.ends_with(".input_scale") ||
+        name.ends_with(".comfy_quant"))
+      continue;
+    const auto bytes =
+        w->dtype == WeightDType::kBf16 ? w->bytes : w->bytes + w->bytes * 2;
     // A tensor larger than the budget is uploaded alone.
     if (!staged.empty() &&
         bytes > kBatchBytes - std::min(staged_bytes, kBatchBytes))
@@ -955,8 +1009,43 @@ Matrix Runtime::Store(std::string_view name, const qwen_image_21::Weight& w,
   const int rows = m.rows, cols = m.cols;
   const auto count = static_cast<std::size_t>(rows) * cols;
   if (target.raw.data) {
-    FloatToBf16<<<Blocks(count), 256, 0, stream_>>>(
-        reinterpret_cast<const float*>(target.raw.data), Ptr(m), count);
+    if (w.dtype == WeightDType::kF32) {
+      FloatToBf16<<<Blocks(count), 256, 0, stream_>>>(
+          reinterpret_cast<const float*>(target.raw.data), Ptr(m), count);
+    } else if (w.dtype == WeightDType::kI8 || w.dtype == WeightDType::kF8E4M3) {
+      Matrix scale_dev;
+      std::size_t scale_count = 0;
+      if (name.ends_with(".weight")) {
+        const std::string base(name.substr(0, name.size() - 7));
+        std::string scale_key;
+        if (weights_.Contains(base + "._weight_scale"))
+          scale_key = base + "._weight_scale";
+        else if (weights_.Contains(base + ".weight_scale"))
+          scale_key = base + ".weight_scale";
+        if (!scale_key.empty()) {
+          const auto& sw = weights_.Get(scale_key);
+          if (sw.dtype == WeightDType::kF32 && sw.bytes >= 4 &&
+              (sw.bytes / 4U == 1U ||
+               sw.bytes / 4U == static_cast<std::size_t>(rows))) {
+            scale_dev = Raw(sw.bytes);
+            UploadMapped(scale_dev.data, sw.data, sw.bytes);
+            scale_count = sw.bytes / 4U;
+          }
+        }
+      }
+      const float* scale_ptr =
+          scale_dev.data ? reinterpret_cast<const float*>(scale_dev.data)
+                         : nullptr;
+      if (w.dtype == WeightDType::kI8) {
+        Int8ToBf16<<<Blocks(count), 256, 0, stream_>>>(
+            reinterpret_cast<const std::int8_t*>(target.raw.data), scale_ptr,
+            Ptr(m), count, cols, scale_count);
+      } else {
+        Fp8E4M3ToBf16<<<Blocks(count), 256, 0, stream_>>>(
+            reinterpret_cast<const std::uint8_t*>(target.raw.data), scale_ptr,
+            Ptr(m), count, cols, scale_count);
+      }
+    }
     target.raw = {};
   }
   if (const auto lora = loras_.find(name); lora != loras_.end())

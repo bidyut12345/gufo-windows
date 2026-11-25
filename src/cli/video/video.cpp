@@ -165,6 +165,11 @@ void RegisterVideoOptions(ArgParser& parser, VideoCliOptions& options,
   parser.AddOption("", "--latents-dir", "DIR",
                    "Final F32 latent dump directory", "Diagnostics",
                    &request.latents_directory);
+  parser.AddOption("", "--checkpoint-dir", "DIR",
+                   "Stage/step checkpoint directory", "Diagnostics",
+                   &request.checkpoint_directory);
+  parser.AddFlag("", "--resume", "Resume from existing checkpoint directory",
+                 "Diagnostics", &request.resume_from_checkpoint);
   parser.AddFlag("", "--no-audio", "Skip AudioVAE (requires --no-mux)",
                  "Diagnostics", &overrides.no_audio);
   parser.AddFlag("", "--no-mux", "Skip MP4 composition (requires --frames-dir)",

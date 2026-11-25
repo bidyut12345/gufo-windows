@@ -19,6 +19,7 @@ namespace gufo::server {
 enum class VideoJobStatus : std::uint8_t {
   kQueued,
   kInProgress,
+  kPaused,
   kCompleted,
   kFailed,
   kCancelled,
@@ -75,6 +76,9 @@ struct VideoJobSnapshot {
   /// is merged into the job's parameters.json report.
   std::string first_frame_sha256;
   std::string last_frame_sha256;
+  std::string checkpoint_stage;
+  int checkpoint_step{0};
+  int checkpoint_total{0};
 };
 
 struct VideoJobContent {
@@ -140,6 +144,8 @@ public:
   [[nodiscard]] VideoJobCreateResult Create(const VideoJobRequest& request);
   [[nodiscard]] VideoJobLookupResult Get(std::string_view id);
   [[nodiscard]] VideoJobContentResult Content(std::string_view id);
+  [[nodiscard]] VideoJobLookupResult Pause(std::string_view id);
+  [[nodiscard]] VideoJobLookupResult Resume(std::string_view id);
   [[nodiscard]] VideoJobLookupResult Delete(std::string_view id);
 
 private:

@@ -83,6 +83,20 @@ struct DenoiserTelemetry {
 using DenoiserProgress = void (*)(int completed_steps, int total_steps,
                                   void* opaque);
 
+struct DenoiserCheckpointState {
+  int completed_steps{0};
+  bool have_velocity{false};
+  std::vector<float> video_latent;
+  std::vector<float> audio_latent;
+  std::vector<float> video_velocity;
+  std::vector<float> audio_velocity;
+  std::vector<float> previous_video_velocity;
+  std::vector<float> previous_audio_velocity;
+};
+
+using DenoiserStepCheckpoint = bool (*)(const DenoiserCheckpointState& state,
+                                        void* opaque, std::string* error);
+
 class DenoiserSession {
 public:
   ~DenoiserSession();
@@ -118,6 +132,14 @@ public:
                                          void* progress_opaque,
                                          DenoiserTelemetry* telemetry,
                                          std::string* error = nullptr);
+
+  [[nodiscard]] bool DenoiseWithCheckpoints(
+      std::span<float> video_latent, std::span<float> audio_latent,
+      int start_step, const DenoiserCheckpointState* initial_state,
+      const CancellationToken* cancellation, DenoiserProgress progress,
+      void* progress_opaque, DenoiserStepCheckpoint step_checkpoint,
+      void* step_checkpoint_opaque, DenoiserTelemetry* telemetry,
+      std::string* error = nullptr);
 
   [[nodiscard]] const GenerationGeometry& geometry() const noexcept;
   [[nodiscard]] const PackedLayout& layout() const noexcept;
