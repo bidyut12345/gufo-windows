@@ -13,9 +13,12 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path "$PSScriptRoot\..\..").Path
-$build = Join-Path $root "build\release"
+$build = Join-Path $root "build\windows-release"
+if (-not (Test-Path (Join-Path $build "gufo.exe"))) {
+  $build = Join-Path $root "build\release"
+}
 if (-not $Out) { $Out = Join-Path $root "dist" }
-if (-not (Test-Path (Join-Path $build "gufo.exe"))) { throw "build first: tools\windows\build.ps1" }
+if (-not (Test-Path (Join-Path $build "gufo.exe"))) { throw "build first: tools\windows\build.ps1 -Preset windows-release" }
 
 $name = "gufo-windows-$Version"
 $stage = Join-Path $Out $name

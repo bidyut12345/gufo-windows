@@ -31,10 +31,13 @@ Write-Host " Target Version    : $Version (Tag: $Tag)" -ForegroundColor White
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 # 2. Verify / Build gufo.exe if needed
-$buildExe = Join-Path $root "build\release\gufo.exe"
+$buildExe = Join-Path $root "build\windows-release\gufo.exe"
+if (-not (Test-Path $buildExe)) {
+    $buildExe = Join-Path $root "build\release\gufo.exe"
+}
 if (-not (Test-Path $buildExe) -and -not $SkipBuild) {
     Write-Host "`n[1/4] Building Gufo Windows release binary..." -ForegroundColor Yellow
-    powershell -ExecutionPolicy Bypass -File (Join-Path $root "tools\windows\build.ps1") -Target gufo
+    powershell -ExecutionPolicy Bypass -File (Join-Path $root "tools\windows\build.ps1") -Preset windows-release -Target gufo
     if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 } else {
     Write-Host "`n[1/4] Found built release binary: $buildExe" -ForegroundColor Green
