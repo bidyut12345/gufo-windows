@@ -55,6 +55,7 @@ struct VideoJobRequest {
   std::vector<std::vector<std::uint8_t>> reference_image_bytes;
   std::vector<std::vector<std::uint8_t>> reference_video_bytes;
   bool lock_canvas_to_preset{false};
+  std::vector<ext::VideoLora> loras;
 };
 
 struct VideoJobSnapshot {
@@ -96,6 +97,8 @@ struct VideoJobServiceOptions {
   /// Additional IDs accepted from requests. They behave as the root
   /// `minimax-h3` name; the preset-selecting variants stay fixed (#957).
   std::vector<std::string> model_aliases;
+  std::vector<std::pair<std::string, std::filesystem::path>> lora_files;
+  std::vector<ext::VideoLora> default_loras;
   bool validate_model_inventory{true};
   std::function<std::string()> id_factory;
   std::function<std::int64_t()> now;
@@ -141,6 +144,11 @@ public:
   /// `minimax-h3`, unknown names are returned unchanged for rejection.
   [[nodiscard]] std::string normalize_model(std::string_view name) const;
   [[nodiscard]] const std::vector<std::string>& model_aliases() const;
+  [[nodiscard]] const std::vector<std::pair<std::string, std::filesystem::path>>&
+  lora_files() const;
+  [[nodiscard]] const std::vector<ext::VideoLora>& default_loras() const;
+  [[nodiscard]] std::optional<std::filesystem::path> FindLora(
+      std::string_view name) const;
   [[nodiscard]] VideoJobCreateResult Create(const VideoJobRequest& request);
   [[nodiscard]] VideoJobLookupResult Get(std::string_view id);
   [[nodiscard]] VideoJobContentResult Content(std::string_view id);

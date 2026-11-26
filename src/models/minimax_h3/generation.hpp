@@ -70,6 +70,12 @@ struct GenerationParameters {
     std::span<const float> video, std::span<const float> audio,
     const CancellationToken* cancellation, std::string* error = nullptr);
 
+struct GenerationLora {
+  std::string name;
+  std::filesystem::path path;
+  float scale{1.0F};
+};
+
 struct GenerationRequest {
   std::filesystem::path model_root;
   std::filesystem::path source_manifest;
@@ -96,6 +102,7 @@ struct GenerationRequest {
   // Optional directory for stage/step checkpoints and resume.
   std::filesystem::path checkpoint_directory;
   bool resume_from_checkpoint{false};
+  std::vector<GenerationLora> loras;
 };
 
 struct GenerationTelemetry {

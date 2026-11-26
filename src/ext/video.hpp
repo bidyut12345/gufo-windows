@@ -29,6 +29,12 @@ struct VideoParameters {
   std::vector<int> selected_frames;
 };
 
+struct VideoLora {
+  std::string name;
+  std::filesystem::path path;
+  float scale{1.0f};
+};
+
 struct VideoRequest {
   std::filesystem::path model_root;
   std::filesystem::path source_manifest;
@@ -61,6 +67,8 @@ struct VideoRequest {
   /// Optional directory for stage/step checkpoints and resume.
   std::filesystem::path checkpoint_directory;
   bool resume_from_checkpoint{false};
+  /// Optional LoRA adapters to merge into matching DiT weights for this run.
+  std::vector<VideoLora> loras;
 };
 
 struct VideoTelemetry {

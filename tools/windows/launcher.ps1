@@ -107,7 +107,7 @@ if ($Last) {
 Write-Host "Looking for models..." -ForegroundColor DarkGray
 $all = @(Find-GufoGgufs)
 $memory = Get-GufoMemory
-$familyOrder = @{ "fn" = 0; "27b" = 1; "a3b" = 2 }
+$familyOrder = @{ "fn" = 0; "27b" = 1; "a3b" = 2; "inkling2" = 3 }
 $targets = @($all | Where-Object { $_.Kind -eq "target" -and $_.MissingShards.Count -eq 0 } |
   Sort-Object @{ Expression = { $familyOrder[$_.Family] } }, Name, @{ Expression = "Bytes"; Descending = $true })
 
@@ -125,6 +125,7 @@ function Get-Option($Target) {
         if ($draft) { $draftKind = "DFlash2" }
       }
     }
+    "inkling2" { $draft = @(Get-GufoCompanions $Target $all "dflash" | ForEach-Object { $_.Record }) | Select-Object -First 1; if ($draft) { $draftKind = "DSpark" } }
   }
   $vision = @(Get-GufoCompanions $Target $all "mmproj" | ForEach-Object { $_.Record }) | Select-Object -First 1
   if (-not $vision -and $Target.Family -eq "a3b") {
@@ -178,7 +179,7 @@ function Show-Models {
 # speculative decoding; 27B has no survival or draft-vocab switch.
 function Get-Features($o) {
   $saved = $settings.Features[$o.Key]
-  $f = [ordered]@{ Spec = [bool]$o.DraftKind; Lookup = [bool]$o.DraftKind; Survival = $o.Target.Family -ne "27b" -and [bool]$o.DraftKind
+  $f = [ordered]@{ Spec = [bool]$o.DraftKind; Lookup = [bool]$o.DraftKind; Survival = $o.Target.Family -notin @("27b", "inkling2") -and [bool]$o.DraftKind
     Vocab = $false; Vision = [bool]$o.Vision; Think = $true; Context = $o.Context; Lan = $false; KvQuant = "f16" }
   if ($saved) {
     foreach ($name in @($f.Keys)) { if ($null -ne $saved.$name) { $f[$name] = $saved.$name } }
@@ -200,8 +201,8 @@ function Show-Features($o, $f) {
   $rows = @(
     @("1", (& $box $f.Spec $spec), "Speculative decoding", $(if ($spec) { "$($o.DraftKind)$(if ($o.Draft) { ': ' + $o.Draft.FileName })" } else { "no draft found: $($o.Info.DraftDownload)" }), $spec),
     @("2", (& $box $f.Lookup $rides), "Prompt lookup", "drafts copied from the context; big win on code edits", $rides),
-    @("3", (& $box $f.Survival ($rides -and $family -ne "27b")), "Survival stopping", "stop a draft chain once it is unlikely to be accepted", ($rides -and $family -ne "27b")),
-    @("4", (& $box $f.Vocab ($rides -and $family -ne "27b")), "Latin draft vocabulary", "RECOMMENDED for English: ~5% faster, output identical", ($rides -and $family -ne "27b")),
+    @("3", (& $box $f.Survival ($rides -and $family -notin @("27b", "inkling2"))), "Survival stopping", "stop a draft chain once it is unlikely to be accepted", ($rides -and $family -notin @("27b", "inkling2"))),
+    @("4", (& $box $f.Vocab ($rides -and $family -notin @("27b", "inkling2"))), "Latin draft vocabulary", "RECOMMENDED for English: ~5% faster, output identical", ($rides -and $family -notin @("27b", "inkling2"))),
     @("5", (& $box $f.Vision ([bool]$o.Vision)), "Images (vision)", $(if ($o.Vision) { $o.Vision.FileName } else { "no matching mmproj-BF16.gguf found" }), [bool]$o.Vision),
     @("6", (& $box $f.Think $true), "Thinking", "reasoning before the answer (clients can still turn it off per request)", $true),
     @("7", "   ", "Context", ("{0}K tokens per request  (press 7 to change)" -f ([int]$f.Context / 1024)), $true),
@@ -252,9 +253,10 @@ function New-Plan($o, $f) {
         if ($o.DraftKind -eq "MTP") { $llm += @("--speculative", "mtp", "--draft-tokens", "6") }
         else { $llm += @("--speculative", "dflash2", "--dflash-model", $o.Draft.Path, "--draft-tokens", "7", "--min-draft-tokens", "1") }
       }
+      "inkling2" { $llm += @("--speculative", "dspark", "--dspark-model", $o.Draft.Path) }
     }
     $labels += $o.DraftKind
-    if ($family -ne "27b") {
+    if ($family -notin @("27b", "inkling2")) {
       if ($f.Survival) { $llm += @("--mtp-policy", "survival"); $labels += "survival" }
       if ($f.Vocab) { $llm += @("--mtp-draft-vocab", "latin"); $labels += "latin vocab" }
       if ($f.Lookup) { $llm += "--prompt-lookup" }
@@ -299,8 +301,8 @@ while ($true) {
     switch -regex ([string]$key.KeyChar) {
       "1" { if ($o.DraftKind) { $f.Spec = -not $f.Spec } }
       "2" { $f.Lookup = -not $f.Lookup }
-      "3" { if ($o.Target.Family -ne "27b") { $f.Survival = -not $f.Survival } }
-      "4" { if ($o.Target.Family -ne "27b") { $f.Vocab = -not $f.Vocab } }
+      "3" { if ($o.Target.Family -notin @("27b", "inkling2")) { $f.Survival = -not $f.Survival } }
+      "4" { if ($o.Target.Family -notin @("27b", "inkling2")) { $f.Vocab = -not $f.Vocab } }
       "5" { if ($o.Vision) { $f.Vision = -not $f.Vision } }
       "6" { $f.Think = -not $f.Think }
       "7" { $i = [array]::IndexOf($o.Contexts, [int]$f.Context); $f.Context = $o.Contexts[($i + 1) % $o.Contexts.Count] }

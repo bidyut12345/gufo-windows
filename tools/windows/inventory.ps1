@@ -194,7 +194,10 @@ function New-GufoRecord($File, [string]$Repo, [string]$Snapshot, $Header, [int64
     $record.MatchName = ConvertTo-GufoMatchName $name
   } elseif ($arch -eq "dflash") {
     $record.Kind = "dflash"
-    $base = Get-HeaderValue $Header "general.base_model.0.name" (Get-HeaderValue $Header "general.base_model.name" (Get-HeaderValue $Header "general.basename" $name))
+    $base = Get-HeaderValue $Header "general.base_model.0.name" (Get-HeaderValue $Header "general.base_model.name" (Get-HeaderValue $Header "general.basename" $null))
+    if (-not $base -or $base -eq "Hf Source") {
+      $base = ([IO.Path]::GetFileNameWithoutExtension($File.Name) -replace "^dspark-", "")
+    }
     $record.MatchName = ConvertTo-GufoMatchName ([string]$base)
     $record.Note = "draft for $base"
   } elseif ($arch -eq "qwen4exp") {
@@ -214,6 +217,10 @@ function New-GufoRecord($File, [string]$Repo, [string]$Snapshot, $Header, [int64
     $record.Kind = "target"
     $record.Family = "a3b"
     $record.HasMtp = $nextn -gt 0
+    $record.MatchName = ConvertTo-GufoMatchName $name
+  } elseif ($arch -eq "inkling2_loop") {
+    $record.Kind = "target"
+    $record.Family = "inkling2"
     $record.MatchName = ConvertTo-GufoMatchName $name
   } else {
     $record.Note = if ($arch) { "architecture '$arch' is not served by gufo on Windows" } else { "no architecture in the header" }
@@ -239,6 +246,11 @@ function Get-GufoFamilyInfo([string]$Family) {
       Download = 'hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf; hf download unsloth/Qwen3.6-35B-A3B-GGUF mmproj-BF16.gguf'
       DraftDownload = 'hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf'
       Overhead = 3.0 } }
+    "inkling2" { @{
+      Title = "Inkling-2-Mini"; ServedName = "inkling-2-mini"; DefaultContext = 131072
+      Download = ''
+      DraftDownload = ''
+      Overhead = 2.5 } }
   }
 }
 

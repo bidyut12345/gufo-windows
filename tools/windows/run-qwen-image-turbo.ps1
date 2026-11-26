@@ -8,6 +8,7 @@ param(
   [string]$ModelLocation = "C:\AI\gufo-image-models",
   [string]$ModelName = "qwen-image-2.1-turbo",
   [string]$BindHost = "127.0.0.1",
+  [string]$WebHost = "0.0.0.0",
   [int]$Port = 8080,
   [int]$BackendPort = 8081,
   [int]$MaxRequestBytes = 33554432,
@@ -16,6 +17,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "lan.ps1")
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $candidates = @(
@@ -75,6 +77,16 @@ $gufoArgs = @(
   "--model", $modelDir,
   "--served-model-name", $ModelName
 )
+$loraDir = Join-Path $ModelLocation "loras"
+if (Test-Path $loraDir) {
+  $seenLoras = @{}
+  foreach ($loraFile in Get-ChildItem -Path $loraDir -Recurse -Filter *.safetensors -ErrorAction SilentlyContinue) {
+    $loraName = ($loraFile.BaseName -replace '[^A-Za-z0-9_.-]', '_')
+    if ($seenLoras.ContainsKey($loraName)) { continue }
+    $seenLoras[$loraName] = $true
+    $gufoArgs += @("--lora", "`"${loraName}=$($loraFile.FullName)`"")
+  }
+}
 
 Write-Host "Starting Gufo image server: $gufoExe $($gufoArgs -join ' ')"
 $gufoProc = Start-Process -FilePath $gufoExe -ArgumentList $gufoArgs -NoNewWindow -PassThru
@@ -89,15 +101,15 @@ try {
     $webuiScript = Join-Path $PSScriptRoot "image-webui.py"
     $webArgs = @(
       $webuiScript,
-      "--host", $BindHost,
+      "--host", $WebHost,
       "--port", "$Port",
       "--backend", "http://${BindHost}:${gufoPort}",
       "--model", $ModelName,
       "--parent-pid", "$($gufoProc.Id)"
     )
     $webProc = Start-Process -FilePath $pythonCmd.Source -ArgumentList $webArgs -NoNewWindow -PassThru
-    $webUrl = "http://${BindHost}:${Port}/"
-    Write-Host "Image WebUI & OpenAI Image API: $webUrl"
+    $webUrl = "http://127.0.0.1:${Port}/"
+    Show-WebUiUrls -WebHost $WebHost -Port $Port -Label "Image WebUI"
     if (-not $NoBrowser) {
       Start-Process $webUrl | Out-Null
     }

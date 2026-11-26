@@ -3,14 +3,23 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <span>
 #include <string>
 #include <vector>
 
+#include "src/models/minimax_h3/lora.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 
 namespace gufo::minimax_h3 {
+
+struct DitLoras {
+  std::vector<std::shared_ptr<const LoraAdapter>> adapters;
+  std::deque<LokrPatch> lokr_patches;
+  LoraTargetMap terms;
+  LokrTargetMap lokr_terms;
+};
 
 inline constexpr std::size_t kDitBlocks = 50;
 inline constexpr std::size_t kDitHiddenSize = 5376;
@@ -60,6 +69,7 @@ struct DitBlockOptions {
   std::size_t modulation_rows{0};
   bool row_parallel_attention{true};
   bool validate_gemm_plans{true};
+  std::shared_ptr<const DitLoras> loras;
 };
 
 struct DitBlockInput {

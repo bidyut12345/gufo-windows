@@ -109,6 +109,9 @@ foreach ($dir in @("hipblaslt", "rocblas")) {
     Copy-Item $libraryDir -Destination $bin -Recurse -Force
   }
 }
+if (Test-Path "$Rocm\.kpack") {
+  Copy-Item "$Rocm\.kpack" -Destination (Join-Path (Split-Path $bin -Parent) ".kpack") -Recurse -Force
+}
 $vcpkgDllDirs = @(
   (Join-Path $build "vcpkg_installed\x64-windows\bin"),
   (Join-Path $build "vcpkg_installed\x64-windows-release\bin"),

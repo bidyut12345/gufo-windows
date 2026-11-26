@@ -500,6 +500,224 @@ bool LoadWeight(const ModelInventory& inventory,
   return true;
 }
 
+__device__ __forceinline__ float DitBf16ToFloat(std::uint16_t bits) {
+  return __uint_as_float(static_cast<std::uint32_t>(bits) << 16U);
+}
+
+__global__ void DitAddLoraDeltaBf16Kernel(std::uint16_t* weight,
+                                          const float* delta, std::size_t n,
+                                          std::size_t cols, bool repack_qkv) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  std::size_t dst_i = i;
+  if (repack_qkv) {
+    const std::size_t row = i / cols;
+    const std::size_t col = i % cols;
+    const std::size_t qkv = row / 7168U;
+    const std::size_t rem = row % 7168U;
+    const std::size_t head = rem / 128U;
+    const std::size_t d = rem % 128U;
+    dst_i = ((head * 3U + qkv) * 128U + d) * cols + col;
+  }
+  weight[dst_i] = DitFloatToBf16(DitBf16ToFloat(weight[dst_i]) + delta[i]);
+}
+
+__global__ void DitAddLokrDeltaBf16Kernel(std::uint16_t* weight,
+                                          const float* w1, const float* w2,
+                                          int w1_cols, int w2_rows, int w2_cols,
+                                          std::size_t n, std::size_t cols,
+                                          float scale, bool repack_qkv) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  const int row = static_cast<int>(i / cols);
+  const int col = static_cast<int>(i % cols);
+  const int r1 = row / w2_rows;
+  const int r2 = row % w2_rows;
+  const int c1 = col / w2_cols;
+  const int c2 = col % w2_cols;
+  const float delta =
+      scale * w1[r1 * w1_cols + c1] * w2[r2 * w2_cols + c2];
+  std::size_t dst_i = i;
+  if (repack_qkv) {
+    const std::size_t u_row = static_cast<std::size_t>(row);
+    const std::size_t u_col = static_cast<std::size_t>(col);
+    const std::size_t qkv = u_row / 7168U;
+    const std::size_t rem = u_row % 7168U;
+    const std::size_t head = rem / 128U;
+    const std::size_t d = rem % 128U;
+    dst_i = ((head * 3U + qkv) * 128U + d) * cols + u_col;
+  }
+  weight[dst_i] = DitFloatToBf16(DitBf16ToFloat(weight[dst_i]) + delta);
+}
+
+bool ApplyLokrTerms(LoadedWeight* weight, std::span<const LokrTerm> terms,
+                    hipStream_t stream, std::string* error) {
+  if (terms.empty() || weight == nullptr || weight->descriptor == nullptr ||
+      weight->descriptor->shape.size() != 2U) {
+    return true;
+  }
+  const auto& desc = *weight->descriptor;
+  const std::size_t rows = static_cast<std::size_t>(desc.shape[0]);
+  const std::size_t cols = static_cast<std::size_t>(desc.shape[1]);
+  const std::size_t count = rows * cols;
+  if (count == 0U) {
+    return true;
+  }
+  const bool quantized =
+      desc.dtype == DType::kInt8 || desc.dtype == DType::kFloat8E4M3;
+  const bool repack_qkv = quantized &&
+                          desc.name.ends_with("attn.qkv_proj.weight") &&
+                          rows == 21504U && cols != 0U;
+  const unsigned threads = 256U;
+  const unsigned blocks =
+      static_cast<unsigned>((count + threads - 1U) / threads);
+  for (const auto& term : terms) {
+    const auto& p = *term.patch;
+    DeviceBuffer w1_dev;
+    DeviceBuffer w2_dev;
+    if (!w1_dev.Allocate(p.w1.size() * sizeof(float), error) ||
+        !w2_dev.Allocate(p.w2.size() * sizeof(float), error)) {
+      return false;
+    }
+    if (hipMemcpyAsync(w1_dev.data(), p.w1.data(), p.w1.size() * sizeof(float),
+                       hipMemcpyHostToDevice, stream) != hipSuccess ||
+        hipMemcpyAsync(w2_dev.data(), p.w2.data(), p.w2.size() * sizeof(float),
+                       hipMemcpyHostToDevice, stream) != hipSuccess) {
+      SetError(error, "failed to upload MiniMax H3 LoKr factors");
+      return false;
+    }
+    DitAddLokrDeltaBf16Kernel<<<blocks, threads, 0, stream>>>(
+        weight->storage.As<std::uint16_t>(), w1_dev.As<float>(),
+        w2_dev.As<float>(), p.w1_cols, p.w2_rows, p.w2_cols, count, cols,
+        p.scale * term.strength, repack_qkv);
+    hipError_t status = hipGetLastError();
+    if (status == hipSuccess) {
+      status = hipStreamSynchronize(stream);
+    }
+    if (status != hipSuccess) {
+      SetError(error, HipError("apply MiniMax H3 LoKr delta", status));
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ApplyLoraTerms(LoadedWeight* weight, std::span<const LoraTerm> terms,
+                    hipStream_t stream, rocblas_handle blas,
+                    std::string* error) {
+  if (terms.empty() || weight == nullptr || weight->descriptor == nullptr ||
+      weight->descriptor->shape.size() != 2U) {
+    return true;
+  }
+  const auto& desc = *weight->descriptor;
+  const std::size_t rows = static_cast<std::size_t>(desc.shape[0]);
+  const std::size_t cols = static_cast<std::size_t>(desc.shape[1]);
+  const std::size_t count = rows * cols;
+  if (count == 0U) {
+    return true;
+  }
+  DeviceBuffer delta_dev;
+  if (!delta_dev.Allocate(count * sizeof(float), error)) {
+    return false;
+  }
+  hipError_t status = hipMemsetAsync(delta_dev.data(), 0, count * sizeof(float),
+                                     stream);
+  if (status != hipSuccess) {
+    SetError(error, HipError("zero MiniMax H3 LoRA delta", status));
+    return false;
+  }
+  for (const auto& term : terms) {
+    const auto& patch = *term.patch;
+    if (patch.base_row != 0 || patch.rows != static_cast<int>(rows) ||
+        patch.cols != static_cast<int>(cols) || patch.magnitude.data) {
+      SetError(error, "unsupported MiniMax H3 LoRA patch layout for " +
+                          desc.name);
+      return false;
+    }
+    if (patch.diff.data) {
+      const auto diff_host = LoraFloats(patch.diff, 0, count);
+      DeviceBuffer diff_dev;
+      if (!diff_dev.Allocate(count * sizeof(float), error)) {
+        return false;
+      }
+      status = hipMemcpyAsync(diff_dev.data(), diff_host.data(),
+                              count * sizeof(float), hipMemcpyHostToDevice,
+                              stream);
+      if (status != hipSuccess) {
+        SetError(error, HipError("upload MiniMax H3 LoRA diff", status));
+        return false;
+      }
+      const rocblas_status bstat =
+          rocblas_saxpy(blas, static_cast<rocblas_int>(count), &term.strength,
+                        diff_dev.As<float>(), 1, delta_dev.As<float>(), 1);
+      if (bstat != rocblas_status_success) {
+        SetError(error, "rocBLAS MiniMax H3 LoRA diff failed: " +
+                            std::to_string(static_cast<int>(bstat)));
+        return false;
+      }
+      continue;
+    }
+    const std::size_t up_count = rows * static_cast<std::size_t>(patch.rank);
+    const std::size_t down_count = static_cast<std::size_t>(patch.rank) * cols;
+    const auto up_host = LoraFloats(patch.up, 0, up_count);
+    const auto down_host = LoraFloats(patch.down, 0, down_count);
+    DeviceBuffer up_dev;
+    DeviceBuffer down_dev;
+    if (!up_dev.Allocate(up_count * sizeof(float), error) ||
+        !down_dev.Allocate(down_count * sizeof(float), error)) {
+      return false;
+    }
+    if (hipMemcpyAsync(up_dev.data(), up_host.data(), up_count * sizeof(float),
+                       hipMemcpyHostToDevice, stream) != hipSuccess ||
+        hipMemcpyAsync(down_dev.data(), down_host.data(),
+                       down_count * sizeof(float), hipMemcpyHostToDevice,
+                       stream) != hipSuccess) {
+      SetError(error, "failed to upload MiniMax H3 LoRA factors");
+      return false;
+    }
+    const float alpha = patch.scale * term.strength;
+    const float beta = 1.0F;
+    const rocblas_status bstat = rocblas_sgemm(
+        blas, rocblas_operation_none, rocblas_operation_none,
+        static_cast<rocblas_int>(cols), static_cast<rocblas_int>(rows),
+        static_cast<rocblas_int>(patch.rank), &alpha, down_dev.As<float>(),
+        static_cast<rocblas_int>(cols), up_dev.As<float>(),
+        static_cast<rocblas_int>(patch.rank), &beta, delta_dev.As<float>(),
+        static_cast<rocblas_int>(cols));
+    if (bstat != rocblas_status_success) {
+      SetError(error, "rocBLAS MiniMax H3 LoRA SGEMM failed: " +
+                          std::to_string(static_cast<int>(bstat)));
+      return false;
+    }
+  }
+  const bool quantized = desc.dtype == DType::kInt8 ||
+                         desc.dtype == DType::kFloat8E4M3;
+  const bool repack_qkv = quantized &&
+                          desc.name.ends_with("attn.qkv_proj.weight") &&
+                          rows == 21504U && cols != 0U;
+  const unsigned threads = 256U;
+  const unsigned blocks =
+      static_cast<unsigned>((count + threads - 1U) / threads);
+  DitAddLoraDeltaBf16Kernel<<<blocks, threads, 0, stream>>>(
+      weight->storage.As<std::uint16_t>(), delta_dev.As<float>(), count, cols,
+      repack_qkv);
+  status = hipGetLastError();
+  if (status == hipSuccess) {
+    status = hipStreamSynchronize(stream);
+  }
+  if (status != hipSuccess) {
+    SetError(error, HipError("apply MiniMax H3 LoRA delta", status));
+    return false;
+  }
+  return true;
+}
+
 class Bf16Gemm {
 private:
   struct Plan {
@@ -1011,6 +1229,48 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
   }
   (void)hipHostFree(impl->staging);
   impl->staging = nullptr;
+  if (options.loras != nullptr &&
+      (!options.loras->terms.empty() || !options.loras->lokr_terms.empty())) {
+    rocblas_handle lora_blas = nullptr;
+    for (LoadedWeight* weight : {&impl->qkv_weight, &impl->output_weight,
+                                 &impl->fc1_weight, &impl->fc2_weight}) {
+      const auto it = options.loras->terms.find(weight->descriptor->name);
+      if (it != options.loras->terms.end() && !it->second.empty()) {
+        if (lora_blas == nullptr) {
+          if (rocblas_create_handle(&lora_blas) != rocblas_status_success ||
+              rocblas_set_atomics_mode(lora_blas, rocblas_atomics_not_allowed) !=
+                  rocblas_status_success ||
+              rocblas_set_stream(lora_blas, impl->stream) !=
+                  rocblas_status_success) {
+            if (lora_blas != nullptr) {
+              (void)rocblas_destroy_handle(lora_blas);
+            }
+            SetError(error,
+                     "failed to create rocBLAS handle for MiniMax H3 LoRA");
+            return nullptr;
+          }
+        }
+        if (!ApplyLoraTerms(weight, it->second, impl->stream, lora_blas,
+                            error)) {
+          (void)rocblas_destroy_handle(lora_blas);
+          return nullptr;
+        }
+      }
+      const auto lit =
+          options.loras->lokr_terms.find(weight->descriptor->name);
+      if (lit != options.loras->lokr_terms.end() && !lit->second.empty()) {
+        if (!ApplyLokrTerms(weight, lit->second, impl->stream, error)) {
+          if (lora_blas != nullptr) {
+            (void)rocblas_destroy_handle(lora_blas);
+          }
+          return nullptr;
+        }
+      }
+    }
+    if (lora_blas != nullptr) {
+      (void)rocblas_destroy_handle(lora_blas);
+    }
+  }
   if (impl->native_projections) {
     for (LoadedWeight* weight : {&impl->qkv_weight, &impl->output_weight,
                                  &impl->fc1_weight, &impl->fc2_weight}) {

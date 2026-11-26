@@ -7,6 +7,7 @@ param(
   [string]$ModelLocation = "C:\AI\gufo-image-models",
   [string]$ModelName = "qwen-image-2.1",
   [string]$BindHost = "127.0.0.1",
+  [string]$WebHost = "0.0.0.0",
   [int]$Port = 8080,
   [int]$BackendPort = 8081,
   [int]$MaxRequestBytes = 33554432,
@@ -20,6 +21,7 @@ $ErrorActionPreference = "Stop"
   -ModelLocation $ModelLocation `
   -ModelName $ModelName `
   -BindHost $BindHost `
+  -WebHost $WebHost `
   -Port $Port `
   -BackendPort $BackendPort `
   -MaxRequestBytes $MaxRequestBytes `

@@ -13,6 +13,7 @@ import ctypes
 import http.client
 import json
 import os
+import re
 import sys
 import threading
 import urllib.parse
@@ -369,6 +370,14 @@ textarea { min-height: 104px; resize: vertical; }
       </div>
       <div class="ref-list" id="refList"></div>
 
+      <div id="loraSection" style="display:none; margin-top:12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:5px;">
+          <label id="loraLabel" style="margin:0;">LoRA Adapters</label>
+          <input id="loraFilter" type="text" placeholder="Filter LoRAs..." style="width:160px; padding:4px 8px; font-size:12px;">
+        </div>
+        <div id="loraList" style="display:flex; flex-direction:column; gap:6px; max-height:200px; overflow-y:auto;"></div>
+      </div>
+
       <div class="actions">
         <button class="btn" id="runBtn" type="submit">Generate Video</button>
         <button class="btn secondary" id="pauseBtn" type="button" style="display:none;">Pause</button>
@@ -539,12 +548,80 @@ $("clearRefBtn").onclick = () => {
   renderRefList();
 };
 
+let lorasLoaded = false;
+
+async function loadLoras() {
+  if (lorasLoaded) return;
+  try {
+    const r = await fetch("/v1/videos/loras");
+    if (!r.ok) return;
+    const list = await r.json();
+    lorasLoaded = true;
+    const wrap = $("loraList");
+    wrap.innerHTML = "";
+    if (!Array.isArray(list) || list.length === 0) {
+      $("loraSection").style.display = "none";
+      return;
+    }
+    $("loraSection").style.display = "block";
+    $("loraLabel").textContent = `LoRA Adapters (${list.length})`;
+    $("loraFilter").oninput = () => {
+      const q = $("loraFilter").value.trim().toLowerCase();
+      for (const row of wrap.children) {
+        const name = (row.dataset.loraName || "").toLowerCase();
+        row.style.display = !q || name.includes(q) ? "flex" : "none";
+      }
+    };
+    for (const item of list) {
+      const name = item.name;
+      if (!name) continue;
+      const row = document.createElement("div");
+      row.dataset.loraName = name;
+      row.style.cssText = "display:flex; align-items:center; gap:8px; background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:6px 10px;";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.style.width = "auto";
+      cb.dataset.loraName = name;
+      cb.checked = false;
+      const lbl = document.createElement("span");
+      lbl.textContent = name;
+      lbl.style.cssText = "flex:1; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;";
+      const sc = document.createElement("input");
+      sc.type = "number";
+      sc.step = "0.05";
+      sc.min = "-10";
+      sc.max = "10";
+      sc.value = "1.0";
+      sc.style.width = "72px";
+      sc.title = "LoRA scale";
+      row.append(cb, lbl, sc);
+      wrap.appendChild(row);
+    }
+  } catch {}
+}
+
+function selectedLoras() {
+  if (!lorasLoaded) return null;
+  const rows = $("loraList").children;
+  if (!rows.length) return null;
+  const out = [];
+  for (const row of rows) {
+    const cb = row.querySelector("input[type=checkbox]");
+    const sc = row.querySelector("input[type=number]");
+    if (cb && cb.checked) {
+      out.push({ name: cb.dataset.loraName, scale: parseFloat(sc.value) || 1.0 });
+    }
+  }
+  return out;
+}
+
 async function pollHealth() {
   try {
     const r = await fetch("/ready");
     if (r.ok) {
       $("healthDot").className = "dot ok";
       $("healthText").textContent = "Server ready";
+      loadLoras();
     } else {
       $("healthDot").className = "dot";
       $("healthText").textContent = "Loading model...";
@@ -699,6 +776,7 @@ $("videoForm").onsubmit = async (e) => {
   $("statusBar").textContent = lastStatusText;
 
   try {
+    const loras = selectedLoras();
     let resp;
     if (firstFile || lastFile || editVideoFile || refFiles.length > 0) {
       const form = new FormData();
@@ -707,16 +785,19 @@ $("videoForm").onsubmit = async (e) => {
       form.append("size", size);
       form.append("seconds", seconds);
       form.append("gufo", JSON.stringify(gufoOpts));
+      if (loras !== null) form.append("loras", JSON.stringify(loras));
       if (firstFile) form.append("first_frame", firstFile);
       if (lastFile) form.append("last_frame", lastFile);
       if (editVideoFile) form.append("reference_video_0", editVideoFile);
       refFiles.forEach((f, idx) => form.append(`reference_${idx}`, f));
       resp = await fetch("/v1/videos", { method: "POST", body: form });
     } else {
+      const payload = { model, prompt, size, seconds: parseFloat(seconds), gufo: gufoOpts };
+      if (loras !== null) payload.loras = loras;
       resp = await fetch("/v1/videos", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, prompt, size, seconds: parseFloat(seconds), gufo: gufoOpts }),
+        body: JSON.stringify(payload),
       });
     }
 
@@ -790,10 +871,11 @@ $("videoForm").onsubmit = async (e) => {
 """
 
 
-def make_handler(backend_url: str, default_model: str):
+def make_handler(backend_url: str, default_model: str, save_dir: str = ""):
     parsed = urllib.parse.urlsplit(backend_url)
     backend_host = parsed.hostname or "127.0.0.1"
     backend_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    video_content_re = re.compile(r"^/v1/videos/([^/]+)/content(?:\?.*)?$")
 
     class ProxyHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -836,6 +918,15 @@ def make_handler(backend_url: str, default_model: str):
                 self.send_header("Content-Length", str(len(resp_body)))
                 self.end_headers()
                 if resp_body:
+                    if save_dir and self.command == "GET" and resp.status == 200:
+                        m = video_content_re.match(self.path)
+                        if m:
+                            os.makedirs(save_dir, exist_ok=True)
+                            safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", m.group(1))
+                            out_path = os.path.join(save_dir, f"{safe_id}.mp4")
+                            if not os.path.exists(out_path):
+                                with open(out_path, "wb") as f:
+                                    f.write(resp_body)
                     self.wfile.write(resp_body)
             except OSError as exc:
                 err = json.dumps({"error": {"message": f"Backend unreachable: {exc}"}}).encode("utf-8")
@@ -893,6 +984,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--backend", default="http://127.0.0.1:8081")
     parser.add_argument("--model", default="minimax-h3")
+    parser.add_argument("--save-dir", default="")
     parser.add_argument("--parent-pid", type=int, default=0)
     args = parser.parse_args()
 
@@ -901,7 +993,7 @@ def main() -> int:
 
     server = ReusableThreadingHTTPServer(
         (args.host, args.port),
-        make_handler(args.backend, args.model),
+        make_handler(args.backend, args.model, args.save_dir),
     )
     print(f"Gufo Video WebUI listening on http://{args.host}:{args.port} -> {args.backend}", flush=True)
     try:

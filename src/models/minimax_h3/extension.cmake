@@ -10,6 +10,7 @@ gufo_extension_target(
     generation.cpp
     image_processor.cpp
     json.cpp
+    lora.cpp
     media.cpp
     prompt_encoder.cpp
     runtime.cpp

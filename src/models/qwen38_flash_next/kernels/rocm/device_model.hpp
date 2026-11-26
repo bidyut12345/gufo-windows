@@ -67,15 +67,21 @@ struct DeviceLayer {
 /// row the same way at any pass width. A separate 16-bit projection would
 /// take the library GEMM, whose sums depend on the pass width, and on the
 /// wide HC route it shares the half staging buffer with the mixed row.
-enum class HcInjectUpload { kCopy, kExpandQ8_0, kWidenBF16 };
+enum class HcInjectUpload { kCopy, kExpandQ8_0, kWidenBF16, kWidenF16 };
 
 [[nodiscard]] constexpr HcInjectUpload HcInjectUploadFor(
     core::GgmlType disk) noexcept {
   switch (disk) {
     case core::GgmlType::kQ8_0:
+    case core::GgmlType::kQ6_K:
+    case core::GgmlType::kQ5_K:
+    case core::GgmlType::kIQ4_NL:
+    case core::GgmlType::kIQ4_XS:
       return HcInjectUpload::kExpandQ8_0;
     case core::GgmlType::kBF16:
       return HcInjectUpload::kWidenBF16;
+    case core::GgmlType::kF16:
+      return HcInjectUpload::kWidenF16;
     default:
       return HcInjectUpload::kCopy;
   }

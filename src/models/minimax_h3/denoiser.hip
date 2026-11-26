@@ -758,6 +758,80 @@ bool LoadRefinerBlock(const ModelInventory& inventory, std::size_t block,
   return true;
 }
 
+bool ApplyFloat32Loras(const TensorDescriptor& desc, DeviceBuffer* buffer,
+                       const DitLoras* loras, hipStream_t stream,
+                       std::string* error) {
+  if (loras == nullptr || desc.shape.size() != 2U) {
+    return true;
+  }
+  const auto it = loras->terms.find(desc.name);
+  const auto lit = loras->lokr_terms.find(desc.name);
+  const bool has_lora = it != loras->terms.end() && !it->second.empty();
+  const bool has_lokr = lit != loras->lokr_terms.end() && !lit->second.empty();
+  if (!has_lora && !has_lokr) {
+    return true;
+  }
+  const std::size_t rows = static_cast<std::size_t>(desc.shape[0]);
+  const std::size_t cols = static_cast<std::size_t>(desc.shape[1]);
+  const std::size_t count = rows * cols;
+  std::vector<float> host(count);
+  if (hipMemcpyAsync(host.data(), buffer->data(), count * sizeof(float),
+                     hipMemcpyDeviceToHost, stream) != hipSuccess ||
+      hipStreamSynchronize(stream) != hipSuccess) {
+    SetError(error, "failed to read F32 tensor for LoRA: " + desc.name);
+    return false;
+  }
+  if (has_lora) {
+    for (const auto& term : it->second) {
+      const auto& p = *term.patch;
+      if (p.diff.data) {
+        const auto d = LoraFloats(p.diff, 0, count);
+        for (std::size_t i = 0; i < count; ++i) {
+          host[i] += term.strength * d[i];
+        }
+        continue;
+      }
+      const auto up =
+          LoraFloats(p.up, 0, rows * static_cast<std::size_t>(p.rank));
+      const auto down =
+          LoraFloats(p.down, 0, static_cast<std::size_t>(p.rank) * cols);
+      const float s = p.scale * term.strength;
+      for (std::size_t r = 0; r < rows; ++r) {
+        for (std::size_t c = 0; c < cols; ++c) {
+          float acc = 0.0F;
+          for (int k = 0; k < p.rank; ++k) {
+            acc += up[r * p.rank + k] * down[k * cols + c];
+          }
+          host[r * cols + c] += s * acc;
+        }
+      }
+    }
+  }
+  if (has_lokr) {
+    for (const auto& term : lit->second) {
+      const auto& p = *term.patch;
+      const float s = p.scale * term.strength;
+      for (std::size_t r = 0; r < rows; ++r) {
+        const int r1 = static_cast<int>(r) / p.w2_rows;
+        const int r2 = static_cast<int>(r) % p.w2_rows;
+        for (std::size_t c = 0; c < cols; ++c) {
+          const int c1 = static_cast<int>(c) / p.w2_cols;
+          const int c2 = static_cast<int>(c) % p.w2_cols;
+          host[r * cols + c] += s * p.w1[r1 * p.w1_cols + c1] *
+                                p.w2[r2 * p.w2_cols + c2];
+        }
+      }
+    }
+  }
+  if (hipMemcpyAsync(buffer->data(), host.data(), count * sizeof(float),
+                     hipMemcpyHostToDevice, stream) != hipSuccess ||
+      hipStreamSynchronize(stream) != hipSuccess) {
+    SetError(error, "failed to upload F32 tensor after LoRA: " + desc.name);
+    return false;
+  }
+  return true;
+}
+
 bool IsFinite(std::span<const float> values, std::string_view name,
               std::string* first_non_finite) {
   for (std::size_t index = 0; index < values.size(); ++index) {
@@ -821,6 +895,7 @@ struct DenoiserSession::Impl {
   int active_blocks{static_cast<int>(kDitBlocks)};
   int reuse_interval{1};
   bool row_parallel_attention{true};
+  std::shared_ptr<const DitLoras> loras;
 
   ~Impl() {
     if (staging != nullptr) {
@@ -1520,7 +1595,8 @@ struct DenoiserSession::Impl {
            .modulation_rows =
                static_cast<std::size_t>(time_rows.time_rows) * kDitModalities,
            .row_parallel_attention = row_parallel_attention,
-           .validate_gemm_plans = blocks.empty()},
+           .validate_gemm_plans = blocks.empty(),
+           .loras = loras},
           block_workspace, cancellation, error);
       if (session == nullptr ||
           !session->PrepareConstants(modulation, rope_cos, rope_sin,
@@ -1586,14 +1662,20 @@ struct DenoiserSession::Impl {
     if (!Load(*video_weight, &video_patch_weight, cancellation, error) ||
         !Load(*video_bias, &video_patch_bias, cancellation, error) ||
         !Load(*audio_weight, &audio_patch_weight, cancellation, error) ||
+        !ApplyFloat32Loras(*audio_weight, &audio_patch_weight, loras.get(),
+                           stream, error) ||
         !Load(*audio_bias, &audio_patch_bias, cancellation, error) ||
         !Load(*final_norm, &final_norm_weight, cancellation, error) ||
         !Load(*final_video_weight_descriptor, &final_video_weight, cancellation,
               error) ||
+        !ApplyFloat32Loras(*final_video_weight_descriptor, &final_video_weight,
+                           loras.get(), stream, error) ||
         !Load(*final_video_bias_descriptor, &final_video_bias, cancellation,
               error) ||
         !Load(*final_audio_weight_descriptor, &final_audio_weight, cancellation,
               error) ||
+        !ApplyFloat32Loras(*final_audio_weight_descriptor, &final_audio_weight,
+                           loras.get(), stream, error) ||
         !Load(*final_audio_bias_descriptor, &final_audio_bias, cancellation,
               error) ||
         !final_modulation.Allocate(
@@ -1980,6 +2062,7 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   impl->active_blocks = options.active_blocks;
   impl->reuse_interval = options.reuse_interval;
   impl->row_parallel_attention = options.row_parallel_attention;
+  impl->loras = options.loras;
   impl->base_telemetry.row_parallel_attention = options.row_parallel_attention;
   impl->text_tags.assign(conditioning.tags.begin(), conditioning.tags.end());
   if (impl->text_tags.empty()) {

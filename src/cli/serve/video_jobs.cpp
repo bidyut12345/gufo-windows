@@ -754,6 +754,7 @@ struct VideoJobService::Impl {
           .lock_canvas_to_preset = job->request.lock_canvas_to_preset,
           .checkpoint_directory = job->directory / "checkpoint",
           .resume_from_checkpoint = job->resume_from_checkpoint,
+          .loras = job->request.loras,
       };
       {
         // Delete can clear a queued/active prompt concurrently with admission.
@@ -964,6 +965,25 @@ std::string VideoJobService::normalize_model(std::string_view name) const {
 
 const std::vector<std::string>& VideoJobService::model_aliases() const {
   return impl_->options.model_aliases;
+}
+
+const std::vector<std::pair<std::string, std::filesystem::path>>&
+VideoJobService::lora_files() const {
+  return impl_->options.lora_files;
+}
+
+const std::vector<ext::VideoLora>& VideoJobService::default_loras() const {
+  return impl_->options.default_loras;
+}
+
+std::optional<std::filesystem::path> VideoJobService::FindLora(
+    std::string_view name) const {
+  for (const auto& [entry_name, path] : impl_->options.lora_files) {
+    if (entry_name == name) {
+      return path;
+    }
+  }
+  return std::nullopt;
 }
 
 VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {

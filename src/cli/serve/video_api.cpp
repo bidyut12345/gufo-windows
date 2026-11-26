@@ -660,6 +660,54 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     }
   }
 
+  std::vector<ext::VideoLora> loras = service.default_loras();
+  if (const json::Value* loras_value = body.find("loras")) {
+    std::optional<json::Value> parsed_loras;
+    const json::Value* array_value = loras_value;
+    if (loras_value->is_string()) {
+      try {
+        parsed_loras = json::parse(loras_value->str());
+      } catch (const std::exception&) {
+        return Error(400, "Bad Request", "'loras' must be a JSON array",
+                     "invalid_loras");
+      }
+      array_value = &*parsed_loras;
+    }
+    if (!array_value->is_array()) {
+      return Error(400, "Bad Request", "'loras' must be an array",
+                   "invalid_loras");
+    }
+    loras.clear();
+    for (const json::Value& entry : array_value->items()) {
+      if (!entry.is_object()) {
+        return Error(400, "Bad Request", "each 'loras' entry must be an object",
+                     "invalid_loras");
+      }
+      const json::Value* name = entry.find("name");
+      if (name == nullptr || !name->is_string()) {
+        return Error(400, "Bad Request", "LoRA 'name' must be a string",
+                     "invalid_loras");
+      }
+      const auto path = service.FindLora(name->str());
+      if (!path.has_value()) {
+        return Error(400, "Bad Request",
+                     "unknown video LoRA adapter: " + name->str(),
+                     "unknown_lora");
+      }
+      float scale = 1.0F;
+      if (const json::Value* s = entry.find("scale")) {
+        if (!s->is_number() || !std::isfinite(s->as_double()) ||
+            std::abs(s->as_double()) > 10.0) {
+          return Error(400, "Bad Request",
+                       "LoRA 'scale' must be a finite number within [-10, 10]",
+                       "invalid_loras");
+        }
+        scale = static_cast<float>(s->as_double());
+      }
+      loras.push_back({.name = name->str(), .path = *path, .scale = scale});
+    }
+  }
+
   const VideoJobCreateResult created = service.Create({
       .model = model,
       .prompt = prompt,
@@ -673,6 +721,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       .reference_image_bytes = std::move(reference_images),
       .reference_video_bytes = std::move(reference_videos),
       .lock_canvas_to_preset = lock_resolution,
+      .loras = std::move(loras),
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =
@@ -919,6 +968,26 @@ HttpResponse HandleVideoApiRequest(const HttpRequest& request,
                  "method_not_allowed");
   }
 
+  if (request.path == "/v1/videos/loras") {
+    if (request.method != "GET") {
+      return Error(405, "Method Not Allowed", "method is not allowed",
+                   "method_not_allowed");
+    }
+    auto body = json::Value::array();
+    for (const auto& [name, path] : service.lora_files()) {
+      auto item = json::Value::object();
+      item["name"] = name;
+      item["path"] = path.string();
+      body.push_back(std::move(item));
+    }
+    return {
+        .status = 200,
+        .reason = "OK",
+        .body = body.dump(),
+        .headers = {},
+        .streaming_body = {},
+    };
+  }
   const auto parsed = ParseVideoPath(request.path);
   if (!parsed.has_value()) {
     return Error(404, "Not Found", "video job not found", "video_not_found");

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 
@@ -30,6 +31,7 @@ struct DenoiserOptions {
   // FL2VA keyframe anchors ride as extra leading video rows; zero keeps the
   // text-only packed sequence [text | audio | video].
   std::size_t condition_video_rows{0};
+  std::shared_ptr<const DitLoras> loras;
 };
 
 struct DenoiserConditioning {

@@ -1337,6 +1337,48 @@ int RunServe(std::span<const char* const> args) {
                            &video_ttl_seconds);
     std::vector<std::string> video_names;
     AddServedModelNamesOption(video_parser, &video_names);
+    std::vector<std::pair<std::string, std::filesystem::path>> video_lora_files;
+    std::vector<std::pair<std::string, float>> video_lora_defaults;
+    video_parser.AddCustomOption(
+        "", "--lora", "NAME=PATH",
+        "Register a LoRA adapter for MiniMax H3; requests select it by name "
+        "(repeatable)",
+        "Model",
+        [&video_lora_files](std::string_view, std::string_view value,
+                            std::string* err) {
+          std::string name;
+          std::string path;
+          if (!SplitNameValue(value, "--lora", &name, &path, err)) {
+            return false;
+          }
+          video_lora_files.emplace_back(std::move(name), std::move(path));
+          return true;
+        });
+    video_parser.AddCustomOption(
+        "", "--lora-default", "NAME:SCALE",
+        "Apply a registered --lora to video requests that omit 'loras' "
+        "(repeatable)",
+        "Model",
+        [&video_lora_defaults](std::string_view, std::string_view value,
+                               std::string* err) {
+          const std::size_t separator = value.rfind(':');
+          float scale = 0;
+          if (separator == std::string_view::npos || separator == 0) {
+            *err = "--lora-default expects NAME:SCALE";
+            return false;
+          }
+          const auto text = value.substr(separator + 1);
+          const auto [end, ec] =
+              std::from_chars(text.data(), text.data() + text.size(), scale);
+          if (text.empty() || ec != std::errc{} ||
+              end != text.data() + text.size()) {
+            *err = "--lora-default expects NAME:SCALE";
+            return false;
+          }
+          video_lora_defaults.emplace_back(
+              std::string(value.substr(0, separator)), scale);
+          return true;
+        });
 
     add_server_options(video_parser);
     if (!video_parser.Parse(sub_args, &parse_err)) {
@@ -1365,6 +1407,24 @@ int RunServe(std::span<const char* const> args) {
       return 2;
     }
 
+    std::vector<ext::VideoLora> resolved_video_defaults;
+    for (const auto& [name, scale] : video_lora_defaults) {
+      std::optional<std::filesystem::path> found;
+      for (const auto& [reg_name, reg_path] : video_lora_files) {
+        if (reg_name == name) {
+          found = reg_path;
+          break;
+        }
+      }
+      if (!found.has_value()) {
+        std::cerr << "Error: --lora-default names unknown adapter '" << name
+                  << "'\n";
+        return 2;
+      }
+      resolved_video_defaults.push_back(
+          {.name = name, .path = *found, .scale = scale});
+    }
+
     ModelLoadLog load_log("video_inventory", video_model);
     video_jobs = std::make_shared<server::VideoJobService>(
         server::VideoJobServiceOptions{
@@ -1377,6 +1437,8 @@ int RunServe(std::span<const char* const> args) {
             // Video's canonical names select presets, so every supplied
             // name is an accepted alias of the root minimax-h3 (#957).
             .model_aliases = video_names,
+            .lora_files = std::move(video_lora_files),
+            .default_loras = std::move(resolved_video_defaults),
             .validate_model_inventory = true,
             .id_factory = {},
             .now = {},

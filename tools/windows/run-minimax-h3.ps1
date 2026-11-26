@@ -10,9 +10,10 @@ param(
   [string]$ManifestPath = "",
   [string]$ModelName = "minimax-h3",
   [string]$BindHost = "127.0.0.1",
+  [string]$WebHost = "0.0.0.0",
   [int]$Port = 8080,
   [int]$BackendPort = 8081,
-  [int]$Ttl = 3600,
+  [int64]$Ttl = 3153600000,
   [int]$MaxRequestBytes = 268435456,
   [switch]$NoWebUi,
   [switch]$NoBrowser
@@ -29,6 +30,7 @@ if (-not $ManifestPath) {
 }
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "lan.ps1")
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $candidates = @(
@@ -108,6 +110,21 @@ $gufoArgs = @(
   "--root", $JobsRoot,
   "--ttl", "$Ttl"
 )
+$loraSearchRoots = @(
+  (Join-Path (Split-Path $JobsRoot -Parent) "loras"),
+  (Join-Path (Split-Path $ModelDir -Parent) "loras"),
+  (Join-Path (Split-Path (Split-Path $ModelDir -Parent) -Parent) "loras")
+) | Select-Object -Unique
+$seenLoras = @{}
+foreach ($loraRoot in $loraSearchRoots) {
+  if (-not (Test-Path $loraRoot)) { continue }
+  foreach ($loraFile in Get-ChildItem -Path $loraRoot -Recurse -Filter *.safetensors -ErrorAction SilentlyContinue) {
+    $loraName = ($loraFile.BaseName -replace '[^A-Za-z0-9_.-]', '_')
+    if ($seenLoras.ContainsKey($loraName)) { continue }
+    $seenLoras[$loraName] = $true
+    $gufoArgs += @("--lora", "`"${loraName}=$($loraFile.FullName)`"")
+  }
+}
 
 Write-Host "Starting Gufo video server: $gufoExe $($gufoArgs -join ' ')"
 $gufoProc = Start-Process -FilePath $gufoExe -ArgumentList $gufoArgs -NoNewWindow -PassThru
@@ -122,15 +139,16 @@ try {
     $webuiScript = Join-Path $PSScriptRoot "video-webui.py"
     $webArgs = @(
       $webuiScript,
-      "--host", $BindHost,
+      "--host", $WebHost,
       "--port", "$Port",
       "--backend", "http://${BindHost}:${gufoPort}",
       "--model", $ModelName,
+      "--save-dir", (Join-Path $JobsRoot "saved"),
       "--parent-pid", "$($gufoProc.Id)"
     )
     $webProc = Start-Process -FilePath $pythonCmd.Source -ArgumentList $webArgs -NoNewWindow -PassThru
-    $webUrl = "http://${BindHost}:${Port}/"
-    Write-Host "Video WebUI & OpenAI Video API: $webUrl"
+    $webUrl = "http://127.0.0.1:${Port}/"
+    Show-WebUiUrls -WebHost $WebHost -Port $Port -Label "Video WebUI"
     if (-not $NoBrowser) {
       Start-Process $webUrl | Out-Null
     }

@@ -61,6 +61,14 @@ public:
         .checkpoint_directory = request.checkpoint_directory,
         .resume_from_checkpoint = request.resume_from_checkpoint,
     };
+    req.loras.reserve(request.loras.size());
+    for (const auto& lora : request.loras) {
+      req.loras.push_back({
+          .name = lora.name,
+          .path = lora.path,
+          .scale = lora.scale,
+      });
+    }
     gufo::minimax_h3::CancellationToken token;
     std::jthread watcher;
     if (is_cancelled) {

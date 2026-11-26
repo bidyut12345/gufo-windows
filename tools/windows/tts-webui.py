@@ -169,29 +169,39 @@ if (isDesign) $("voiceBox").classList.add("hidden");
 const updateCount = () => { $("charCount").textContent = new TextEncoder().encode($("text").value).length; };
 $("text").addEventListener("input", updateCount); updateCount();
 
+let voicesLoaded = false;
+
 async function refreshHealth() {
   try {
     const r = await fetch("/ready", { cache: "no-store" });
     $("dot").className = "dot " + (r.ok ? "ok" : "");
     $("health").textContent = r.ok ? "Ready" : "Loading model...";
+    if (r.ok && !voicesLoaded) loadVoices();
   } catch { $("dot").className = "dot err"; $("health").textContent = "Server offline"; }
 }
 async function loadVoices() {
   try {
-    const m = await (await fetch("/v1/models")).json();
-    if (m.data && m.data[0] && m.data[0].id) MODEL = m.data[0].id;
+    const mr = await fetch("/v1/models");
+    if (mr.ok) {
+      const m = await mr.json();
+      if (m.data && m.data[0] && m.data[0].id) MODEL = m.data[0].id;
+    }
   } catch {}
   try {
-    const v = await (await fetch("/v1/audio/voices")).json();
+    const vr = await fetch("/v1/audio/voices");
+    if (!vr.ok) return;
+    const v = await vr.json();
     const names = Array.isArray(v) ? v : (v.voices || []);
     const sel = $("voice"); sel.innerHTML = "";
     if (isBase) sel.add(new Option("Upload a reference below", ""));
     for (const n of names) sel.add(new Option(typeof n === "string" ? n : n.id, typeof n === "string" ? n : n.id));
     if (!names.length && !isBase) $("voiceBox").classList.add("hidden");
+    else $("voiceBox").classList.remove("hidden");
     if (isBase) sel.onchange = () => $("cloneBox").classList.toggle("hidden", !!sel.value);
+    voicesLoaded = true;
   } catch {}
 }
-refreshHealth(); setInterval(refreshHealth, 5000); loadVoices();
+refreshHealth(); setInterval(refreshHealth, 3000); loadVoices();
 
 // Decode any audio file, downmix to mono, resample to 24 kHz and encode a 16-bit WAV.
 async function fileToWavB64(file) {

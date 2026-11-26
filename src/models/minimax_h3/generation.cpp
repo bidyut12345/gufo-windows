@@ -1548,6 +1548,52 @@ bool GenerateTextVideo(const GenerationRequest& request,
           !embedding.tags.empty()
               ? embedding.tags
               : std::vector<std::uint8_t>(embedding.tokens, 1);
+      std::shared_ptr<DitLoras> dit_loras;
+      if (!request.loras.empty()) {
+        dit_loras = std::make_shared<DitLoras>();
+        const auto base_shape = [&](std::string_view name) -> std::vector<int> {
+          const TensorDescriptor* desc = inventory->FindTensor(name);
+          if (desc == nullptr) {
+            return {};
+          }
+          std::vector<int> shape;
+          shape.reserve(desc->shape.size());
+          for (const std::uint64_t dim : desc->shape) {
+            shape.push_back(static_cast<int>(dim));
+          }
+          return shape;
+        };
+        for (const auto& req_lora : request.loras) {
+          try {
+            auto loaded = LoadMinimaxAdapter(req_lora.path, base_shape);
+            if (loaded.lora) {
+              for (const auto& patch : loaded.lora->patches()) {
+                dit_loras->terms[patch.target].push_back(
+                    {&patch, req_lora.scale});
+              }
+              dit_loras->adapters.push_back(std::move(loaded.lora));
+            }
+            if (!loaded.lokr_patches.empty()) {
+              const std::size_t base_idx = dit_loras->lokr_patches.size();
+              for (auto& lp : loaded.lokr_patches) {
+                dit_loras->lokr_patches.push_back(std::move(lp));
+              }
+              for (std::size_t idx = base_idx;
+                   idx < dit_loras->lokr_patches.size(); ++idx) {
+                const auto& lp = dit_loras->lokr_patches[idx];
+                dit_loras->lokr_terms[lp.target].push_back(
+                    {&lp, req_lora.scale});
+              }
+            }
+          } catch (const std::exception& exc) {
+            if (error != nullptr) {
+              *error = "failed to load MiniMax H3 LoRA '" + req_lora.name +
+                       "': " + exc.what();
+            }
+            return false;
+          }
+        }
+      }
       auto denoiser = DenoiserSession::Create(
           *inventory,
           {.geometry = *geometry,
@@ -1556,7 +1602,8 @@ bool GenerateTextVideo(const GenerationRequest& request,
            .active_blocks = parameters.active_blocks,
            .reuse_interval = parameters.reuse_interval,
            .row_parallel_attention = parameters.row_parallel_attention,
-           .condition_video_rows = condition_rows.size() / kH3VideoPatchWidth},
+           .condition_video_rows = condition_rows.size() / kH3VideoPatchWidth,
+           .loras = std::move(dit_loras)},
           {.layer50 = embedding.values,
            .tags = tags,
            .condition_rows = condition_rows,

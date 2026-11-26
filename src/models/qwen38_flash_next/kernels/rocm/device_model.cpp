@@ -32,7 +32,8 @@ namespace {
 constexpr std::size_t kTailMargin = 4096;
 
 [[nodiscard]] constexpr bool NeedsQ8Reencode(const TensorRef& t) noexcept {
-  return (t.type == core::GgmlType::kQ6_K ||
+  return (t.type == core::GgmlType::kQ6_K || t.type == core::GgmlType::kQ5_K ||
+          t.type == core::GgmlType::kIQ4_NL ||
           t.type == core::GgmlType::kIQ4_XS) &&
          t.experts == 1 && (t.cols % 32) == 0;
 }
@@ -351,7 +352,9 @@ struct Uploader {
       case HcInjectUpload::kCopy:
         return Copy(t);
       case HcInjectUpload::kWidenBF16:
-        return UploadWidened(t);
+        return UploadWidened(t, false);
+      case HcInjectUpload::kWidenF16:
+        return UploadWidened(t, true);
       case HcInjectUpload::kExpandQ8_0:
         break;
     }
@@ -368,14 +371,14 @@ struct Uploader {
     }
     allocations.push_back(f32);
     bytes += count * sizeof(float) + kTailMargin;
-    conversions.push_back({d.data, f32, count, true, t.SizeBytes()});
+    conversions.push_back({d.data, f32, count, true, DeviceBytesOf(t)});
     tail_zeros.push_back(static_cast<std::uint8_t*>(f32) + count * 4);
     d.data = f32;
     d.type = core::GgmlType::kF32;
     return d;
   }
 
-  DeviceTensor UploadWidened(const TensorRef& t) {
+  DeviceTensor UploadWidened(const TensorRef& t, bool from_f16) {
     DeviceTensor d;
     const std::size_t count = t.cols * t.rows * t.experts;
     void* f32 = nullptr;
@@ -389,7 +392,12 @@ struct Uploader {
     allocations.push_back(f32);
     bytes += count * sizeof(float) + kTailMargin;
     std::vector<float> host(count);
-    WidenBF16(static_cast<const std::uint16_t*>(t.data), host.data(), count);
+    if (from_f16) {
+      gufo::quant::DequantizeRow(core::GgmlType::kF16, t.data, host.data(),
+                                 count);
+    } else {
+      WidenBF16(static_cast<const std::uint16_t*>(t.data), host.data(), count);
+    }
     if (hipMemcpy(f32, host.data(), count * sizeof(float),
                   hipMemcpyHostToDevice) != hipSuccess ||
         hipMemset(static_cast<std::uint8_t*>(f32) + count * sizeof(float), 0,
@@ -617,7 +625,7 @@ struct Uploader {
     d.ple_norm_key = Copy(l.ple_norm_key);
     d.ple_norm_query = Copy(l.ple_norm_query);
     d.ple_norm_conv = Copy(l.ple_norm_conv);
-    d.ple_conv1d = Copy(l.ple_conv1d);
+    d.ple_conv1d = CopyF32(l.ple_conv1d);
     d.router = Stack({&l.router, &l.shexp_gate_inp});
     d.ffn_gate_exps = Copy(l.ffn_gate_exps);
     d.ffn_up_exps = Copy(l.ffn_up_exps);

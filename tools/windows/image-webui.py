@@ -444,6 +444,11 @@ dialog img { max-width: 88vw; max-height: 82vh; display: block; border-radius: 8
       <label for="modelName">Model ID</label>
       <input id="modelName" type="text" value="DEFAULT_MODEL_PLACEHOLDER">
 
+      <div id="loraSection" style="display:none; margin-top:12px;">
+        <label>LoRA Adapters</label>
+        <div id="loraList" style="display:flex; flex-direction:column; gap:6px;"></div>
+      </div>
+
       <div class="actions">
         <button class="btn" id="runBtn" type="submit">Generate Image</button>
       </div>
@@ -547,11 +552,70 @@ function syncDefaultSteps(modelId) {
 }
 syncDefaultSteps($("modelName").value);
 
+let lorasLoaded = false;
+
+async function loadLoras() {
+  if (lorasLoaded) return;
+  try {
+    const r = await fetch("/sdapi/v1/loras");
+    if (!r.ok) return;
+    const list = await r.json();
+    lorasLoaded = true;
+    const wrap = $("loraList");
+    wrap.innerHTML = "";
+    if (!Array.isArray(list) || list.length === 0) {
+      $("loraSection").style.display = "none";
+      return;
+    }
+    $("loraSection").style.display = "block";
+    for (const item of list) {
+      const name = item.name || item.alias;
+      if (!name) continue;
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex; align-items:center; gap:8px; background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:6px 10px;";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.style.width = "auto";
+      cb.dataset.loraName = name;
+      cb.checked = true;
+      const lbl = document.createElement("span");
+      lbl.textContent = name;
+      lbl.style.cssText = "flex:1; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;";
+      const sc = document.createElement("input");
+      sc.type = "number";
+      sc.step = "0.05";
+      sc.min = "-10";
+      sc.max = "10";
+      sc.value = "0.8";
+      sc.style.width = "72px";
+      sc.title = "LoRA scale";
+      row.append(cb, lbl, sc);
+      wrap.appendChild(row);
+    }
+  } catch {}
+}
+
+function selectedLoras() {
+  if (!lorasLoaded) return null;
+  const rows = $("loraList").children;
+  if (!rows.length) return null;
+  const out = [];
+  for (const row of rows) {
+    const cb = row.querySelector("input[type=checkbox]");
+    const sc = row.querySelector("input[type=number]");
+    if (cb && cb.checked) {
+      out.push({ name: cb.dataset.loraName, scale: parseFloat(sc.value) || 0.8 });
+    }
+  }
+  return out;
+}
+
 async function pollHealth() {
   try {
     const r = await fetch("/ready");
     if (r.ok) {
       $("healthDot").className = "dot ok";
+      loadLoras();
       let modelInfo = "";
       try {
         const mr = await fetch("/v1/models");
@@ -700,6 +764,8 @@ $("studioForm").onsubmit = async (e) => {
       if (stepsStr) payload.steps = parseInt(stepsStr, 10);
       if (seedStr) payload.seed = parseInt(seedStr, 10);
       if (neg) payload.negative_prompt = neg;
+      const loras = selectedLoras();
+      if (loras !== null) payload.loras = loras;
       const initInput = $("initFile").files[0];
       if (initInput) {
         payload.image = await fileToDataUrl(initInput);
