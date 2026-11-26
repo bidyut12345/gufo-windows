@@ -40,7 +40,6 @@ gufo_extension_target(
   LINK_LIBRARIES
     gufo_minimax_h3
     hip::host
-    roc::hipblaslt
     roc::rocblas
 )
 

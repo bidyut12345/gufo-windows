@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/gguf_reader.hpp>
 #include <gufo/ext/sampling.hpp>
 
 #include "src/families/qwen/hip_common/rope.hpp"
@@ -704,6 +705,11 @@ void VerificationCandidates(const float* logits, GreedyPenaltyRows penalties,
 /// values. One launch; the result depends only on the input bytes.
 void QuantizeQ8_0ToQ4K(const void* q8, void* q4k, std::size_t rows,
                        std::uint32_t cols, hipStream_t stream);
+
+/// Re-encodes IQ4_NL, IQ4_XS, Q5_K, or Q6_K blocks on device to Q8_0 blocks.
+/// `elements` must be a multiple of the format's block size (32 or 256).
+bool ReencodeToQ8_0(gufo::core::GgmlType src_type, const void* src, void* dst,
+                    std::size_t elements, hipStream_t stream);
 
 /// Draft logits of empty table slots (table[i] < 0) become -infinity.
 void MaskDraftLogits(float* logits, const std::int32_t* table, std::uint32_t n,

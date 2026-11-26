@@ -263,6 +263,45 @@ void CheckAttentionKernel() {
   for (const std::uint16_t element : got) {
     CHECK(std::isfinite(ToFloat(element)));
   }
+
+  // Long sequence (> 16128 tokens) must not exceed 64 KiB LDS in CausalGqaKernel.
+  constexpr std::uint32_t kLongSequence = 16500;
+  constexpr std::uint32_t kLongHeads = 1;
+  constexpr std::uint32_t kLongHeadDim = 128;
+  std::vector<std::uint16_t> long_q(
+      static_cast<std::size_t>(kLongSequence) * kLongHeads * kLongHeadDim,
+      ToBf16(0.0F));
+  std::vector<std::uint16_t> long_k(long_q.size(), ToBf16(0.0F));
+  std::vector<std::uint16_t> long_v(long_q.size(), ToBf16(1.0F));
+  for (std::uint32_t row = 0; row < kLongSequence; ++row) {
+    long_q[static_cast<std::size_t>(row) * kLongHeadDim] = ToBf16(1.0F);
+    long_k[static_cast<std::size_t>(row) * kLongHeadDim] =
+        ToBf16(row == 0 ? 10.0F : 0.0F);
+    long_v[static_cast<std::size_t>(row) * kLongHeadDim] =
+        ToBf16(row == 0 ? 5.0F : 1.0F);
+  }
+  DeviceArray<std::uint16_t> d_long_q(long_q.size());
+  DeviceArray<std::uint16_t> d_long_k(long_k.size());
+  DeviceArray<std::uint16_t> d_long_v(long_v.size());
+  DeviceArray<std::uint16_t> d_long_out(long_q.size());
+  CHECK(d_long_q.CopyFrom(long_q));
+  CHECK(d_long_k.CopyFrom(long_k));
+  CHECK(d_long_v.CopyFrom(long_v));
+  h3ops::LaunchCausalGqa(d_long_q.get(), d_long_k.get(), d_long_v.get(),
+                         d_long_out.get(), kLongSequence, kLongHeads,
+                         kLongHeads, kLongHeadDim, 1.0F, nullptr);
+  CHECK(hipGetLastError() == hipSuccess);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  std::vector<std::uint16_t> long_got(long_q.size());
+  CHECK(d_long_out.CopyTo(long_got));
+  const std::size_t last_base =
+      static_cast<std::size_t>(kLongSequence - 1U) * kLongHeadDim;
+  const float w0 = std::exp(10.0F);
+  const float expected_dim0 =
+      (w0 * 5.0F + static_cast<float>(kLongSequence - 1U)) /
+      (w0 + static_cast<float>(kLongSequence - 1U));
+  CHECK(std::abs(ToFloat(long_got[last_base]) - expected_dim0) < 0.05F);
+  CHECK(std::abs(ToFloat(long_got[last_base + 1U]) - 1.0F) < 0.02F);
 }
 
 bool CheckAnalytic() {

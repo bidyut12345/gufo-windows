@@ -9,11 +9,14 @@ through, so PCM speech plays while it is generated. Uses only Python stdlib.
 from __future__ import annotations
 
 import argparse
+import atexit
 import ctypes
+import glob
 import http.client
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import urllib.parse
@@ -78,14 +81,14 @@ button.primary:disabled { opacity: .55; cursor: wait; }
 </head>
 <body>
 <header>
-  <div class="brand">Gufo Speech Studio <span id="variantLabel" class="badge"></span></div>
+  <div class="brand">Gufo Speech Studio <select id="variantSelect" class="badge" style="width:auto;padding:4px 10px;margin-left:6px" title="Switch Qwen3-TTS model"></select></div>
   <div class="badge"><span id="dot" class="dot"></span><span id="health">Connecting...</span></div>
 </header>
 <main>
   <section class="card">
     <label for="text">Text</label>
     <textarea id="text" placeholder="Type what to say...">Hello from Gufo, running Qwen3 text to speech on this machine.</textarea>
-    <div class="hint"><span id="charCount">0</span> / 16384 bytes</div>
+    <div class="hint"><span id="charCount">0</span> chars (<span id="chunkCount">1</span> chunk)</div>
 
     <div class="row">
       <div id="voiceBox">
@@ -137,7 +140,7 @@ button.primary:disabled { opacity: .55; cursor: wait; }
       <div class="row-3">
         <div><label for="repPen">Repetition pen.</label><input id="repPen" type="number" step="0.01" min="0" placeholder="1.05"></div>
         <div><label for="seed">Seed</label><input id="seed" type="number" min="0" placeholder="random"></div>
-        <div><label for="maxTok">Max tokens</label><input id="maxTok" type="number" min="1" max="8192" placeholder="3000"></div>
+        <div><label for="maxTok">Max tokens</label><input id="maxTok" type="number" min="1" max="32768" placeholder="auto"></div>
       </div>
     </details>
 
@@ -151,27 +154,143 @@ button.primary:disabled { opacity: .55; cursor: wait; }
 </main>
 
 <script>
-const VARIANT = "DEFAULT_VARIANT_PLACEHOLDER";
+const $ = (id) => document.getElementById(id);
+let VARIANT = "DEFAULT_VARIANT_PLACEHOLDER";
 let MODEL = "DEFAULT_MODEL_PLACEHOLDER";
 const SAMPLE_RATE = 24000;
-const $ = (id) => document.getElementById(id);
 let busy = false;
+let switching = false;
 let refWavB64 = null;
-
-$("variantLabel").textContent = VARIANT;
-const isBase = VARIANT === "Base";
-const isDesign = VARIANT === "VoiceDesign";
-$("cloneBox").classList.toggle("hidden", !isBase);
-$("instructBox").classList.toggle("hidden", isBase);
-$("instructReq").textContent = isDesign ? "(required)" : "(optional)";
-if (isDesign) $("voiceBox").classList.add("hidden");
-
-const updateCount = () => { $("charCount").textContent = new TextEncoder().encode($("text").value).length; };
-$("text").addEventListener("input", updateCount); updateCount();
-
+let isBase = false;
+let isDesign = false;
 let voicesLoaded = false;
 
+function applyVariant(v, m) {
+  VARIANT = v;
+  if (m) MODEL = m;
+  isBase = VARIANT === "Base";
+  isDesign = VARIANT === "VoiceDesign";
+  $("cloneBox").classList.toggle("hidden", !isBase);
+  $("instructBox").classList.toggle("hidden", isBase);
+  $("instructReq").textContent = isDesign ? "(required)" : "(optional)";
+  $("voiceBox").classList.toggle("hidden", isDesign);
+  voicesLoaded = false;
+}
+applyVariant(VARIANT, MODEL);
+
+function splitSpeechText(text, maxChars = 14000) {
+  const chunks = [];
+  let cur = "";
+  const flushCur = () => {
+    const s = cur.trim();
+    if (s) chunks.push(s);
+    cur = "";
+  };
+  const appendUnit = (unit, sep) => {
+    const u = unit.trim();
+    if (!u) return;
+    if (u.length > maxChars) {
+      flushCur();
+      let rest = u;
+      while (rest.length > maxChars) {
+        let cut = rest.lastIndexOf(" ", maxChars);
+        if (cut < maxChars * 0.4) cut = maxChars;
+        chunks.push(rest.slice(0, cut).trim());
+        rest = rest.slice(cut).trim();
+      }
+      if (rest) cur = rest;
+      return;
+    }
+    const next = cur ? cur + sep + u : u;
+    if (next.length > maxChars) {
+      flushCur();
+      cur = u;
+    } else {
+      cur = next;
+    }
+  };
+  for (const para of text.split(/\n+/)) {
+    const p = para.trim();
+    if (!p) continue;
+    if (p.length <= maxChars) {
+      appendUnit(p, "\n");
+      continue;
+    }
+    const sentences = p.match(/[^.!?。！？]+(?:[.!?。！？]+["'”’)\]]*\s*|$)/g) || [p];
+    for (const sent of sentences) appendUnit(sent, " ");
+  }
+  flushCur();
+  return chunks.length ? chunks : [text.trim()];
+}
+
+const updateCount = () => {
+  const v = $("text").value.trim();
+  $("charCount").textContent = $("text").value.length;
+  $("chunkCount").textContent = v ? splitSpeechText(v).length : 0;
+};
+$("text").addEventListener("input", updateCount); updateCount();
+
+async function loadVariantList() {
+  const sel = $("variantSelect");
+  try {
+    const r = await fetch("/webui/models", { cache: "no-store" });
+    if (!r.ok) throw new Error();
+    const d = await r.json();
+    sel.innerHTML = "";
+    for (const v of (d.available || [VARIANT])) sel.add(new Option(v, v));
+    sel.value = d.current || VARIANT;
+    sel.disabled = !d.can_switch || (d.available || []).length <= 1;
+  } catch {
+    sel.innerHTML = "";
+    sel.add(new Option(VARIANT, VARIANT));
+    sel.disabled = true;
+  }
+}
+
+$("variantSelect").onchange = async () => {
+  const next = $("variantSelect").value;
+  if (!next || next === VARIANT || busy || switching) {
+    $("variantSelect").value = VARIANT;
+    return;
+  }
+  switching = true;
+  $("variantSelect").disabled = true;
+  $("runBtn").disabled = true;
+  $("dot").className = "dot";
+  $("health").textContent = `Switching to ${next}...`;
+  $("statusBar").className = "status-bar";
+  $("statusBar").textContent = `Switching model to ${next}...`;
+  try {
+    const r = await fetch("/webui/switch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ variant: next })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error((d.error && d.error.message) || `HTTP ${r.status}`);
+    applyVariant(d.variant, d.model);
+    for (let i = 0; i < 60; i++) {
+      await new Promise((res) => setTimeout(res, 250));
+      try {
+        const rr = await fetch("/ready", { cache: "no-store" });
+        if (rr.ok) break;
+      } catch {}
+    }
+    await refreshHealth();
+    $("statusBar").textContent = `Switched to ${VARIANT}.`;
+  } catch (e) {
+    $("variantSelect").value = VARIANT;
+    $("statusBar").className = "status-bar error";
+    $("statusBar").textContent = `Switch failed: ${e.message}`;
+  } finally {
+    switching = false;
+    $("variantSelect").disabled = false;
+    $("runBtn").disabled = false;
+  }
+};
+
 async function refreshHealth() {
+  if (switching) return;
   try {
     const r = await fetch("/ready", { cache: "no-store" });
     $("dot").className = "dot " + (r.ok ? "ok" : "");
@@ -201,7 +320,7 @@ async function loadVoices() {
     voicesLoaded = true;
   } catch {}
 }
-refreshHealth(); setInterval(refreshHealth, 3000); loadVoices();
+refreshHealth(); setInterval(refreshHealth, 3000); loadVariantList(); loadVoices();
 
 // Decode any audio file, downmix to mono, resample to 24 kHz and encode a 16-bit WAV.
 async function fileToWavB64(file) {
@@ -293,42 +412,63 @@ $("runBtn").onclick = async () => {
   const stream = $("stream").checked;
   payload.response_format = stream ? "pcm" : "wav";
 
+  const textChunks = splitSpeechText(text);
   busy = true; $("runBtn").disabled = true;
-  $("statusBar").className = "status-bar"; $("statusBar").textContent = "Generating...";
+  $("statusBar").className = "status-bar";
+  $("statusBar").textContent = textChunks.length > 1 ? `Generating (chunk 1/${textChunks.length})...` : "Generating...";
   const t0 = performance.now();
   try {
-    const resp = await fetch("/v1/audio/speech", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    if (!resp.ok) {
-      let msg = `HTTP ${resp.status}`;
-      try { const e = await resp.json(); msg = (e.error && e.error.message) || msg; } catch {}
-      throw new Error(msg);
-    }
-    let blob, firstMs = null, audioSec;
-    if (stream) {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
-      let playAt = ctx.currentTime + 0.15, carry = null, total = 0;
-      const chunks = []; const reader = resp.body.getReader();
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (firstMs === null) { firstMs = performance.now() - t0; $("statusBar").textContent = `Playing (first audio after ${Math.round(firstMs)} ms)...`; }
-        chunks.push(value); total += value.length;
-        let bytes = value;
-        if (carry) { const m = new Uint8Array(carry.length + value.length); m.set(carry); m.set(value, carry.length); bytes = m; carry = null; }
-        const even = bytes.length - (bytes.length % 2);
-        if (even < bytes.length) carry = bytes.slice(even);
-        if (!even) continue;
-        const view = new DataView(bytes.buffer, bytes.byteOffset, even);
-        const f = new Float32Array(even / 2);
-        for (let i = 0; i < f.length; i++) f[i] = view.getInt16(i * 2, true) / 32768;
-        const ab = ctx.createBuffer(1, f.length, SAMPLE_RATE); ab.copyToChannel(f, 0);
-        const src = ctx.createBufferSource(); src.buffer = ab; src.connect(ctx.destination);
-        playAt = Math.max(playAt, ctx.currentTime); src.start(playAt); playAt += ab.duration;
+    let firstMs = null, total = 0;
+    const pcmChunks = [];
+    const ctx = stream ? new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE }) : null;
+    let playAt = ctx ? ctx.currentTime + 0.15 : 0;
+    for (let idx = 0; idx < textChunks.length; idx++) {
+      const chunkPayload = { ...payload, input: textChunks[idx] };
+      if (textChunks.length > 1 && idx > 0) {
+        $("statusBar").textContent = `Generating chunk ${idx + 1}/${textChunks.length}...`;
       }
-      blob = pcmToWavBlob(chunks, total); audioSec = total / 2 / SAMPLE_RATE;
-    } else {
-      blob = await resp.blob(); audioSec = Math.max(0, (blob.size - 44) / 2 / SAMPLE_RATE);
+      const resp = await fetch("/v1/audio/speech", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(chunkPayload) });
+      if (!resp.ok) {
+        let msg = `HTTP ${resp.status}`;
+        try { const e = await resp.json(); msg = (e.error && e.error.message) || msg; } catch {}
+        throw new Error(msg);
+      }
+      if (stream) {
+        let carry = null;
+        const reader = resp.body.getReader();
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (firstMs === null) {
+            firstMs = performance.now() - t0;
+            $("statusBar").textContent = textChunks.length > 1
+              ? `Playing chunk ${idx + 1}/${textChunks.length} (first audio after ${Math.round(firstMs)} ms)...`
+              : `Playing (first audio after ${Math.round(firstMs)} ms)...`;
+          }
+          pcmChunks.push(value); total += value.length;
+          let bytes = value;
+          if (carry) { const m = new Uint8Array(carry.length + value.length); m.set(carry); m.set(value, carry.length); bytes = m; carry = null; }
+          const even = bytes.length - (bytes.length % 2);
+          if (even < bytes.length) carry = bytes.slice(even);
+          if (!even) continue;
+          const view = new DataView(bytes.buffer, bytes.byteOffset, even);
+          const f = new Float32Array(even / 2);
+          for (let i = 0; i < f.length; i++) f[i] = view.getInt16(i * 2, true) / 32768;
+          const ab = ctx.createBuffer(1, f.length, SAMPLE_RATE); ab.copyToChannel(f, 0);
+          const src = ctx.createBufferSource(); src.buffer = ab; src.connect(ctx.destination);
+          playAt = Math.max(playAt, ctx.currentTime); src.start(playAt); playAt += ab.duration;
+        }
+      } else {
+        const buf = await resp.arrayBuffer();
+        if (buf.byteLength > 44) {
+          const pcm = new Uint8Array(buf, 44);
+          pcmChunks.push(pcm);
+          total += pcm.length;
+        }
+      }
     }
+    const blob = pcmToWavBlob(pcmChunks, total);
+    const audioSec = total / 2 / SAMPLE_RATE;
     const dt = (performance.now() - t0) / 1000;
     const meta = `${VARIANT}${payload.voice ? " | " + payload.voice : ""} | ${payload.language} | seed ${payload.seed} | ${audioSec.toFixed(1)}s audio in ${dt.toFixed(1)}s` + (firstMs !== null ? ` | first audio ${Math.round(firstMs)} ms` : "");
     const el = addResult(blob, text, meta);
@@ -347,8 +487,99 @@ HOP_BY_HOP = {"host", "connection", "keep-alive", "proxy-authenticate", "proxy-a
               "te", "trailers", "transfer-encoding", "upgrade"}
 
 
-def make_handler(backend_url: str, default_model: str, variant: str):
-    parsed = urllib.parse.urlsplit(backend_url)
+VARIANT_MODELS = {
+    "CustomVoice": "qwen3-tts-12hz-1.7b-customvoice",
+    "VoiceDesign": "qwen3-tts-12hz-1.7b-voice-design",
+    "Base": "qwen3-tts-12hz-1.7b-base",
+}
+
+
+class BackendManager:
+    def __init__(self, backend_url: str, default_model: str, variant: str,
+                 gufo_exe: str = "", model_location: str = "",
+                 backend_port: int = 8091, context: int = 32768,
+                 max_request_bytes: int = 33554432, npu: bool = False) -> None:
+        self.backend_url = backend_url
+        self.current_model = default_model
+        self.current_variant = variant
+        self.gufo_exe = gufo_exe
+        self.model_location = model_location
+        self.backend_port = backend_port
+        self.context = context
+        self.max_request_bytes = max_request_bytes
+        self.npu = npu
+        self.lock = threading.Lock()
+        self.proc: subprocess.Popen | None = None
+        self.variant_dirs = self._discover_variants() if gufo_exe and model_location else {}
+        self.available = list(self.variant_dirs.keys()) or [variant]
+        self.can_switch = bool(self.variant_dirs)
+
+    def _discover_variants(self) -> dict[str, str]:
+        found: dict[str, str] = {}
+        for v in VARIANT_MODELS:
+            name = f"Qwen3-TTS-12Hz-1.7B-{v}"
+            for candidate in (os.path.join(self.model_location, "models", name),
+                              os.path.join(self.model_location, name)):
+                if os.path.isfile(os.path.join(candidate, "config.json")):
+                    found[v] = candidate
+                    break
+        return found
+
+    def start(self, variant: str) -> None:
+        if not self.can_switch:
+            return
+        if variant not in self.variant_dirs:
+            raise ValueError(f"Variant '{variant}' not found under '{self.model_location}'")
+        self.stop()
+        model_dir = self.variant_dirs[variant]
+        model_name = VARIANT_MODELS[variant]
+        cmd = [
+            self.gufo_exe, "serve",
+            "--host", "127.0.0.1",
+            "--port", str(self.backend_port),
+            "--max-request-bytes", str(self.max_request_bytes),
+            "--no-webui",
+            "tts",
+            "--model", model_dir,
+            "--served-model-name", model_name,
+            "--served-model-name", "qwen3-tts",
+        ]
+        if self.context > 0:
+            cmd += ["--context", str(self.context)]
+        if self.npu:
+            cmd.append("--npu")
+        if variant == "Base":
+            voice_dir = os.path.join(self.model_location, "voices")
+            os.makedirs(voice_dir, exist_ok=True)
+            for wav in sorted(glob.glob(os.path.join(voice_dir, "*.wav"))):
+                stem = os.path.splitext(os.path.basename(wav))[0]
+                cmd += ["--voice", f"{stem}={wav}"]
+        print(f"Starting Gufo TTS server ({variant}): {' '.join(cmd)}", flush=True)
+        self.proc = subprocess.Popen(cmd)
+        self.current_variant = variant
+        self.current_model = model_name
+
+    def switch(self, variant: str) -> tuple[str, str]:
+        with self.lock:
+            if not self.can_switch:
+                raise RuntimeError("Model switching is only available when launched via run-qwen3-tts.ps1")
+            if variant != self.current_variant or self.proc is None or self.proc.poll() is not None:
+                self.start(variant)
+            return self.current_variant, self.current_model
+
+    def stop(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+        self.proc = None
+
+
+def make_handler(manager: BackendManager):
+    parsed = urllib.parse.urlsplit(manager.backend_url)
     backend_host = parsed.hostname or "127.0.0.1"
     backend_port = parsed.port or 80
 
@@ -363,8 +594,10 @@ def make_handler(backend_url: str, default_model: str, variant: str):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
+            self.close_connection = True
 
         def _proxy(self) -> None:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -372,6 +605,7 @@ def make_handler(backend_url: str, default_model: str, variant: str):
             headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
             headers["Connection"] = "close"
             conn = http.client.HTTPConnection(backend_host, backend_port, timeout=3600)
+            headers_sent = False
             try:
                 conn.request(self.command, self.path, body=body, headers=headers)
                 resp = conn.getresponse()
@@ -384,6 +618,7 @@ def make_handler(backend_url: str, default_model: str, variant: str):
                 if known_length is not None:
                     self.send_header("Content-Length", known_length)
                     self.end_headers()
+                    headers_sent = True
                     while True:
                         chunk = resp.read(65536)
                         if not chunk:
@@ -394,6 +629,7 @@ def make_handler(backend_url: str, default_model: str, variant: str):
                     self.send_header("Transfer-Encoding", "chunked")
                     self.send_header("Connection", "close")
                     self.end_headers()
+                    headers_sent = True
                     while True:
                         chunk = resp.read1(65536)
                         if not chunk:
@@ -402,22 +638,33 @@ def make_handler(backend_url: str, default_model: str, variant: str):
                         self.wfile.flush()
                     self.wfile.write(b"0\r\n\r\n")
                     self.close_connection = True
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, http.client.IncompleteRead):
                 self.close_connection = True
-            except OSError as exc:
-                err = json.dumps({"error": {"message": f"Backend unreachable: {exc}"}}).encode()
-                try:
-                    self._send_bytes(502, "application/json; charset=utf-8", err)
-                except OSError:
-                    pass
+            except (http.client.HTTPException, OSError) as exc:
+                if headers_sent:
+                    self.close_connection = True
+                else:
+                    err = json.dumps({"error": {"message": f"Backend unreachable: {exc}"}}).encode()
+                    try:
+                        self._send_bytes(502, "application/json; charset=utf-8", err)
+                    except OSError:
+                        pass
             finally:
                 conn.close()
 
         def do_GET(self) -> None:
             if self.path in ("/", "/index.html"):
-                page = (HTML_PAGE.replace("DEFAULT_MODEL_PLACEHOLDER", default_model)
-                        .replace("DEFAULT_VARIANT_PLACEHOLDER", variant))
+                page = (HTML_PAGE.replace("DEFAULT_MODEL_PLACEHOLDER", manager.current_model)
+                        .replace("DEFAULT_VARIANT_PLACEHOLDER", manager.current_variant))
                 self._send_bytes(200, "text/html; charset=utf-8", page.encode("utf-8"))
+            elif self.path == "/webui/models":
+                payload = json.dumps({
+                    "current": manager.current_variant,
+                    "model": manager.current_model,
+                    "available": manager.available,
+                    "can_switch": manager.can_switch,
+                }).encode("utf-8")
+                self._send_bytes(200, "application/json; charset=utf-8", payload)
             elif self.path == "/sw.js":
                 js = (b"self.addEventListener('install',()=>self.skipWaiting());"
                       b"self.addEventListener('activate',e=>e.waitUntil(self.registration.unregister()));")
@@ -426,19 +673,39 @@ def make_handler(backend_url: str, default_model: str, variant: str):
                 self._proxy()
 
         def do_POST(self) -> None:
-            self._proxy()
+            if self.path == "/webui/switch":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    req = json.loads(raw.decode("utf-8"))
+                    target = req.get("variant", "")
+                    v, m = manager.switch(target)
+                    self._send_bytes(200, "application/json; charset=utf-8",
+                                     json.dumps({"ok": True, "variant": v, "model": m}).encode("utf-8"))
+                except ValueError as exc:
+                    self._send_bytes(400, "application/json; charset=utf-8",
+                                     json.dumps({"error": {"message": str(exc)}}).encode("utf-8"))
+                except Exception as exc:
+                    self._send_bytes(500, "application/json; charset=utf-8",
+                                     json.dumps({"error": {"message": str(exc)}}).encode("utf-8"))
+            else:
+                self._proxy()
 
     return ProxyHandler
 
 
-def _watch_parent(pid: int) -> None:
+def _watch_parent(pid: int, manager: BackendManager | None = None) -> None:
     if pid <= 0 or os.name != "nt":
         return
     handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
     if not handle:
+        if manager is not None:
+            manager.stop()
         os._exit(0)
     ctypes.windll.kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
     ctypes.windll.kernel32.CloseHandle(handle)
+    if manager is not None:
+        manager.stop()
     os._exit(0)
 
 
@@ -454,14 +721,35 @@ def main() -> int:
     parser.add_argument("--backend", default="http://127.0.0.1:8091")
     parser.add_argument("--model", default="qwen3-tts")
     parser.add_argument("--variant", default="CustomVoice", choices=["CustomVoice", "VoiceDesign", "Base"])
+    parser.add_argument("--gufo-exe", default="")
+    parser.add_argument("--model-location", default="")
+    parser.add_argument("--backend-port", type=int, default=8091)
+    parser.add_argument("--context", type=int, default=32768)
+    parser.add_argument("--max-request-bytes", type=int, default=33554432)
+    parser.add_argument("--npu", action="store_true")
     parser.add_argument("--parent-pid", type=int, default=0)
     args = parser.parse_args()
 
+    manager = BackendManager(
+        backend_url=args.backend,
+        default_model=args.model,
+        variant=args.variant,
+        gufo_exe=args.gufo_exe,
+        model_location=args.model_location,
+        backend_port=args.backend_port,
+        context=args.context,
+        max_request_bytes=args.max_request_bytes,
+        npu=args.npu,
+    )
+    atexit.register(manager.stop)
+    if manager.can_switch:
+        manager.start(args.variant)
+
     if args.parent_pid > 0:
-        threading.Thread(target=_watch_parent, args=(args.parent_pid,), daemon=True).start()
+        threading.Thread(target=_watch_parent, args=(args.parent_pid, manager), daemon=True).start()
 
     server = ReusableThreadingHTTPServer((args.host, args.port),
-                                         make_handler(args.backend, args.model, args.variant))
+                                         make_handler(manager))
     print(f"Gufo Speech WebUI listening on http://{args.host}:{args.port} -> {args.backend}", flush=True)
     try:
         server.serve_forever()
@@ -469,6 +757,7 @@ def main() -> int:
         pass
     finally:
         server.server_close()
+        manager.stop()
     return 0
 
 

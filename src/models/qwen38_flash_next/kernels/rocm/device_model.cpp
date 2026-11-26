@@ -3,14 +3,11 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
-#include <bit>
 #include <cassert>
-#include <cmath>
 #include <cstring>
 #include <gufo/ext/experimental/ggml_dequant.hpp>
 #include <gufo/ext/experimental/managed_alloc.hpp>
 #include <gufo/ext/experimental/weight_upload.hpp>
-#include <gufo/ext/platform/fs.hpp>
 #include <gufo/ext/platform/mapped_file.hpp>
 #include <gufo/ext/platform/pages.hpp>
 #include <gufo/ext/platform/prefault.hpp>
@@ -45,194 +42,14 @@ constexpr std::size_t kTailMargin = 4096;
   return t.SizeBytes();
 }
 
-[[nodiscard]] inline std::uint16_t FloatToHalfBits(float value) noexcept {
-  const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
-  const std::uint32_t sign = (bits >> 16) & 0x8000u;
-  const std::uint32_t abs_bits = bits & 0x7fffffffu;
-  if (abs_bits > 0x7f800000u) {
-    return static_cast<std::uint16_t>(sign | 0x7e00u |
-                                      ((abs_bits >> 13) & 0x01ffu));
-  }
-  if (abs_bits >= 0x47800000u) {
-    return static_cast<std::uint16_t>(sign | 0x7c00u);
-  }
-  if (abs_bits < 0x38800000u) {
-    if (abs_bits < 0x33000000u) {
-      return static_cast<std::uint16_t>(sign);
-    }
-    const std::uint32_t shift = 126u - (abs_bits >> 23);
-    const std::uint32_t mant = (abs_bits & 0x007fffffu) | 0x00800000u;
-    const std::uint32_t rounded =
-        mant + (1u << (shift - 1u)) - 1u + ((mant >> shift) & 1u);
-    return static_cast<std::uint16_t>(sign | (rounded >> shift));
-  }
-  const std::uint32_t rounded =
-      abs_bits + 0x00000fffu + ((abs_bits >> 13) & 1u);
-  if (rounded >= 0x47800000u) {
-    return static_cast<std::uint16_t>(sign | 0x7c00u);
-  }
-  const std::uint32_t half_exp = ((rounded >> 23) - 112u) << 10;
-  const std::uint32_t half_mant = (rounded >> 13) & 0x03ffu;
-  return static_cast<std::uint16_t>(sign | half_exp | half_mant);
-}
-
-inline void QuantizeRowQ8_0(const float* src, std::uint8_t* dst,
-                            std::size_t cols) noexcept {
-  for (std::size_t offset = 0; offset < cols; offset += 32) {
-    float amax = 0.0f;
-    for (std::size_t j = 0; j < 32; ++j) {
-      amax = std::max(amax, std::abs(src[offset + j]));
-    }
-    const float d = amax / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    const std::uint16_t d_half = FloatToHalfBits(d);
-    std::memcpy(dst, &d_half, sizeof(d_half));
-    auto* qs = reinterpret_cast<std::int8_t*>(dst + 2);
-    for (std::size_t j = 0; j < 32; ++j) {
-      const long v = std::clamp(std::lround(src[offset + j] * id), -127L, 127L);
-      qs[j] = static_cast<std::int8_t>(v);
-    }
-    dst += 34;
-  }
-}
-
-struct ReencodeScratch {
-  std::vector<platform::PlatformFile> direct_shards;
-  std::vector<float> row_f32;
-  std::vector<std::uint8_t> chunk_src;
-  std::vector<std::uint8_t> chunk_q8;
-
-  explicit ReencodeScratch(std::size_t shard_count)
-      : direct_shards(shard_count, platform::kInvalidFile) {}
-
-  ~ReencodeScratch() {
-    for (platform::PlatformFile f : direct_shards) {
-      platform::CloseFile(f);
-    }
-  }
+struct PendingReencode {
+  core::GgmlType type;
+  void* src;
+  void* dst;
+  std::size_t elements;
 };
 
-[[nodiscard]] bool ReadTensorSlice(platform::PlatformFile fd,
-                                   platform::PlatformFile direct_fd,
-                                   std::uint64_t offset, std::size_t bytes,
-                                   std::vector<std::uint8_t>& buffer,
-                                   const std::uint8_t*& out_ptr) {
-  constexpr std::size_t kReadAlign = 4096;
-  const std::uint64_t aligned_begin = offset & ~(std::uint64_t{kReadAlign - 1});
-  const auto skip = static_cast<std::size_t>(offset - aligned_begin);
-  const std::size_t aligned_len =
-      (skip + bytes + kReadAlign - 1) & ~(kReadAlign - 1);
-  if (buffer.size() < aligned_len + kReadAlign) {
-    buffer.resize(aligned_len + kReadAlign);
-  }
-  const auto addr = reinterpret_cast<std::uintptr_t>(buffer.data());
-  const std::size_t align_pad = (kReadAlign - (addr % kReadAlign)) % kReadAlign;
-  auto* aligned_buf = buffer.data() + align_pad;
-
-  auto read_loop = [&](platform::PlatformFile handle, std::uint64_t pos,
-                       std::size_t req_len, std::size_t min_bytes) -> bool {
-    std::size_t got = 0;
-    while (got < min_bytes) {
-      const std::size_t n = platform::ReadFileAt(handle, aligned_buf + got,
-                                                 req_len - got, pos + got);
-      if (n == 0) {
-        return false;
-      }
-      got += n;
-    }
-    return true;
-  };
-
-  if (platform::FileValid(direct_fd) &&
-      read_loop(direct_fd, aligned_begin, aligned_len, skip + bytes)) {
-    out_ptr = aligned_buf + skip;
-    return true;
-  }
-  if (read_loop(fd, offset, bytes, bytes)) {
-    out_ptr = aligned_buf;
-    return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool UploadReencodedQ8_0(
-    const TensorRef& t, void* device_dst,
-    std::span<const core::GgufMappedRegion> shards, std::uint32_t shard_idx,
-    ReencodeScratch& scratch, std::string* error) {
-  const bool has_fd = shard_idx < shards.size() &&
-                      platform::FileValid(shards[shard_idx].file_descriptor);
-  if (!has_fd && t.data == nullptr) {
-    if (error != nullptr) {
-      *error = "missing mapped host pointer for " + std::string(t.name);
-    }
-    return false;
-  }
-  const std::size_t cols = t.cols;
-  const std::size_t src_row_bytes = t.SizeBytes() / t.rows;
-  const std::size_t dst_row_bytes = (cols / 32) * 34;
-  // Cap host scratch around 16 MiB regardless of vocabulary row count.
-  const std::size_t chunk_rows =
-      std::max<std::size_t>(1, (std::size_t{16} << 20) / dst_row_bytes);
-  if (scratch.row_f32.size() < cols) {
-    scratch.row_f32.resize(cols);
-  }
-  const std::size_t max_q8_bytes =
-      std::min<std::size_t>(chunk_rows, t.rows) * dst_row_bytes;
-  if (scratch.chunk_q8.size() < max_q8_bytes) {
-    scratch.chunk_q8.resize(max_q8_bytes);
-  }
-  platform::PlatformFile fd = platform::kInvalidFile;
-  platform::PlatformFile direct_fd = platform::kInvalidFile;
-  if (has_fd) {
-    fd = shards[shard_idx].file_descriptor;
-    if (!platform::FileValid(scratch.direct_shards[shard_idx])) {
-      scratch.direct_shards[shard_idx] = platform::ReopenUnbuffered(fd);
-    }
-    direct_fd = scratch.direct_shards[shard_idx];
-  }
-  const auto* src_base = static_cast<const std::uint8_t*>(t.data);
-  auto* dst_base = static_cast<std::uint8_t*>(device_dst);
-  for (std::size_t row = 0; row < t.rows; row += chunk_rows) {
-    const std::size_t count = std::min<std::size_t>(chunk_rows, t.rows - row);
-    const std::uint8_t* chunk_ptr = nullptr;
-    if (has_fd) {
-      const std::uint64_t slice_offset =
-          t.file_offset + static_cast<std::uint64_t>(row) * src_row_bytes;
-      const std::size_t slice_bytes = count * src_row_bytes;
-      if (!ReadTensorSlice(fd, direct_fd, slice_offset, slice_bytes,
-                           scratch.chunk_src, chunk_ptr)) {
-        if (error != nullptr) {
-          *error = "unbuffered host read failed for " + std::string(t.name);
-        }
-        return false;
-      }
-    } else {
-      chunk_ptr = src_base + row * src_row_bytes;
-    }
-    for (std::size_t r = 0; r < count; ++r) {
-      if (!gufo::quant::DequantizeRow(t.type, chunk_ptr + r * src_row_bytes,
-                                      scratch.row_f32.data(), cols)) {
-        if (error != nullptr) {
-          *error = "unsupported host dequantization for " + std::string(t.name);
-        }
-        return false;
-      }
-      QuantizeRowQ8_0(scratch.row_f32.data(),
-                      scratch.chunk_q8.data() + r * dst_row_bytes, cols);
-    }
-    const hipError_t rc =
-        hipMemcpy(dst_base + row * dst_row_bytes, scratch.chunk_q8.data(),
-                  count * dst_row_bytes, hipMemcpyHostToDevice);
-    if (rc != hipSuccess) {
-      if (error != nullptr) {
-        *error = "HIP upload failed for " + std::string(t.name) + ": " +
-                 hipGetErrorString(rc);
-      }
-      return false;
-    }
-  }
-  return true;
-}
+constexpr std::size_t kReencodeBatchBytes = std::size_t{512} << 20;
 
 struct Conversion {
   void* source;
@@ -257,8 +74,6 @@ struct Uploaded {
 /// no device work, so the weight placement can be decided from the tensors.
 struct Uploader {
   hip::WeightUpload& stager;
-  std::span<const core::GgufMappedRegion> shards;
-  ReencodeScratch& reencode_scratch;
   const hip::WeightAllocator* weights;
   std::vector<Conversion>& conversions;
   std::vector<void*>& tail_zeros;
@@ -270,6 +85,34 @@ struct Uploader {
   bool ok{true};
   std::uint32_t shard_base{0};
   std::uint64_t requested{0};
+  std::vector<PendingReencode> pending_reencodes{};
+  std::size_t pending_reencode_bytes{0};
+
+  Uploader(hip::WeightUpload& stager_in, const hip::WeightAllocator* weights_in,
+           std::vector<Conversion>& conversions_in,
+           std::vector<void*>& tail_zeros_in,
+           std::vector<void*>& allocations_in, std::size_t& bytes_in,
+           std::size_t& max_half_cols_in, std::size_t& max_q8_cols_in,
+           std::string* error_in)
+      : stager(stager_in),
+        weights(weights_in),
+        conversions(conversions_in),
+        tail_zeros(tail_zeros_in),
+        allocations(allocations_in),
+        bytes(bytes_in),
+        max_half_cols(max_half_cols_in),
+        max_q8_cols(max_q8_cols_in),
+        error(error_in) {}
+
+  ~Uploader() {
+    if (!pending_reencodes.empty()) {
+      (void)stager.Finish(nullptr);
+      (void)hipStreamSynchronize(nullptr);
+      for (const auto& r : pending_reencodes) {
+        (void)hipFree(r.src);
+      }
+    }
+  }
 
   [[nodiscard]] bool Measuring() const noexcept { return weights == nullptr; }
 
@@ -286,6 +129,73 @@ struct Uploader {
       return hipSuccess;
     }
     return weights->Allocate(pointer, size);
+  }
+
+  [[nodiscard]] bool FlushReencodes() {
+    if (pending_reencodes.empty()) {
+      return true;
+    }
+    if (!stager.Finish(error)) {
+      for (const auto& r : pending_reencodes) {
+        (void)hipFree(r.src);
+      }
+      pending_reencodes.clear();
+      pending_reencode_bytes = 0;
+      ok = false;
+      return false;
+    }
+    bool dispatch_ok = true;
+    for (const auto& r : pending_reencodes) {
+      if (!ReencodeToQ8_0(r.type, r.src, r.dst, r.elements, nullptr)) {
+        Fail("unsupported GPU Q8_0 re-encoding type");
+        dispatch_ok = false;
+        break;
+      }
+    }
+    const hipError_t sync_rc = hipStreamSynchronize(nullptr);
+    for (const auto& r : pending_reencodes) {
+      (void)hipFree(r.src);
+    }
+    pending_reencodes.clear();
+    pending_reencode_bytes = 0;
+    if (!dispatch_ok) {
+      return false;
+    }
+    if (sync_rc != hipSuccess) {
+      Fail("GPU Q8_0 re-encoding failed: " +
+           std::string(hipGetErrorString(sync_rc)));
+      return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool QueueReencode(const TensorRef& t, void* dst) {
+    const std::size_t src_bytes = t.SizeBytes();
+    if (pending_reencode_bytes > 0 &&
+        pending_reencode_bytes + src_bytes > kReencodeBatchBytes) {
+      if (!FlushReencodes()) {
+        return false;
+      }
+    }
+    void* src = nullptr;
+    if (const hipError_t alloc_err = weights->Allocate(&src, src_bytes);
+        alloc_err != hipSuccess) {
+      Fail("staging device allocation failed for " + std::string(t.name) +
+           " (" + std::to_string(src_bytes) +
+           " bytes): " + hipGetErrorString(alloc_err));
+      return false;
+    }
+    if (!stager.Copy(shard_base + t.shard, t.file_offset, src_bytes, src,
+                     error)) {
+      (void)hipFree(src);
+      Fail("upload failed for " + std::string(t.name) +
+           (error != nullptr ? ": " + *error : std::string()));
+      return false;
+    }
+    pending_reencodes.push_back(
+        {t.type, src, dst, static_cast<std::size_t>(t.cols * t.rows)});
+    pending_reencode_bytes += src_bytes;
+    return true;
   }
 
   DeviceTensor Copy(const TensorRef& t) {
@@ -308,14 +218,7 @@ struct Uploader {
     allocations.push_back(ptr);
     bytes += size + kTailMargin;
     if (reencode_q8) {
-      // Drain queued async staging copies before synchronous pageable-host
-      // hipMemcpy in UploadReencodedQ8_0 to avoid concurrent stream/paging faults.
-      if (!stager.Finish(error) ||
-          !UploadReencodedQ8_0(t, ptr, shards, shard_base + t.shard,
-                               reencode_scratch, error)) {
-        Fail(error != nullptr && !error->empty()
-                 ? *error
-                 : ("upload failed for " + std::string(t.name)));
+      if (!QueueReencode(t, ptr)) {
         return d;
       }
     } else if (!stager.Copy(shard_base + t.shard, t.file_offset, size, ptr,
@@ -420,7 +323,8 @@ struct Uploader {
     if (t.empty() || !ok)
       return;
     const auto combined = Copy(t);
-    if (!ok || (!Measuring() && !stager.Finish(error))) {
+    if (!ok ||
+        (!Measuring() && (!FlushReencodes() || !stager.Finish(error)))) {
       Fail("MTP projection upload failed");
       return;
     }
@@ -504,12 +408,7 @@ struct Uploader {
         auto* dst = static_cast<std::uint8_t*>(ptr) + offset;
         const std::size_t part_bytes = DeviceBytesOf(*t);
         if (NeedsQ8Reencode(*t)) {
-          if (!stager.Finish(error) ||
-              !UploadReencodedQ8_0(*t, dst, shards, shard_base + t->shard,
-                                   reencode_scratch, error)) {
-            Fail(error != nullptr && !error->empty()
-                     ? *error
-                     : ("upload failed for " + std::string(t->name)));
+          if (!QueueReencode(*t, dst)) {
             return d;
           }
         } else if (!stager.Copy(shard_base + t->shard, t->file_offset,
@@ -770,16 +669,15 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   // will request of the device heap.
   std::uint64_t measured = 0;
   {
-    ReencodeScratch measure_scratch(0);
     std::vector<Conversion> conversions;
     std::vector<void*> tail_zeros;
     std::vector<void*> allocations;
     std::size_t bytes = 0;
     std::size_t max_half_cols = 1;
     std::size_t max_q8_cols = 32;
-    Uploader measure{*stager,     shards,      measure_scratch, nullptr,
-                     conversions, tail_zeros,  allocations,     bytes,
-                     max_half_cols, max_q8_cols, error_msg};
+    Uploader measure{*stager,       nullptr,       conversions,  tail_zeros,
+                     allocations,   bytes,         max_half_cols, max_q8_cols,
+                     error_msg};
     (void)measure.Model(w, mtp, shard_count);
     if (!measure.ok) {
       return nullptr;
@@ -787,15 +685,13 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     measured = measure.requested;
   }
   const hip::WeightAllocator weights(measured);
-  ReencodeScratch reencode_scratch(shards.size());
   std::vector<Conversion> conversions;
   std::vector<void*> tail_zeros;
-  Uploader up{
-      *stager,      shards,           reencode_scratch, &weights,
-      conversions,  tail_zeros,       m->allocations_,  m->bytes_,
-      m->max_half_cols_, m->max_q8_cols_, error_msg};
+  Uploader up{*stager,          &weights,         conversions,   tail_zeros,
+              m->allocations_,  m->bytes_,        m->max_half_cols_,
+              m->max_q8_cols_,  error_msg};
   Uploaded uploaded = up.Model(w, mtp, shard_count);
-  if (!up.ok || !stager->Finish(error_msg)) {
+  if (!up.ok || !up.FlushReencodes() || !stager->Finish(error_msg)) {
     return nullptr;
   }
   static constexpr std::uint8_t kZeroTail[kTailMargin]{};

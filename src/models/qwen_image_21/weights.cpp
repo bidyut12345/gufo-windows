@@ -339,6 +339,11 @@ void Weights::Load(const std::filesystem::path& path,
     weight.offset = 8 + header_size + begin;
     ranges.emplace_back(begin, end);
     std::string key = prefix + name;
+    if (prefix == "text_encoder." &&
+        (name.starts_with("model.embed_tokens.") ||
+         name.starts_with("model.layers."))) {
+      key = prefix + "model.language_model." + name.substr(6);
+    }
     if (key.ends_with("._weight_qdata")) {
       key.replace(key.size() - 14U, 14U, ".weight");
     }

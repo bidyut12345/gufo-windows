@@ -89,20 +89,24 @@ struct SynthesisHipRuntime::Impl {
     }
 
     NativePrompt prompt;
+    std::size_t max_new_tokens = 0;
     if (!(this->*prompt_builder_)(request, tokens, &prompt, error) ||
-        !FitsContext(prompt.talker, request.max_new_tokens, error)) {
+        !ClampMaxNewTokens(prompt.talker, request.max_new_tokens,
+                           &max_new_tokens, error)) {
       return false;
     }
 
     if (request.on_audio) {
-      return GenerateStreaming(request, prompt, is_cancelled, result, error);
+      return GenerateStreaming(request, prompt, max_new_tokens, is_cancelled,
+                               result, error);
     }
     if (device_ == SynthesisDevice::kNpu) {
-      return GenerateOverlapped(request, prompt, is_cancelled, result, error);
+      return GenerateOverlapped(request, prompt, max_new_tokens, is_cancelled,
+                                result, error);
     }
     TalkerGenerationOutput generated;
-    if (!GenerateCodecFrames(request, prompt.talker, is_cancelled, &generated,
-                             error) ||
+    if (!GenerateCodecFrames(request, prompt.talker, max_new_tokens,
+                             is_cancelled, &generated, error) ||
         IsCancelled(is_cancelled, error)) {
       return false;
     }
@@ -112,6 +116,7 @@ struct SynthesisHipRuntime::Impl {
 private:
   [[nodiscard]] bool GenerateStreaming(const SynthesisRequest& request,
                                        const NativePrompt& prompt,
+                                       std::size_t max_new_tokens,
                                        const CancellationCheck& is_cancelled,
                                        SynthesisResult* result,
                                        std::string* error) {
@@ -152,8 +157,8 @@ private:
     };
     TalkerGenerationOutput generated;
     if (!talker_->Generate(
-            prompt.talker, request.max_new_tokens, request.sampling,
-            is_cancelled, &generated, error,
+            prompt.talker, max_new_tokens, request.sampling, is_cancelled,
+            &generated, error,
             [&](const auto& progress) { return emit(progress, false); }) ||
         !emit(generated, true) || generated.frames == 0) {
       if (!stream_error.empty())
@@ -176,6 +181,7 @@ private:
   /// the samples equal those of one Decode after generation.
   [[nodiscard]] bool GenerateOverlapped(const SynthesisRequest& request,
                                         const NativePrompt& prompt,
+                                        std::size_t max_new_tokens,
                                         const CancellationCheck& is_cancelled,
                                         SynthesisResult* result,
                                         std::string* error) {
@@ -213,8 +219,8 @@ private:
     TalkerGenerationOutput generated;
     const bool generated_ok =
         talker_->Generate(
-            prompt.talker, request.max_new_tokens, request.sampling,
-            is_cancelled, &generated, error,
+            prompt.talker, max_new_tokens, request.sampling, is_cancelled,
+            &generated, error,
             [&](const auto& progress) { return emit(progress, false); }) &&
         emit(generated, true) && generated.frames != 0;
     if (!generated_ok || failed) {
@@ -432,29 +438,31 @@ private:
     return true;
   }
 
-  [[nodiscard]] bool FitsContext(const TalkerPromptOutput& prompt,
-                                 std::size_t maximum_new_tokens,
-                                 std::string* error) const {
-    const std::size_t available =
-        maximum_context_tokens_ -
-        std::min(prompt.tokens, maximum_context_tokens_);
-    if (maximum_new_tokens <= available) {
-      return true;
+  [[nodiscard]] bool ClampMaxNewTokens(const TalkerPromptOutput& prompt,
+                                       std::size_t requested_new_tokens,
+                                       std::size_t* effective_new_tokens,
+                                       std::string* error) const {
+    if (prompt.tokens >= maximum_context_tokens_) {
+      SetError(error,
+               "Qwen3-TTS prompt (" + std::to_string(prompt.tokens) +
+                   " tokens) exceeds native context capacity (" +
+                   std::to_string(maximum_context_tokens_) + " tokens)");
+      return false;
     }
-    SetError(error,
-             "Qwen3-TTS prompt plus generated tokens exceeds native context "
-             "capacity");
-    return false;
+    const std::size_t available = maximum_context_tokens_ - prompt.tokens;
+    *effective_new_tokens = std::min(requested_new_tokens, available);
+    return *effective_new_tokens > 0;
   }
 
   [[nodiscard]] bool GenerateCodecFrames(const SynthesisRequest& request,
                                          const TalkerPromptOutput& prompt,
+                                         std::size_t max_new_tokens,
                                          const CancellationCheck& is_cancelled,
                                          TalkerGenerationOutput* generated,
                                          std::string* error) {
     const SamplingOptions& sampling = request.sampling;
-    if (!talker_->Generate(prompt, request.max_new_tokens, sampling,
-                           is_cancelled, generated, error)) {
+    if (!talker_->Generate(prompt, max_new_tokens, sampling, is_cancelled,
+                           generated, error)) {
       return false;
     }
     if (generated->frames != 0 && generated->code_groups == 16 &&

@@ -5,7 +5,7 @@
 // Dense projections and residency/prefetch are independent ROCm/HIP code.
 
 #include <hip/hip_runtime.h>
-#include <hipblaslt/hipblaslt.h>
+#include <rocblas/rocblas.h>
 
 #include <algorithm>
 #include <array>
@@ -18,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <sstream>
@@ -39,8 +40,6 @@ using Clock = std::chrono::steady_clock;
 constexpr float kRmsEpsilon = 1.0e-6F;
 constexpr float kRopeTheta = 5'000'000.0F;
 constexpr std::size_t kMaximumPromptTokens = 32768;
-constexpr std::size_t kGemmWorkspaceBytes = 64ULL << 20U;
-constexpr std::size_t kMaximumGemmAlgorithms = 16;
 
 std::atomic<std::uint64_t> g_registered_host_bytes{0};
 std::atomic<bool> g_prompt_encoder_active{false};
@@ -186,13 +185,27 @@ struct LoadedBatch {
   std::uint64_t peak_registered_bytes{0};
   double load_ms{0.0};
 
-  [[nodiscard]] const std::uint16_t* Find(std::string_view name) const {
-    for (const auto& tensor : tensors) {
-      if (tensor.descriptor != nullptr && tensor.descriptor->name == name) {
-        return tensor.data;
+  [[nodiscard]] const LoadedTensor* FindTensor(std::string_view name) const {
+    auto match = [&](std::string_view target) -> const LoadedTensor* {
+      for (const auto& tensor : tensors) {
+        if (tensor.descriptor != nullptr && tensor.descriptor->name == target) {
+          return &tensor;
+        }
       }
+      return nullptr;
+    };
+    if (const LoadedTensor* found = match(name)) {
+      return found;
+    }
+    if (name.starts_with("model.language_model.")) {
+      return match("model." + std::string(name.substr(21)));
     }
     return nullptr;
+  }
+
+  [[nodiscard]] const std::uint16_t* Find(std::string_view name) const {
+    const LoadedTensor* tensor = FindTensor(name);
+    return tensor != nullptr ? tensor->data : nullptr;
   }
 };
 
@@ -202,16 +215,84 @@ struct FileInterval {
   std::uint64_t end{0};
 };
 
+struct PinnedAllocation {
+  void* host{nullptr};
+  std::size_t capacity{0};
+};
+
+class PinnedPool {
+public:
+  ~PinnedPool() { ReleaseAll(); }
+
+  bool Acquire(std::size_t min_bytes, PinnedAllocation* out,
+               std::string* error) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (auto it = free_.begin(); it != free_.end(); ++it) {
+        if (it->capacity >= min_bytes) {
+          *out = *it;
+          free_.erase(it);
+          return true;
+        }
+      }
+      if (!free_.empty()) {
+        PinnedAllocation old = free_.back();
+        free_.pop_back();
+        (void)hipHostFree(old.host);
+        g_registered_host_bytes.fetch_sub(old.capacity,
+                                          std::memory_order_acq_rel);
+      }
+    }
+    void* ptr = nullptr;
+    const hipError_t status =
+        hipHostMalloc(&ptr, min_bytes, hipHostMallocMapped);
+    if (status != hipSuccess) {
+      *error = HipError("hipHostMalloc(H3 text weight)", status);
+      return false;
+    }
+    g_registered_host_bytes.fetch_add(min_bytes, std::memory_order_acq_rel);
+    *out = {.host = ptr, .capacity = min_bytes};
+    return true;
+  }
+
+  void Release(PinnedAllocation alloc) noexcept {
+    if (alloc.host == nullptr) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    free_.push_back(alloc);
+  }
+
+  void ReleaseAll() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const PinnedAllocation& alloc : free_) {
+      if (alloc.host != nullptr) {
+        (void)hipHostFree(alloc.host);
+        g_registered_host_bytes.fetch_sub(alloc.capacity,
+                                          std::memory_order_acq_rel);
+      }
+    }
+    free_.clear();
+  }
+
+private:
+  std::mutex mutex_;
+  std::vector<PinnedAllocation> free_;
+};
+
 struct HostMapping {
   std::filesystem::path shard;
   platform::RawMappedFile mapping_file;
   void* host{nullptr};
   std::size_t bytes{0};
+  std::size_t capacity{0};
   std::uint64_t file_offset{0};
   void* device{nullptr};
+  DeviceBuffer device_storage;
   bool registered{false};
   // `host` is pinned memory filled from the file, not a mapping view.
   bool pinned{false};
+  PinnedPool* pool{nullptr};
 
   HostMapping() = default;
   HostMapping(const HostMapping&) = delete;
@@ -221,10 +302,13 @@ struct HostMapping {
         mapping_file(std::exchange(other.mapping_file, {})),
         host(std::exchange(other.host, nullptr)),
         bytes(std::exchange(other.bytes, 0)),
+        capacity(std::exchange(other.capacity, 0)),
         file_offset(other.file_offset),
         device(std::exchange(other.device, nullptr)),
+        device_storage(std::move(other.device_storage)),
         registered(std::exchange(other.registered, false)),
-        pinned(std::exchange(other.pinned, false)) {}
+        pinned(std::exchange(other.pinned, false)),
+        pool(std::exchange(other.pool, nullptr)) {}
   HostMapping& operator=(HostMapping&& other) noexcept {
     if (this != &other) {
       Release();
@@ -232,19 +316,26 @@ struct HostMapping {
       mapping_file = std::exchange(other.mapping_file, {});
       host = std::exchange(other.host, nullptr);
       bytes = std::exchange(other.bytes, 0);
+      capacity = std::exchange(other.capacity, 0);
       file_offset = other.file_offset;
       device = std::exchange(other.device, nullptr);
+      device_storage = std::move(other.device_storage);
       registered = std::exchange(other.registered, false);
       pinned = std::exchange(other.pinned, false);
+      pool = std::exchange(other.pool, nullptr);
     }
     return *this;
   }
   ~HostMapping() { Release(); }
 
-  void Release() noexcept {
+  void ReleaseHost() noexcept {
     if (pinned && host != nullptr) {
-      (void)hipHostFree(host);
-      g_registered_host_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+      if (pool != nullptr) {
+        pool->Release({.host = host, .capacity = capacity});
+      } else {
+        (void)hipHostFree(host);
+        g_registered_host_bytes.fetch_sub(capacity, std::memory_order_acq_rel);
+      }
       pinned = false;
     }
     if (registered && host != nullptr) {
@@ -254,8 +345,15 @@ struct HostMapping {
     }
     mapping_file.Close();
     host = nullptr;
-    device = nullptr;
     bytes = 0;
+    capacity = 0;
+    pool = nullptr;
+  }
+
+  void Release() noexcept {
+    ReleaseHost();
+    device_storage.Reset();
+    device = nullptr;
   }
 };
 
@@ -292,22 +390,38 @@ std::vector<FileInterval> BuildIntervals(
 }
 
 bool HasShape(const TensorDescriptor& descriptor,
-              std::initializer_list<std::uint64_t> expected) {
-  return descriptor.dtype == DType::kBFloat16 &&
+              std::initializer_list<std::uint64_t> expected,
+              bool allow_int8 = false) {
+  const bool dtype_ok =
+      descriptor.dtype == DType::kBFloat16 ||
+      (allow_int8 && descriptor.dtype == DType::kInt8);
+  return dtype_ok &&
          descriptor.shape ==
              std::vector<std::uint64_t>(expected.begin(), expected.end());
 }
 
+const TensorDescriptor* FindPromptTensor(const ModelInventory& inventory,
+                                         std::string_view name) {
+  if (const TensorDescriptor* descriptor = inventory.FindTensor(name)) {
+    return descriptor;
+  }
+  if (name.starts_with("model.language_model.")) {
+    return inventory.FindTensor("model." + std::string(name.substr(21)));
+  }
+  return nullptr;
+}
+
 const TensorDescriptor* RequireTensor(
     const ModelInventory& inventory, std::string_view name,
-    std::initializer_list<std::uint64_t> shape, std::string* error) {
-  const TensorDescriptor* descriptor = inventory.FindTensor(name);
+    std::initializer_list<std::uint64_t> shape, std::string* error,
+    bool allow_int8 = false) {
+  const TensorDescriptor* descriptor = FindPromptTensor(inventory, name);
   if (descriptor == nullptr) {
     SetError(error, "required H3 text tensor is absent: " + std::string(name));
     return nullptr;
   }
   if (descriptor->phase != Phase::kPromptEncoder ||
-      !HasShape(*descriptor, shape)) {
+      !HasShape(*descriptor, shape, allow_int8)) {
     SetError(error, "H3 text tensor contract mismatch: " + std::string(name));
     return nullptr;
   }
@@ -322,14 +436,26 @@ struct BatchLoadResult {
 // Windows HIP rejects hipHostRegister on file mapping views, so there the
 // interval is read into mapped pinned memory that the GPU reads the same way.
 bool ReadIntervalPinned(const std::filesystem::path& path, std::uint64_t offset,
-                        std::size_t length, HostMapping* mapping,
-                        std::string* error) {
-  hipError_t status =
-      hipHostMalloc(&mapping->host, length, hipHostMallocMapped);
-  if (status != hipSuccess) {
-    mapping->host = nullptr;
-    *error = HipError("hipHostMalloc(H3 text weight)", status);
-    return false;
+                        std::size_t length, PinnedPool* pool,
+                        HostMapping* mapping, std::string* error) {
+  if (pool != nullptr) {
+    PinnedAllocation alloc;
+    if (!pool->Acquire(length, &alloc, error)) {
+      return false;
+    }
+    mapping->host = alloc.host;
+    mapping->capacity = alloc.capacity;
+    mapping->pool = pool;
+  } else {
+    hipError_t status =
+        hipHostMalloc(&mapping->host, length, hipHostMallocMapped);
+    if (status != hipSuccess) {
+      mapping->host = nullptr;
+      *error = HipError("hipHostMalloc(H3 text weight)", status);
+      return false;
+    }
+    mapping->capacity = length;
+    g_registered_host_bytes.fetch_add(length, std::memory_order_acq_rel);
   }
   mapping->pinned = true;
   mapping->bytes = length;
@@ -359,7 +485,8 @@ bool ReadIntervalPinned(const std::filesystem::path& path, std::uint64_t offset,
 
 BatchLoadResult LoadBatch(const ModelInventory& inventory,
                           std::vector<const TensorDescriptor*> descriptors,
-                          int device, const CancellationToken* cancellation) {
+                          int device, PinnedPool* pool,
+                          const CancellationToken* cancellation) {
   const auto begin = Clock::now();
   BatchLoadResult result;
   if (IsCancelled(cancellation)) {
@@ -392,11 +519,31 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
       mapping.shard = interval.shard;
       mapping.file_offset = interval.begin;
 #if defined(_WIN32)
-      if (!ReadIntervalPinned(path, interval.begin, length, &mapping,
+      if (!ReadIntervalPinned(path, interval.begin, length, pool, &mapping,
                               &result.error)) {
         return result;
       }
+      // Stage into device memory on Windows so hipblasLtMatmul operates on
+      // hipMalloc pointers instead of host-mapped memory.
+      std::string device_error;
+      if (mapping.device_storage.Allocate(length, &device_error) &&
+          hipMemcpy(mapping.device_storage.data(), mapping.host, length,
+                    hipMemcpyHostToDevice) == hipSuccess) {
+        mapping.device = mapping.device_storage.data();
+        const std::size_t staged_bytes = length;
+        mapping.ReleaseHost();
+        mapping.bytes = staged_bytes;
+      } else {
+        mapping.device_storage.Reset();
+        status = hipHostGetDevicePointer(&mapping.device, mapping.host, 0);
+        if (status != hipSuccess) {
+          result.error =
+              HipError("hipHostGetDevicePointer(H3 text weight)", status);
+          return result;
+        }
+      }
 #else
+      (void)pool;
       std::string map_error;
       if (!mapping.mapping_file.OpenRange(path, interval.begin, length,
                                           platform::MapHint::kNone,
@@ -415,16 +562,16 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
         return result;
       }
       mapping.registered = true;
-#endif
+      g_registered_host_bytes.fetch_add(length, std::memory_order_acq_rel);
       status = hipHostGetDevicePointer(&mapping.device, mapping.host, 0);
       if (status != hipSuccess) {
         result.error =
             HipError("hipHostGetDevicePointer(H3 text weight)", status);
         return result;
       }
+#endif
       const std::uint64_t registered =
-          g_registered_host_bytes.fetch_add(length, std::memory_order_acq_rel) +
-          length;
+          g_registered_host_bytes.load(std::memory_order_acquire);
       batch.peak_registered_bytes =
           std::max(batch.peak_registered_bytes, registered);
       mappings.push_back(std::move(mapping));
@@ -509,15 +656,33 @@ std::vector<const TensorDescriptor*> LayerDescriptors(
        {kPromptEncoderHiddenSize, kPromptEncoderIntermediateSize}},
   }};
   std::vector<const TensorDescriptor*> result;
-  result.reserve(kExpected.size());
+  result.reserve(kExpected.size() * 2U);
   for (const auto& expected : kExpected) {
+    const bool is_projection = expected.shape.size() == 2U;
     const TensorDescriptor* descriptor =
         RequireTensor(inventory, prefix + std::string(expected.suffix),
-                      expected.shape, error);
+                      expected.shape, error, is_projection);
     if (descriptor == nullptr) {
       return {};
     }
     result.push_back(descriptor);
+    if (descriptor->dtype == DType::kInt8) {
+      const std::string scale_name = descriptor->name + "_scale";
+      const TensorDescriptor* scale_desc = inventory.FindTensor(scale_name);
+      if (scale_desc == nullptr && descriptor->name.ends_with(".weight")) {
+        scale_desc = inventory.FindTensor(
+            descriptor->name.substr(0, descriptor->name.size() - 7U) +
+            "._weight_scale");
+      }
+      if (scale_desc == nullptr || scale_desc->phase != Phase::kPromptEncoder ||
+          scale_desc->dtype != DType::kFloat32 ||
+          (scale_desc->payload_bytes != 4U &&
+           scale_desc->payload_bytes != *expected.shape.begin() * 4U)) {
+        SetError(error, "H3 text INT8 scale tensor invalid: " + scale_name);
+        return {};
+      }
+      result.push_back(scale_desc);
+    }
   }
   return result;
 }
@@ -525,165 +690,64 @@ std::vector<const TensorDescriptor*> LayerDescriptors(
 class Bf16Gemm {
 public:
   Bf16Gemm() {
-    if (hipblasLtCreate(&handle_) != HIPBLAS_STATUS_SUCCESS) {
+    if (rocblas_create_handle(&handle_) != rocblas_status_success) {
       handle_ = nullptr;
       return;
     }
-    if (hipMalloc(&workspace_, kGemmWorkspaceBytes) == hipSuccess) {
-      workspace_capacity_ = kGemmWorkspaceBytes;
-    }
+    (void)rocblas_set_atomics_mode(handle_, rocblas_atomics_not_allowed);
   }
   ~Bf16Gemm() {
-    plans_.clear();
-    if (workspace_ != nullptr) {
-      (void)hipFree(workspace_);
-    }
     if (handle_ != nullptr) {
-      (void)hipblasLtDestroy(handle_);
+      (void)rocblas_destroy_handle(handle_);
+      handle_ = nullptr;
     }
   }
   Bf16Gemm(const Bf16Gemm&) = delete;
   Bf16Gemm& operator=(const Bf16Gemm&) = delete;
 
-  [[nodiscard]] std::size_t workspace_bytes() const noexcept {
-    return workspace_capacity_;
-  }
+  [[nodiscard]] std::size_t workspace_bytes() const noexcept { return 0; }
 
   bool Run(const std::uint16_t* weight, const std::uint16_t* input,
            std::uint16_t* output, std::size_t batch, std::size_t rows,
            std::size_t columns, hipStream_t stream, std::string* error) {
-    Plan* plan = FindPlan(batch, rows, columns, error);
-    if (plan == nullptr) {
+    if (handle_ == nullptr || batch == 0 || rows == 0 || columns == 0 ||
+        rows > static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        columns >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max())) {
+      SetError(error, "invalid rocBLAS BF16 matmul dimensions");
       return false;
     }
+    if (rocblas_set_stream(handle_, stream) != rocblas_status_success) {
+      SetError(error, "rocBLAS set_stream failed for H3 prompt encoder");
+      return false;
+    }
+    constexpr std::size_t kGemmBatchChunk = 4096;
     constexpr float alpha = 1.0F;
     constexpr float beta = 0.0F;
-    const hipblasStatus_t status = hipblasLtMatmul(
-        handle_, plan->operation, &alpha, weight, plan->weight_layout, input,
-        plan->input_layout, &beta, output, plan->output_layout, output,
-        plan->output_layout, &plan->algorithm, workspace_,
-        plan->workspace_bytes, stream);
-    if (status != HIPBLAS_STATUS_SUCCESS) {
-      SetError(error, "hipBLASLt BF16 matmul dispatch failed");
-      return false;
+    for (std::size_t offset = 0; offset < batch; offset += kGemmBatchChunk) {
+      const std::size_t chunk = std::min(kGemmBatchChunk, batch - offset);
+      const rocblas_status status = rocblas_gemm_ex(
+          handle_, rocblas_operation_transpose, rocblas_operation_none,
+          static_cast<rocblas_int>(rows), static_cast<rocblas_int>(chunk),
+          static_cast<rocblas_int>(columns), &alpha, weight,
+          rocblas_datatype_bf16_r, static_cast<rocblas_int>(columns),
+          input + offset * columns, rocblas_datatype_bf16_r,
+          static_cast<rocblas_int>(columns), &beta, output + offset * rows,
+          rocblas_datatype_bf16_r, static_cast<rocblas_int>(rows),
+          output + offset * rows, rocblas_datatype_bf16_r,
+          static_cast<rocblas_int>(rows), rocblas_datatype_f32_r,
+          rocblas_gemm_algo_standard, 0, 0);
+      if (status != rocblas_status_success) {
+        SetError(error, "rocBLAS BF16 matmul dispatch failed: " +
+                            std::to_string(static_cast<int>(status)));
+        return false;
+      }
     }
     return true;
   }
 
 private:
-  struct Plan {
-    std::size_t batch{0};
-    std::size_t rows{0};
-    std::size_t columns{0};
-    hipblasLtMatmulDesc_t operation{nullptr};
-    hipblasLtMatrixLayout_t weight_layout{nullptr};
-    hipblasLtMatrixLayout_t input_layout{nullptr};
-    hipblasLtMatrixLayout_t output_layout{nullptr};
-    hipblasLtMatmulAlgo_t algorithm{};
-    std::size_t workspace_bytes{0};
-
-    ~Plan() {
-      if (output_layout != nullptr) {
-        (void)hipblasLtMatrixLayoutDestroy(output_layout);
-      }
-      if (input_layout != nullptr) {
-        (void)hipblasLtMatrixLayoutDestroy(input_layout);
-      }
-      if (weight_layout != nullptr) {
-        (void)hipblasLtMatrixLayoutDestroy(weight_layout);
-      }
-      if (operation != nullptr) {
-        (void)hipblasLtMatmulDescDestroy(operation);
-      }
-    }
-  };
-
-  Plan* FindPlan(std::size_t batch, std::size_t rows, std::size_t columns,
-                 std::string* error) {
-    for (const auto& plan : plans_) {
-      if (plan->batch == batch && plan->rows == rows &&
-          plan->columns == columns) {
-        return plan.get();
-      }
-    }
-    if (handle_ == nullptr || batch == 0 || rows == 0 || columns == 0 ||
-        batch > std::numeric_limits<std::uint32_t>::max() ||
-        rows > std::numeric_limits<std::uint32_t>::max() ||
-        columns > std::numeric_limits<std::uint32_t>::max()) {
-      SetError(error, "invalid hipBLASLt BF16 matmul dimensions");
-      return nullptr;
-    }
-    auto plan = std::make_unique<Plan>();
-    plan->batch = batch;
-    plan->rows = rows;
-    plan->columns = columns;
-    if (hipblasLtMatmulDescCreate(&plan->operation, HIPBLAS_COMPUTE_32F,
-                                  HIP_R_32F) != HIPBLAS_STATUS_SUCCESS) {
-      SetError(error, "cannot create hipBLASLt operation");
-      return nullptr;
-    }
-    const hipblasOperation_t transpose = HIPBLAS_OP_T;
-    if (hipblasLtMatmulDescSetAttribute(
-            plan->operation, HIPBLASLT_MATMUL_DESC_TRANSA, &transpose,
-            sizeof(transpose)) != HIPBLAS_STATUS_SUCCESS ||
-        hipblasLtMatrixLayoutCreate(&plan->weight_layout, HIP_R_16BF, columns,
-                                    rows, columns) != HIPBLAS_STATUS_SUCCESS ||
-        hipblasLtMatrixLayoutCreate(&plan->input_layout, HIP_R_16BF, columns,
-                                    batch, columns) != HIPBLAS_STATUS_SUCCESS ||
-        hipblasLtMatrixLayoutCreate(&plan->output_layout, HIP_R_16BF, rows,
-                                    batch, rows) != HIPBLAS_STATUS_SUCCESS) {
-      SetError(error, "cannot create hipBLASLt BF16 layouts");
-      return nullptr;
-    }
-    hipblasLtMatmulPreference_t preference = nullptr;
-    if (hipblasLtMatmulPreferenceCreate(&preference) !=
-        HIPBLAS_STATUS_SUCCESS) {
-      SetError(error, "cannot create hipBLASLt preference");
-      return nullptr;
-    }
-    const hipblasStatus_t preference_status =
-        hipblasLtMatmulPreferenceSetAttribute(
-            preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-            &workspace_capacity_, sizeof(workspace_capacity_));
-    std::array<hipblasLtMatmulHeuristicResult_t, kMaximumGemmAlgorithms>
-        results{};
-    int count = 0;
-    const hipblasStatus_t heuristic_status =
-        preference_status == HIPBLAS_STATUS_SUCCESS
-            ? hipblasLtMatmulAlgoGetHeuristic(
-                  handle_, plan->operation, plan->weight_layout,
-                  plan->input_layout, plan->output_layout, plan->output_layout,
-                  preference, static_cast<int>(results.size()), results.data(),
-                  &count)
-            : preference_status;
-    (void)hipblasLtMatmulPreferenceDestroy(preference);
-    if (heuristic_status != HIPBLAS_STATUS_SUCCESS || count <= 0) {
-      SetError(error, "hipBLASLt has no BF16 algorithm for H3 projection");
-      return nullptr;
-    }
-    bool selected = false;
-    for (int index = 0; index < count; ++index) {
-      if (results[index].state == HIPBLAS_STATUS_SUCCESS &&
-          results[index].workspaceSize <= workspace_capacity_) {
-        plan->algorithm = results[index].algo;
-        plan->workspace_bytes = results[index].workspaceSize;
-        selected = true;
-        break;
-      }
-    }
-    if (!selected) {
-      SetError(error, "hipBLASLt BF16 algorithms exceed workspace");
-      return nullptr;
-    }
-    Plan* result = plan.get();
-    plans_.push_back(std::move(plan));
-    return result;
-  }
-
-  hipblasLtHandle_t handle_{nullptr};
-  void* workspace_{nullptr};
-  std::size_t workspace_capacity_{0};
-  std::vector<std::unique_ptr<Plan>> plans_;
+  rocblas_handle handle_{nullptr};
 };
 
 struct Activations {
@@ -753,31 +817,103 @@ bool AllocateActivations(std::size_t tokens, Activations* activations,
          allocate_bf16(&activations->mlp, tokens * kPromptEncoderHiddenSize);
 }
 
+struct LayerEvents {
+  hipEvent_t start{nullptr};
+  hipEvent_t stop{nullptr};
+
+  void Destroy() noexcept {
+    if (stop != nullptr) {
+      (void)hipEventDestroy(stop);
+      stop = nullptr;
+    }
+    if (start != nullptr) {
+      (void)hipEventDestroy(start);
+      start = nullptr;
+    }
+  }
+};
+
+bool CollectLayerTiming(LayerEvents* events,
+                        PromptEncoderLayerTelemetry* telemetry,
+                        std::string* error) {
+  const hipError_t wait_status = hipEventSynchronize(events->stop);
+  if (wait_status != hipSuccess) {
+    events->Destroy();
+    SetError(error, HipError("H3 prompt encoder layer wait", wait_status));
+    return false;
+  }
+  float elapsed_ms = 0.0F;
+  if (hipEventElapsedTime(&elapsed_ms, events->start, events->stop) !=
+      hipSuccess) {
+    events->Destroy();
+    SetError(error, "cannot read H3 prompt encoder GPU timing");
+    return false;
+  }
+  telemetry->gpu_ms = elapsed_ms;
+  events->Destroy();
+  return true;
+}
+
 bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
-              Bf16Gemm* gemm, Activations* activations, hipStream_t stream,
-              PromptEncoderLayerTelemetry* telemetry, std::string* error) {
+              Bf16Gemm* gemm, DeviceBuffer* dequant_scratch,
+              Activations* activations, hipStream_t stream,
+              PromptEncoderLayerTelemetry* telemetry, LayerEvents* events,
+              std::string* error) {
   const std::string prefix =
       "model.language_model.layers." + std::to_string(layer) + ".";
   const auto tensor = [&](std::string_view suffix) {
     return weights.Find(prefix + std::string(suffix));
   };
+  const auto proj_bf16 = [&](std::string_view suffix, std::size_t rows,
+                             std::size_t cols) -> const std::uint16_t* {
+    const LoadedTensor* loaded =
+        weights.FindTensor(prefix + std::string(suffix));
+    if (loaded == nullptr || loaded->descriptor == nullptr) {
+      return nullptr;
+    }
+    if (loaded->descriptor->dtype == DType::kBFloat16) {
+      return loaded->data;
+    }
+    if (loaded->descriptor->dtype != DType::kInt8) {
+      return nullptr;
+    }
+    const std::string& wname = loaded->descriptor->name;
+    const LoadedTensor* scale = weights.FindTensor(wname + "_scale");
+    if (scale == nullptr && wname.ends_with(".weight")) {
+      scale = weights.FindTensor(wname.substr(0, wname.size() - 7U) +
+                                 "._weight_scale");
+    }
+    if (scale == nullptr || scale->descriptor == nullptr) {
+      return nullptr;
+    }
+    const std::size_t max_bytes = kPromptEncoderIntermediateSize *
+                                  kPromptEncoderHiddenSize *
+                                  sizeof(std::uint16_t);
+    if (dequant_scratch->bytes() < max_bytes &&
+        !dequant_scratch->Allocate(max_bytes, error)) {
+      return nullptr;
+    }
+    const std::size_t scale_count =
+        static_cast<std::size_t>(scale->descriptor->payload_bytes / 4U);
+    ops::LaunchDequantInt8ToBf16(
+        reinterpret_cast<const std::int8_t*>(loaded->data),
+        reinterpret_cast<const float*>(scale->data),
+        dequant_scratch->As<std::uint16_t>(), rows, cols, scale_count, stream);
+    return dequant_scratch->As<std::uint16_t>();
+  };
   const std::uint16_t* input_norm = tensor("input_layernorm.weight");
-  const std::uint16_t* query_weight = tensor("self_attn.q_proj.weight");
-  const std::uint16_t* key_weight = tensor("self_attn.k_proj.weight");
-  const std::uint16_t* value_weight = tensor("self_attn.v_proj.weight");
   const std::uint16_t* query_norm = tensor("self_attn.q_norm.weight");
   const std::uint16_t* key_norm = tensor("self_attn.k_norm.weight");
-  const std::uint16_t* output_weight = tensor("self_attn.o_proj.weight");
   const std::uint16_t* post_norm = tensor("post_attention_layernorm.weight");
-  const std::uint16_t* gate_weight = tensor("mlp.gate_proj.weight");
-  const std::uint16_t* up_weight = tensor("mlp.up_proj.weight");
-  const std::uint16_t* down_weight = tensor("mlp.down_proj.weight");
-  if (input_norm == nullptr || query_weight == nullptr ||
-      key_weight == nullptr || value_weight == nullptr ||
-      query_norm == nullptr || key_norm == nullptr ||
-      output_weight == nullptr || post_norm == nullptr ||
-      gate_weight == nullptr || up_weight == nullptr ||
-      down_weight == nullptr) {
+  if (input_norm == nullptr || query_norm == nullptr || key_norm == nullptr ||
+      post_norm == nullptr ||
+      weights.FindTensor(prefix + "self_attn.q_proj.weight") == nullptr ||
+      weights.FindTensor(prefix + "self_attn.k_proj.weight") == nullptr ||
+      weights.FindTensor(prefix + "self_attn.v_proj.weight") == nullptr ||
+      weights.FindTensor(prefix + "self_attn.o_proj.weight") == nullptr ||
+      weights.FindTensor(prefix + "mlp.gate_proj.weight") == nullptr ||
+      weights.FindTensor(prefix + "mlp.up_proj.weight") == nullptr ||
+      weights.FindTensor(prefix + "mlp.down_proj.weight") == nullptr) {
     SetError(error, "loaded H3 text layer is incomplete");
     return false;
   }
@@ -797,14 +933,37 @@ bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
   ops::LaunchRmsNorm(activations->hidden.As<std::uint16_t>(), input_norm,
                      activations->norm.As<std::uint16_t>(), token_count,
                      kPromptEncoderHiddenSize, kRmsEpsilon, stream);
-  if (!gemm->Run(query_weight, activations->norm.As<std::uint16_t>(),
+  const std::uint16_t* query_weight = proj_bf16(
+      "self_attn.q_proj.weight",
+      kPromptEncoderQueryHeads * kPromptEncoderHeadDimension,
+      kPromptEncoderHiddenSize);
+  if (query_weight == nullptr ||
+      !gemm->Run(query_weight, activations->norm.As<std::uint16_t>(),
                  activations->query.As<std::uint16_t>(), tokens,
                  kPromptEncoderQueryHeads * kPromptEncoderHeadDimension,
-                 kPromptEncoderHiddenSize, stream, error) ||
+                 kPromptEncoderHiddenSize, stream, error)) {
+    (void)hipEventDestroy(stop_event);
+    (void)hipEventDestroy(start_event);
+    return false;
+  }
+  const std::uint16_t* key_weight = proj_bf16(
+      "self_attn.k_proj.weight",
+      kPromptEncoderKeyValueHeads * kPromptEncoderHeadDimension,
+      kPromptEncoderHiddenSize);
+  if (key_weight == nullptr ||
       !gemm->Run(key_weight, activations->norm.As<std::uint16_t>(),
                  activations->key.As<std::uint16_t>(), tokens,
                  kPromptEncoderKeyValueHeads * kPromptEncoderHeadDimension,
-                 kPromptEncoderHiddenSize, stream, error) ||
+                 kPromptEncoderHiddenSize, stream, error)) {
+    (void)hipEventDestroy(stop_event);
+    (void)hipEventDestroy(start_event);
+    return false;
+  }
+  const std::uint16_t* value_weight = proj_bf16(
+      "self_attn.v_proj.weight",
+      kPromptEncoderKeyValueHeads * kPromptEncoderHeadDimension,
+      kPromptEncoderHiddenSize);
+  if (value_weight == nullptr ||
       !gemm->Run(value_weight, activations->norm.As<std::uint16_t>(),
                  activations->value.As<std::uint16_t>(), tokens,
                  kPromptEncoderKeyValueHeads * kPromptEncoderHeadDimension,
@@ -834,7 +993,11 @@ bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
       kPromptEncoderHeadDimension,
       1.0F / std::sqrt(static_cast<float>(kPromptEncoderHeadDimension)),
       stream);
-  if (!gemm->Run(output_weight, activations->attention.As<std::uint16_t>(),
+  const std::uint16_t* output_weight = proj_bf16(
+      "self_attn.o_proj.weight", kPromptEncoderHiddenSize,
+      kPromptEncoderQueryHeads * kPromptEncoderHeadDimension);
+  if (output_weight == nullptr ||
+      !gemm->Run(output_weight, activations->attention.As<std::uint16_t>(),
                  activations->projection.As<std::uint16_t>(), tokens,
                  kPromptEncoderHiddenSize,
                  kPromptEncoderQueryHeads * kPromptEncoderHeadDimension, stream,
@@ -850,10 +1013,22 @@ bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
   ops::LaunchRmsNorm(activations->hidden.As<std::uint16_t>(), post_norm,
                      activations->norm.As<std::uint16_t>(), token_count,
                      kPromptEncoderHiddenSize, kRmsEpsilon, stream);
-  if (!gemm->Run(gate_weight, activations->norm.As<std::uint16_t>(),
+  const std::uint16_t* gate_weight = proj_bf16(
+      "mlp.gate_proj.weight", kPromptEncoderIntermediateSize,
+      kPromptEncoderHiddenSize);
+  if (gate_weight == nullptr ||
+      !gemm->Run(gate_weight, activations->norm.As<std::uint16_t>(),
                  activations->gate.As<std::uint16_t>(), tokens,
                  kPromptEncoderIntermediateSize, kPromptEncoderHiddenSize,
-                 stream, error) ||
+                 stream, error)) {
+    (void)hipEventDestroy(stop_event);
+    (void)hipEventDestroy(start_event);
+    return false;
+  }
+  const std::uint16_t* up_weight = proj_bf16(
+      "mlp.up_proj.weight", kPromptEncoderIntermediateSize,
+      kPromptEncoderHiddenSize);
+  if (up_weight == nullptr ||
       !gemm->Run(up_weight, activations->norm.As<std::uint16_t>(),
                  activations->up.As<std::uint16_t>(), tokens,
                  kPromptEncoderIntermediateSize, kPromptEncoderHiddenSize,
@@ -866,7 +1041,11 @@ bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
                     activations->up.As<std::uint16_t>(),
                     activations->gate.As<std::uint16_t>(),
                     tokens * kPromptEncoderIntermediateSize, stream);
-  if (!gemm->Run(down_weight, activations->gate.As<std::uint16_t>(),
+  const std::uint16_t* down_weight = proj_bf16(
+      "mlp.down_proj.weight", kPromptEncoderHiddenSize,
+      kPromptEncoderIntermediateSize);
+  if (down_weight == nullptr ||
+      !gemm->Run(down_weight, activations->gate.As<std::uint16_t>(),
                  activations->mlp.As<std::uint16_t>(), tokens,
                  kPromptEncoderHiddenSize, kPromptEncoderIntermediateSize,
                  stream, error)) {
@@ -887,24 +1066,9 @@ bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
   }
   (void)hipEventRecord(stop_event, stream);
   telemetry->submit_ms = Milliseconds(submit_begin, Clock::now());
-  const hipError_t wait_status = hipEventSynchronize(stop_event);
-  if (wait_status != hipSuccess) {
-    SetError(error, HipError("H3 prompt encoder layer wait", wait_status));
-    (void)hipEventDestroy(stop_event);
-    (void)hipEventDestroy(start_event);
-    return false;
-  }
-  float elapsed_ms = 0.0F;
-  if (hipEventElapsedTime(&elapsed_ms, start_event, stop_event) != hipSuccess) {
-    SetError(error, "cannot read H3 prompt encoder GPU timing");
-    (void)hipEventDestroy(stop_event);
-    (void)hipEventDestroy(start_event);
-    return false;
-  }
-  telemetry->gpu_ms = elapsed_ms;
   telemetry->dispatches = 17;
-  (void)hipEventDestroy(stop_event);
-  (void)hipEventDestroy(start_event);
+  events->start = start_event;
+  events->stop = stop_event;
   return true;
 }
 
@@ -970,7 +1134,8 @@ bool EncodePromptCore(const ModelInventory& inventory,
     *telemetry = {};
   }
   if (token_ids.size() > kMaximumPromptTokens) {
-    SetError(error, "MiniMax H3 prompt exceeds 4096 tokens");
+    SetError(error, "MiniMax H3 prompt exceeds " +
+                        std::to_string(kMaximumPromptTokens) + " tokens");
     return false;
   }
   if (output == nullptr || telemetry == nullptr || token_ids.empty() ||
@@ -1044,8 +1209,10 @@ bool EncodePromptCore(const ModelInventory& inventory,
     destroy_stream();
     return false;
   }
+  PinnedPool pinned_pool;
   BatchLoadResult embedding_result =
-      LoadBatch(inventory, {embedding_descriptor}, device, cancellation);
+      LoadBatch(inventory, {embedding_descriptor}, device, &pinned_pool,
+                cancellation);
   if (!embedding_result.batch.has_value()) {
     SetError(error, std::move(embedding_result.error));
     destroy_stream();
@@ -1094,6 +1261,7 @@ bool EncodePromptCore(const ModelInventory& inventory,
   }
 
   Bf16Gemm gemm;
+  DeviceBuffer dequant_scratch;
   telemetry->peak_device_bytes = std::max<std::uint64_t>(
       telemetry->peak_device_bytes,
       telemetry->activation_bytes + gemm.workspace_bytes());
@@ -1106,8 +1274,9 @@ bool EncodePromptCore(const ModelInventory& inventory,
     return false;
   }
   auto load_start = Clock::now();
-  BatchLoadResult current_result = LoadBatch(
-      inventory, std::move(current_descriptors), device, cancellation);
+  BatchLoadResult current_result =
+      LoadBatch(inventory, std::move(current_descriptors), device, &pinned_pool,
+                cancellation);
   double current_wait_ms = Milliseconds(load_start, Clock::now());
   if (!current_result.batch.has_value()) {
     SetError(error, std::move(current_result.error));
@@ -1135,9 +1304,9 @@ bool EncodePromptCore(const ModelInventory& inventory,
       next_future =
           std::async(std::launch::async,
                      [&inventory, descriptors = std::move(next_descriptors),
-                      device, cancellation]() mutable {
+                      device, &pinned_pool, cancellation]() mutable {
                        return LoadBatch(inventory, std::move(descriptors),
-                                        device, cancellation);
+                                        device, &pinned_pool, cancellation);
                      });
       future_valid = true;
     }
@@ -1152,8 +1321,11 @@ bool EncodePromptCore(const ModelInventory& inventory,
     telemetry->peak_device_bytes = std::max<std::uint64_t>(
         telemetry->peak_device_bytes,
         telemetry->activation_bytes + gemm.workspace_bytes() + current->bytes);
-    if (!RunLayer(*current, layer, token_ids.size(), &gemm, &activations,
-                  compute_stream, &layer_telemetry, error)) {
+    LayerEvents layer_events;
+    if (!RunLayer(*current, layer, token_ids.size(), &gemm, &dequant_scratch,
+                  &activations, compute_stream, &layer_telemetry, &layer_events,
+                  error)) {
+      layer_events.Destroy();
       if (future_valid) {
         (void)next_future.get();
       }
@@ -1171,6 +1343,7 @@ bool EncodePromptCore(const ModelInventory& inventory,
           activations.hidden.As<std::uint16_t>(), vision->row_count,
           kPromptEncoderHiddenSize, compute_stream);
       if (hipGetLastError() != hipSuccess) {
+        layer_events.Destroy();
         if (future_valid) {
           (void)next_future.get();
         }
@@ -1183,13 +1356,28 @@ bool EncodePromptCore(const ModelInventory& inventory,
     telemetry->layers.push_back(layer_telemetry);
 
     if (layer + 1 >= options.layer_count) {
+      if (!CollectLayerTiming(&layer_events, &telemetry->layers.back(),
+                              error)) {
+        destroy_stream();
+        return false;
+      }
       break;
     }
     const auto wait_begin = Clock::now();
     BatchLoadResult next_result;
     if (future_valid) {
       next_result = next_future.get();
+      if (!CollectLayerTiming(&layer_events, &telemetry->layers.back(),
+                              error)) {
+        destroy_stream();
+        return false;
+      }
     } else {
+      if (!CollectLayerTiming(&layer_events, &telemetry->layers.back(),
+                              error)) {
+        destroy_stream();
+        return false;
+      }
       current.reset();
       auto next_descriptors =
           LayerDescriptors(inventory, layer + 1, &descriptor_error);
@@ -1199,7 +1387,7 @@ bool EncodePromptCore(const ModelInventory& inventory,
         return false;
       }
       next_result = LoadBatch(inventory, std::move(next_descriptors), device,
-                              cancellation);
+                              &pinned_pool, cancellation);
     }
     current_wait_ms = Milliseconds(wait_begin, Clock::now());
     if (!next_result.batch.has_value()) {
@@ -1229,6 +1417,7 @@ bool EncodePromptCore(const ModelInventory& inventory,
     return false;
   }
   current.reset();
+  pinned_pool.ReleaseAll();
   destroy_stream();
   telemetry->live_registered_host_bytes_after =
       PromptEncoderLiveRegisteredHostBytes();
@@ -1279,20 +1468,19 @@ bool EncodePromptWithVisions(const ModelInventory& inventory,
   std::vector<std::uint16_t> all_deep;
   all_deep.reserve(3U * total_rows * kPromptEncoderHiddenSize);
   std::vector<std::vector<std::uint16_t>> tap_buffers(3);
-  for (const KeyframeVision& vision : visions) {
-    if (IsCancelled(cancellation)) {
-      SetError(error, "MiniMax H3 multimodal prompt cancelled");
-      return false;
+  std::vector<std::vector<std::uint16_t>> embedded_batch;
+  std::vector<std::vector<std::uint16_t>> deep_batch;
+  if (!EncodeVisionBatch(inventory, visions, cancellation, &embedded_batch,
+                         &deep_batch, error)) {
+    if (error != nullptr && error->empty()) {
+      SetError(error, "MiniMax H3 vision tower failed");
     }
-    std::vector<std::uint16_t> embedded;
-    std::vector<std::uint16_t> deep;
-    if (!EncodeVision(inventory, vision, cancellation, &embedded, &deep,
-                      error)) {
-      if (error != nullptr && error->empty()) {
-        SetError(error, "MiniMax H3 vision tower failed");
-      }
-      return false;
-    }
+    return false;
+  }
+  for (std::size_t i = 0; i < visions.size(); ++i) {
+    const KeyframeVision& vision = visions[i];
+    const std::vector<std::uint16_t>& embedded = embedded_batch[i];
+    const std::vector<std::uint16_t>& deep = deep_batch[i];
     const std::size_t rows =
         static_cast<std::size_t>(vision.grid_h / 2) * (vision.grid_w / 2);
     if (embedded.size() != rows * kPromptEncoderHiddenSize ||

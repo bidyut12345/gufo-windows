@@ -220,6 +220,8 @@ inline void LaunchRope(std::uint16_t* query, std::uint16_t* key,
       query_heads, key_value_heads, head_dimension);
 }
 
+inline constexpr std::uint32_t kCausalGqaTile = 64U;
+
 static __global__ void CausalGqaKernel(
     const std::uint16_t* query, const std::uint16_t* key,
     const std::uint16_t* value, std::uint16_t* output, std::uint32_t sequence,
@@ -232,9 +234,11 @@ static __global__ void CausalGqaKernel(
     return;
   }
   extern __shared__ float shared[];
-  float* scores = shared;
-  float* shared_query = scores + sequence;
-  float* reductions = shared_query + head_dimension;
+  float* shared_query = shared;
+  float* shared_acc = shared_query + head_dimension;
+  float* scores = shared_acc + head_dimension;
+  float* reductions = scores + kCausalGqaTile;
+  auto* tile_kv = reinterpret_cast<std::uint16_t*>(reductions + 128U);
   const std::uint32_t key_value_head =
       query_head / (query_heads / key_value_heads);
   const std::size_t query_base =
@@ -244,62 +248,106 @@ static __global__ void CausalGqaKernel(
        dimension += blockDim.x) {
     shared_query[dimension] = Bf16ToFloat(
         FloatToBf16(Bf16ToFloat(query[query_base + dimension]) * scale));
+    shared_acc[dimension] = 0.0F;
   }
   __syncthreads();
 
   const std::uint32_t key_count = query_row + 1U;
-  float local_maximum = -INFINITY;
-  for (std::uint32_t key_row = lane; key_row < key_count;
-       key_row += blockDim.x) {
-    const std::size_t key_base =
-        (static_cast<std::size_t>(key_row) * key_value_heads + key_value_head) *
-        head_dimension;
-    float dot = 0.0F;
-    for (std::uint32_t dimension = 0; dimension < head_dimension; ++dimension) {
-      dot = fmaf(shared_query[dimension],
-                 Bf16ToFloat(key[key_base + dimension]), dot);
-    }
-    scores[key_row] = dot;
-    local_maximum = fmaxf(local_maximum, dot);
-  }
-  reductions[lane] = local_maximum;
-  __syncthreads();
-  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
-    if (lane < stride) {
-      reductions[lane] = fmaxf(reductions[lane], reductions[lane + stride]);
-    }
-    __syncthreads();
-  }
-  const float maximum = reductions[0];
-  float local_sum = 0.0F;
-  for (std::uint32_t key_row = lane; key_row < key_count;
-       key_row += blockDim.x) {
-    const float probability = expf(scores[key_row] - maximum);
-    scores[key_row] = probability;
-    local_sum += probability;
-  }
-  reductions[lane] = local_sum;
-  __syncthreads();
-  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
-    if (lane < stride) {
-      reductions[lane] += reductions[lane + stride];
-    }
-    __syncthreads();
-  }
-  const float inverse_sum = 1.0F / reductions[0];
-  for (std::uint32_t dimension = lane; dimension < head_dimension;
-       dimension += blockDim.x) {
-    float sum = 0.0F;
-    for (std::uint32_t key_row = 0; key_row < key_count; ++key_row) {
-      const std::size_t value_index =
-          (static_cast<std::size_t>(key_row) * key_value_heads +
+  float running_max = -INFINITY;
+  float running_sum = 0.0F;
+  for (std::uint32_t tile_start = 0; tile_start < key_count;
+       tile_start += kCausalGqaTile) {
+    const std::uint32_t tile_count =
+        key_count - tile_start < kCausalGqaTile ? key_count - tile_start
+                                                : kCausalGqaTile;
+    const std::size_t tile_elements =
+        static_cast<std::size_t>(tile_count) * head_dimension;
+    for (std::size_t idx = lane; idx < tile_elements; idx += blockDim.x) {
+      const std::uint32_t k = static_cast<std::uint32_t>(idx / head_dimension);
+      const std::uint32_t d = static_cast<std::uint32_t>(idx % head_dimension);
+      const std::size_t key_index =
+          (static_cast<std::size_t>(tile_start + k) * key_value_heads +
            key_value_head) *
               head_dimension +
-          dimension;
-      sum = fmaf(scores[key_row] * inverse_sum, Bf16ToFloat(value[value_index]),
-                 sum);
+          d;
+      tile_kv[idx] = key[key_index];
     }
-    output[query_base + dimension] = FloatToBf16(sum);
+    __syncthreads();
+
+    float local_max = -INFINITY;
+    if (lane < tile_count) {
+      const std::uint16_t* key_row =
+          tile_kv + static_cast<std::size_t>(lane) * head_dimension;
+      float dot = 0.0F;
+      for (std::uint32_t dimension = 0; dimension < head_dimension;
+           ++dimension) {
+        dot = fmaf(shared_query[dimension], Bf16ToFloat(key_row[dimension]),
+                   dot);
+      }
+      scores[lane] = dot;
+      local_max = dot;
+    }
+    reductions[lane] = local_max;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
+      if (lane < stride) {
+        reductions[lane] = fmaxf(reductions[lane], reductions[lane + stride]);
+      }
+      __syncthreads();
+    }
+    const float new_max = fmaxf(running_max, reductions[0]);
+    const float rescale =
+        running_sum == 0.0F ? 0.0F : expf(running_max - new_max);
+
+    float local_sum = 0.0F;
+    if (lane < tile_count) {
+      const float probability = expf(scores[lane] - new_max);
+      scores[lane] = probability;
+      local_sum = probability;
+    }
+    reductions[lane] = local_sum;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
+      if (lane < stride) {
+        reductions[lane] += reductions[lane + stride];
+      }
+      __syncthreads();
+    }
+    running_sum = running_sum * rescale + reductions[0];
+    running_max = new_max;
+
+    for (std::size_t idx = lane; idx < tile_elements; idx += blockDim.x) {
+      const std::uint32_t k = static_cast<std::uint32_t>(idx / head_dimension);
+      const std::uint32_t d = static_cast<std::uint32_t>(idx % head_dimension);
+      const std::size_t value_index =
+          (static_cast<std::size_t>(tile_start + k) * key_value_heads +
+           key_value_head) *
+              head_dimension +
+          d;
+      tile_kv[idx] = value[value_index];
+    }
+    __syncthreads();
+
+    for (std::uint32_t dimension = lane; dimension < head_dimension;
+         dimension += blockDim.x) {
+      float sum = shared_acc[dimension] * rescale;
+      for (std::uint32_t k = 0; k < tile_count; ++k) {
+        sum = fmaf(scores[k],
+                   Bf16ToFloat(tile_kv[static_cast<std::size_t>(k) *
+                                           head_dimension +
+                                       dimension]),
+                   sum);
+      }
+      shared_acc[dimension] = sum;
+    }
+    __syncthreads();
+  }
+
+  const float inverse_sum = 1.0F / running_sum;
+  for (std::uint32_t dimension = lane; dimension < head_dimension;
+       dimension += blockDim.x) {
+    output[query_base + dimension] =
+        FloatToBf16(shared_acc[dimension] * inverse_sum);
   }
 }
 
@@ -450,6 +498,185 @@ static __global__ void GroupedCausalGqaKernel(
   }
 }
 
+inline constexpr std::uint32_t kTiledGqaKeyTile = 32U;
+inline constexpr std::uint32_t kCausalGqaRowChunk = 2048U;
+
+// Tiled FlashAttention-style causal GQA kernel: shares K/V global loads across
+// all grouped query heads (up to 8) in a 128-thread block, using fixed LDS
+// independent of sequence length and supporting row-chunked launches for TDR.
+static __global__ void TiledGroupedCausalGqaKernel(
+    const std::uint16_t* query, const std::uint16_t* key,
+    const std::uint16_t* value, std::uint16_t* output, std::uint32_t sequence,
+    std::uint32_t row_offset, std::uint32_t query_heads,
+    std::uint32_t key_value_heads, std::uint32_t head_dimension, float scale) {
+  constexpr std::uint32_t kMaxGrouped = 8U;
+  constexpr std::uint32_t kThreads = 128U;
+  const std::uint32_t query_row = row_offset + blockIdx.x;
+  const std::uint32_t kv_head = blockIdx.y;
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t grouped_heads = query_heads / key_value_heads;
+  if (query_row >= sequence || kv_head >= key_value_heads ||
+      grouped_heads == 0 || grouped_heads > kMaxGrouped ||
+      head_dimension > kThreads) {
+    return;
+  }
+
+  extern __shared__ float shared[];
+  float* shared_queries = shared;  // [grouped_heads][head_dimension]
+  float* shared_acc =
+      shared_queries + static_cast<std::size_t>(grouped_heads) * head_dimension;
+  float* scores =
+      shared_acc + static_cast<std::size_t>(grouped_heads) * head_dimension;
+  float* running_max =
+      scores + static_cast<std::size_t>(grouped_heads) * kTiledGqaKeyTile;
+  float* running_sum = running_max + kMaxGrouped;
+  float* tile_rescale = running_sum + kMaxGrouped;
+  auto* tile_kv = reinterpret_cast<std::uint16_t*>(tile_rescale + kMaxGrouped);
+
+  for (std::uint32_t g = 0; g < grouped_heads; ++g) {
+    const std::uint32_t q_head = kv_head * grouped_heads + g;
+    const std::size_t q_base =
+        (static_cast<std::size_t>(query_row) * query_heads + q_head) *
+        head_dimension;
+    if (tid < head_dimension) {
+      shared_queries[static_cast<std::size_t>(g) * head_dimension + tid] =
+          Bf16ToFloat(FloatToBf16(Bf16ToFloat(query[q_base + tid]) * scale));
+      shared_acc[static_cast<std::size_t>(g) * head_dimension + tid] = 0.0F;
+    }
+  }
+  if (tid < grouped_heads) {
+    running_max[tid] = -INFINITY;
+    running_sum[tid] = 0.0F;
+    tile_rescale[tid] = 0.0F;
+  }
+  __syncthreads();
+
+  const std::uint32_t key_count = query_row + 1U;
+  const std::uint32_t k_idx = tid / 4U;      // 0..31
+  const std::uint32_t d_quarter = tid % 4U;  // 0..3
+  const std::uint32_t d_chunk = (head_dimension + 3U) / 4U;
+  const std::uint32_t d_begin = d_quarter * d_chunk;
+  const std::uint32_t d_end =
+      d_begin + d_chunk < head_dimension ? d_begin + d_chunk : head_dimension;
+
+  for (std::uint32_t tile_start = 0; tile_start < key_count;
+       tile_start += kTiledGqaKeyTile) {
+    const std::uint32_t tile_count = key_count - tile_start < kTiledGqaKeyTile
+                                         ? key_count - tile_start
+                                         : kTiledGqaKeyTile;
+    const std::size_t tile_elements =
+        static_cast<std::size_t>(tile_count) * head_dimension;
+    for (std::size_t idx = tid; idx < tile_elements; idx += kThreads) {
+      const std::uint32_t k = static_cast<std::uint32_t>(idx / head_dimension);
+      const std::uint32_t d = static_cast<std::uint32_t>(idx % head_dimension);
+      const std::size_t key_index =
+          (static_cast<std::size_t>(tile_start + k) * key_value_heads +
+           kv_head) *
+              head_dimension +
+          d;
+      tile_kv[idx] = key[key_index];
+    }
+    __syncthreads();
+
+    float dots[kMaxGrouped] = {};
+    if (k_idx < tile_count) {
+      const std::uint16_t* key_row =
+          tile_kv + static_cast<std::size_t>(k_idx) * head_dimension;
+      for (std::uint32_t d = d_begin; d < d_end; ++d) {
+        const float k_val = Bf16ToFloat(key_row[d]);
+        for (std::uint32_t g = 0; g < grouped_heads; ++g) {
+          dots[g] = fmaf(
+              shared_queries[static_cast<std::size_t>(g) * head_dimension + d],
+              k_val, dots[g]);
+        }
+      }
+    }
+    for (std::uint32_t g = 0; g < grouped_heads; ++g) {
+      float sum = dots[g];
+      sum += __shfl_xor(sum, 1);
+      sum += __shfl_xor(sum, 2);
+      if (d_quarter == 0 && k_idx < tile_count) {
+        scores[static_cast<std::size_t>(g) * kTiledGqaKeyTile + k_idx] = sum;
+      }
+    }
+    __syncthreads();
+
+    // First `grouped_heads` warps (or warp 0 if grouped_heads <= 8, one head per
+    // warp up to 4 warps in two passes) update online softmax in registers.
+    const std::uint32_t warp = tid / 32U;
+    const std::uint32_t lane = tid % 32U;
+    for (std::uint32_t g = warp; g < grouped_heads; g += 4U) {
+      float* g_scores = scores + static_cast<std::size_t>(g) * kTiledGqaKeyTile;
+      float val = lane < tile_count ? g_scores[lane] : -INFINITY;
+      float local_max = val;
+      for (std::uint32_t s = 16U; s != 0; s >>= 1U) {
+        local_max = fmaxf(local_max, __shfl_xor(local_max, s));
+      }
+      const float old_max = running_max[g];
+      const float new_max = fmaxf(old_max, local_max);
+      const float old_sum = running_sum[g];
+      const float rescale = old_sum == 0.0F ? 0.0F : expf(old_max - new_max);
+      const float prob = lane < tile_count ? expf(val - new_max) : 0.0F;
+      if (lane < tile_count) {
+        g_scores[lane] = prob;
+      }
+      float prob_sum = prob;
+      for (std::uint32_t s = 16U; s != 0; s >>= 1U) {
+        prob_sum += __shfl_xor(prob_sum, s);
+      }
+      if (lane == 0) {
+        running_max[g] = new_max;
+        running_sum[g] = old_sum * rescale + prob_sum;
+        tile_rescale[g] = rescale;
+      }
+    }
+
+    for (std::size_t idx = tid; idx < tile_elements; idx += kThreads) {
+      const std::uint32_t k = static_cast<std::uint32_t>(idx / head_dimension);
+      const std::uint32_t d = static_cast<std::uint32_t>(idx % head_dimension);
+      const std::size_t value_index =
+          (static_cast<std::size_t>(tile_start + k) * key_value_heads +
+           kv_head) *
+              head_dimension +
+          d;
+      tile_kv[idx] = value[value_index];
+    }
+    __syncthreads();
+
+    if (tid < head_dimension) {
+      for (std::uint32_t g = 0; g < grouped_heads; ++g) {
+        const float* g_scores =
+            scores + static_cast<std::size_t>(g) * kTiledGqaKeyTile;
+        float acc =
+            shared_acc[static_cast<std::size_t>(g) * head_dimension + tid] *
+            tile_rescale[g];
+        for (std::uint32_t k = 0; k < tile_count; ++k) {
+          acc = fmaf(
+              g_scores[k],
+              Bf16ToFloat(tile_kv[static_cast<std::size_t>(k) * head_dimension +
+                                  tid]),
+              acc);
+        }
+        shared_acc[static_cast<std::size_t>(g) * head_dimension + tid] = acc;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid < head_dimension) {
+    for (std::uint32_t g = 0; g < grouped_heads; ++g) {
+      const std::uint32_t q_head = kv_head * grouped_heads + g;
+      const std::size_t out_index =
+          (static_cast<std::size_t>(query_row) * query_heads + q_head) *
+              head_dimension +
+          tid;
+      output[out_index] = FloatToBf16(
+          shared_acc[static_cast<std::size_t>(g) * head_dimension + tid] /
+          running_sum[g]);
+    }
+  }
+}
+
 inline void LaunchCausalGqa(const std::uint16_t* query,
                             const std::uint16_t* key,
                             const std::uint16_t* value, std::uint16_t* output,
@@ -473,9 +700,32 @@ inline void LaunchCausalGqa(const std::uint16_t* query,
                        head_dimension, scale);
     return;
   }
+  if (key_value_heads != 0 && query_heads % key_value_heads == 0 &&
+      grouped_heads <= 8 && head_dimension <= 128U) {
+    const std::size_t tiled_shared_bytes =
+        (static_cast<std::size_t>(grouped_heads) * head_dimension * 2U +
+         static_cast<std::size_t>(grouped_heads) * kTiledGqaKeyTile + 24U) *
+            sizeof(float) +
+        static_cast<std::size_t>(kTiledGqaKeyTile) * head_dimension *
+            sizeof(std::uint16_t);
+    for (std::uint32_t row_offset = 0; row_offset < sequence;
+         row_offset += kCausalGqaRowChunk) {
+      const std::uint32_t chunk_rows = sequence - row_offset < kCausalGqaRowChunk
+                                           ? sequence - row_offset
+                                           : kCausalGqaRowChunk;
+      hipLaunchKernelGGL(TiledGroupedCausalGqaKernel,
+                         dim3(chunk_rows, key_value_heads), dim3(128),
+                         tiled_shared_bytes, stream, query, key, value, output,
+                         sequence, row_offset, query_heads, key_value_heads,
+                         head_dimension, scale);
+    }
+    return;
+  }
   const std::size_t shared_bytes =
-      (static_cast<std::size_t>(sequence) + head_dimension + 128U) *
-      sizeof(float);
+      (static_cast<std::size_t>(head_dimension) * 2U + kCausalGqaTile + 128U) *
+          sizeof(float) +
+      static_cast<std::size_t>(kCausalGqaTile) * head_dimension *
+          sizeof(std::uint16_t);
   hipLaunchKernelGGL(CausalGqaKernel, dim3(sequence, query_heads), dim3(128),
                      shared_bytes, stream, query, key, value, output, sequence,
                      query_heads, key_value_heads, head_dimension, scale);
@@ -619,6 +869,38 @@ inline void LaunchAddRows(const std::uint32_t* rows,
       AddRowsKernel,
       dim3(static_cast<std::uint32_t>((elements + kThreads - 1U) / kThreads)),
       dim3(kThreads), 0, stream, rows, source, matrix, width, elements);
+}
+
+static __global__ void DequantInt8ToBf16Kernel(const std::int8_t* source,
+                                               const float* scale,
+                                               std::uint16_t* destination,
+                                               std::size_t elements,
+                                               std::size_t columns,
+                                               std::size_t scale_count) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    float s = 1.0F;
+    if (scale != nullptr && scale_count != 0U) {
+      s = scale_count == 1U ? scale[0] : scale[index / columns];
+    }
+    destination[index] = FloatToBf16(static_cast<float>(source[index]) * s);
+  }
+}
+
+inline void LaunchDequantInt8ToBf16(const std::int8_t* source,
+                                    const float* scale,
+                                    std::uint16_t* destination,
+                                    std::size_t rows, std::size_t columns,
+                                    std::size_t scale_count,
+                                    hipStream_t stream) {
+  constexpr std::size_t kThreads = 256;
+  const std::size_t elements = rows * columns;
+  hipLaunchKernelGGL(
+      DequantInt8ToBf16Kernel,
+      dim3(static_cast<std::uint32_t>((elements + kThreads - 1U) / kThreads)),
+      dim3(kThreads), 0, stream, source, scale, destination, elements, columns,
+      scale_count);
 }
 
 }  // namespace gufo::minimax_h3::ops

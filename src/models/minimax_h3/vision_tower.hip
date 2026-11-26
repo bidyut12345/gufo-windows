@@ -402,6 +402,9 @@ std::uint16_t HostFloatToBf16(float value) {
 bool LoadRaw(const ModelInventory& inventory, std::string_view name,
              std::vector<std::uint16_t>& out, std::string* error) {
   const TensorDescriptor* descriptor = inventory.FindTensor(name);
+  if (descriptor == nullptr && name.starts_with("model.visual.")) {
+    descriptor = inventory.FindTensor(name.substr(6));
+  }
   if (descriptor == nullptr) {
     Fail(error,
          "MiniMax H3 vision tower tensor is missing: " + std::string(name));
@@ -639,29 +642,34 @@ private:
   rocblas_handle handle_{nullptr};
 };
 
-bool EncodeOneVision(const ModelInventory& inventory,
-                     const KeyframeVision& vision,
-                     const CancellationToken* cancellation,
-                     std::vector<std::uint16_t>* output,
-                     std::vector<std::uint16_t>* deepstack,
-                     std::string* error) {
+bool EncodeVisionsInternal(const ModelInventory& inventory,
+                           std::span<const KeyframeVision> visions,
+                           const CancellationToken* cancellation,
+                           std::vector<std::vector<std::uint16_t>>* outputs,
+                           std::vector<std::vector<std::uint16_t>>* deepstacks,
+                           std::string* error) {
   using namespace vt;  // NOLINT
-  if (output == nullptr) {
-    Fail(error, "MiniMax H3 vision tower output is missing");
+  if (outputs == nullptr || visions.empty()) {
+    Fail(error, "MiniMax H3 vision tower batch inputs are invalid");
     return false;
   }
-  if (vision.grid_h < 2 || vision.grid_w < 2 || vision.grid_h % 2 != 0 ||
-      vision.grid_w % 2 != 0) {
-    Fail(error, "MiniMax H3 vision grid must be even and at least 2");
-    return false;
+  outputs->assign(visions.size(), {});
+  if (deepstacks != nullptr) {
+    deepstacks->assign(visions.size(), {});
   }
-  const std::uint32_t rows =
-      static_cast<std::uint32_t>(vision.grid_h) * vision.grid_w;
-  const std::size_t merged = static_cast<std::size_t>(rows) / 4U;
-  if (vision.pixel_values.size() !=
-      static_cast<std::size_t>(rows) * kPatchDim) {
-    Fail(error, "MiniMax H3 vision pixel payload differs from the grid");
-    return false;
+  for (const KeyframeVision& vision : visions) {
+    if (vision.grid_h < 2 || vision.grid_w < 2 || vision.grid_h % 2 != 0 ||
+        vision.grid_w % 2 != 0) {
+      Fail(error, "MiniMax H3 vision grid must be even and at least 2");
+      return false;
+    }
+    const std::uint32_t rows =
+        static_cast<std::uint32_t>(vision.grid_h) * vision.grid_w;
+    if (vision.pixel_values.size() !=
+        static_cast<std::size_t>(rows) * kPatchDim) {
+      Fail(error, "MiniMax H3 vision pixel payload differs from the grid");
+      return false;
+    }
   }
   int device = 0;
   if (hipGetDevice(&device) != hipSuccess) {
@@ -682,7 +690,7 @@ bool EncodeOneVision(const ModelInventory& inventory,
     return false;
   }
 
-  // --- weights --------------------------------------------------------------
+  // --- weights (loaded once for the entire batch) -------------------------
   VisionTowerWeights weights;
   std::uint64_t loaded_bytes = 0;
   const auto load = [&](const std::string& name, std::size_t elements,
@@ -743,6 +751,21 @@ bool EncodeOneVision(const ModelInventory& inventory,
     cleanup();
     return false;
   }
+
+  for (std::size_t vision_index = 0; vision_index < visions.size();
+       ++vision_index) {
+    if (IsCancelled(cancellation)) {
+      Fail(error, "MiniMax H3 vision tower cancelled");
+      cleanup();
+      return false;
+    }
+    const KeyframeVision& vision = visions[vision_index];
+    std::vector<std::uint16_t>* output = &(*outputs)[vision_index];
+    std::vector<std::uint16_t>* deepstack =
+        deepstacks != nullptr ? &(*deepstacks)[vision_index] : nullptr;
+    const std::uint32_t rows =
+        static_cast<std::uint32_t>(vision.grid_h) * vision.grid_w;
+    const std::size_t merged = static_cast<std::size_t>(rows) / 4U;
 
   // --- host-prepared inputs
   // ---------------------------------------------------
@@ -1062,21 +1085,50 @@ bool EncodeOneVision(const ModelInventory& inventory,
       return false;
     }
   }
+  }
   cleanup();
   return true;
 }
 
 }  // namespace
 
+bool EncodeVisionBatch(const ModelInventory& inventory,
+                       std::span<const KeyframeVision> visions,
+                       const CancellationToken* cancellation,
+                       std::vector<std::vector<std::uint16_t>>* outputs,
+                       std::vector<std::vector<std::uint16_t>>* deepstacks,
+                       std::string* error) {
+  if (deepstacks != nullptr) {
+    deepstacks->clear();
+  }
+  return EncodeVisionsInternal(inventory, visions, cancellation, outputs,
+                               deepstacks, error);
+}
+
 bool EncodeVision(const ModelInventory& inventory, const KeyframeVision& vision,
                   const CancellationToken* cancellation,
                   std::vector<std::uint16_t>* output,
                   std::vector<std::uint16_t>* deepstack, std::string* error) {
+  if (output == nullptr) {
+    vt::Fail(error, "MiniMax H3 vision tower output is missing");
+    return false;
+  }
   if (deepstack != nullptr) {
     deepstack->clear();
   }
-  return EncodeOneVision(inventory, vision, cancellation, output, deepstack,
-                         error);
+  std::vector<std::vector<std::uint16_t>> outputs;
+  std::vector<std::vector<std::uint16_t>> deepstacks;
+  const std::span<const KeyframeVision> one(&vision, 1U);
+  if (!EncodeVisionsInternal(inventory, one, cancellation, &outputs,
+                             deepstack != nullptr ? &deepstacks : nullptr,
+                             error)) {
+    return false;
+  }
+  *output = std::move(outputs[0]);
+  if (deepstack != nullptr) {
+    *deepstack = std::move(deepstacks[0]);
+  }
+  return true;
 }
 
 }  // namespace gufo::minimax_h3

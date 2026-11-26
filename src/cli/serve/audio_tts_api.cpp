@@ -15,6 +15,7 @@
 #include "src/cli/serve/audio_buffer.hpp"
 #include "src/cli/serve/audio_stream.hpp"
 #include "src/core/json.hpp"
+#include "src/core/logging/logging.hpp"
 #include "src/ext/tts.hpp"
 
 namespace gufo::server {
@@ -23,7 +24,7 @@ namespace {
 constexpr std::string_view kSpeechPath = "/v1/audio/speech";
 constexpr std::string_view kVoicesPath = "/v1/audio/voices";
 constexpr std::size_t kMaximumInputBytes = 16U << 10U;
-constexpr std::size_t kMaximumNewTokens = 8192;
+constexpr std::size_t kMaximumNewTokens = 32768;
 
 std::uint64_t AudioDurationMs(std::size_t samples,
                               std::uint32_t sample_rate) noexcept {
@@ -350,11 +351,11 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                  "invalid_speed");
   }
   std::size_t max_new_tokens = 0;
-  if (!ReadUnsigned(body, "max_new_tokens", 3000, kMaximumNewTokens,
+  if (!ReadUnsigned(body, "max_new_tokens", kMaximumNewTokens, kMaximumNewTokens,
                     &max_new_tokens) ||
       max_new_tokens == 0) {
     return Error(400, "Bad Request",
-                 "'max_new_tokens' must be between 1 and 8192",
+                 "'max_new_tokens' must be between 1 and 32768",
                  "invalid_max_new_tokens");
   }
   std::size_t seed = 0;
@@ -437,8 +438,9 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
     response.stream_log = log;
     response
         .streaming_body = [&service, synthesis = std::move(synthesis),
-                           cancelled = request.is_cancelled, log,
-                           sse](const HttpResponse::BodyWriter& write) mutable {
+                           cancelled = request.is_cancelled, log, sse,
+                           request_id = request.request_id](
+                              const HttpResponse::BodyWriter& write) mutable {
       const auto started = std::chrono::steady_clock::now();
       std::size_t samples = 0;
       bool disconnected = false;
@@ -474,6 +476,10 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service,
                                     : "generation_failed";
         if (invalid_audio)
           error = "Qwen3-TTS produced invalid audio";
+        if (!check() && !error.empty()) {
+          Logger::Error("tts", "request=" + request_id +
+                                   " event=stream_failed reason=" + error);
+        }
         if (sse && !check()) {
           auto event = json::Value::object();
           event["type"] = "error";

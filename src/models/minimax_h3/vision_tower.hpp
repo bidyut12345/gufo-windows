@@ -14,6 +14,7 @@
 // local://gufo-h3-internals.md §3 are the authoritative feature contract.
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,15 @@ struct KeyframeVision {
                                 std::vector<std::uint16_t>* output,
                                 std::vector<std::uint16_t>* deepstack,
                                 std::string* error = nullptr);
+
+// Batch variant that loads the vision tower weights and rocBLAS handle once
+// across all keyframes / video-pair frames.
+[[nodiscard]] bool EncodeVisionBatch(
+    const ModelInventory& inventory, std::span<const KeyframeVision> visions,
+    const CancellationToken* cancellation,
+    std::vector<std::vector<std::uint16_t>>* outputs,
+    std::vector<std::vector<std::uint16_t>>* deepstacks,
+    std::string* error = nullptr);
 
 }  // namespace gufo::minimax_h3
 

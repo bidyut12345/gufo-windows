@@ -8,6 +8,8 @@
 #include <fstream>
 #include <gufo/ext/platform/os_info.hpp>
 #include <iomanip>
+#include <list>
+#include <mutex>
 #include <sstream>
 #include <system_error>
 #include <utility>
@@ -82,6 +84,64 @@ using Clock = std::chrono::steady_clock;
 
 double Milliseconds(Clock::time_point begin, Clock::time_point end) {
   return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
+template<typename Value>
+class BoundedCache {
+public:
+  explicit BoundedCache(std::size_t capacity) : capacity_(capacity) {}
+
+  bool Get(const std::string& key, Value* out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+      if (it->first == key) {
+        *out = it->second;
+        entries_.splice(entries_.begin(), entries_, it);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void Put(std::string key, Value value) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+      if (it->first == key) {
+        it->second = std::move(value);
+        entries_.splice(entries_.begin(), entries_, it);
+        return;
+      }
+    }
+    entries_.emplace_front(std::move(key), std::move(value));
+    if (entries_.size() > capacity_) {
+      entries_.pop_back();
+    }
+  }
+
+private:
+  std::size_t capacity_;
+  std::mutex mutex_;
+  std::list<std::pair<std::string, Value>> entries_;
+};
+
+BoundedCache<PromptEmbedding>& PromptCache() {
+  static BoundedCache<PromptEmbedding> cache(4);
+  return cache;
+}
+
+BoundedCache<std::vector<float>>& KeyframeLatentCache() {
+  static BoundedCache<std::vector<float>> cache(16);
+  return cache;
+}
+
+std::string HashBytes(std::span<const std::uint8_t> bytes) {
+  return Sha256(std::span<const unsigned char>(
+      reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size()));
+}
+
+std::string HashString(std::string_view text) {
+  return Sha256(std::span<const unsigned char>(
+      reinterpret_cast<const unsigned char*>(text.data()), text.size()));
 }
 #endif
 
@@ -1180,23 +1240,60 @@ bool GenerateTextVideo(const GenerationRequest& request,
   // neutral.
   std::vector<PreparedKeyframe> keyframes;
   if (has_references) {
-    constexpr double kReferenceImageShortEdge = 2048.0;
+    // Cap per-image resolution and total vision-token budget across all
+    // reference images so multi-ref prompts stay fast and within GPU/TDR limits.
+    constexpr double kMaxReferenceShortEdge = 768.0;
+    constexpr double kMaxTotalReferenceVisionTokens = 2048.0;
+    auto snap_dim = [](double value) {
+      return std::max(
+          kH3CanvasMultiple,
+          static_cast<int>(
+              std::llround(std::nearbyint(value / kH3CanvasMultiple))) *
+              kH3CanvasMultiple);
+    };
+    struct RefSize {
+      int width{0};
+      int height{0};
+    };
+    std::vector<RefSize> target_sizes;
+    target_sizes.reserve(ref_images.size());
+    double total_vision_tokens = 0.0;
     for (const core::Image& ref : ref_images) {
       const double w = static_cast<double>(ref.width);
       const double h = static_cast<double>(ref.height);
-      const double scale = kReferenceImageShortEdge / std::min(w, h);
-      const int target_h = std::max(
-          kH3CanvasMultiple,
-          static_cast<int>(std::llround(
-              std::nearbyint(h * scale / kH3CanvasMultiple))) *
-              kH3CanvasMultiple);
-      const int target_w = std::max(
-          kH3CanvasMultiple,
-          static_cast<int>(std::llround(
-              std::nearbyint(w * scale / kH3CanvasMultiple))) *
-              kH3CanvasMultiple);
+      const double short_edge = std::min(w, h);
+      const double target_short = std::min(kMaxReferenceShortEdge, short_edge);
+      const double scale = target_short / short_edge;
+      int target_w = snap_dim(w * scale);
+      int target_h = snap_dim(h * scale);
+      while (static_cast<std::int64_t>(target_w) * target_h <
+             image_processor::kVisionMinimumPixels) {
+        target_w += kH3CanvasMultiple;
+        target_h += kH3CanvasMultiple;
+      }
+      total_vision_tokens +=
+          static_cast<double>(target_w / kH3CanvasMultiple) *
+          static_cast<double>(target_h / kH3CanvasMultiple);
+      target_sizes.push_back({target_w, target_h});
+    }
+    if (total_vision_tokens > kMaxTotalReferenceVisionTokens) {
+      const double budget_scale =
+          std::sqrt(kMaxTotalReferenceVisionTokens / total_vision_tokens);
+      for (std::size_t i = 0; i < ref_images.size(); ++i) {
+        int target_w = snap_dim(target_sizes[i].width * budget_scale);
+        int target_h = snap_dim(target_sizes[i].height * budget_scale);
+        while (static_cast<std::int64_t>(target_w) * target_h <
+               image_processor::kVisionMinimumPixels) {
+          target_w += kH3CanvasMultiple;
+          target_h += kH3CanvasMultiple;
+        }
+        target_sizes[i] = {target_w, target_h};
+      }
+    }
+    for (std::size_t i = 0; i < ref_images.size(); ++i) {
       keyframes.emplace_back();
-      if (!PrepareKeyframe(ref, target_w, target_h, false, &keyframes.back(),
+      if (!PrepareKeyframe(ref_images[i], target_sizes[i].width,
+                           target_sizes[i].height, false, &keyframes.back(),
                            error)) {
         return false;
       }
@@ -1226,11 +1323,29 @@ bool GenerateTextVideo(const GenerationRequest& request,
     }
   }
   begin = Clock::now();
-  if (keyframes.empty() && ref_videos.empty()) {
+  std::string prompt_cache_key;
+  {
+    std::ostringstream key_stream;
+    key_stream << inventory->variant_dir() << '|' << prompt_sha256 << '|'
+               << keyframes.size() << '|' << ref_videos.size();
+    for (const PreparedKeyframe& kf : keyframes) {
+      key_stream << '|' << kf.width << 'x' << kf.height << ':'
+                 << HashBytes(kf.rgb);
+    }
+    for (const DecodedReferenceVideo& vid : ref_videos) {
+      key_stream << '|' << vid.width << 'x' << vid.height << 'x'
+                 << vid.frame_count << ':' << HashBytes(vid.rgb24);
+    }
+    prompt_cache_key = HashString(key_stream.str());
+  }
+  if (PromptCache().Get(prompt_cache_key, &embedding)) {
+    local.prompt_tokens = embedding.tokens;
+  } else if (keyframes.empty() && ref_videos.empty()) {
     if (!EncodePromptLayer50(*inventory, tokens, {}, cancellation, &embedding,
                              &local.prompt_encoder, error)) {
       return false;
     }
+    PromptCache().Put(prompt_cache_key, embedding);
   } else {
     std::vector<MultimodalBlock> vision_blocks;
     std::vector<KeyframeVision> visions;
@@ -1317,6 +1432,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
       }
       return false;
     }
+    PromptCache().Put(prompt_cache_key, embedding);
   }
   local.prompt_ms = Milliseconds(begin, Clock::now());
   Report(progress, progress_opaque, "prompt", 1, 1);
@@ -1332,9 +1448,22 @@ bool GenerateTextVideo(const GenerationRequest& request,
     const std::size_t ref_count = ref_images.size();
     std::vector<std::size_t> cond_latent_sizes;
     cond_latent_sizes.reserve(keyframes.size() + ref_videos.size());
+    auto encode_or_get_keyframe = [&](PreparedKeyframe& kf) -> bool {
+      const std::string key = HashString(
+          std::string(inventory->variant_dir()) + "|" +
+          std::to_string(kf.width) + "x" + std::to_string(kf.height) + ":" +
+          HashBytes(kf.rgb));
+      if (KeyframeLatentCache().Get(key, &kf.latent)) {
+        return true;
+      }
+      if (!EncodeKeyframeLatent(*inventory, kf, cancellation, nullptr, error)) {
+        return false;
+      }
+      KeyframeLatentCache().Put(key, kf.latent);
+      return true;
+    };
     for (std::size_t i = 0; i < ref_count; ++i) {
-      if (!EncodeKeyframeLatent(*inventory, keyframes[i], cancellation, nullptr,
-                                error)) {
+      if (!encode_or_get_keyframe(keyframes[i])) {
         return false;
       }
       const std::size_t lh =
@@ -1367,8 +1496,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
       cond_latent_sizes.push_back(encoded_videos[v].latent.size());
     }
     for (std::size_t i = ref_count; i < keyframes.size(); ++i) {
-      if (!EncodeKeyframeLatent(*inventory, keyframes[i], cancellation, nullptr,
-                                error)) {
+      if (!encode_or_get_keyframe(keyframes[i])) {
         return false;
       }
       const std::size_t lh =
