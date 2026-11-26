@@ -557,6 +557,155 @@ inline void LaunchUnpackRgb(const float* projected, const std::int32_t* frames,
                      frame_count, tile_height, tile_width, output_frames);
 }
 
+static __global__ void FloatToBf16Kernel(const float* source,
+                                         std::uint16_t* destination,
+                                         std::size_t elements) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    const std::uint32_t bits = __float_as_uint(source[index]);
+    if ((bits & 0x7F800000U) == 0x7F800000U) {
+      destination[index] = static_cast<std::uint16_t>((bits | 0x0040U) >> 16U);
+    } else {
+      const std::uint32_t rounding = 0x7FFFU + ((bits >> 16U) & 1U);
+      destination[index] = static_cast<std::uint16_t>((bits + rounding) >> 16U);
+    }
+  }
+}
+
+inline void LaunchFloatToBf16(const float* source, std::uint16_t* destination,
+                              std::size_t elements, hipStream_t stream) {
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(
+      FloatToBf16Kernel,
+      dim3(static_cast<std::uint32_t>((elements + kThreads - 1U) / kThreads)),
+      dim3(kThreads), 0, stream, source, destination, elements);
+}
+
+// Tiled FlashAttention for VisualVAE decoder: [sequence, heads, head_dim=64].
+// Eliminates materializing the [heads, sequence, sequence] score matrix.
+static __global__ void VideoFlashAttentionKernel(
+    const float* query, const float* key, const float* value, float* output,
+    std::uint32_t sequence, std::uint32_t heads, float scale) {
+  constexpr std::uint32_t kHeadDim = 64U;
+  constexpr std::uint32_t kTileK = 32U;
+  const std::uint32_t q_row = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  const std::uint32_t tid = threadIdx.x;  // 0..63
+  if (q_row >= sequence || head >= heads) {
+    return;
+  }
+
+  __shared__ float shared_q[kHeadDim];
+  __shared__ float shared_acc[kHeadDim];
+  __shared__ float shared_kv[kTileK * kHeadDim];
+  __shared__ float scores[kTileK];
+  __shared__ float running_max;
+  __shared__ float running_sum;
+  __shared__ float tile_rescale;
+
+  const std::size_t row_stride = static_cast<std::size_t>(heads) * kHeadDim;
+  const std::size_t q_base =
+      static_cast<std::size_t>(q_row) * row_stride + head * kHeadDim;
+  shared_q[tid] = query[q_base + tid] * scale;
+  shared_acc[tid] = 0.0F;
+  if (tid == 0) {
+    running_max = -INFINITY;
+    running_sum = 0.0F;
+    tile_rescale = 0.0F;
+  }
+  __syncthreads();
+
+  const std::uint32_t k_idx = tid / 2U;    // 0..31
+  const std::uint32_t d_half = tid % 2U;   // 0..1
+  const std::uint32_t d_begin = d_half * 32U;
+  const std::uint32_t d_end = d_begin + 32U;
+
+  for (std::uint32_t tile_start = 0; tile_start < sequence;
+       tile_start += kTileK) {
+    const std::uint32_t tile_count =
+        sequence - tile_start < kTileK ? sequence - tile_start : kTileK;
+    const std::size_t tile_elements =
+        static_cast<std::size_t>(tile_count) * kHeadDim;
+    for (std::size_t idx = tid; idx < tile_elements; idx += kHeadDim) {
+      const std::uint32_t k = static_cast<std::uint32_t>(idx / kHeadDim);
+      const std::uint32_t d = static_cast<std::uint32_t>(idx % kHeadDim);
+      shared_kv[idx] =
+          key[static_cast<std::size_t>(tile_start + k) * row_stride +
+              head * kHeadDim + d];
+    }
+    __syncthreads();
+
+    float dot = 0.0F;
+    if (k_idx < tile_count) {
+      const float* k_row =
+          shared_kv + static_cast<std::size_t>(k_idx) * kHeadDim;
+      for (std::uint32_t d = d_begin; d < d_end; ++d) {
+        dot = fmaf(shared_q[d], k_row[d], dot);
+      }
+    }
+    dot += __shfl_xor(dot, 1);
+    if (d_half == 0 && k_idx < tile_count) {
+      scores[k_idx] = dot;
+    }
+    __syncthreads();
+
+    if (tid < 32U) {
+      const float val = tid < tile_count ? scores[tid] : -INFINITY;
+      float local_max = val;
+      for (std::uint32_t s = 16U; s != 0; s >>= 1U) {
+        local_max = fmaxf(local_max, __shfl_xor(local_max, s));
+      }
+      const float old_max = running_max;
+      const float new_max = fmaxf(old_max, local_max);
+      const float old_sum = running_sum;
+      const float rescale = old_sum == 0.0F ? 0.0F : expf(old_max - new_max);
+      const float prob = tid < tile_count ? expf(val - new_max) : 0.0F;
+      if (tid < tile_count) {
+        scores[tid] = prob;
+      }
+      float prob_sum = prob;
+      for (std::uint32_t s = 16U; s != 0; s >>= 1U) {
+        prob_sum += __shfl_xor(prob_sum, s);
+      }
+      if (tid == 0) {
+        running_max = new_max;
+        running_sum = old_sum * rescale + prob_sum;
+        tile_rescale = rescale;
+      }
+    }
+
+    for (std::size_t idx = tid; idx < tile_elements; idx += kHeadDim) {
+      const std::uint32_t k = static_cast<std::uint32_t>(idx / kHeadDim);
+      const std::uint32_t d = static_cast<std::uint32_t>(idx % kHeadDim);
+      shared_kv[idx] =
+          value[static_cast<std::size_t>(tile_start + k) * row_stride +
+                head * kHeadDim + d];
+    }
+    __syncthreads();
+
+    float acc = shared_acc[tid] * tile_rescale;
+    for (std::uint32_t k = 0; k < tile_count; ++k) {
+      acc = fmaf(scores[k],
+                 shared_kv[static_cast<std::size_t>(k) * kHeadDim + tid], acc);
+    }
+    shared_acc[tid] = acc;
+    __syncthreads();
+  }
+
+  output[q_base + tid] = shared_acc[tid] / running_sum;
+}
+
+inline void LaunchVideoFlashAttention(const float* query, const float* key,
+                                      const float* value, float* output,
+                                      std::uint32_t sequence,
+                                      std::uint32_t heads, float scale,
+                                      hipStream_t stream) {
+  hipLaunchKernelGGL(VideoFlashAttentionKernel, dim3(sequence, heads), dim3(64),
+                     0, stream, query, key, value, output, sequence, heads,
+                     scale);
+}
+
 }  // namespace gufo::minimax_h3::video_vae_ops
 
 #endif  // GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_HIP_HPP_

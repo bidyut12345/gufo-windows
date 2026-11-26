@@ -130,7 +130,8 @@ bool ReadKeyframeNormalization(const ModelInventory& inventory,
 bool EncodeKeyframeLatent(const ModelInventory& inventory,
                           PreparedKeyframe& keyframe,
                           const CancellationToken* cancellation,
-                          VideoVaeTelemetry* telemetry, std::string* error) {
+                          VideoVaeTelemetry* telemetry, std::string* error,
+                          VideoVaeEncoder* shared_encoder) {
   const int latent_height = keyframe.height / kH3VideoVaeSpatialRatio;
   const int latent_width = keyframe.width / kH3VideoVaeSpatialRatio;
   if (keyframe.width % kH3VideoVaeSpatialRatio != 0 ||
@@ -146,8 +147,13 @@ bool EncodeKeyframeLatent(const ModelInventory& inventory,
   if (!ReadKeyframeNormalization(inventory, &mean, &deviation, error)) {
     return false;
   }
-  std::unique_ptr<VideoVaeEncoder> encoder =
-      VideoVaeEncoder::Create(inventory, cancellation, telemetry, error);
+  std::unique_ptr<VideoVaeEncoder> owned_encoder;
+  VideoVaeEncoder* encoder = shared_encoder;
+  if (encoder == nullptr) {
+    owned_encoder =
+        VideoVaeEncoder::Create(inventory, cancellation, telemetry, error);
+    encoder = owned_encoder.get();
+  }
   if (encoder == nullptr) {
     return false;
   }
@@ -201,7 +207,8 @@ bool EncodeVideoReferenceLatent(
     const ModelInventory& inventory, std::span<const std::uint8_t> rgb24,
     int num_frames, int width, int height,
     const CancellationToken* cancellation, VideoVaeTelemetry* telemetry,
-    std::vector<float>* latent, int* out_latent_frames, std::string* error) {
+    std::vector<float>* latent, int* out_latent_frames, std::string* error,
+    VideoVaeEncoder* shared_encoder) {
   if (latent == nullptr || out_latent_frames == nullptr || num_frames < 5 ||
       width % kH3VideoVaeSpatialRatio != 0 ||
       height % kH3VideoVaeSpatialRatio != 0 ||
@@ -224,8 +231,13 @@ bool EncodeVideoReferenceLatent(
   if (!ReadKeyframeNormalization(inventory, &mean, &deviation, error)) {
     return false;
   }
-  std::unique_ptr<VideoVaeEncoder> encoder =
-      VideoVaeEncoder::Create(inventory, cancellation, telemetry, error);
+  std::unique_ptr<VideoVaeEncoder> owned_encoder;
+  VideoVaeEncoder* encoder = shared_encoder;
+  if (encoder == nullptr) {
+    owned_encoder =
+        VideoVaeEncoder::Create(inventory, cancellation, telemetry, error);
+    encoder = owned_encoder.get();
+  }
   if (encoder == nullptr) {
     return false;
   }

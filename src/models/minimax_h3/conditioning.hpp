@@ -16,6 +16,8 @@
 
 namespace gufo::minimax_h3 {
 
+class VideoVaeEncoder;
+
 // FL2VA keyframe conditioning (upstream issue #177). Keyframes are resized
 // onto the target canvas by the released index rule (the geometry anchor is
 // stretched; a follower is aspect-cover cropped), VisualVAE-encoded with the
@@ -58,7 +60,8 @@ struct PreparedKeyframe {
                                         PreparedKeyframe& keyframe,
                                         const CancellationToken* cancellation,
                                         VideoVaeTelemetry* telemetry,
-                                        std::string* error);
+                                        std::string* error,
+                                        VideoVaeEncoder* shared_encoder = nullptr);
 
 // Encodes a decoded 24 fps reference video (snapped down to 17*n + 5 frames)
 // through the causal 3D VisualVAE encoder, posterior-sampled with seed 42,
@@ -67,7 +70,8 @@ struct PreparedKeyframe {
     const ModelInventory& inventory, std::span<const std::uint8_t> rgb24,
     int num_frames, int width, int height,
     const CancellationToken* cancellation, VideoVaeTelemetry* telemetry,
-    std::vector<float>* latent, int* out_latent_frames, std::string* error);
+    std::vector<float>* latent, int* out_latent_frames, std::string* error,
+    VideoVaeEncoder* shared_encoder = nullptr);
 
 // mixed = t * latent + (1 - t) * augmentation evaluated in float32 with the
 // reference's separate multiply/add rounding (no fused contraction) and

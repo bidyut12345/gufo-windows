@@ -325,9 +325,52 @@ public:
     return true;
   }
 
+  bool RunBf16(const std::uint16_t* weight_bf16, const float* input_f32,
+               float* output, std::size_t batch, std::size_t rows,
+               std::size_t columns, hipStream_t stream, std::string* error) {
+    if (handle_ == nullptr || batch == 0 || rows == 0 || columns == 0 ||
+        batch >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        rows >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        columns >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        rocblas_set_stream(handle_, stream) != rocblas_status_success) {
+      SetError(error, "invalid MiniMax H3 VisualVAE BF16 GEMM");
+      return false;
+    }
+    const std::size_t input_elements = batch * columns;
+    const std::size_t bf16_bytes = input_elements * sizeof(std::uint16_t);
+    if (input_bf16_.bytes() < bf16_bytes &&
+        !input_bf16_.Allocate(bf16_bytes, error)) {
+      return false;
+    }
+    video_vae_ops::LaunchFloatToBf16(
+        input_f32, input_bf16_.As<std::uint16_t>(), input_elements, stream);
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    const rocblas_status status = rocblas_gemm_ex(
+        handle_, rocblas_operation_transpose, rocblas_operation_none,
+        static_cast<rocblas_int>(rows), static_cast<rocblas_int>(batch),
+        static_cast<rocblas_int>(columns), &alpha, weight_bf16,
+        rocblas_datatype_bf16_r, static_cast<rocblas_int>(columns),
+        input_bf16_.As<std::uint16_t>(), rocblas_datatype_bf16_r,
+        static_cast<rocblas_int>(columns), &beta, output,
+        rocblas_datatype_f32_r, static_cast<rocblas_int>(rows), output,
+        rocblas_datatype_f32_r, static_cast<rocblas_int>(rows),
+        rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+    if (status != rocblas_status_success) {
+      SetError(error, "MiniMax H3 VisualVAE BF16 GEMM failed: " +
+                          std::to_string(static_cast<int>(status)));
+      return false;
+    }
+    return true;
+  }
+
 private:
   rocblas_handle handle_{nullptr};
   bool pinned_unavailable_{false};
+  DeviceBuffer input_bf16_;
 };
 
 class AttentionGemm {
@@ -637,6 +680,30 @@ struct VideoVaeDecoder::Impl {
                      error)) {
         return false;
       }
+      auto to_bf16 = [&](DeviceBuffer* buf, std::size_t elements) -> bool {
+        DeviceBuffer bf16;
+        if (!bf16.Allocate(elements * sizeof(std::uint16_t), error)) {
+          return false;
+        }
+        video_vae_ops::LaunchFloatToBf16(
+            buf->As<float>(), bf16.As<std::uint16_t>(), elements, stream);
+        if (hipStreamSynchronize(stream) != hipSuccess) {
+          SetError(error, "MiniMax H3 VisualVAE BF16 weight convert failed");
+          return false;
+        }
+        *buf = std::move(bf16);
+        return true;
+      };
+      if (!to_bf16(&weight.qkv_weight,
+                   static_cast<std::size_t>(kAttentionWidth) * 3U * kHidden) ||
+          !to_bf16(&weight.output_weight,
+                   static_cast<std::size_t>(kHidden) * kAttentionWidth) ||
+          !to_bf16(&weight.fc1_weight,
+                   static_cast<std::size_t>(kFeedForward) * 2U * kHidden) ||
+          !to_bf16(&weight.fc2_weight,
+                   static_cast<std::size_t>(kHidden) * kFeedForward)) {
+        return false;
+      }
     }
     if (!LoadNamed("decoder.norm_out.weight", {kHidden}, &final_norm_weight,
                    cancellation, error) ||
@@ -785,6 +852,15 @@ struct VideoVaeDecoder::Impl {
                     rows, output_width, input_width, stream, error);
   }
 
+  bool MatmulBf16(const DeviceBuffer& input, const DeviceBuffer& weight,
+                  DeviceBuffer* output, std::size_t rows,
+                  std::size_t input_width, std::size_t output_width,
+                  std::string* error) {
+    return gemm.RunBf16(weight.As<std::uint16_t>(), input.As<float>(),
+                        output->As<float>(), rows, output_width, input_width,
+                        stream, error);
+  }
+
   bool RunTile(int chunk, int tile_y, int tile_x,
                std::span<const int> local_frames,
                const CancellationToken* cancellation,
@@ -837,8 +913,8 @@ struct VideoVaeDecoder::Impl {
       video_vae_ops::LaunchRmsNorm(hidden.As<float>(), weight.norm1.As<float>(),
                                    norm.As<float>(), sequence, kHidden,
                                    kNormEpsilon, stream);
-      if (!Matmul(norm, weight.qkv_weight, &qkv, sequence, kHidden,
-                  kAttentionWidth * 3U, error)) {
+      if (!MatmulBf16(norm, weight.qkv_weight, &qkv, sequence, kHidden,
+                      kAttentionWidth * 3U, error)) {
         return false;
       }
       video_vae_ops::LaunchVideoQkvRope(
@@ -846,20 +922,13 @@ struct VideoVaeDecoder::Impl {
           rope_sin.As<float>(), query.As<float>(), key.As<float>(),
           value.As<float>(), sequence, kHeads, kHeadDimension, kRopeHalf,
           kNormEpsilon, stream);
-      if (!attention_gemm.Scores(
-              query.As<float>(), key.As<float>(), attention_scores.As<float>(),
-              sequence, 1.0F / std::sqrt(static_cast<float>(kHeadDimension)),
-              stream, error)) {
-        return false;
-      }
-      video_vae_ops::LaunchSoftmaxScoresInPlace(attention_scores.As<float>(),
-                                                sequence, kHeads, stream);
-      if (!CheckLaunch("H3 VisualVAE attention softmax", error) ||
-          !attention_gemm.Values(
-              value.As<float>(), attention_scores.As<float>(),
-              attention_heads.As<float>(), sequence, stream, error) ||
-          !Matmul(attention_heads, weight.output_weight, &branch, sequence,
-                  kAttentionWidth, kHidden, error)) {
+      video_vae_ops::LaunchVideoFlashAttention(
+          query.As<float>(), key.As<float>(), value.As<float>(),
+          attention_heads.As<float>(), sequence, kHeads,
+          1.0F / std::sqrt(static_cast<float>(kHeadDimension)), stream);
+      if (!CheckLaunch("H3 VisualVAE attention", error) ||
+          !MatmulBf16(attention_heads, weight.output_weight, &branch, sequence,
+                      kAttentionWidth, kHidden, error)) {
         return false;
       }
       video_vae_ops::LaunchScaleAdd(hidden.As<float>(), branch.As<float>(),
@@ -870,16 +939,16 @@ struct VideoVaeDecoder::Impl {
                                    norm.As<float>(), sequence, kHidden,
                                    kNormEpsilon, stream);
       if (!CheckLaunch("H3 VisualVAE attention residual/norm", error) ||
-          !Matmul(norm, weight.fc1_weight, &fc1, sequence, kHidden,
-                  kFeedForward * 2U, error)) {
+          !MatmulBf16(norm, weight.fc1_weight, &fc1, sequence, kHidden,
+                      kFeedForward * 2U, error)) {
         return false;
       }
       video_vae_ops::LaunchSwiGlu(fc1.As<float>(), weight.fc1_bias.As<float>(),
                                   activated.As<float>(), sequence, kFeedForward,
                                   stream);
       if (!CheckLaunch("H3 VisualVAE SwiGLU", error) ||
-          !Matmul(activated, weight.fc2_weight, &branch, sequence, kFeedForward,
-                  kHidden, error)) {
+          !MatmulBf16(activated, weight.fc2_weight, &branch, sequence,
+                      kFeedForward, kHidden, error)) {
         return false;
       }
       video_vae_ops::LaunchScaleAdd(

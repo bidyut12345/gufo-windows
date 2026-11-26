@@ -140,6 +140,60 @@ __global__ void AddBiasKernel(float* output, const float* bias,
   output[index] += bias[index % channels];
 }
 
+__global__ void FloatToBf16Kernel(const float* source,
+                                  std::uint16_t* destination,
+                                  std::size_t elements) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    const std::uint32_t bits = __float_as_uint(source[index]);
+    if ((bits & 0x7F800000U) == 0x7F800000U) {
+      destination[index] = static_cast<std::uint16_t>((bits | 0x0040U) >> 16U);
+    } else {
+      const std::uint32_t rounding = 0x7FFFU + ((bits >> 16U) & 1U);
+      destination[index] = static_cast<std::uint16_t>((bits + rounding) >> 16U);
+    }
+  }
+}
+
+void LaunchFloatToBf16(const float* source, std::uint16_t* destination,
+                       std::size_t elements, hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  hipLaunchKernelGGL(
+      FloatToBf16Kernel,
+      dim3(static_cast<std::uint32_t>((elements + kThreads - 1U) / kThreads)),
+      dim3(kThreads), 0, stream, source, destination, elements);
+}
+
+bool UploadBf16Weight(hipStream_t stream, EncDeviceBuffer& target,
+                      std::span<const float> values, std::string* error) {
+  std::vector<std::uint16_t> bf16(values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &values[i], sizeof(bits));
+    if ((bits & 0x7F800000U) == 0x7F800000U) {
+      bf16[i] = static_cast<std::uint16_t>((bits | 0x0040U) >> 16U);
+    } else {
+      const std::uint32_t rounding = 0x7FFFU + ((bits >> 16U) & 1U);
+      bf16[i] = static_cast<std::uint16_t>((bits + rounding) >> 16U);
+    }
+  }
+  if (!target.Allocate(bf16.size() * sizeof(std::uint16_t), error)) {
+    return false;
+  }
+  const hipError_t status =
+      hipMemcpyAsync(target.data(), bf16.data(),
+                     bf16.size() * sizeof(std::uint16_t),
+                     hipMemcpyHostToDevice, stream);
+  if (status != hipSuccess) {
+    EncSetError(error, std::string("upload MiniMax H3 VisualVAE encoder BF16 "
+                                   "weight: ") +
+                           hipGetErrorString(status));
+    return false;
+  }
+  return hipStreamSynchronize(stream) == hipSuccess;
+}
+
 void LaunchAddBias(float* output, const float* bias, std::uint32_t batch,
                    std::uint32_t channels, hipStream_t stream) {
   const std::size_t elements = static_cast<std::size_t>(batch) * channels;
@@ -431,9 +485,8 @@ struct VideoVaeEncoder::Impl {
     FlattenConvWeight(source, out_channels, in_channels, flat);
     conv->out_channels = static_cast<std::uint32_t>(out_channels);
     conv->columns = static_cast<std::uint32_t>(in_channels) * 9U;
-    if (!conv->weight.Allocate(flat.size() * sizeof(float), error) ||
+    if (!UploadBf16Weight(stream, conv->weight, flat, error) ||
         !conv->bias.Allocate(bias.size() * sizeof(float), error) ||
-        !UploadBuffer(stream, conv->weight, flat, error) ||
         !UploadBuffer(stream, conv->bias, bias, error)) {
       return false;
     }
@@ -457,9 +510,8 @@ struct VideoVaeEncoder::Impl {
     }
     conv->out_channels = static_cast<std::uint32_t>(out_channels);
     conv->columns = static_cast<std::uint32_t>(in_channels) * 27U;
-    if (!conv->weight.Allocate(source.size() * sizeof(float), error) ||
+    if (!UploadBf16Weight(stream, conv->weight, source, error) ||
         !conv->bias.Allocate(bias.size() * sizeof(float), error) ||
-        !UploadBuffer(stream, conv->weight, source, error) ||
         !UploadBuffer(stream, conv->bias, bias, error)) {
       return false;
     }
@@ -534,9 +586,8 @@ struct VideoVaeEncoder::Impl {
     }
     conv->out_channels = static_cast<std::uint32_t>(out_channels);
     conv->columns = static_cast<std::uint32_t>(in_channels);
-    if (!conv->weight.Allocate(source.size() * sizeof(float), error) ||
+    if (!UploadBf16Weight(stream, conv->weight, source, error) ||
         !conv->bias.Allocate(bias.size() * sizeof(float), error) ||
-        !UploadBuffer(stream, conv->weight, source, error) ||
         !UploadBuffer(stream, conv->bias, bias, error)) {
       return false;
     }
@@ -585,6 +636,8 @@ struct VideoVaeEncoder::Impl {
     return true;
   }
 
+  EncDeviceBuffer input_bf16;
+
   bool Gemm(const FlatConv& conv, const float* input, float* output,
             std::size_t batch, std::string* error) {
     if (batch == 0) {
@@ -594,21 +647,31 @@ struct VideoVaeEncoder::Impl {
       EncSetError(error, "MiniMax H3 VisualVAE encoder set GEMM stream failed");
       return false;
     }
+    const std::size_t input_elements = batch * conv.columns;
+    const std::size_t bf16_bytes = input_elements * sizeof(std::uint16_t);
+    if (input_bf16.bytes() < bf16_bytes &&
+        !input_bf16.Allocate(bf16_bytes, error)) {
+      return false;
+    }
+    LaunchFloatToBf16(input, input_bf16.As<std::uint16_t>(), input_elements,
+                      stream);
     constexpr float alpha = 1.0F;
     constexpr float beta = 0.0F;
     const rocblas_status status = rocblas_gemm_ex(
         handle_, rocblas_operation_transpose, rocblas_operation_none,
         static_cast<rocblas_int>(conv.out_channels),
         static_cast<rocblas_int>(batch),
-        static_cast<rocblas_int>(conv.columns), &alpha, conv.weight.As<float>(),
-        rocblas_datatype_f32_r, static_cast<rocblas_int>(conv.columns), input,
-        rocblas_datatype_f32_r, static_cast<rocblas_int>(conv.columns), &beta,
-        output, rocblas_datatype_f32_r,
-        static_cast<rocblas_int>(conv.out_channels), output,
+        static_cast<rocblas_int>(conv.columns), &alpha,
+        conv.weight.As<std::uint16_t>(), rocblas_datatype_bf16_r,
+        static_cast<rocblas_int>(conv.columns),
+        input_bf16.As<std::uint16_t>(), rocblas_datatype_bf16_r,
+        static_cast<rocblas_int>(conv.columns), &beta, output,
         rocblas_datatype_f32_r, static_cast<rocblas_int>(conv.out_channels),
-        rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+        output, rocblas_datatype_f32_r,
+        static_cast<rocblas_int>(conv.out_channels), rocblas_datatype_f32_r,
+        rocblas_gemm_algo_standard, 0, 0);
     if (status != rocblas_status_success) {
-      EncSetError(error, "MiniMax H3 VisualVAE encoder F32 GEMM failed: " +
+      EncSetError(error, "MiniMax H3 VisualVAE encoder BF16 GEMM failed: " +
                              std::to_string(static_cast<int>(status)));
       return false;
     }

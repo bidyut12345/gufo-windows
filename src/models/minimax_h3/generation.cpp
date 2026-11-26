@@ -19,6 +19,7 @@
 #include "src/models/minimax_h3/sampling.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 #include "src/models/minimax_h3/tokenizer.hpp"
+#include "src/models/minimax_h3/video_vae_encoder.hpp"
 
 namespace gufo::minimax_h3 {
 
@@ -1448,6 +1449,14 @@ bool GenerateTextVideo(const GenerationRequest& request,
     const std::size_t ref_count = ref_images.size();
     std::vector<std::size_t> cond_latent_sizes;
     cond_latent_sizes.reserve(keyframes.size() + ref_videos.size());
+    std::unique_ptr<VideoVaeEncoder> shared_vae_encoder;
+    auto ensure_vae_encoder = [&]() -> VideoVaeEncoder* {
+      if (shared_vae_encoder == nullptr) {
+        shared_vae_encoder =
+            VideoVaeEncoder::Create(*inventory, cancellation, nullptr, error);
+      }
+      return shared_vae_encoder.get();
+    };
     auto encode_or_get_keyframe = [&](PreparedKeyframe& kf) -> bool {
       const std::string key = HashString(
           std::string(inventory->variant_dir()) + "|" +
@@ -1456,7 +1465,12 @@ bool GenerateTextVideo(const GenerationRequest& request,
       if (KeyframeLatentCache().Get(key, &kf.latent)) {
         return true;
       }
-      if (!EncodeKeyframeLatent(*inventory, kf, cancellation, nullptr, error)) {
+      VideoVaeEncoder* enc = ensure_vae_encoder();
+      if (enc == nullptr) {
+        return false;
+      }
+      if (!EncodeKeyframeLatent(*inventory, kf, cancellation, nullptr, error,
+                                enc)) {
         return false;
       }
       KeyframeLatentCache().Put(key, kf.latent);
@@ -1483,10 +1497,14 @@ bool GenerateTextVideo(const GenerationRequest& request,
       Report(progress, progress_opaque, "video_ref_vae", static_cast<int>(v),
              static_cast<int>(ref_videos.size()));
       const DecodedReferenceVideo& vid = ref_videos[v];
+      VideoVaeEncoder* enc = ensure_vae_encoder();
+      if (enc == nullptr) {
+        return false;
+      }
       if (!EncodeVideoReferenceLatent(
               *inventory, vid.rgb24, vid.frame_count, vid.width, vid.height,
               cancellation, nullptr, &encoded_videos[v].latent,
-              &encoded_videos[v].latent_frames, error)) {
+              &encoded_videos[v].latent_frames, error, enc)) {
         return false;
       }
       Report(progress, progress_opaque, "video_ref_vae",
