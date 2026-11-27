@@ -951,7 +951,9 @@ bool ValidateGenerationParameters(const GenerationParameters& parameters,
       (parameters.output_height & 1) != 0 || parameters.evaluations < 2 ||
       parameters.evaluations > kH3MaximumEvaluations ||
       parameters.active_blocks < 3 || parameters.active_blocks > 50 ||
-      parameters.reuse_interval < 1 || parameters.reuse_interval > 32) {
+      parameters.reuse_interval < 1 || parameters.reuse_interval > 32 ||
+      !std::isfinite(parameters.cfg_scale) || parameters.cfg_scale < 1.0F ||
+      parameters.cfg_scale > 20.0F) {
     SetError(error, "invalid MiniMax H3 generation parameters");
     return false;
   }
@@ -981,10 +983,9 @@ bool ValidateGenerationParameters(const GenerationParameters& parameters,
     }
     previous = frame;
   }
-  if (parameters.mux &&
-      (!parameters.decode_audio || !parameters.selected_frames.empty())) {
+  if (parameters.mux && !parameters.selected_frames.empty()) {
     SetError(error,
-             "MiniMax H3 MP4 output requires audio and every video frame");
+             "MiniMax H3 MP4 output requires every video frame");
     return false;
   }
   return true;
@@ -1014,6 +1015,7 @@ std::string GenerationParametersJson(const GenerationParameters& parameters,
          << "  \"evaluations\": " << parameters.evaluations << ",\n"
          << "  \"active_blocks\": " << parameters.active_blocks << ",\n"
          << "  \"reuse_interval\": " << parameters.reuse_interval << ",\n"
+         << "  \"cfg_scale\": " << parameters.cfg_scale << ",\n"
          << "  \"attention_kernel\": \""
          << (parameters.row_parallel_attention ? "row_parallel" : "scalar")
          << "\",\n"
@@ -1201,6 +1203,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
       static_cast<std::size_t>(geometry->latent_width);
 
   PromptEmbedding embedding;
+  PromptEmbedding uncond_embedding;
   std::vector<float> condition_rows;
   std::vector<double> anchor_temporal;
   std::vector<ConditionBlock> condition_blocks;
@@ -1434,6 +1437,114 @@ bool GenerateTextVideo(const GenerationRequest& request,
       return false;
     }
     PromptCache().Put(prompt_cache_key, embedding);
+  }
+  if (parameters.cfg_scale > 1.0F) {
+    const std::string uncond_sha256 = Sha256(std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(request.negative_prompt.data()),
+        request.negative_prompt.size()));
+    std::string uncond_cache_key;
+    {
+      std::ostringstream key_stream;
+      key_stream << "uncond|" << inventory->variant_dir() << '|'
+                 << uncond_sha256 << '|' << keyframes.size() << '|'
+                 << ref_videos.size();
+      for (const PreparedKeyframe& kf : keyframes) {
+        key_stream << '|' << kf.width << 'x' << kf.height << ':'
+                   << HashBytes(kf.rgb);
+      }
+      for (const DecodedReferenceVideo& vid : ref_videos) {
+        key_stream << '|' << vid.width << 'x' << vid.height << 'x'
+                   << vid.frame_count << ':' << HashBytes(vid.rgb24);
+      }
+      uncond_cache_key = HashString(key_stream.str());
+    }
+    if (!PromptCache().Get(uncond_cache_key, &uncond_embedding)) {
+      if (keyframes.empty() && ref_videos.empty()) {
+        std::vector<std::uint32_t> uncond_tokens;
+        if (!tokenizer.EncodePrompt(request.negative_prompt, &uncond_tokens,
+                                    error) ||
+            uncond_tokens.empty() ||
+            !EncodePromptLayer50(*inventory, uncond_tokens, {}, cancellation,
+                                 &uncond_embedding, &local.prompt_encoder,
+                                 error)) {
+          return false;
+        }
+      } else {
+        std::vector<MultimodalBlock> vision_blocks;
+        std::vector<KeyframeVision> visions;
+        for (std::size_t i = 0; i < keyframes.size(); ++i) {
+          KeyframeVision vision;
+          if (!image_processor::BuildKeyframeVision(
+                  keyframes[i].rgb, keyframes[i].width, keyframes[i].height,
+                  &vision, error)) {
+            return false;
+          }
+          vision_blocks.push_back(
+              {.prefix_label = "<Picture " + std::to_string(i + 1) + ">: ",
+               .is_video = false,
+               .grid_h = vision.grid_h,
+               .grid_w = vision.grid_w});
+          visions.push_back(std::move(vision));
+        }
+        for (std::size_t v = 0; v < ref_videos.size(); ++v) {
+          const DecodedReferenceVideo& vid = ref_videos[v];
+          constexpr double kSampleFps = 2.0;
+          constexpr double kStride = 24.0 / kSampleFps;
+          std::vector<int> indices;
+          double cursor = 0.0;
+          while (static_cast<int>(std::llround(cursor)) < vid.frame_count) {
+            const int idx = static_cast<int>(std::llround(cursor));
+            if (indices.empty() || idx > indices.back()) {
+              indices.push_back(idx);
+            }
+            cursor += kStride;
+          }
+          std::vector<double> timestamps;
+          timestamps.reserve(indices.size() + 1U);
+          for (std::size_t k = 0; k < indices.size(); ++k) {
+            timestamps.push_back(static_cast<double>(k) / kSampleFps);
+          }
+          if (timestamps.size() % 2U != 0U) {
+            indices.push_back(indices.back());
+            timestamps.push_back(timestamps.back());
+          }
+          const std::size_t frame_bytes =
+              static_cast<std::size_t>(vid.width) * vid.height * 3U;
+          for (std::size_t p = 0; p < indices.size(); p += 2U) {
+            KeyframeVision vision;
+            const std::uint8_t* f0 = vid.rgb24.data() +
+                                     static_cast<std::size_t>(indices[p]) *
+                                         frame_bytes;
+            const std::uint8_t* f1 = vid.rgb24.data() +
+                                     static_cast<std::size_t>(indices[p + 1U]) *
+                                         frame_bytes;
+            if (!image_processor::BuildVideoPairVision(
+                    f0, f1, vid.width, vid.height, &vision, error)) {
+              return false;
+            }
+            const double mean_ts = (timestamps[p] + timestamps[p + 1U]) * 0.5;
+            std::ostringstream label;
+            if (p == 0U) {
+              label << "<Video " << (v + 1) << ">: ";
+            }
+            label << "<" << std::fixed << std::setprecision(1) << mean_ts
+                  << " seconds>";
+            vision_blocks.push_back({.prefix_label = label.str(),
+                                     .is_video = true,
+                                     .grid_h = vision.grid_h,
+                                     .grid_w = vision.grid_w});
+            visions.push_back(std::move(vision));
+          }
+        }
+        if (!EncodePromptWithVisions(
+                *inventory, tokenizer, request.negative_prompt, vision_blocks,
+                visions, cancellation, &uncond_embedding, &local.prompt_encoder,
+                error)) {
+          return false;
+        }
+      }
+      PromptCache().Put(uncond_cache_key, uncond_embedding);
+    }
   }
   local.prompt_ms = Milliseconds(begin, Clock::now());
   Report(progress, progress_opaque, "prompt", 1, 1);
@@ -1740,6 +1851,48 @@ bool GenerateTextVideo(const GenerationRequest& request,
           }
         }
       }
+      std::vector<double> uncond_anchor_temporal;
+      std::vector<ConditionBlock> uncond_condition_blocks;
+      double uncond_target_temporal_origin = 0.0;
+      if (parameters.cfg_scale > 1.0F) {
+        if (uncond_embedding.tokens == 0) {
+          Tokenizer tokenizer;
+          std::vector<std::uint32_t> uncond_tokens;
+          if (!Tokenizer::Load(
+                  request.model_root / inventory->variant_dir() /
+                      "tokenizer/tokenizer.json",
+                  &tokenizer, error) ||
+              !tokenizer.EncodePrompt(request.negative_prompt, &uncond_tokens,
+                                      error) ||
+              uncond_tokens.empty() ||
+              !EncodePromptLayer50(*inventory, uncond_tokens, {}, cancellation,
+                                   &uncond_embedding, &local.prompt_encoder,
+                                   error)) {
+            return false;
+          }
+        }
+        if (!anchor_temporal.empty()) {
+          auto anchors = KeyframeAnchorTimes(
+              uncond_embedding.tokens, geometry->temporal.video_latent_frames,
+              !request.first_frame_path.empty(),
+              !request.last_frame_path.empty(), error);
+          if (!anchors.has_value()) {
+            return false;
+          }
+          uncond_anchor_temporal = std::move(*anchors);
+        } else if (!condition_blocks.empty()) {
+          const double delta =
+              static_cast<double>(uncond_embedding.tokens) -
+              static_cast<double>(embedding.tokens);
+          uncond_condition_blocks = condition_blocks;
+          for (ConditionBlock& blk : uncond_condition_blocks) {
+            blk.temporal += delta;
+          }
+          if (target_temporal_origin > 0.0) {
+            uncond_target_temporal_origin = target_temporal_origin + delta;
+          }
+        }
+      }
       auto denoiser = DenoiserSession::Create(
           *inventory,
           {.geometry = *geometry,
@@ -1749,13 +1902,20 @@ bool GenerateTextVideo(const GenerationRequest& request,
            .reuse_interval = parameters.reuse_interval,
            .row_parallel_attention = parameters.row_parallel_attention,
            .condition_video_rows = condition_rows.size() / kH3VideoPatchWidth,
+           .cfg_scale = parameters.cfg_scale,
+           .uncond_text_rows = uncond_embedding.tokens,
            .loras = std::move(dit_loras)},
           {.layer50 = embedding.values,
            .tags = tags,
+           .uncond_layer50 = uncond_embedding.values,
+           .uncond_tags = uncond_embedding.tags,
            .condition_rows = condition_rows,
            .anchor_temporal = anchor_temporal,
+           .uncond_anchor_temporal = uncond_anchor_temporal,
            .condition_blocks = condition_blocks,
-           .target_temporal_origin = target_temporal_origin},
+           .uncond_condition_blocks = uncond_condition_blocks,
+           .target_temporal_origin = target_temporal_origin,
+           .uncond_target_temporal_origin = uncond_target_temporal_origin},
           cancellation, &local.denoiser, error);
       if (denoiser == nullptr) {
         return false;
@@ -1841,8 +2001,8 @@ bool GenerateTextVideo(const GenerationRequest& request,
     return false;
   }
 
+  AudioWaveform waveform;
   if (parameters.decode_audio) {
-    AudioWaveform waveform;
     if (resumed_stage >= CheckpointStage::kAudioVae) {
       if (!LoadAudioVaeCheckpoint(request.checkpoint_directory, &waveform,
                                   error)) {
@@ -1878,23 +2038,34 @@ bool GenerateTextVideo(const GenerationRequest& request,
         }
       }
     }
-    if (parameters.mux) {
-      begin = Clock::now();
-      const std::vector<std::uint8_t> rgb24 = ToRgb24(frames);
-      if (!WriteSynchronizedMp4(request.output_path, rgb24,
-                                static_cast<int>(frames.frame_indices.size()),
-                                {.input_width = frames.width,
-                                 .input_height = frames.height,
-                                 .output_width = parameters.output_width,
-                                 .output_height = parameters.output_height,
-                                 .fps = kH3FramesPerSecond},
-                                waveform.pcm, waveform.samples,
-                                waveform.channels, waveform.sample_rate,
-                                cancellation, &local.media, error)) {
-        return false;
-      }
-      local.media_ms = Milliseconds(begin, Clock::now());
+  } else if (parameters.mux) {
+    constexpr int kSilentSampleRate = 44100;
+    constexpr int kSilentChannels = 2;
+    const int frame_count = static_cast<int>(frames.frame_indices.size());
+    waveform.sample_rate = kSilentSampleRate;
+    waveform.channels = kSilentChannels;
+    waveform.samples = static_cast<int>(std::llround(
+        static_cast<double>(frame_count) / kH3FramesPerSecond *
+        kSilentSampleRate));
+    waveform.pcm.assign(
+        static_cast<std::size_t>(waveform.samples) * kSilentChannels, 0.0F);
+  }
+  if (parameters.mux) {
+    begin = Clock::now();
+    const std::vector<std::uint8_t> rgb24 = ToRgb24(frames);
+    if (!WriteSynchronizedMp4(request.output_path, rgb24,
+                              static_cast<int>(frames.frame_indices.size()),
+                              {.input_width = frames.width,
+                               .input_height = frames.height,
+                               .output_width = parameters.output_width,
+                               .output_height = parameters.output_height,
+                               .fps = kH3FramesPerSecond},
+                              waveform.pcm, waveform.samples,
+                              waveform.channels, waveform.sample_rate,
+                              cancellation, &local.media, error)) {
+      return false;
     }
+    local.media_ms = Milliseconds(begin, Clock::now());
   }
   if (has_checkpoint) {
     std::error_code ignored;

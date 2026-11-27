@@ -78,6 +78,18 @@ __global__ void EulerUpdateKernel(float* sample, std::size_t sample_offset,
   sample[sample_index] = sample_term + denoised_term;
 }
 
+__global__ void CfgCombineKernel(float* cond, const float* uncond,
+                                 std::size_t elements, float cfg_scale) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= elements) {
+    return;
+  }
+  const float u = uncond[index];
+  const float c = cond[index];
+  cond[index] = u + cfg_scale * (c - u);
+}
+
 }  // namespace
 
 bool HipEulerUpdate(void* sample_f32, std::size_t sample_elements,
@@ -115,6 +127,36 @@ bool HipEulerUpdate(void* sample_f32, std::size_t sample_elements,
   const hipError_t status = hipGetLastError();
   if (status != hipSuccess) {
     SetError(error, std::string("MiniMax H3 Euler kernel launch: ") +
+                        hipGetErrorString(status));
+    return false;
+  }
+  return true;
+}
+
+bool HipCfgCombine(void* cond_f32, const void* uncond_f32, std::size_t elements,
+                   float cfg_scale, void* stream, std::string* error) {
+  if (cond_f32 == nullptr || uncond_f32 == nullptr || elements == 0 ||
+      elements >
+          static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()) *
+              256ULL ||
+      !std::isfinite(cfg_scale) || cfg_scale < 1.0F || cfg_scale > 20.0F) {
+    SetError(error, "invalid MiniMax H3 HIP CFG combine");
+    return false;
+  }
+  if (!ValidateTarget(error)) {
+    return false;
+  }
+  constexpr unsigned int kThreads = 256;
+  const unsigned int blocks =
+      static_cast<unsigned int>((elements + kThreads - 1) / kThreads);
+  hipLaunchKernelGGL(CfgCombineKernel, dim3(blocks), dim3(kThreads), 0,
+                     static_cast<hipStream_t>(stream),
+                     static_cast<float*>(cond_f32),
+                     static_cast<const float*>(uncond_f32), elements,
+                     cfg_scale);
+  const hipError_t status = hipGetLastError();
+  if (status != hipSuccess) {
+    SetError(error, std::string("MiniMax H3 CFG kernel launch: ") +
                         hipGetErrorString(status));
     return false;
   }

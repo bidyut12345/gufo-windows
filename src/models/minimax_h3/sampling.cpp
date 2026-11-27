@@ -1082,6 +1082,18 @@ bool HipEulerUpdate(void* sample_f32, std::size_t sample_elements,
            "MiniMax H3 GPU-state Euler updates require ENGINE_ENABLE_HIP");
   return false;
 }
+
+bool HipCfgCombine(void* cond_f32, const void* uncond_f32, std::size_t elements,
+                   float cfg_scale, void* stream, std::string* error) {
+  (void)cond_f32;
+  (void)uncond_f32;
+  (void)elements;
+  (void)cfg_scale;
+  (void)stream;
+  SetError(error,
+           "MiniMax H3 GPU-state CFG combine requires ENGINE_ENABLE_HIP");
+  return false;
+}
 #endif
 
 }  // namespace gufo::minimax_h3

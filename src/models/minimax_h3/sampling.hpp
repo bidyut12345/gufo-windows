@@ -245,6 +245,12 @@ struct EulerStepPlan {
     std::size_t velocity_elements, float sigma_from_timestep, float ratio,
     float extrapolation, void* stream, std::string* error = nullptr);
 
+// Combines conditional and unconditional F32 velocities in-place:
+// cond[i] = uncond[i] + cfg_scale * (cond[i] - uncond[i]).
+[[nodiscard]] bool HipCfgCombine(void* cond_f32, const void* uncond_f32,
+                                 std::size_t elements, float cfg_scale,
+                                 void* stream, std::string* error = nullptr);
+
 }  // namespace gufo::minimax_h3
 
 #endif  // GUFO_MODELS_MINIMAX_H3_SAMPLING_HPP_

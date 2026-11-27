@@ -26,6 +26,7 @@ struct VideoParameters {
   bool row_parallel_attention{true};
   bool decode_audio{true};
   bool mux{true};
+  float cfg_scale{1.0f};
   std::vector<int> selected_frames;
 };
 
@@ -42,6 +43,7 @@ struct VideoRequest {
   std::filesystem::path frames_directory;
   std::filesystem::path latents_directory;
   std::string prompt;
+  std::string negative_prompt;
   std::uint64_t seed{0};
   VideoParameters parameters;
   /// Optional keyframe conditioning anchors (issue #177). Empty paths select
@@ -91,6 +93,14 @@ struct VideoResult {
   std::string error;
 };
 
+struct VideoAnalyzeRequest {
+  std::filesystem::path model_root;
+  std::filesystem::path source_manifest;
+  std::vector<std::filesystem::path> image_paths;
+  std::string prompt;
+  std::size_t max_new_tokens{512};
+};
+
 using VideoProgress = void (*)(std::string_view phase, int completed, int total,
                                void* opaque);
 using CancellationCheck = std::function<bool()>;
@@ -130,6 +140,10 @@ struct VideoProvider {
                                  std::uint64_t seed,
                                  std::string_view prompt_sha256) = nullptr;
   std::string (*telemetry_json)(const VideoTelemetry& telemetry) = nullptr;
+  bool (*analyze_frames)(const VideoAnalyzeRequest& request,
+                         const CancellationCheck& is_cancelled,
+                         std::string* output_text,
+                         std::string* error) = nullptr;
 };
 
 void RegisterVideoProvider(VideoProvider provider);

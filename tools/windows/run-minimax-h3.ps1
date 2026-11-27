@@ -15,6 +15,11 @@ param(
   [int]$BackendPort = 8081,
   [int64]$Ttl = 3153600000,
   [int]$MaxRequestBytes = 268435456,
+  [string]$VisionBackend = "",
+  [string]$VisionModel = "",
+  [string]$VlmModel = "",
+  [string]$VlmMmproj = "",
+  [switch]$AutoVlm,
   [switch]$NoWebUi,
   [switch]$NoBrowser
 )
@@ -144,8 +149,21 @@ try {
       "--backend", "http://${BindHost}:${gufoPort}",
       "--model", $ModelName,
       "--save-dir", (Join-Path $JobsRoot "saved"),
+      "--gufo-exe", $gufoExe,
       "--parent-pid", "$($gufoProc.Id)"
     )
+    if ($VisionBackend) {
+      $webArgs += @("--vision-backend", $VisionBackend)
+    }
+    if ($VisionModel) {
+      $webArgs += @("--vision-model", $VisionModel)
+    }
+    if ($VlmModel) {
+      $webArgs += @("--vlm-model", $VlmModel)
+      if ($VlmMmproj) {
+        $webArgs += @("--vlm-mmproj", $VlmMmproj)
+      }
+    }
     $webProc = Start-Process -FilePath $pythonCmd.Source -ArgumentList $webArgs -NoNewWindow -PassThru
     $webUrl = "http://127.0.0.1:${Port}/"
     Show-WebUiUrls -WebHost $WebHost -Port $Port -Label "Video WebUI"

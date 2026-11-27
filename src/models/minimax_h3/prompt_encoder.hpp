@@ -16,6 +16,7 @@
 namespace gufo::minimax_h3 {
 
 inline constexpr std::size_t kPromptEncoderLayers = 50;
+inline constexpr std::size_t kPromptEncoderFullLayers = 64;
 inline constexpr std::size_t kPromptEncoderHiddenSize = 5120;
 inline constexpr std::size_t kPromptEncoderIntermediateSize = 25600;
 inline constexpr std::size_t kPromptEncoderQueryHeads = 64;
@@ -119,6 +120,21 @@ struct MultimodalBlock {
     const std::vector<KeyframeVision>& visions,
     const CancellationToken* cancellation, PromptEmbedding* output,
     PromptEncoderTelemetry* telemetry, std::string* error = nullptr);
+
+struct VlmRequest {
+  std::vector<std::filesystem::path> image_paths;
+  std::string prompt;
+  std::size_t max_new_tokens{512};
+};
+
+// Runs full 64-layer Qwen3-VL autoregressive text generation using the
+// MiniMax H3 text_encoder (vision tower + 64 language layers + final RMSNorm +
+// lm_head) for multimodal tasks such as character detection in video frames.
+[[nodiscard]] bool GenerateVlmText(const ModelInventory& inventory,
+                                   const VlmRequest& request,
+                                   const CancellationToken* cancellation,
+                                   std::string* output_text,
+                                   std::string* error = nullptr);
 
 [[nodiscard]] std::uint64_t PromptEncoderLiveRegisteredHostBytes() noexcept;
 

@@ -31,21 +31,28 @@ struct DenoiserOptions {
   // FL2VA keyframe anchors ride as extra leading video rows; zero keeps the
   // text-only packed sequence [text | audio | video].
   std::size_t condition_video_rows{0};
+  float cfg_scale{1.0F};
+  std::size_t uncond_text_rows{0};
   std::shared_ptr<const DitLoras> loras;
 };
 
 struct DenoiserConditioning {
   std::span<const std::uint16_t> layer50;
   std::span<const std::uint8_t> tags;
+  std::span<const std::uint16_t> uncond_layer50;
+  std::span<const std::uint8_t> uncond_tags;
   // Patchified anchor rows in packed order (first, then last),
   // condition_video_rows * kH3VideoPatchWidth F32, frozen for the loop.
   std::span<const float> condition_rows;
   // fp64 rotary time per anchor, same packed order; empty for text-only.
   std::span<const double> anchor_temporal;
+  std::span<const double> uncond_anchor_temporal;
   // Ref2VA condition blocks (per-reference latent grid + rotary time).
   // Mutually exclusive with anchor_temporal.
   std::span<const ConditionBlock> condition_blocks;
+  std::span<const ConditionBlock> uncond_condition_blocks;
   double target_temporal_origin{0.0};
+  double uncond_target_temporal_origin{0.0};
 };
 
 struct DenoiserVelocity {

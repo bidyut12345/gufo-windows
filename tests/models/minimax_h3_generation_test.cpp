@@ -426,6 +426,29 @@ void TestAtomicLatents() {
   std::filesystem::remove_all(root, ignored);
 }
 
+void TestCfgParameters() {
+  std::string error;
+  auto params = h3::ResolveGenerationPreset("exact", &error);
+  Check(params.has_value(), "exact preset resolves for CFG test");
+  if (!params.has_value()) {
+    return;
+  }
+  Check(params->cfg_scale == 1.0F, "default cfg_scale is 1.0");
+  params->cfg_scale = 3.5F;
+  Check(h3::ValidateGenerationParameters(*params, &error),
+        "valid cfg_scale passes validation");
+  const std::string json =
+      h3::GenerationParametersJson(*params, 42, "abc123");
+  Check(json.find("\"cfg_scale\": 3.5") != std::string::npos,
+        "parameters JSON records cfg_scale");
+  params->cfg_scale = 0.5F;
+  Check(!h3::ValidateGenerationParameters(*params, &error),
+        "cfg_scale below 1.0 is rejected");
+  params->cfg_scale = 25.0F;
+  Check(!h3::ValidateGenerationParameters(*params, &error),
+        "cfg_scale above 20.0 is rejected");
+}
+
 }  // namespace
 
 int main() {
@@ -435,6 +458,7 @@ int main() {
   TestKeyframeCanvas();
   TestAtomicFrames();
   TestAtomicLatents();
+  TestCfgParameters();
 #if !defined(ENGINE_ENABLE_HIP)
   h3::GenerationTelemetry telemetry;
   std::string error;

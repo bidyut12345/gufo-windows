@@ -304,6 +304,73 @@ void CheckAttentionKernel() {
   CHECK(std::abs(ToFloat(long_got[last_base + 1U]) - 1.0F) < 0.02F);
 }
 
+void CheckDequantConvrotKernel() {
+  constexpr std::size_t kRows = 3;
+  constexpr std::size_t kCols = 512;
+  constexpr std::uint32_t kGroup = 256;
+  std::vector<std::int8_t> quantized(kRows * kCols);
+  for (std::size_t r = 0; r < kRows; ++r) {
+    for (std::size_t c = 0; c < kCols; ++c) {
+      quantized[r * kCols + c] =
+          static_cast<std::int8_t>(((r * 37 + c * 13) % 251) - 125);
+    }
+  }
+  const std::vector<float> scales = {0.01F, 0.025F, 0.005F};
+  DeviceArray<std::int8_t> d_src(quantized.size());
+  DeviceArray<float> d_scale(scales.size());
+  DeviceArray<std::uint16_t> d_dst(quantized.size());
+  CHECK(d_src && d_scale && d_dst);
+  CHECK(d_src.CopyFrom(quantized));
+  CHECK(d_scale.CopyFrom(scales));
+
+  // Unrotated baseline (convrot_groupsize = 0).
+  h3ops::LaunchDequantInt8ToBf16(d_src.get(), d_scale.get(), d_dst.get(), kRows,
+                                 kCols, scales.size(), nullptr, 0U);
+  CHECK(hipGetLastError() == hipSuccess);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  std::vector<std::uint16_t> got_plain(quantized.size());
+  CHECK(d_dst.CopyTo(got_plain));
+  std::vector<float> expected_plain(quantized.size());
+  for (std::size_t r = 0; r < kRows; ++r) {
+    for (std::size_t c = 0; c < kCols; ++c) {
+      expected_plain[r * kCols + c] =
+          static_cast<float>(quantized[r * kCols + c]) * scales[r];
+    }
+  }
+  CheckClose(got_plain, expected_plain, 0.02F);
+
+  // ConvRot RHT(H4) with groupsize = 256.
+  h3ops::LaunchDequantInt8ToBf16(d_src.get(), d_scale.get(), d_dst.get(), kRows,
+                                 kCols, scales.size(), nullptr, kGroup);
+  CHECK(hipGetLastError() == hipSuccess);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  std::vector<std::uint16_t> got_rot(quantized.size());
+  CHECK(d_dst.CopyTo(got_rot));
+
+  // CPU reference: 4-stage radix-4 Regular Hadamard Transform on each 256-block.
+  std::vector<float> expected_rot = expected_plain;
+  for (std::size_t r = 0; r < kRows; ++r) {
+    for (std::size_t g = 0; g < kCols / kGroup; ++g) {
+      float* block = expected_rot.data() + r * kCols + g * kGroup;
+      for (std::uint32_t stride = 1U; stride < kGroup; stride *= 4U) {
+        for (std::uint32_t tid = 0; tid < kGroup / 4U; ++tid) {
+          const std::uint32_t i0 = (tid / stride) * (4U * stride) + (tid % stride);
+          const float a = block[i0];
+          const float b = block[i0 + stride];
+          const float c = block[i0 + 2U * stride];
+          const float d = block[i0 + 3U * stride];
+          const float half_sum = 0.5F * (a + b + c + d);
+          block[i0] = half_sum - d;
+          block[i0 + stride] = half_sum - c;
+          block[i0 + 2U * stride] = half_sum - b;
+          block[i0 + 3U * stride] = half_sum - a;
+        }
+      }
+    }
+  }
+  CheckClose(got_rot, expected_rot, 0.03F);
+}
+
 bool CheckAnalytic() {
   int device = 0;
   hipDeviceProp_t properties{};
@@ -317,6 +384,7 @@ bool CheckAnalytic() {
   CheckRmsNormKernel();
   CheckHeadNormRopeKernels();
   CheckAttentionKernel();
+  CheckDequantConvrotKernel();
   CHECK(PromptEncoderLiveRegisteredHostBytes() == 0);
   return true;
 }

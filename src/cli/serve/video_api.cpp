@@ -339,6 +339,14 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   // stay canonical (#957).
   const std::string model = service.normalize_model(model_value->str());
   const std::string prompt = prompt_value->str();
+  std::string negative_prompt;
+  if (const json::Value* neg_value = body.find("negative_prompt")) {
+    if (!neg_value->is_string()) {
+      return Error(400, "Bad Request", "'negative_prompt' must be a string",
+                   "invalid_parameter_type");
+    }
+    negative_prompt = neg_value->str();
+  }
   const std::string size = body.member_str("size", "512x512");
   const json::Value* seconds_value = body.find("seconds");
   std::string seconds;
@@ -381,15 +389,21 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   std::optional<int> frames;
   std::optional<int> selected_frame;
   std::optional<int> steps_evaluations;
+  std::optional<int> active_blocks;
+  std::optional<int> reuse_interval;
   bool lock_resolution = false;
   bool step_reuse = false;
+  bool decode_audio = true;
+  float cfg_scale = 1.0F;
   bool preset_explicit = false;
   if (const json::Value* extension = body.find("gufo")) {
     if (!extension->is_object() ||
         !HasOnlyMembers(*extension, {"preset", "seed", "frames",
                                      "output_format", "selected_frame",
                                      "steps", "lock_resolution",
-                                     "step_reuse"})) {
+                                     "step_reuse", "decode_audio",
+                                     "cfg_scale", "active_blocks",
+                                     "reuse_interval"})) {
       return Error(400, "Bad Request",
                    "'gufo' must contain only supported video options",
                    "invalid_strix_options");
@@ -461,6 +475,45 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       }
       step_reuse = reuse_val->as_bool();
     }
+    if (extension->contains("decode_audio")) {
+      const json::Value* audio_val = extension->find("decode_audio");
+      if (!audio_val->is_bool()) {
+        return Error(400, "Bad Request",
+                     "'gufo.decode_audio' must be a boolean",
+                     "invalid_decode_audio");
+      }
+      decode_audio = audio_val->as_bool();
+    }
+    if (extension->contains("cfg_scale")) {
+      const json::Value* cfg_val = extension->find("cfg_scale");
+      if (!cfg_val->is_number() || !std::isfinite(cfg_val->as_double()) ||
+          cfg_val->as_double() < 1.0 || cfg_val->as_double() > 20.0) {
+        return Error(400, "Bad Request",
+                     "'gufo.cfg_scale' must be a number between 1.0 and 20.0",
+                     "invalid_cfg_scale");
+      }
+      cfg_scale = static_cast<float>(cfg_val->as_double());
+    }
+    if (extension->contains("active_blocks")) {
+      const auto parsed_blocks = JsonFrame(extension->find("active_blocks"));
+      if (!parsed_blocks.has_value() || *parsed_blocks < 3 ||
+          *parsed_blocks > 50) {
+        return Error(400, "Bad Request",
+                     "'gufo.active_blocks' must be an integer between 3 and 50",
+                     "invalid_active_blocks");
+      }
+      active_blocks = *parsed_blocks;
+    }
+    if (extension->contains("reuse_interval")) {
+      const auto parsed_reuse = JsonFrame(extension->find("reuse_interval"));
+      if (!parsed_reuse.has_value() || *parsed_reuse < 1 ||
+          *parsed_reuse > 32) {
+        return Error(400, "Bad Request",
+                     "'gufo.reuse_interval' must be an integer between 1 and 32",
+                     "invalid_reuse_interval");
+      }
+      reuse_interval = *parsed_reuse;
+    }
   }
   if (preset_explicit && !model_preset.empty() && preset != model_preset) {
     return Error(400, "Bad Request",
@@ -480,6 +533,14 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     parameters->reuse_interval = 2;
     parameters->active_blocks = 45;
   }
+  if (active_blocks.has_value()) {
+    parameters->active_blocks = *active_blocks;
+  }
+  if (reuse_interval.has_value()) {
+    parameters->reuse_interval = *reuse_interval;
+  }
+  parameters->decode_audio = decode_audio;
+  parameters->cfg_scale = cfg_scale;
   if (size_value != nullptr && output_format == "mp4" &&
       model == "minimax-h3" &&
       (parameters->preset == "exact-512" ||
@@ -711,6 +772,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   const VideoJobCreateResult created = service.Create({
       .model = model,
       .prompt = prompt,
+      .negative_prompt = negative_prompt,
       .size = size,
       .seconds = seconds,
       .output_format = output_format,
@@ -984,6 +1046,89 @@ HttpResponse HandleVideoApiRequest(const HttpRequest& request,
         .status = 200,
         .reason = "OK",
         .body = body.dump(),
+        .headers = {},
+        .streaming_body = {},
+    };
+  }
+  if (request.path == "/v1/videos/analyze") {
+    if (request.method != "POST") {
+      return Error(405, "Method Not Allowed", "method is not allowed",
+                   "method_not_allowed");
+    }
+    json::Value body;
+    try {
+      body = json::parse(request.body);
+    } catch (const std::exception&) {
+      return Error(400, "Bad Request", "request body must be valid JSON",
+                   "parse_error");
+    }
+    if (!body.is_object()) {
+      return Error(400, "Bad Request", "request body must be a JSON object",
+                   "invalid_body");
+    }
+    const json::Value* images_val = body.find("images");
+    const json::Value* prompt_val = body.find("prompt");
+    if (images_val == nullptr || !images_val->is_array() ||
+        images_val->items().empty() || prompt_val == nullptr ||
+        !prompt_val->is_string() || prompt_val->str().empty()) {
+      return Error(400, "Bad Request",
+                   "'images' (non-empty array) and 'prompt' (string) are required",
+                   "missing_required_parameter");
+    }
+    if (images_val->items().size() > 6U) {
+      return Error(400, "Bad Request", "'images' accepts at most 6 frames",
+                   "too_many_images");
+    }
+    std::vector<std::vector<std::uint8_t>> images;
+    images.reserve(images_val->items().size());
+    for (const json::Value& item : images_val->items()) {
+      if (!item.is_string() || !item.str().starts_with("data:")) {
+        return Error(400, "Bad Request",
+                     "each 'images' entry must be a base64 image data URL",
+                     "invalid_image");
+      }
+      try {
+        core::ImageReadBudget budget;
+        std::vector<std::uint8_t> bytes = core::ReadImageUrl(item.str(), budget);
+        const core::Image decoded = core::DecodeImage(bytes);
+        if (decoded.width == 0 || decoded.height == 0) {
+          throw std::invalid_argument("empty decode");
+        }
+        images.push_back(std::move(bytes));
+      } catch (const std::exception&) {
+        return Error(400, "Bad Request",
+                     "each 'images' entry must be a decodable PNG, JPEG, or WebP image",
+                     "invalid_image");
+      }
+    }
+    std::size_t max_tokens = 512;
+    if (const json::Value* mt = body.find("max_tokens")) {
+      const auto parsed = JsonUnsigned(mt);
+      if (!parsed.has_value() || *parsed == 0 || *parsed > 1024) {
+        return Error(400, "Bad Request",
+                     "'max_tokens' must be an integer between 1 and 1024",
+                     "invalid_max_tokens");
+      }
+      max_tokens = static_cast<std::size_t>(*parsed);
+    }
+    std::string output_text;
+    std::string analyze_error;
+    if (!service.AnalyzeFrames(images, prompt_val->str(), max_tokens,
+                               &output_text, &analyze_error)) {
+      HttpResponse err_resp =
+          Error(500, "Internal Server Error",
+                analyze_error.empty() ? "VLM frame analysis failed"
+                                      : analyze_error,
+                "vlm_analysis_failed");
+      err_resp.log_details = "error=" + analyze_error;
+      return err_resp;
+    }
+    json::Value resp = json::Value::object();
+    resp["text"] = std::move(output_text);
+    return {
+        .status = 200,
+        .reason = "OK",
+        .body = resp.dump(),
         .headers = {},
         .streaming_body = {},
     };

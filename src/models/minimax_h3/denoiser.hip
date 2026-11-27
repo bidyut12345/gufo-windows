@@ -849,12 +849,16 @@ struct DenoiserSession::Impl {
   const ModelInventory* inventory{nullptr};
   GenerationGeometry geometry;
   PackedLayout layout;
+  PackedLayout uncond_layout;
   SigmaSchedule schedule;
   TimeRowSchedule time_rows;
   std::vector<EulerStepPlan> euler_plan;
   std::vector<std::uint8_t> text_tags;
+  std::vector<std::uint8_t> uncond_text_tags;
   std::vector<std::vector<std::uint32_t>> row_maps;
+  std::vector<std::vector<std::uint32_t>> uncond_row_maps;
   std::vector<std::uint16_t> refined_text_host;
+  std::vector<std::uint16_t> uncond_refined_text_host;
   std::vector<std::uint16_t> block0_modulation_host;
   std::vector<std::uint16_t> final_modulation_host;
   std::vector<float> video_rows_host;
@@ -888,6 +892,10 @@ struct DenoiserSession::Impl {
   DeviceBuffer block_row_map;
   DeviceBuffer video_velocity_f32;
   DeviceBuffer audio_velocity_f32;
+  DeviceBuffer uncond_video_velocity_f32;
+  DeviceBuffer uncond_audio_velocity_f32;
+  DeviceBuffer uncond_rope_cos_device;
+  DeviceBuffer uncond_rope_sin_device;
   DeviceBuffer previous_video_velocity_f32;
   DeviceBuffer previous_audio_velocity_f32;
 
@@ -895,7 +903,13 @@ struct DenoiserSession::Impl {
   int active_blocks{static_cast<int>(kDitBlocks)};
   int reuse_interval{1};
   bool row_parallel_attention{true};
+  float cfg_scale{1.0F};
   std::shared_ptr<const DitLoras> loras;
+
+  [[nodiscard]] std::size_t MaxLayoutRows() const noexcept {
+    return cfg_scale > 1.0F ? std::max(layout.rows(), uncond_layout.rows())
+                            : layout.rows();
+  }
 
   ~Impl() {
     if (staging != nullptr) {
@@ -928,10 +942,10 @@ struct DenoiserSession::Impl {
     return true;
   }
 
-  bool RefineText(std::span<const std::uint16_t> conditioning,
+  bool RefineText(std::span<const std::uint16_t> conditioning, std::size_t rows,
+                  std::vector<std::uint16_t>* out_refined_text,
                   const CancellationToken* cancellation, std::string* error) {
     const auto begin = Clock::now();
-    const std::size_t rows = layout.text_rows;
     const std::size_t hidden_elements = rows * kDitHiddenSize;
     const std::size_t attention_elements = rows * kDitAttentionWidth;
     const std::size_t qkv_elements = attention_elements * 3U;
@@ -1129,9 +1143,9 @@ struct DenoiserSession::Impl {
     if (!CheckLaunch("H3 refiner final norm", error)) {
       return false;
     }
-    refined_text_host.resize(hidden_elements);
-    if (!CopyAsync(refined_text_host.data(), hidden.data(),
-                   refined_text_host.size() * sizeof(std::uint16_t),
+    out_refined_text->resize(hidden_elements);
+    if (!CopyAsync(out_refined_text->data(), hidden.data(),
+                   out_refined_text->size() * sizeof(std::uint16_t),
                    hipMemcpyDeviceToHost, "read H3 refined text", error) ||
         hipStreamSynchronize(stream) != hipSuccess) {
       if (error != nullptr && error->empty()) {
@@ -1139,11 +1153,12 @@ struct DenoiserSession::Impl {
       }
       return false;
     }
-    base_telemetry.text_refiner_ms = Milliseconds(begin, Clock::now());
+    base_telemetry.text_refiner_ms += Milliseconds(begin, Clock::now());
     return true;
   }
 
-  bool BuildRope(std::vector<std::uint16_t>* cosine,
+  bool BuildRope(const PackedLayout& target_layout,
+                 std::vector<std::uint16_t>* cosine,
                  std::vector<std::uint16_t>* sine, std::string* error) {
     const TensorDescriptor* descriptor =
         RequireTensor(*inventory, "rope.inv_freq", DType::kFloat32,
@@ -1156,12 +1171,12 @@ struct DenoiserSession::Impl {
                         sizeof(inverse), error)) {
       return false;
     }
-    cosine->resize(layout.rows() * kDitRopeHalf);
-    sine->resize(layout.rows() * kDitRopeHalf);
-    for (std::size_t row = 0; row < layout.rows(); ++row) {
-      const std::array<double, 3> axes = {layout.positions[row].temporal,
-                                          layout.positions[row].height,
-                                          layout.positions[row].width};
+    cosine->resize(target_layout.rows() * kDitRopeHalf);
+    sine->resize(target_layout.rows() * kDitRopeHalf);
+    for (std::size_t row = 0; row < target_layout.rows(); ++row) {
+      const std::array<double, 3> axes = {target_layout.positions[row].temporal,
+                                          target_layout.positions[row].height,
+                                          target_layout.positions[row].width};
       for (std::size_t axis = 0; axis < axes.size(); ++axis) {
         for (std::size_t frequency = 0; frequency < kRopeFrequencies;
              ++frequency) {
@@ -1345,14 +1360,39 @@ struct DenoiserSession::Impl {
     }
     std::vector<std::uint16_t> rope_cos;
     std::vector<std::uint16_t> rope_sin;
-    if (!BuildRope(&rope_cos, &rope_sin, error)) {
+    if (!BuildRope(layout, &rope_cos, &rope_sin, error)) {
       return false;
+    }
+    const std::size_t max_rows = MaxLayoutRows();
+    if (rope_cos.size() < max_rows * kDitRopeHalf) {
+      rope_cos.resize(max_rows * kDitRopeHalf, 0);
+      rope_sin.resize(max_rows * kDitRopeHalf, 0);
+    }
+    if (cfg_scale > 1.0F) {
+      std::vector<std::uint16_t> uncond_rope_cos;
+      std::vector<std::uint16_t> uncond_rope_sin;
+      if (!BuildRope(uncond_layout, &uncond_rope_cos, &uncond_rope_sin,
+                     error) ||
+          !uncond_rope_cos_device.Allocate(
+              uncond_rope_cos.size() * sizeof(std::uint16_t), error) ||
+          !uncond_rope_sin_device.Allocate(
+              uncond_rope_sin.size() * sizeof(std::uint16_t), error) ||
+          !CopyAsync(uncond_rope_cos_device.data(), uncond_rope_cos.data(),
+                     uncond_rope_cos_device.bytes(), hipMemcpyHostToDevice,
+                     "copy H3 uncond RoPE cos", error) ||
+          !CopyAsync(uncond_rope_sin_device.data(), uncond_rope_sin.data(),
+                     uncond_rope_sin_device.bytes(), hipMemcpyHostToDevice,
+                     "copy H3 uncond RoPE sin", error)) {
+        return false;
+      }
+      base_telemetry.cumulative_allocation_bytes +=
+          uncond_rope_cos_device.bytes() + uncond_rope_sin_device.bytes();
     }
     std::vector<std::size_t> selected_blocks;
     std::vector<std::vector<std::uint16_t>> ranked_modulations;
     std::vector<std::uint16_t> modulation;
     auto block_workspace = DitBlockWorkspace::Create(
-        {.rows = layout.rows(),
+        {.rows = max_rows,
          .row_parallel_attention = row_parallel_attention},
         error);
     if (block_workspace == nullptr) {
@@ -1429,7 +1469,7 @@ struct DenoiserSession::Impl {
         std::uint64_t gemm_plan_validations{0};
         std::string error;
       };
-      const std::size_t rows = layout.rows();
+      const std::size_t rows = max_rows;
       const std::size_t modulation_rows =
           static_cast<std::size_t>(time_rows.time_rows) * kDitModalities;
       auto core_future = std::async(std::launch::async, [this, rows,
@@ -1591,7 +1631,7 @@ struct DenoiserSession::Impl {
       auto session = DitBlockSession::Create(
           *inventory,
           {.block_index = block,
-           .rows = layout.rows(),
+           .rows = max_rows,
            .modulation_rows =
                static_cast<std::size_t>(time_rows.time_rows) * kDitModalities,
            .row_parallel_attention = row_parallel_attention,
@@ -1707,7 +1747,8 @@ struct DenoiserSession::Impl {
     const std::size_t audio_rows = layout.audio_target_rows;
     const std::size_t condition_elements =
         layout.video_condition_rows * kH3VideoPatchWidth;
-    const std::size_t hidden_elements = layout.rows() * kDitHiddenSize;
+    const std::size_t max_rows = MaxLayoutRows();
+    const std::size_t hidden_elements = max_rows * kDitHiddenSize;
     const std::size_t maximum_projection_rows =
         std::max({video_rows, audio_rows, layout.video_condition_rows});
     const auto bf16 = [](std::size_t elements) {
@@ -1721,9 +1762,13 @@ struct DenoiserSession::Impl {
         !projection_scratch_f32.Allocate(
             maximum_projection_rows * kDitHiddenSize * sizeof(float), error) ||
         !hidden_device.Allocate(bf16(hidden_elements), error) ||
-        !block_row_map.Allocate(layout.rows() * sizeof(std::uint32_t), error) ||
+        !block_row_map.Allocate(max_rows * sizeof(std::uint32_t), error) ||
         !video_velocity_f32.Allocate(video_elements * sizeof(float), error) ||
         !audio_velocity_f32.Allocate(audio_elements * sizeof(float), error) ||
+        (cfg_scale > 1.0F && (!uncond_video_velocity_f32.Allocate(
+                                  video_elements * sizeof(float), error) ||
+                              !uncond_audio_velocity_f32.Allocate(
+                                  audio_elements * sizeof(float), error))) ||
         (reuse_interval > 1 && (!previous_video_velocity_f32.Allocate(
                                     video_elements * sizeof(float), error) ||
                                 !previous_audio_velocity_f32.Allocate(
@@ -1734,7 +1779,7 @@ struct DenoiserSession::Impl {
     audio_rows_host.resize(audio_elements);
     forward_history.reserve(static_cast<std::size_t>(schedule.evaluations()) +
                             16U);
-    const std::array<const DeviceBuffer*, 10> buffers = {
+    const std::array<const DeviceBuffer*, 14> buffers = {
         &video_sample,
         &audio_sample,
         &condition_sample,
@@ -1743,6 +1788,10 @@ struct DenoiserSession::Impl {
         &block_row_map,
         &video_velocity_f32,
         &audio_velocity_f32,
+        &uncond_video_velocity_f32,
+        &uncond_audio_velocity_f32,
+        &uncond_rope_cos_device,
+        &uncond_rope_sin_device,
         &previous_video_velocity_f32,
         &previous_audio_velocity_f32,
     };
@@ -1813,7 +1862,7 @@ struct DenoiserSession::Impl {
 
   bool ForwardDevice(int step, const CancellationToken* cancellation,
                      bool read_velocity, DenoiserVelocity* velocity,
-                     std::string* error) {
+                     std::string* error, bool use_uncond = false) {
     if (step < 0 || step >= schedule.evaluations()) {
       SetError(error, "MiniMax H3 denoiser step is out of range");
       return false;
@@ -1823,61 +1872,77 @@ struct DenoiserSession::Impl {
       return false;
     }
     const auto begin = Clock::now();
-    const std::size_t condition_offset = layout.text_rows * kDitHiddenSize;
+    const PackedLayout& active_layout = use_uncond ? uncond_layout : layout;
+    const std::vector<std::uint16_t>& active_refined =
+        use_uncond ? uncond_refined_text_host : refined_text_host;
+    const std::vector<std::uint32_t>& active_row_map =
+        use_uncond ? uncond_row_maps[static_cast<std::size_t>(step)]
+                   : row_maps[static_cast<std::size_t>(step)];
+    const std::uint16_t* active_rope_cos =
+        use_uncond ? uncond_rope_cos_device.As<std::uint16_t>() : nullptr;
+    const std::uint16_t* active_rope_sin =
+        use_uncond ? uncond_rope_sin_device.As<std::uint16_t>() : nullptr;
+    DeviceBuffer& out_video_velocity =
+        use_uncond ? uncond_video_velocity_f32 : video_velocity_f32;
+    DeviceBuffer& out_audio_velocity =
+        use_uncond ? uncond_audio_velocity_f32 : audio_velocity_f32;
+
+    const std::size_t condition_offset = active_layout.text_rows * kDitHiddenSize;
     const std::size_t audio_offset =
-        (layout.text_rows + layout.video_condition_rows) * kDitHiddenSize;
+        (active_layout.text_rows + active_layout.video_condition_rows) *
+        kDitHiddenSize;
     const std::size_t video_offset =
-        (layout.text_rows + layout.video_condition_rows +
-         layout.audio_target_rows) * kDitHiddenSize;
+        (active_layout.text_rows + active_layout.video_condition_rows +
+         active_layout.audio_target_rows) *
+        kDitHiddenSize;
     // Compose the token sequence directly in its first trunk input buffer.
     // Separate projected-token allocations and D2D copies serve no purpose.
     if (!projection_gemm.Run(
             video_patch_weight.As<float>(), video_sample.As<float>(),
-            projection_scratch_f32.As<float>(), layout.video_target_rows,
+            projection_scratch_f32.As<float>(), active_layout.video_target_rows,
             kDitHiddenSize, kH3VideoPatchWidth, stream, error)) {
       return false;
     }
     dit_ops::LaunchAddBiasF32ToBf16(
         projection_scratch_f32.As<float>(), video_patch_bias.As<float>(),
         hidden_device.As<std::uint16_t>() + video_offset,
-        static_cast<std::uint32_t>(layout.video_target_rows), kDitHiddenSize,
-        stream);
+        static_cast<std::uint32_t>(active_layout.video_target_rows),
+        kDitHiddenSize, stream);
     if (!projection_gemm.Run(
             audio_patch_weight.As<float>(), audio_sample.As<float>(),
-            projection_scratch_f32.As<float>(), layout.audio_target_rows,
+            projection_scratch_f32.As<float>(), active_layout.audio_target_rows,
             kDitHiddenSize, kH3AudioLatentChannels, stream, error)) {
       return false;
     }
     dit_ops::LaunchAddBiasF32ToBf16(
         projection_scratch_f32.As<float>(), audio_patch_bias.As<float>(),
         hidden_device.As<std::uint16_t>() + audio_offset,
-        static_cast<std::uint32_t>(layout.audio_target_rows), kDitHiddenSize,
-        stream);
-    if (layout.video_condition_rows != 0) {
+        static_cast<std::uint32_t>(active_layout.audio_target_rows),
+        kDitHiddenSize, stream);
+    if (active_layout.video_condition_rows != 0) {
       // Anchors share the generated-video projection (reference proj_in over
       // the leading conditioned rows) but never receive velocity updates.
       if (!projection_gemm.Run(
               video_patch_weight.As<float>(), condition_sample.As<float>(),
               projection_scratch_f32.As<float>(),
-              layout.video_condition_rows, kDitHiddenSize,
+              active_layout.video_condition_rows, kDitHiddenSize,
               kH3VideoPatchWidth, stream, error)) {
         return false;
       }
       dit_ops::LaunchAddBiasF32ToBf16(
           projection_scratch_f32.As<float>(), video_patch_bias.As<float>(),
           hidden_device.As<std::uint16_t>() + condition_offset,
-          static_cast<std::uint32_t>(layout.video_condition_rows),
+          static_cast<std::uint32_t>(active_layout.video_condition_rows),
           kDitHiddenSize, stream);
     }
     const std::size_t text_bytes =
-        refined_text_host.size() * sizeof(std::uint16_t);
+        active_refined.size() * sizeof(std::uint16_t);
     if (!CheckLaunch("H3 patch projections", error) ||
-        !CopyAsync(hidden_device.data(), refined_text_host.data(), text_bytes,
+        !CopyAsync(hidden_device.data(), active_refined.data(), text_bytes,
                    hipMemcpyHostToDevice, "copy H3 refined text", error) ||
-        !CopyAsync(block_row_map.data(),
-                   row_maps[static_cast<std::size_t>(step)].data(),
-                   block_row_map.bytes(), hipMemcpyHostToDevice,
-                   "copy H3 block row map", error)) {
+        !CopyAsync(block_row_map.data(), active_row_map.data(),
+                   active_row_map.size() * sizeof(std::uint32_t),
+                   hipMemcpyHostToDevice, "copy H3 block row map", error)) {
       return false;
     }
 
@@ -1896,7 +1961,7 @@ struct DenoiserSession::Impl {
               hidden_input, block_row_map.As<std::uint32_t>(), hidden_input,
               static_cast<void*>(stream), block != 0,
               block + 1U < blocks.size(), cancellation, &block_telemetry,
-              error)) {
+              error, active_layout.rows(), active_rope_cos, active_rope_sin)) {
         return false;
       }
       block_dispatches += block_telemetry.dispatches;
@@ -1906,35 +1971,35 @@ struct DenoiserSession::Impl {
         hidden_input + audio_offset, final_norm_weight.As<std::uint16_t>(),
         final_modulation.As<std::uint16_t>(), time_rows.audio_rows[step],
         projection_scratch_f32.As<float>(),
-        static_cast<std::uint32_t>(layout.audio_target_rows), kDitHiddenSize,
-        kFinalModulationSlots, 0, 1, kDitNormEpsilon, stream);
+        static_cast<std::uint32_t>(active_layout.audio_target_rows),
+        kDitHiddenSize, kFinalModulationSlots, 0, 1, kDitNormEpsilon, stream);
     if (!CheckLaunch("H3 final audio normalization", error) ||
         !projection_gemm.Run(
             final_audio_weight.As<float>(), projection_scratch_f32.As<float>(),
-            audio_velocity_f32.As<float>(), layout.audio_target_rows,
+            out_audio_velocity.As<float>(), active_layout.audio_target_rows,
             kH3AudioLatentChannels, kDitHiddenSize, stream, error)) {
       return false;
     }
     dit_ops::LaunchAddBiasF32(
-        audio_velocity_f32.As<float>(), final_audio_bias.As<float>(),
-        static_cast<std::uint32_t>(layout.audio_target_rows),
+        out_audio_velocity.As<float>(), final_audio_bias.As<float>(),
+        static_cast<std::uint32_t>(active_layout.audio_target_rows),
         kH3AudioLatentChannels, stream);
     dit_ops::LaunchFinalAdaLn(
         hidden_input + video_offset, final_norm_weight.As<std::uint16_t>(),
         final_modulation.As<std::uint16_t>(), time_rows.video_rows[step],
         projection_scratch_f32.As<float>(),
-        static_cast<std::uint32_t>(layout.video_target_rows), kDitHiddenSize,
-        kFinalModulationSlots, 0, 1, kDitNormEpsilon, stream);
+        static_cast<std::uint32_t>(active_layout.video_target_rows),
+        kDitHiddenSize, kFinalModulationSlots, 0, 1, kDitNormEpsilon, stream);
     if (!CheckLaunch("H3 final video normalization", error) ||
         !projection_gemm.Run(
             final_video_weight.As<float>(), projection_scratch_f32.As<float>(),
-            video_velocity_f32.As<float>(), layout.video_target_rows,
+            out_video_velocity.As<float>(), active_layout.video_target_rows,
             kH3VideoPatchWidth, kDitHiddenSize, stream, error)) {
       return false;
     }
     dit_ops::LaunchAddBiasF32(
-        video_velocity_f32.As<float>(), final_video_bias.As<float>(),
-        static_cast<std::uint32_t>(layout.video_target_rows),
+        out_video_velocity.As<float>(), final_video_bias.As<float>(),
+        static_cast<std::uint32_t>(active_layout.video_target_rows),
         kH3VideoPatchWidth, stream);
     if (!CheckLaunch("H3 final velocity heads", error)) {
       return false;
@@ -2002,15 +2067,24 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   const bool has_anchors = !conditioning.anchor_temporal.empty();
   const bool has_blocks = !conditioning.condition_blocks.empty();
   const bool conditioned = has_anchors || has_blocks;
+  const bool use_cfg = options.cfg_scale > 1.0F;
   if (options.evaluations < 2 || options.evaluations > kH3MaximumEvaluations ||
       options.active_blocks < 3 ||
       options.active_blocks > static_cast<int>(kDitBlocks) ||
       options.reuse_interval < 1 || options.reuse_interval > 32 ||
+      !std::isfinite(options.cfg_scale) || options.cfg_scale < 1.0F ||
+      options.cfg_scale > 20.0F ||
       options.text_rows == 0 ||
       conditioning.layer50.size() !=
           options.text_rows * kH3TextConditionWidth ||
       (!conditioning.tags.empty() &&
        conditioning.tags.size() != options.text_rows) ||
+      (use_cfg &&
+       (options.uncond_text_rows == 0 ||
+        conditioning.uncond_layer50.size() !=
+            options.uncond_text_rows * kH3TextConditionWidth ||
+        (!conditioning.uncond_tags.empty() &&
+         conditioning.uncond_tags.size() != options.uncond_text_rows))) ||
       (has_anchors && has_blocks) ||
       (conditioned != (options.condition_video_rows != 0)) ||
       conditioning.condition_rows.size() !=
@@ -2052,16 +2126,48 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   if (!euler_plan) {
     return nullptr;
   }
+  std::optional<PackedLayout> uncond_layout;
+  if (use_cfg) {
+    const double uncond_origin =
+        conditioning.uncond_target_temporal_origin > 0.0
+            ? conditioning.uncond_target_temporal_origin
+            : static_cast<double>(options.uncond_text_rows);
+    const std::span<const ConditionBlock> uncond_blocks =
+        !conditioning.uncond_condition_blocks.empty()
+            ? conditioning.uncond_condition_blocks
+            : conditioning.condition_blocks;
+    const std::span<const double> uncond_anchors =
+        !conditioning.uncond_anchor_temporal.empty()
+            ? conditioning.uncond_anchor_temporal
+            : conditioning.anchor_temporal;
+    uncond_layout =
+        has_blocks
+            ? BuildReferenceLayout(options.uncond_text_rows, options.geometry,
+                                   uncond_blocks, uncond_origin, error)
+            : (has_anchors
+                   ? BuildKeyframeLayout(options.uncond_text_rows,
+                                         options.geometry, uncond_anchors,
+                                         error)
+                   : BuildTextOnlyLayout(options.uncond_text_rows,
+                                         options.geometry, error));
+    if (!uncond_layout) {
+      return nullptr;
+    }
+  }
   auto impl = std::make_unique<Impl>();
   impl->inventory = &inventory;
   impl->geometry = options.geometry;
   impl->layout = std::move(*layout);
+  if (use_cfg) {
+    impl->uncond_layout = std::move(*uncond_layout);
+  }
   impl->schedule = std::move(*schedule);
   impl->time_rows = std::move(*time_rows);
   impl->euler_plan = std::move(*euler_plan);
   impl->active_blocks = options.active_blocks;
   impl->reuse_interval = options.reuse_interval;
   impl->row_parallel_attention = options.row_parallel_attention;
+  impl->cfg_scale = options.cfg_scale;
   impl->loras = options.loras;
   impl->base_telemetry.row_parallel_attention = options.row_parallel_attention;
   impl->text_tags.assign(conditioning.tags.begin(), conditioning.tags.end());
@@ -2079,6 +2185,24 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
     }
     impl->row_maps.push_back(std::move(*rows));
   }
+  if (use_cfg) {
+    impl->uncond_text_tags.assign(conditioning.uncond_tags.begin(),
+                                  conditioning.uncond_tags.end());
+    if (impl->uncond_text_tags.empty()) {
+      impl->uncond_text_tags.assign(options.uncond_text_rows, 1);
+    }
+    impl->uncond_row_maps.reserve(
+        static_cast<std::size_t>(options.evaluations));
+    for (int step = 0; step < options.evaluations; ++step) {
+      auto rows = BuildModulationRowMap(impl->time_rows, step,
+                                        impl->uncond_layout,
+                                        impl->uncond_text_tags, error);
+      if (!rows) {
+        return nullptr;
+      }
+      impl->uncond_row_maps.push_back(std::move(*rows));
+    }
+  }
   if (!ValidateTarget(&impl->device, error)) {
     return nullptr;
   }
@@ -2092,7 +2216,13 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
     SetError(error, HipError("create MiniMax H3 denoiser resources", status));
     return nullptr;
   }
-  if (!impl->RefineText(conditioning.layer50, cancellation, error) ||
+  if (!impl->RefineText(conditioning.layer50, impl->layout.text_rows,
+                        &impl->refined_text_host, cancellation, error) ||
+      (use_cfg &&
+       !impl->RefineText(conditioning.uncond_layer50,
+                         impl->uncond_layout.text_rows,
+                         &impl->uncond_refined_text_host, cancellation,
+                         error)) ||
       !impl->BuildBlocks(cancellation, error) ||
       !impl->LoadHeads(cancellation, error) || !impl->AllocateIo(error) ||
       !impl->UploadConditionRows(error)) {
@@ -2261,8 +2391,25 @@ bool DenoiserSession::DenoiseWithCheckpoints(
                              "retain H3 previous audio velocity", error))) {
         return false;
       }
-      if (!impl_->ForwardDevice(step, cancellation, false, nullptr, error)) {
-        return false;
+      if (impl_->cfg_scale > 1.0F) {
+        if (!impl_->ForwardDevice(step, cancellation, false, nullptr, error,
+                                  true) ||
+            !impl_->ForwardDevice(step, cancellation, false, nullptr, error,
+                                  false) ||
+            !HipCfgCombine(impl_->video_velocity_f32.data(),
+                           impl_->uncond_video_velocity_f32.data(),
+                           impl_->video_velocity_f32.bytes() / sizeof(float),
+                           impl_->cfg_scale, impl_->stream, error) ||
+            !HipCfgCombine(impl_->audio_velocity_f32.data(),
+                           impl_->uncond_audio_velocity_f32.data(),
+                           impl_->audio_velocity_f32.bytes() / sizeof(float),
+                           impl_->cfg_scale, impl_->stream, error)) {
+          return false;
+        }
+      } else {
+        if (!impl_->ForwardDevice(step, cancellation, false, nullptr, error)) {
+          return false;
+        }
       }
       if (!have_velocity && impl_->reuse_interval > 1 &&
           (!impl_->CopyAsync(impl_->previous_video_velocity_f32.data(),

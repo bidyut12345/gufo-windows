@@ -34,6 +34,7 @@ struct GenerationParameters {
   bool row_parallel_attention{true};
   bool decode_audio{true};
   bool mux{true};
+  float cfg_scale{1.0F};
   std::vector<int> selected_frames;
 };
 
@@ -83,6 +84,7 @@ struct GenerationRequest {
   std::filesystem::path frames_directory;
   std::filesystem::path latents_directory;
   std::string prompt;
+  std::string negative_prompt;
   std::uint64_t seed{0};
   GenerationParameters parameters;
   // FL2VA keyframe anchors (issue #177). Empty keeps the text-only path

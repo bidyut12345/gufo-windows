@@ -12,6 +12,7 @@
 
 #include "src/models/minimax_h3/generation.hpp"
 #include "src/models/minimax_h3/probe.hpp"
+#include "src/models/minimax_h3/prompt_encoder.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 
 namespace gufo::models::minimax_h3 {
@@ -35,6 +36,7 @@ public:
         .frames_directory = request.frames_directory,
         .latents_directory = request.latents_directory,
         .prompt = request.prompt,
+        .negative_prompt = request.negative_prompt,
         .seed = request.seed,
         .parameters =
             {
@@ -51,6 +53,7 @@ public:
                     request.parameters.row_parallel_attention,
                 .decode_audio = request.parameters.decode_audio,
                 .mux = request.parameters.mux,
+                .cfg_scale = request.parameters.cfg_scale,
                 .selected_frames = request.parameters.selected_frames,
             },
         .first_frame_path = request.first_frame_path,
@@ -131,6 +134,44 @@ std::unique_ptr<ext::VideoRunner> CreateMinimaxH3Runner(
     const std::string& model_root, std::string*) {
   return std::make_unique<MinimaxH3RunnerImpl>(model_root);
 }
+
+bool AnalyzeMinimaxH3Frames(const ext::VideoAnalyzeRequest& request,
+                            const ext::CancellationCheck& is_cancelled,
+                            std::string* output_text, std::string* error) {
+  auto inventory = gufo::minimax_h3::ModelInventory::Inspect(
+      request.model_root, request.source_manifest, error);
+  if (!inventory.has_value()) {
+    return false;
+  }
+  gufo::minimax_h3::CancellationToken token;
+  std::jthread watcher;
+  if (is_cancelled) {
+    watcher =
+        std::jthread([&token, &is_cancelled](const std::stop_token& stop) {
+          while (!stop.stop_requested()) {
+            if (is_cancelled()) {
+              token.Cancel();
+              break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+        });
+  }
+  const gufo::minimax_h3::VlmRequest vlm_req{
+      .image_paths = request.image_paths,
+      .prompt = request.prompt,
+      .max_new_tokens = request.max_new_tokens,
+  };
+  const bool ok = gufo::minimax_h3::GenerateVlmText(*inventory, vlm_req, &token,
+                                                    output_text, error);
+  if (is_cancelled) {
+    watcher.request_stop();
+    if (watcher.joinable()) {
+      watcher.join();
+    }
+  }
+  return ok;
+}
 #endif
 
 }  // namespace gufo::models::minimax_h3
@@ -150,6 +191,7 @@ void minimax_h3_provider_register(gufo::ext::Registry& registry) {
       .validate_parameters = &ValidateParameters,
       .parameters_json = &ParametersJson,
       .telemetry_json = &TelemetryJson,
+      .analyze_frames = &AnalyzeMinimaxH3Frames,
   });
 #endif
 }

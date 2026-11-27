@@ -107,7 +107,7 @@ bool MatchesOutputContract(const VideoJobRequest& request) {
         (parameters.preset == "fast-384" ||
          parameters.preset == "aggressive-320");
     return (custom_exact || preset_512) && parameters.mux &&
-           parameters.decode_audio && parameters.selected_frames.empty();
+           parameters.selected_frames.empty();
   }
   return request.output_format == "ppm" && request.size == "256x256" &&
          parameters.preset == "development-256" &&
@@ -745,6 +745,7 @@ struct VideoJobService::Impl {
                                   : std::filesystem::path(),
           .latents_directory = {},
           .prompt = {},
+          .negative_prompt = {},
           .seed = job->request.seed,
           .parameters = job->request.parameters,
           .first_frame_path = job->first_frame_path,
@@ -760,6 +761,7 @@ struct VideoJobService::Impl {
         // Delete can clear a queued/active prompt concurrently with admission.
         const std::lock_guard<std::mutex> lock(mutex);
         generation.prompt = job->request.prompt;
+        generation.negative_prompt = job->request.negative_prompt;
       }
       const std::string prompt_hash =
           crypto::Sha256Hex(std::span<const std::uint8_t>(
@@ -771,6 +773,7 @@ struct VideoJobService::Impl {
                                                 job->request.seed, prompt_hash),
                        &metadata_error)) {
         WipeString(&generation.prompt);
+      WipeString(&generation.negative_prompt);
         const std::lock_guard<std::mutex> lock(mutex);
         active.reset();
         job->snapshot.status = VideoJobStatus::kFailed;
@@ -798,6 +801,7 @@ struct VideoJobService::Impl {
         error = "video generation backend failed unexpectedly";
       }
       WipeString(&generation.prompt);
+      WipeString(&generation.negative_prompt);
       if (!success && !job->cancelled.load(std::memory_order_relaxed)) {
         Logger::Error("video", "job=" + job->snapshot.id +
                                    " event=backend_failed detail=" + error);
@@ -1307,6 +1311,81 @@ VideoJobLookupResult VideoJobService::Delete(std::string_view id) {
   impl_->condition.notify_all();
   return {
       .result = VideoJobResult::kOk, .job = std::move(snapshot), .error = {}};
+}
+
+bool VideoJobService::AnalyzeFrames(
+    const std::vector<std::vector<std::uint8_t>>& images,
+    std::string_view prompt, std::size_t max_new_tokens,
+    std::string* output_text, std::string* error) {
+  if (output_text != nullptr) {
+    output_text->clear();
+  }
+  if (!ready()) {
+    if (error != nullptr) {
+      *error = initialization_error();
+    }
+    return false;
+  }
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider == nullptr || provider->analyze_frames == nullptr) {
+    if (error != nullptr) {
+      *error = "MiniMax H3 VLM frame analysis is unavailable";
+    }
+    return false;
+  }
+  if (images.empty() || prompt.empty()) {
+    if (error != nullptr) {
+      *error = "images and prompt are required";
+    }
+    return false;
+  }
+
+  const std::string temp_id = impl_->options.id_factory
+                                  ? impl_->options.id_factory()
+                                  : "vlm_tmp";
+  const std::filesystem::path temp_dir =
+      impl_->options.storage_root / ("analyze_" + temp_id);
+  std::error_code ec;
+  std::filesystem::create_directories(temp_dir, ec);
+  if (ec) {
+    if (error != nullptr) {
+      *error = "failed creating VLM staging directory: " + ec.message();
+    }
+    return false;
+  }
+  const auto cleanup = [&]() {
+    std::error_code ignored;
+    std::filesystem::remove_all(temp_dir, ignored);
+  };
+
+  std::vector<std::filesystem::path> image_paths;
+  image_paths.reserve(images.size());
+  for (std::size_t i = 0; i < images.size(); ++i) {
+    const std::filesystem::path p =
+        temp_dir / ("frame_" + std::to_string(i) + ".img");
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(images[i].data()),
+              static_cast<std::streamsize>(images[i].size()));
+    if (!out.good()) {
+      if (error != nullptr) {
+        *error = "failed writing staged VLM frame";
+      }
+      cleanup();
+      return false;
+    }
+    image_paths.push_back(p);
+  }
+
+  const ext::VideoAnalyzeRequest req{
+      .model_root = impl_->options.model_root,
+      .source_manifest = impl_->options.source_manifest,
+      .image_paths = std::move(image_paths),
+      .prompt = std::string(prompt),
+      .max_new_tokens = max_new_tokens,
+  };
+  const bool ok = provider->analyze_frames(req, {}, output_text, error);
+  cleanup();
+  return ok;
 }
 
 }  // namespace gufo::server

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <map>
@@ -27,8 +28,12 @@
 #include <utility>
 #include <vector>
 
+#include <gufo/ext/image.hpp>
 #include <gufo/ext/mapped_prefetch.hpp>
 #include <gufo/ext/platform/mapped_file.hpp>
+#include "src/families/qwen/control_tokens/control_tokens.hpp"
+#include "src/models/minimax_h3/image_processor.hpp"
+#include "src/models/minimax_h3/json.hpp"
 #include "src/models/minimax_h3/prompt_encoder.hpp"
 #include "src/models/minimax_h3/prompt_encoder_ops.hip.hpp"
 
@@ -174,6 +179,7 @@ private:
 struct LoadedTensor {
   const TensorDescriptor* descriptor{nullptr};
   const std::uint16_t* data{nullptr};
+  std::uint32_t convrot_groupsize{0};
 };
 
 struct HostMapping;
@@ -483,6 +489,75 @@ bool ReadIntervalPinned(const std::filesystem::path& path, std::uint64_t offset,
   return true;
 }
 
+std::optional<std::uint32_t> ReadConvrotGroupSize(
+    const ModelInventory& inventory, const TensorDescriptor& descriptor,
+    std::string* error) {
+  if (descriptor.dtype != DType::kInt8 ||
+      !descriptor.name.ends_with(".weight")) {
+    return 0U;
+  }
+  const std::string base =
+      descriptor.name.substr(0, descriptor.name.size() - 7U);
+  const TensorDescriptor* cq = inventory.FindTensor(base + ".comfy_quant");
+  if (cq == nullptr) {
+    return 0U;
+  }
+  if (cq->dtype != DType::kUint8 || cq->payload_bytes == 0U ||
+      cq->payload_bytes > 4096U) {
+    SetError(error, "invalid H3 comfy_quant metadata tensor: " + cq->name);
+    return std::nullopt;
+  }
+  const auto path = inventory.model_root() / cq->shard;
+  std::string open_error;
+  const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
+  if (!platform::FileValid(file)) {
+    SetError(error, "cannot open H3 shard for comfy_quant " + path.string() +
+                        ": " + open_error);
+    return std::nullopt;
+  }
+  std::string raw(static_cast<std::size_t>(cq->payload_bytes), '\0');
+  std::size_t read_bytes = 0;
+  while (read_bytes < raw.size()) {
+    const std::size_t r = platform::ReadFileAt(
+        file, reinterpret_cast<std::byte*>(raw.data()) + read_bytes,
+        raw.size() - read_bytes, cq->file_offset + read_bytes);
+    if (r == 0) {
+      break;
+    }
+    read_bytes += r;
+  }
+  platform::CloseFile(file);
+  if (read_bytes != raw.size()) {
+    SetError(error, "short read loading H3 comfy_quant: " + cq->name);
+    return std::nullopt;
+  }
+  try {
+    const json::Value meta = json::Parse(raw);
+    const json::Value* convrot = meta.Find("convrot");
+    if (convrot == nullptr || !convrot->IsBool() || !convrot->AsBool()) {
+      return 0U;
+    }
+    std::uint64_t gs = 256U;
+    if (const json::Value* gs_val = meta.Find("convrot_groupsize")) {
+      gs = gs_val->AsUint64();
+    }
+    const bool valid_power_of_4 =
+        gs == 4U || gs == 16U || gs == 64U || gs == 256U || gs == 1024U;
+    const std::uint64_t cols =
+        descriptor.shape.size() == 2U ? descriptor.shape[1] : 0U;
+    if (!valid_power_of_4 || cols == 0U || (cols % gs) != 0U) {
+      SetError(error, "unsupported H3 convrot_groupsize " + std::to_string(gs) +
+                          " for " + descriptor.name);
+      return std::nullopt;
+    }
+    return static_cast<std::uint32_t>(gs);
+  } catch (const std::exception& exc) {
+    SetError(error, "failed parsing H3 comfy_quant " + cq->name + ": " +
+                        exc.what());
+    return std::nullopt;
+  }
+}
+
 BatchLoadResult LoadBatch(const ModelInventory& inventory,
                           std::vector<const TensorDescriptor*> descriptors,
                           int device, PinnedPool* pool,
@@ -604,10 +679,16 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
       }
       const auto delta = static_cast<std::size_t>(descriptor->file_offset -
                                                   mapping->file_offset);
+      const auto convrot_gs =
+          ReadConvrotGroupSize(inventory, *descriptor, &result.error);
+      if (!convrot_gs.has_value()) {
+        return result;
+      }
       LoadedTensor tensor{
           .descriptor = descriptor,
           .data = reinterpret_cast<const std::uint16_t*>(
               static_cast<const std::byte*>(mapping->device) + delta),
+          .convrot_groupsize = *convrot_gs,
       };
       batch.bytes += bytes;
       batch.tensors.push_back(std::move(tensor));
@@ -854,6 +935,48 @@ bool CollectLayerTiming(LayerEvents* events,
   return true;
 }
 
+const std::uint16_t* ResolveProjectionBf16(const LoadedBatch& weights,
+                                           std::string_view full_name,
+                                           std::size_t rows, std::size_t cols,
+                                           DeviceBuffer* dequant_scratch,
+                                           hipStream_t stream,
+                                           std::string* error) {
+  const LoadedTensor* loaded = weights.FindTensor(full_name);
+  if (loaded == nullptr || loaded->descriptor == nullptr) {
+    return nullptr;
+  }
+  if (loaded->descriptor->dtype == DType::kBFloat16) {
+    return loaded->data;
+  }
+  if (loaded->descriptor->dtype != DType::kInt8) {
+    return nullptr;
+  }
+  const std::string& wname = loaded->descriptor->name;
+  const LoadedTensor* scale = weights.FindTensor(wname + "_scale");
+  if (scale == nullptr && wname.ends_with(".weight")) {
+    scale = weights.FindTensor(wname.substr(0, wname.size() - 7U) +
+                               "._weight_scale");
+  }
+  if (scale == nullptr || scale->descriptor == nullptr) {
+    return nullptr;
+  }
+  const std::size_t max_bytes = kPromptEncoderIntermediateSize *
+                                kPromptEncoderHiddenSize *
+                                sizeof(std::uint16_t);
+  if (dequant_scratch->bytes() < max_bytes &&
+      !dequant_scratch->Allocate(max_bytes, error)) {
+    return nullptr;
+  }
+  const std::size_t scale_count =
+      static_cast<std::size_t>(scale->descriptor->payload_bytes / 4U);
+  ops::LaunchDequantInt8ToBf16(
+      reinterpret_cast<const std::int8_t*>(loaded->data),
+      reinterpret_cast<const float*>(scale->data),
+      dequant_scratch->As<std::uint16_t>(), rows, cols, scale_count, stream,
+      loaded->convrot_groupsize);
+  return dequant_scratch->As<std::uint16_t>();
+}
+
 bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
               Bf16Gemm* gemm, DeviceBuffer* dequant_scratch,
               Activations* activations, hipStream_t stream,
@@ -866,40 +989,8 @@ bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
   };
   const auto proj_bf16 = [&](std::string_view suffix, std::size_t rows,
                              std::size_t cols) -> const std::uint16_t* {
-    const LoadedTensor* loaded =
-        weights.FindTensor(prefix + std::string(suffix));
-    if (loaded == nullptr || loaded->descriptor == nullptr) {
-      return nullptr;
-    }
-    if (loaded->descriptor->dtype == DType::kBFloat16) {
-      return loaded->data;
-    }
-    if (loaded->descriptor->dtype != DType::kInt8) {
-      return nullptr;
-    }
-    const std::string& wname = loaded->descriptor->name;
-    const LoadedTensor* scale = weights.FindTensor(wname + "_scale");
-    if (scale == nullptr && wname.ends_with(".weight")) {
-      scale = weights.FindTensor(wname.substr(0, wname.size() - 7U) +
-                                 "._weight_scale");
-    }
-    if (scale == nullptr || scale->descriptor == nullptr) {
-      return nullptr;
-    }
-    const std::size_t max_bytes = kPromptEncoderIntermediateSize *
-                                  kPromptEncoderHiddenSize *
-                                  sizeof(std::uint16_t);
-    if (dequant_scratch->bytes() < max_bytes &&
-        !dequant_scratch->Allocate(max_bytes, error)) {
-      return nullptr;
-    }
-    const std::size_t scale_count =
-        static_cast<std::size_t>(scale->descriptor->payload_bytes / 4U);
-    ops::LaunchDequantInt8ToBf16(
-        reinterpret_cast<const std::int8_t*>(loaded->data),
-        reinterpret_cast<const float*>(scale->data),
-        dequant_scratch->As<std::uint16_t>(), rows, cols, scale_count, stream);
-    return dequant_scratch->As<std::uint16_t>();
+    return ResolveProjectionBf16(weights, prefix + std::string(suffix), rows,
+                                 cols, dequant_scratch, stream, error);
   };
   const std::uint16_t* input_norm = tensor("input_layernorm.weight");
   const std::uint16_t* query_norm = tensor("self_attn.q_norm.weight");
@@ -1610,6 +1701,629 @@ bool EncodePromptMultimodal(const ModelInventory& inventory,
   return EncodePromptWithVisions(inventory, tokenizer, prompt, blocks,
                                  keyframes, cancellation, output, telemetry,
                                  error);
+}
+
+namespace {
+
+struct LayerKvCache {
+  DeviceBuffer key;
+  DeviceBuffer value;
+};
+
+float HostBf16ToFloat(std::uint16_t bits) noexcept {
+  const std::uint32_t raw = static_cast<std::uint32_t>(bits) << 16U;
+  float value = 0.0F;
+  std::memcpy(&value, &raw, sizeof(value));
+  return value;
+}
+
+bool ReadFileBytes(const std::filesystem::path& path,
+                   std::vector<std::uint8_t>* bytes, std::string* error) {
+  std::ifstream input(path, std::ios::binary | std::ios::ate);
+  if (!input.is_open()) {
+    SetError(error, "cannot open image file: " + path.string());
+    return false;
+  }
+  const std::streamsize size = input.tellg();
+  if (size <= 0) {
+    SetError(error, "empty image file: " + path.string());
+    return false;
+  }
+  input.seekg(0, std::ios::beg);
+  bytes->resize(static_cast<std::size_t>(size));
+  if (!input.read(reinterpret_cast<char*>(bytes->data()), size)) {
+    SetError(error, "failed reading image file: " + path.string());
+    return false;
+  }
+  return true;
+}
+
+bool RunDecodeLayer(const LoadedBatch& weights, std::size_t layer,
+                    std::uint32_t kv_len, LayerKvCache* kv_cache,
+                    Bf16Gemm* gemm, DeviceBuffer* dequant_scratch,
+                    Activations* activations, hipStream_t stream,
+                    std::string* error) {
+  const std::string prefix =
+      "model.language_model.layers." + std::to_string(layer) + ".";
+  const auto tensor = [&](std::string_view suffix) -> const std::uint16_t* {
+    return weights.Find(prefix + std::string(suffix));
+  };
+  const auto proj_bf16 = [&](std::string_view suffix, std::size_t rows,
+                             std::size_t cols) -> const std::uint16_t* {
+    return ResolveProjectionBf16(weights, prefix + std::string(suffix), rows,
+                                 cols, dequant_scratch, stream, error);
+  };
+
+  const std::uint16_t* input_norm = tensor("input_layernorm.weight");
+  const std::uint16_t* query_norm = tensor("self_attn.q_norm.weight");
+  const std::uint16_t* key_norm = tensor("self_attn.k_norm.weight");
+  const std::uint16_t* post_norm = tensor("post_attention_layernorm.weight");
+  if (input_norm == nullptr || query_norm == nullptr || key_norm == nullptr ||
+      post_norm == nullptr) {
+    SetError(error, "loaded H3 VLM layer is incomplete");
+    return false;
+  }
+
+  constexpr std::size_t kKvWidth =
+      kPromptEncoderKeyValueHeads * kPromptEncoderHeadDimension;
+  constexpr std::size_t kQWidth =
+      kPromptEncoderQueryHeads * kPromptEncoderHeadDimension;
+
+  ops::LaunchRmsNorm(activations->hidden.As<std::uint16_t>(), input_norm,
+                     activations->norm.As<std::uint16_t>(), 1U,
+                     kPromptEncoderHiddenSize, kRmsEpsilon, stream);
+  const std::uint16_t* q_w =
+      proj_bf16("self_attn.q_proj.weight", kQWidth, kPromptEncoderHiddenSize);
+  if (q_w == nullptr ||
+      !gemm->Run(q_w, activations->norm.As<std::uint16_t>(),
+                 activations->query.As<std::uint16_t>(), 1U, kQWidth,
+                 kPromptEncoderHiddenSize, stream, error)) {
+    return false;
+  }
+  const std::uint16_t* k_w =
+      proj_bf16("self_attn.k_proj.weight", kKvWidth, kPromptEncoderHiddenSize);
+  if (k_w == nullptr ||
+      !gemm->Run(k_w, activations->norm.As<std::uint16_t>(),
+                 activations->key.As<std::uint16_t>(), 1U, kKvWidth,
+                 kPromptEncoderHiddenSize, stream, error)) {
+    return false;
+  }
+  const std::uint16_t* v_w =
+      proj_bf16("self_attn.v_proj.weight", kKvWidth, kPromptEncoderHiddenSize);
+  if (v_w == nullptr ||
+      !gemm->Run(v_w, activations->norm.As<std::uint16_t>(),
+                 activations->value.As<std::uint16_t>(), 1U, kKvWidth,
+                 kPromptEncoderHiddenSize, stream, error)) {
+    return false;
+  }
+  ops::LaunchHeadRmsNorm(activations->query.As<std::uint16_t>(), query_norm,
+                         1U, kPromptEncoderQueryHeads,
+                         kPromptEncoderHeadDimension, kRmsEpsilon, stream);
+  ops::LaunchHeadRmsNorm(activations->key.As<std::uint16_t>(), key_norm, 1U,
+                         kPromptEncoderKeyValueHeads,
+                         kPromptEncoderHeadDimension, kRmsEpsilon, stream);
+  ops::LaunchRope(activations->query.As<std::uint16_t>(),
+                  activations->key.As<std::uint16_t>(),
+                  activations->rope_cosine.As<float>(),
+                  activations->rope_sine.As<float>(), 1U,
+                  kPromptEncoderQueryHeads, kPromptEncoderKeyValueHeads,
+                  kPromptEncoderHeadDimension, stream);
+
+  const std::size_t kv_offset =
+      static_cast<std::size_t>(kv_len - 1U) * kKvWidth;
+  if (hipMemcpyAsync(kv_cache->key.As<std::uint16_t>() + kv_offset,
+                     activations->key.data(),
+                     kKvWidth * sizeof(std::uint16_t), hipMemcpyDeviceToDevice,
+                     stream) != hipSuccess ||
+      hipMemcpyAsync(kv_cache->value.As<std::uint16_t>() + kv_offset,
+                     activations->value.data(),
+                     kKvWidth * sizeof(std::uint16_t), hipMemcpyDeviceToDevice,
+                     stream) != hipSuccess) {
+    SetError(error, "H3 VLM KV cache append failed");
+    return false;
+  }
+
+  ops::LaunchDecodeGqa(
+      activations->query.As<std::uint16_t>(),
+      kv_cache->key.As<std::uint16_t>(), kv_cache->value.As<std::uint16_t>(),
+      activations->attention.As<std::uint16_t>(), kv_len,
+      kPromptEncoderQueryHeads, kPromptEncoderKeyValueHeads,
+      kPromptEncoderHeadDimension,
+      1.0F / std::sqrt(static_cast<float>(kPromptEncoderHeadDimension)),
+      stream);
+
+  const std::uint16_t* o_w =
+      proj_bf16("self_attn.o_proj.weight", kPromptEncoderHiddenSize, kQWidth);
+  if (o_w == nullptr ||
+      !gemm->Run(o_w, activations->attention.As<std::uint16_t>(),
+                 activations->projection.As<std::uint16_t>(), 1U,
+                 kPromptEncoderHiddenSize, kQWidth, stream, error)) {
+    return false;
+  }
+  ops::LaunchAdd(activations->hidden.As<std::uint16_t>(),
+                 activations->projection.As<std::uint16_t>(),
+                 activations->hidden.As<std::uint16_t>(),
+                 kPromptEncoderHiddenSize, stream);
+  ops::LaunchRmsNorm(activations->hidden.As<std::uint16_t>(), post_norm,
+                     activations->norm.As<std::uint16_t>(), 1U,
+                     kPromptEncoderHiddenSize, kRmsEpsilon, stream);
+
+  const std::uint16_t* gate_w = proj_bf16(
+      "mlp.gate_proj.weight", kPromptEncoderIntermediateSize,
+      kPromptEncoderHiddenSize);
+  if (gate_w == nullptr ||
+      !gemm->Run(gate_w, activations->norm.As<std::uint16_t>(),
+                 activations->gate.As<std::uint16_t>(), 1U,
+                 kPromptEncoderIntermediateSize, kPromptEncoderHiddenSize,
+                 stream, error)) {
+    return false;
+  }
+  const std::uint16_t* up_w = proj_bf16(
+      "mlp.up_proj.weight", kPromptEncoderIntermediateSize,
+      kPromptEncoderHiddenSize);
+  if (up_w == nullptr ||
+      !gemm->Run(up_w, activations->norm.As<std::uint16_t>(),
+                 activations->up.As<std::uint16_t>(), 1U,
+                 kPromptEncoderIntermediateSize, kPromptEncoderHiddenSize,
+                 stream, error)) {
+    return false;
+  }
+  ops::LaunchSwiGlu(activations->gate.As<std::uint16_t>(),
+                    activations->up.As<std::uint16_t>(),
+                    activations->gate.As<std::uint16_t>(),
+                    kPromptEncoderIntermediateSize, stream);
+  const std::uint16_t* down_w = proj_bf16(
+      "mlp.down_proj.weight", kPromptEncoderHiddenSize,
+      kPromptEncoderIntermediateSize);
+  if (down_w == nullptr ||
+      !gemm->Run(down_w, activations->gate.As<std::uint16_t>(),
+                 activations->mlp.As<std::uint16_t>(), 1U,
+                 kPromptEncoderHiddenSize, kPromptEncoderIntermediateSize,
+                 stream, error)) {
+    return false;
+  }
+  ops::LaunchAdd(activations->hidden.As<std::uint16_t>(),
+                 activations->mlp.As<std::uint16_t>(),
+                 activations->hidden.As<std::uint16_t>(),
+                 kPromptEncoderHiddenSize, stream);
+  if (hipGetLastError() != hipSuccess) {
+    SetError(error, "H3 VLM decode layer kernel launch failed");
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool GenerateVlmText(const ModelInventory& inventory, const VlmRequest& request,
+                     const CancellationToken* cancellation,
+                     std::string* output_text, std::string* error) {
+  if (output_text != nullptr) {
+    output_text->clear();
+  }
+  if (output_text == nullptr || request.image_paths.empty() ||
+      request.prompt.empty()) {
+    SetError(error, "invalid MiniMax H3 VLM request");
+    return false;
+  }
+  if (IsCancelled(cancellation)) {
+    SetError(error, "MiniMax H3 VLM generation cancelled");
+    return false;
+  }
+  auto phase_lease = PromptPhaseLease::Acquire(error);
+  if (!phase_lease.has_value()) {
+    return false;
+  }
+
+  Tokenizer tokenizer;
+  if (!Tokenizer::Load(inventory.model_root() / inventory.variant_dir() /
+                           "tokenizer/tokenizer.json",
+                       &tokenizer, error)) {
+    return false;
+  }
+
+  std::vector<KeyframeVision> visions;
+  std::vector<MultimodalBlock> blocks;
+  visions.reserve(request.image_paths.size());
+  blocks.reserve(request.image_paths.size());
+  for (std::size_t i = 0; i < request.image_paths.size(); ++i) {
+    std::vector<std::uint8_t> encoded_bytes;
+    if (!ReadFileBytes(request.image_paths[i], &encoded_bytes, error)) {
+      return false;
+    }
+    core::Image decoded;
+    try {
+      decoded = core::DecodeImage(encoded_bytes);
+    } catch (const std::exception& exc) {
+      SetError(error, "failed decoding VLM frame: " + std::string(exc.what()));
+      return false;
+    }
+    // Preserve aspect ratio within 512px max edge, multiples of 32, >= 256x256
+    const double max_edge =
+        static_cast<double>(std::max(decoded.width, decoded.height));
+    const double scale = max_edge > 512.0 ? (512.0 / max_edge) : 1.0;
+    auto round32 = [](double v) -> int {
+      const int r = static_cast<int>(std::round(v / 32.0)) * 32;
+      return std::max(256, std::min(512, r));
+    };
+    const int w32 = round32(static_cast<double>(decoded.width) * scale);
+    const int h32 = round32(static_cast<double>(decoded.height) * scale);
+    std::vector<std::uint8_t> rgb;
+    if (!image_processor::PrepareKeyframe(
+            decoded, w32, h32, image_processor::KeyframeFit::kStretch, &rgb,
+            error)) {
+      return false;
+    }
+    KeyframeVision vision;
+    if (!image_processor::BuildKeyframeVision(rgb, w32, h32, &vision, error)) {
+      return false;
+    }
+    std::string prefix = i == 0
+                             ? std::string(tokenization::kImStart) +
+                                   "user\nFrame 0: "
+                             : "\nFrame " + std::to_string(i) + ": ";
+    blocks.push_back({.prefix_label = std::move(prefix),
+                      .is_video = false,
+                      .grid_h = vision.grid_h,
+                      .grid_w = vision.grid_w});
+    visions.push_back(std::move(vision));
+  }
+
+  const std::string chat_prompt =
+      "\n" + request.prompt + std::string(tokenization::kImEnd) + "\n" +
+      std::string(tokenization::kImStart) + "assistant\n";
+  KeyframePresentation presentation;
+  if (!BuildMultimodalPresentation(tokenizer, chat_prompt, blocks,
+                                   &presentation, error)) {
+    return false;
+  }
+  const std::size_t prompt_len = presentation.ids.size();
+  const std::size_t max_new_tokens =
+      std::max<std::size_t>(1U, std::min<std::size_t>(request.max_new_tokens, 1024U));
+  const std::size_t max_seq_len = prompt_len + max_new_tokens;
+  if (max_seq_len > kMaximumPromptTokens) {
+    SetError(error, "H3 VLM sequence exceeds token limit");
+    return false;
+  }
+
+  std::vector<std::vector<std::uint16_t>> embedded_batch;
+  std::vector<std::vector<std::uint16_t>> deep_batch;
+  if (!EncodeVisionBatch(inventory, visions, cancellation, &embedded_batch,
+                         &deep_batch, error)) {
+    return false;
+  }
+  const std::size_t total_rows = presentation.image_rows.size();
+  std::vector<std::uint16_t> all_embeddings;
+  all_embeddings.reserve(total_rows * kPromptEncoderHiddenSize);
+  std::vector<std::uint16_t> all_deep;
+  all_deep.reserve(3U * total_rows * kPromptEncoderHiddenSize);
+  std::vector<std::vector<std::uint16_t>> tap_buffers(3);
+  for (std::size_t i = 0; i < visions.size(); ++i) {
+    const std::size_t rows = static_cast<std::size_t>(visions[i].grid_h / 2) *
+                             (visions[i].grid_w / 2);
+    all_embeddings.insert(all_embeddings.end(), embedded_batch[i].begin(),
+                          embedded_batch[i].end());
+    const std::size_t tap_stride = rows * kPromptEncoderHiddenSize;
+    for (std::size_t tap = 0; tap < 3U; ++tap) {
+      tap_buffers[tap].insert(
+          tap_buffers[tap].end(),
+          deep_batch[i].begin() + static_cast<std::ptrdiff_t>(tap * tap_stride),
+          deep_batch[i].begin() +
+              static_cast<std::ptrdiff_t>((tap + 1U) * tap_stride));
+    }
+  }
+  for (const auto& tb : tap_buffers) {
+    all_deep.insert(all_deep.end(), tb.begin(), tb.end());
+  }
+
+  int device = 0;
+  if (!ValidateTarget(&device, error)) {
+    return false;
+  }
+  hipStream_t stream = nullptr;
+  if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) {
+    SetError(error, "failed creating H3 VLM stream");
+    return false;
+  }
+  const auto destroy_stream = [&]() {
+    if (stream != nullptr) {
+      (void)hipStreamDestroy(stream);
+      stream = nullptr;
+    }
+  };
+
+  DeviceBuffer rows_dev, emb_dev, deep_dev, pos_dev;
+  if (!rows_dev.Allocate(presentation.image_rows.size() * sizeof(std::uint32_t),
+                         error) ||
+      !emb_dev.Allocate(all_embeddings.size() * sizeof(std::uint16_t), error) ||
+      !deep_dev.Allocate(all_deep.size() * sizeof(std::uint16_t), error) ||
+      !pos_dev.Allocate(presentation.rope_positions.size() * sizeof(std::int32_t),
+                        error) ||
+      hipMemcpy(rows_dev.data(), presentation.image_rows.data(),
+                rows_dev.bytes(), hipMemcpyHostToDevice) != hipSuccess ||
+      hipMemcpy(emb_dev.data(), all_embeddings.data(), emb_dev.bytes(),
+                hipMemcpyHostToDevice) != hipSuccess ||
+      hipMemcpy(deep_dev.data(), all_deep.data(), deep_dev.bytes(),
+                hipMemcpyHostToDevice) != hipSuccess ||
+      hipMemcpy(pos_dev.data(), presentation.rope_positions.data(),
+                pos_dev.bytes(), hipMemcpyHostToDevice) != hipSuccess) {
+    destroy_stream();
+    return false;
+  }
+
+  Activations prefill_act;
+  Activations decode_act;
+  if (!AllocateActivations(prompt_len, &prefill_act, error) ||
+      !AllocateActivations(1U, &decode_act, error)) {
+    destroy_stream();
+    return false;
+  }
+  if (hipMemcpyAsync(prefill_act.ids.data(), presentation.ids.data(),
+                     prompt_len * sizeof(std::uint32_t), hipMemcpyHostToDevice,
+                     stream) != hipSuccess) {
+    SetError(error, "failed copying H3 VLM prompt IDs");
+    destroy_stream();
+    return false;
+  }
+  ops::LaunchPrepareRopeMulti(prefill_act.rope_cosine.As<float>(),
+                              prefill_act.rope_sine.As<float>(),
+                              pos_dev.As<std::int32_t>(),
+                              static_cast<std::uint32_t>(prompt_len),
+                              kPromptEncoderHeadDimension, kRopeTheta, stream);
+
+  const TensorDescriptor* embed_desc = RequireTensor(
+      inventory, "model.language_model.embed_tokens.weight",
+      {kPromptEncoderVocabularySize, kPromptEncoderHiddenSize}, error);
+  const TensorDescriptor* norm_desc = RequireTensor(
+      inventory, "model.language_model.norm.weight",
+      {kPromptEncoderHiddenSize}, error);
+  const TensorDescriptor* lm_head_desc =
+      FindPromptTensor(inventory, "lm_head.weight");
+  const bool tied_lm_head = (lm_head_desc == nullptr);
+  if (tied_lm_head) {
+    lm_head_desc = embed_desc;
+  }
+  if (embed_desc == nullptr || norm_desc == nullptr || lm_head_desc == nullptr) {
+    destroy_stream();
+    return false;
+  }
+
+  PinnedPool pinned_pool;
+  std::vector<const TensorDescriptor*> head_descs = {embed_desc, norm_desc};
+  if (!tied_lm_head) {
+    head_descs.push_back(lm_head_desc);
+  }
+  BatchLoadResult head_res = LoadBatch(
+      inventory, std::move(head_descs), device, &pinned_pool,
+      cancellation);
+  if (!head_res.batch.has_value()) {
+    SetError(error, std::move(head_res.error));
+    destroy_stream();
+    return false;
+  }
+  LoadedBatch head_weights = std::move(*head_res.batch);
+  const std::uint16_t* embed_w =
+      head_weights.Find("model.language_model.embed_tokens.weight");
+  const std::uint16_t* final_norm_w =
+      head_weights.Find("model.language_model.norm.weight");
+  const std::uint16_t* lm_head_w =
+      tied_lm_head ? embed_w : head_weights.Find("lm_head.weight");
+  if (embed_w == nullptr || final_norm_w == nullptr || lm_head_w == nullptr) {
+    SetError(error, "H3 VLM head weights missing");
+    destroy_stream();
+    return false;
+  }
+
+  ops::LaunchEmbedding(embed_w, prefill_act.ids.As<std::uint32_t>(),
+                       prefill_act.hidden.As<std::uint16_t>(),
+                       static_cast<std::uint32_t>(prompt_len),
+                       kPromptEncoderVocabularySize, kPromptEncoderHiddenSize,
+                       stream);
+  if (!presentation.image_rows.empty()) {
+    ops::LaunchReplaceRows(rows_dev.As<std::uint32_t>(),
+                           emb_dev.As<std::uint16_t>(),
+                           prefill_act.hidden.As<std::uint16_t>(),
+                           static_cast<std::uint32_t>(presentation.image_rows.size()),
+                           kPromptEncoderHiddenSize, stream);
+  }
+
+  constexpr std::size_t kKvWidth =
+      kPromptEncoderKeyValueHeads * kPromptEncoderHeadDimension;
+  std::vector<LayerKvCache> kv_caches(kPromptEncoderFullLayers);
+  for (std::size_t l = 0; l < kPromptEncoderFullLayers; ++l) {
+    if (!kv_caches[l].key.Allocate(max_seq_len * kKvWidth * sizeof(std::uint16_t),
+                                   error) ||
+        !kv_caches[l].value.Allocate(
+            max_seq_len * kKvWidth * sizeof(std::uint16_t), error)) {
+      destroy_stream();
+      return false;
+    }
+  }
+
+  // Stream layers one at a time so peak host/device memory stays bounded (~3-4 GiB).
+  const bool all_resident = false;
+  std::vector<LoadedBatch> resident_layers;
+  std::string desc_err;
+
+  Bf16Gemm gemm;
+  DeviceBuffer dequant_scratch;
+  DeviceBuffer logits_dev;
+  if (!logits_dev.Allocate(kPromptEncoderVocabularySize * sizeof(std::uint16_t),
+                           error)) {
+    destroy_stream();
+    return false;
+  }
+
+  const auto get_layer = [&](std::size_t l,
+                             std::optional<LoadedBatch>* owned) -> const LoadedBatch* {
+    if (all_resident) {
+      return &resident_layers[l];
+    }
+    auto descs = LayerDescriptors(inventory, l, &desc_err);
+    if (descs.empty()) {
+      SetError(error, std::move(desc_err));
+      return nullptr;
+    }
+    BatchLoadResult lr =
+        LoadBatch(inventory, std::move(descs), device, &pinned_pool, cancellation);
+    if (!lr.batch.has_value()) {
+      SetError(error, std::move(lr.error));
+      return nullptr;
+    }
+    *owned = std::move(*lr.batch);
+    return &**owned;
+  };
+
+  // Prefill layers 0..63
+  for (std::size_t l = 0; l < kPromptEncoderFullLayers; ++l) {
+    if (IsCancelled(cancellation)) {
+      SetError(error, "MiniMax H3 VLM cancelled");
+      destroy_stream();
+      return false;
+    }
+    std::optional<LoadedBatch> owned_layer;
+    const LoadedBatch* layer_w = get_layer(l, &owned_layer);
+    if (layer_w == nullptr) {
+      destroy_stream();
+      return false;
+    }
+    PromptEncoderLayerTelemetry lt{};
+    LayerEvents le{};
+    if (!RunLayer(*layer_w, l, prompt_len, &gemm, &dequant_scratch,
+                  &prefill_act, stream, &lt, &le, error)) {
+      le.Destroy();
+      destroy_stream();
+      return false;
+    }
+    (void)hipStreamSynchronize(stream);
+    le.Destroy();
+    if (hipMemcpyAsync(kv_caches[l].key.data(), prefill_act.key.data(),
+                       prompt_len * kKvWidth * sizeof(std::uint16_t),
+                       hipMemcpyDeviceToDevice, stream) != hipSuccess ||
+        hipMemcpyAsync(kv_caches[l].value.data(), prefill_act.value.data(),
+                       prompt_len * kKvWidth * sizeof(std::uint16_t),
+                       hipMemcpyDeviceToDevice, stream) != hipSuccess) {
+      SetError(error, "H3 VLM prefill KV copy failed");
+      destroy_stream();
+      return false;
+    }
+    if (l < 3U && !presentation.image_rows.empty()) {
+      ops::LaunchAddRows(
+          rows_dev.As<std::uint32_t>(),
+          deep_dev.As<std::uint16_t>() +
+              l * presentation.image_rows.size() * kPromptEncoderHiddenSize,
+          prefill_act.hidden.As<std::uint16_t>(),
+          static_cast<std::uint32_t>(presentation.image_rows.size()),
+          kPromptEncoderHiddenSize, stream);
+    }
+  }
+
+  // Copy last prefill hidden state into decode_act.hidden
+  if (hipMemcpyAsync(decode_act.hidden.data(),
+                     prefill_act.hidden.As<std::uint16_t>() +
+                         (prompt_len - 1U) * kPromptEncoderHiddenSize,
+                     kPromptEncoderHiddenSize * sizeof(std::uint16_t),
+                     hipMemcpyDeviceToDevice, stream) != hipSuccess) {
+    SetError(error, "H3 VLM hidden handoff failed");
+    destroy_stream();
+    return false;
+  }
+  prefill_act = {};
+
+  std::uint32_t im_end_id = 151645;
+  std::uint32_t eot_id = 151643;
+  (void)tokenizer.AddedTokenId(tokenization::kImEnd, &im_end_id);
+  (void)tokenizer.AddedTokenId(tokenization::kEndOfText, &eot_id);
+
+  std::vector<std::uint16_t> logits_host(kPromptEncoderVocabularySize);
+  const auto sample_next = [&]() -> std::optional<std::uint32_t> {
+    ops::LaunchRmsNorm(decode_act.hidden.As<std::uint16_t>(), final_norm_w,
+                       decode_act.norm.As<std::uint16_t>(), 1U,
+                       kPromptEncoderHiddenSize, kRmsEpsilon, stream);
+    if (!gemm.Run(lm_head_w, decode_act.norm.As<std::uint16_t>(),
+                  logits_dev.As<std::uint16_t>(), 1U,
+                  kPromptEncoderVocabularySize, kPromptEncoderHiddenSize,
+                  stream, error)) {
+      return std::nullopt;
+    }
+    if (hipMemcpyAsync(logits_host.data(), logits_dev.data(),
+                       logits_host.size() * sizeof(std::uint16_t),
+                       hipMemcpyDeviceToHost, stream) != hipSuccess ||
+        hipStreamSynchronize(stream) != hipSuccess) {
+      SetError(error, "H3 VLM logits copy failed");
+      return std::nullopt;
+    }
+    std::uint32_t best_id = 0;
+    float best_val = -std::numeric_limits<float>::infinity();
+    for (std::uint32_t id = 0; id < kPromptEncoderVocabularySize; ++id) {
+      const float v = HostBf16ToFloat(logits_host[id]);
+      if (v > best_val) {
+        best_val = v;
+        best_id = id;
+      }
+    }
+    return best_id;
+  };
+
+  std::vector<std::uint32_t> generated_ids;
+  generated_ids.reserve(max_new_tokens);
+  const std::int32_t rope_base =
+      presentation.rope_positions.empty()
+          ? static_cast<std::int32_t>(prompt_len)
+          : presentation.rope_positions[presentation.rope_positions.size() - 3U] + 1;
+
+  for (std::size_t step = 0; step < max_new_tokens; ++step) {
+    const auto next_opt = sample_next();
+    if (!next_opt.has_value()) {
+      destroy_stream();
+      return false;
+    }
+    const std::uint32_t next_id = *next_opt;
+    if (next_id == im_end_id || next_id == eot_id) {
+      break;
+    }
+    generated_ids.push_back(next_id);
+    if (step + 1 >= max_new_tokens || IsCancelled(cancellation)) {
+      break;
+    }
+
+    const std::uint32_t kv_len =
+        static_cast<std::uint32_t>(prompt_len + step + 1U);
+    const std::uint32_t rope_pos =
+        static_cast<std::uint32_t>(rope_base + static_cast<std::int32_t>(step));
+    if (hipMemcpyAsync(decode_act.ids.data(), &next_id, sizeof(next_id),
+                       hipMemcpyHostToDevice, stream) != hipSuccess) {
+      SetError(error, "H3 VLM token upload failed");
+      destroy_stream();
+      return false;
+    }
+    ops::LaunchEmbedding(embed_w, decode_act.ids.As<std::uint32_t>(),
+                         decode_act.hidden.As<std::uint16_t>(), 1U,
+                         kPromptEncoderVocabularySize, kPromptEncoderHiddenSize,
+                         stream);
+    ops::LaunchPrepareRopeAtPosition(decode_act.rope_cosine.As<float>(),
+                                     decode_act.rope_sine.As<float>(),
+                                     rope_pos, kPromptEncoderHeadDimension,
+                                     kRopeTheta, stream);
+    for (std::size_t l = 0; l < kPromptEncoderFullLayers; ++l) {
+      std::optional<LoadedBatch> owned_layer;
+      const LoadedBatch* layer_w = get_layer(l, &owned_layer);
+      if (layer_w == nullptr ||
+          !RunDecodeLayer(*layer_w, l, kv_len, &kv_caches[l], &gemm,
+                          &dequant_scratch, &decode_act, stream, error)) {
+        destroy_stream();
+        return false;
+      }
+    }
+  }
+
+  resident_layers.clear();
+  head_weights = {};
+  kv_caches.clear();
+  pinned_pool.ReleaseAll();
+  destroy_stream();
+
+  return tokenizer.Decode(generated_ids, output_text, error);
 }
 
 }  // namespace gufo::minimax_h3

@@ -40,6 +40,7 @@ enum class VideoJobResult : std::uint8_t {
 struct VideoJobRequest {
   std::string model{"minimax-h3"};
   std::string prompt;
+  std::string negative_prompt;
   std::string size{"512x512"};
   std::string seconds{"1"};
   std::string output_format{"mp4"};
@@ -155,6 +156,10 @@ public:
   [[nodiscard]] VideoJobLookupResult Pause(std::string_view id);
   [[nodiscard]] VideoJobLookupResult Resume(std::string_view id);
   [[nodiscard]] VideoJobLookupResult Delete(std::string_view id);
+  [[nodiscard]] bool AnalyzeFrames(
+      const std::vector<std::vector<std::uint8_t>>& images,
+      std::string_view prompt, std::size_t max_new_tokens,
+      std::string* output_text, std::string* error);
 
 private:
   struct Impl;

@@ -242,6 +242,42 @@ int main() {
     std::cerr << "MiniMax H3 HIP Euler accepted an out-of-bounds range\n";
     return 1;
   }
-  std::cout << "MiniMax H3 gfx1151 GPU-state Euler checks passed\n";
+  {
+    constexpr std::array<float, 4> cond = {2.0F, -1.0F, 5.0F, 0.5F};
+    constexpr std::array<float, 4> uncond = {1.0F, 1.0F, 2.0F, -0.5F};
+    DeviceBuffer d_cond;
+    DeviceBuffer d_uncond;
+    Stream cfg_stream;
+    if (!d_cond.Allocate(sizeof(cond)) || !d_uncond.Allocate(sizeof(uncond)) ||
+        !cfg_stream.Create() ||
+        !CopyToDevice(d_cond.data(), cond.data(), sizeof(cond),
+                      cfg_stream.get()) ||
+        !CopyToDevice(d_uncond.data(), uncond.data(), sizeof(uncond),
+                      cfg_stream.get())) {
+      return 1;
+    }
+    if (!gufo::minimax_h3::HipCfgCombine(d_cond.data(), d_uncond.data(),
+                                         cond.size(), 3.0F, cfg_stream.get(),
+                                         &error)) {
+      std::cerr << "MiniMax H3 HIP CFG combine failed: " << error << '\n';
+      return 1;
+    }
+    std::array<float, 4> out{};
+    if (hipMemcpyAsync(out.data(), d_cond.data(), sizeof(out),
+                       hipMemcpyDeviceToHost, cfg_stream.get()) != hipSuccess ||
+        hipStreamSynchronize(cfg_stream.get()) != hipSuccess) {
+      return 1;
+    }
+    // u + 3 * (c - u): [1+3*(1)=4, 1+3*(-2)=-5, 2+3*(3)=11, -0.5+3*(1)=2.5]
+    constexpr std::array<float, 4> expected = {4.0F, -5.0F, 11.0F, 2.5F};
+    for (std::size_t i = 0; i < out.size(); ++i) {
+      if (std::abs(out[i] - expected[i]) > 1.0e-5F) {
+        std::cerr << "MiniMax H3 HIP CFG mismatch at " << i << ": got "
+                  << out[i] << ", expected " << expected[i] << '\n';
+        return 1;
+      }
+    }
+  }
+  std::cout << "MiniMax H3 gfx1151 GPU-state Euler and CFG checks passed\n";
   return 0;
 }

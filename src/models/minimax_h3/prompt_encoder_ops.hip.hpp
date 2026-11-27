@@ -888,12 +888,72 @@ static __global__ void DequantInt8ToBf16Kernel(const std::int8_t* source,
   }
 }
 
+// Fused INT8 dequantize + inverse Regular Hadamard Transform (ComfyUI convrot).
+// H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]] / 2 is symmetric and
+// self-inverse, so H_G = H4^{\otimes k} (G = 4^k) un-rotates each G-element
+// block along columns in k radix-4 stages.
+static __global__ void DequantInt8ConvrotToBf16Kernel(
+    const std::int8_t* source, const float* scale, std::uint16_t* destination,
+    std::size_t rows, std::size_t columns, std::size_t scale_count,
+    std::uint32_t groupsize) {
+  const std::size_t group = static_cast<std::size_t>(blockIdx.x);
+  const std::size_t row = static_cast<std::size_t>(blockIdx.y);
+  const std::uint32_t tid = threadIdx.x;
+  if (row >= rows || (group + 1U) * groupsize > columns) {
+    return;
+  }
+  const std::size_t group_offset = row * columns + group * groupsize;
+  extern __shared__ float buf[];
+  float s = 1.0F;
+  if (scale != nullptr && scale_count != 0U) {
+    s = scale_count == 1U ? scale[0] : scale[row];
+  }
+  for (std::uint32_t i = tid; i < groupsize; i += blockDim.x) {
+    buf[i] = static_cast<float>(source[group_offset + i]) * s;
+  }
+  __syncthreads();
+  for (std::uint32_t stride = 1U; stride < groupsize; stride *= 4U) {
+    const std::uint32_t block_idx = tid / stride;
+    const std::uint32_t offset = tid % stride;
+    const std::uint32_t i0 = block_idx * (4U * stride) + offset;
+    const std::uint32_t i1 = i0 + stride;
+    const std::uint32_t i2 = i0 + 2U * stride;
+    const std::uint32_t i3 = i0 + 3U * stride;
+    const float a = buf[i0];
+    const float b = buf[i1];
+    const float c = buf[i2];
+    const float d = buf[i3];
+    const float half_sum = 0.5F * (a + b + c + d);
+    buf[i0] = half_sum - d;
+    buf[i1] = half_sum - c;
+    buf[i2] = half_sum - b;
+    buf[i3] = half_sum - a;
+    __syncthreads();
+  }
+  for (std::uint32_t i = tid; i < groupsize; i += blockDim.x) {
+    destination[group_offset + i] = FloatToBf16(buf[i]);
+  }
+}
+
 inline void LaunchDequantInt8ToBf16(const std::int8_t* source,
                                     const float* scale,
                                     std::uint16_t* destination,
                                     std::size_t rows, std::size_t columns,
                                     std::size_t scale_count,
-                                    hipStream_t stream) {
+                                    hipStream_t stream,
+                                    std::uint32_t convrot_groupsize = 0U) {
+  if (convrot_groupsize >= 4U && convrot_groupsize <= 1024U &&
+      (columns % convrot_groupsize) == 0U) {
+    const dim3 grid(static_cast<std::uint32_t>(columns / convrot_groupsize),
+                    static_cast<std::uint32_t>(rows));
+    const dim3 block(convrot_groupsize / 4U);
+    const std::size_t shared_bytes =
+        static_cast<std::size_t>(convrot_groupsize) * sizeof(float);
+    hipLaunchKernelGGL(DequantInt8ConvrotToBf16Kernel, grid, block,
+                       shared_bytes, stream, source, scale, destination, rows,
+                       columns, scale_count, convrot_groupsize);
+    return;
+  }
   constexpr std::size_t kThreads = 256;
   const std::size_t elements = rows * columns;
   hipLaunchKernelGGL(
@@ -901,6 +961,91 @@ inline void LaunchDequantInt8ToBf16(const std::int8_t* source,
       dim3(static_cast<std::uint32_t>((elements + kThreads - 1U) / kThreads)),
       dim3(kThreads), 0, stream, source, scale, destination, elements, columns,
       scale_count);
+}
+
+static __global__ void PrepareRopeAtPositionKernel(float* cosine, float* sine,
+                                                   std::uint32_t position,
+                                                   std::uint32_t head_dimension,
+                                                   float theta) {
+  const std::uint32_t dimension = threadIdx.x;
+  const std::uint32_t half = head_dimension / 2U;
+  if (dimension >= half) {
+    return;
+  }
+  const float exponent =
+      static_cast<float>(2U * dimension) / static_cast<float>(head_dimension);
+  const float inverse_frequency = 1.0F / powf(theta, exponent);
+  const float angle = static_cast<float>(position) * inverse_frequency;
+  cosine[dimension] = cosf(angle);
+  sine[dimension] = sinf(angle);
+}
+
+inline void LaunchPrepareRopeAtPosition(float* cosine, float* sine,
+                                        std::uint32_t position,
+                                        std::uint32_t head_dimension,
+                                        float theta, hipStream_t stream) {
+  hipLaunchKernelGGL(PrepareRopeAtPositionKernel, dim3(1),
+                     dim3(head_dimension / 2U), 0, stream, cosine, sine,
+                     position, head_dimension, theta);
+}
+
+static __global__ void DecodeGqaKernel(
+    const std::uint16_t* query, const std::uint16_t* key_cache,
+    const std::uint16_t* value_cache, std::uint16_t* output,
+    std::uint32_t kv_len, std::uint32_t query_heads,
+    std::uint32_t key_value_heads, std::uint32_t head_dimension, float scale) {
+  const std::uint32_t q_head = blockIdx.x;
+  const std::uint32_t tid = threadIdx.x;
+  if (q_head >= query_heads || tid >= head_dimension) {
+    return;
+  }
+  const std::uint32_t grouped_heads = query_heads / key_value_heads;
+  const std::uint32_t kv_head = q_head / grouped_heads;
+  const float q_val = Bf16ToFloat(
+      query[static_cast<std::size_t>(q_head) * head_dimension + tid]);
+
+  __shared__ float s_dot[128];
+  float acc = 0.0F;
+  float running_max = -INFINITY;
+  float running_sum = 0.0F;
+
+  for (std::uint32_t pos = 0; pos < kv_len; ++pos) {
+    const std::size_t kv_base =
+        (static_cast<std::size_t>(pos) * key_value_heads + kv_head) *
+            head_dimension +
+        tid;
+    s_dot[tid] = q_val * Bf16ToFloat(key_cache[kv_base]);
+    __syncthreads();
+    for (std::uint32_t stride = head_dimension / 2U; stride > 0; stride >>= 1U) {
+      if (tid < stride) {
+        s_dot[tid] += s_dot[tid + stride];
+      }
+      __syncthreads();
+    }
+    const float score = s_dot[0] * scale;
+    const float next_max = score > running_max ? score : running_max;
+    const float exp_prev = expf(running_max - next_max);
+    const float exp_curr = expf(score - next_max);
+    const float v_val = Bf16ToFloat(value_cache[kv_base]);
+    acc = acc * exp_prev + exp_curr * v_val;
+    running_sum = running_sum * exp_prev + exp_curr;
+    running_max = next_max;
+  }
+  output[static_cast<std::size_t>(q_head) * head_dimension + tid] =
+      FloatToBf16(running_sum > 0.0F ? acc / running_sum : 0.0F);
+}
+
+inline void LaunchDecodeGqa(const std::uint16_t* query,
+                            const std::uint16_t* key_cache,
+                            const std::uint16_t* value_cache,
+                            std::uint16_t* output, std::uint32_t kv_len,
+                            std::uint32_t query_heads,
+                            std::uint32_t key_value_heads,
+                            std::uint32_t head_dimension, float scale,
+                            hipStream_t stream) {
+  hipLaunchKernelGGL(DecodeGqaKernel, dim3(query_heads), dim3(head_dimension),
+                     0, stream, query, key_cache, value_cache, output, kv_len,
+                     query_heads, key_value_heads, head_dimension, scale);
 }
 
 }  // namespace gufo::minimax_h3::ops

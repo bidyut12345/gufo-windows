@@ -128,6 +128,15 @@ bool EncodePromptLayer50(const ModelInventory&, std::span<const std::uint32_t>,
   return false;
 }
 
+bool GenerateVlmText(const ModelInventory&, const VlmRequest&,
+                     const CancellationToken*, std::string*,
+                     std::string* error) {
+  if (error != nullptr) {
+    *error = "MiniMax H3 VLM generation requires ENGINE_ENABLE_HIP";
+  }
+  return false;
+}
+
 bool EncodePromptMultimodal(const ModelInventory&, const Tokenizer&,
                             std::string_view,
                             const std::vector<KeyframeVision>&,

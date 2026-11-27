@@ -143,7 +143,10 @@ public:
       const std::uint16_t* hidden_device, const std::uint32_t* row_map_device,
       std::uint16_t* output_device, void* stream, bool input_rms_prepared,
       bool output_rms_required, const CancellationToken* cancellation,
-      DitBlockTelemetry* telemetry, std::string* error = nullptr);
+      DitBlockTelemetry* telemetry, std::string* error = nullptr,
+      std::size_t active_rows = 0,
+      const std::uint16_t* rope_cos_override = nullptr,
+      const std::uint16_t* rope_sin_override = nullptr);
 
   [[nodiscard]] bool Run(const DitBlockInput& input,
                          const CancellationToken* cancellation,
@@ -171,7 +174,10 @@ private:
       std::string* error, const std::uint16_t* hidden_device = nullptr,
       const std::uint32_t* row_map_device = nullptr,
       std::uint16_t* output_device = nullptr, void* external_stream = nullptr,
-      bool input_rms_prepared = false, bool output_rms_required = false);
+      bool input_rms_prepared = false, bool output_rms_required = false,
+      std::size_t active_rows = 0,
+      const std::uint16_t* rope_cos_override = nullptr,
+      const std::uint16_t* rope_sin_override = nullptr);
   std::unique_ptr<Impl> impl_;
 };
 
