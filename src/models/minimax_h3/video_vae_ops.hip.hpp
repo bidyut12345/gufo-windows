@@ -582,6 +582,75 @@ inline void LaunchFloatToBf16(const float* source, std::uint16_t* destination,
       dim3(kThreads), 0, stream, source, destination, elements);
 }
 
+static __global__ void Bf16ToFloatKernel(const std::uint16_t* source,
+                                         float* destination,
+                                         std::size_t elements) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    destination[index] =
+        __uint_as_float(static_cast<std::uint32_t>(source[index]) << 16U);
+  }
+}
+
+inline void LaunchBf16ToFloat(const std::uint16_t* source, float* destination,
+                              std::size_t elements, hipStream_t stream) {
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(
+      Bf16ToFloatKernel,
+      dim3(static_cast<std::uint32_t>((elements + kThreads - 1U) / kThreads)),
+      dim3(kThreads), 0, stream, source, destination, elements);
+}
+
+static __global__ void SoftmaxBf16InPlaceKernel(std::uint16_t* scores,
+                                                std::uint32_t rows,
+                                                std::uint32_t heads) {
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  if (row >= rows || head >= heads) {
+    return;
+  }
+  std::uint16_t* row_scores =
+      scores +
+      (static_cast<std::size_t>(head) * rows + row) *
+          static_cast<std::size_t>(rows);
+  float local_maximum = -INFINITY;
+  for (std::uint32_t column = threadIdx.x; column < rows;
+       column += blockDim.x) {
+    const float value = __uint_as_float(
+        static_cast<std::uint32_t>(row_scores[column]) << 16U);
+    local_maximum = fmaxf(local_maximum, value);
+  }
+  const float maximum = SoftmaxWaveMaximum(local_maximum);
+  float local_sum = 0.0F;
+  for (std::uint32_t column = threadIdx.x; column < rows;
+       column += blockDim.x) {
+    const float value = __uint_as_float(
+        static_cast<std::uint32_t>(row_scores[column]) << 16U);
+    local_sum += expf(value - maximum);
+  }
+  const float inverse_sum = 1.0F / SoftmaxWaveSum(local_sum);
+  for (std::uint32_t column = threadIdx.x; column < rows;
+       column += blockDim.x) {
+    const float value = __uint_as_float(
+        static_cast<std::uint32_t>(row_scores[column]) << 16U);
+    const float prob = expf(value - maximum) * inverse_sum;
+    const std::uint32_t bits = __float_as_uint(prob);
+    if ((bits & 0x7F800000U) == 0x7F800000U) {
+      row_scores[column] = static_cast<std::uint16_t>((bits | 0x0040U) >> 16U);
+    } else {
+      const std::uint32_t rounding = 0x7FFFU + ((bits >> 16U) & 1U);
+      row_scores[column] = static_cast<std::uint16_t>((bits + rounding) >> 16U);
+    }
+  }
+}
+
+inline void LaunchSoftmaxBf16InPlace(std::uint16_t* scores, std::uint32_t rows,
+                                     std::uint32_t heads, hipStream_t stream) {
+  hipLaunchKernelGGL(SoftmaxBf16InPlaceKernel, dim3(rows, heads), dim3(256), 0,
+                     stream, scores, rows, heads);
+}
+
 // Tiled FlashAttention for VisualVAE decoder: [sequence, heads, head_dim=64].
 // Eliminates materializing the [heads, sequence, sequence] score matrix.
 static __global__ void VideoFlashAttentionKernel(
