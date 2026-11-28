@@ -22,6 +22,7 @@
 #include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/dit_ops.hip.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
+#include "src/models/minimax_h3/video_vae_ops.hip.hpp"
 
 namespace {
 
@@ -981,6 +982,218 @@ void CheckNativeAttention(std::uint32_t rows, float query_scale = 1.7F,
   CHECK(relative_max < 0.01);
 }
 
+void CheckSparseAttentionOver65536Rows() {
+  constexpr std::uint32_t kRows = 70000U;
+  constexpr std::uint32_t kHeads = 1U;
+  constexpr std::uint32_t kDim = 128U;
+  constexpr std::uint32_t kPaddedRows = (kRows + 31U) & ~31U;
+  const std::size_t qk_count = static_cast<std::size_t>(kHeads) * kRows * kDim;
+  const std::size_t v_count =
+      static_cast<std::size_t>(kHeads) * kPaddedRows * kDim;
+  std::vector<std::uint16_t> q(qk_count, ToBf16(0.25F));
+  std::vector<std::uint16_t> k(qk_count, ToBf16(0.25F));
+  std::vector<std::uint16_t> v(v_count, ToBf16(0.5F));
+  for (std::uint32_t r = 0; r < kRows; ++r) {
+    v[r * 16U + 0] = ToBf16(r < 3200U ? 1.0F : 0.25F);
+  }
+  DeviceArray<std::uint16_t> d_q(qk_count), d_k(qk_count), d_pv(v_count),
+      d_out(qk_count);
+  CHECK(d_q.CopyFrom(q));
+  CHECK(d_k.CopyFrom(k));
+  CHECK(d_pv.CopyFrom(v));
+  ops::LaunchProjectionAttention(d_q.get(), d_k.get(), d_pv.get(), d_out.get(),
+                                 kRows, kHeads, nullptr, 3200U);
+  CHECK(hipGetLastError() == hipSuccess);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  std::vector<std::uint16_t> out(qk_count);
+  CHECK(d_out.CopyTo(out));
+  for (std::size_t idx : {std::size_t{0}, std::size_t{1024},
+                          qk_count - 16U}) {
+    CHECK(std::isfinite(ToFloat(out[idx])));
+  }
+}
+
+void CheckApplyBf16WeightLoras() {
+  h3::TensorDescriptor desc;
+  desc.name = "token_refiner.blocks.0.attn.out_proj.weight";
+  desc.dtype = h3::DType::kBFloat16;
+  desc.shape = {4, 4};
+
+  h3::LokrPatch patch;
+  patch.target = desc.name;
+  patch.w1 = {1.0F, 0.0F, 0.0F, 1.0F};
+  patch.w2 = {0.5F, 0.25F, -0.25F, 0.5F};
+  patch.w1_rows = 2;
+  patch.w1_cols = 2;
+  patch.w2_rows = 2;
+  patch.w2_cols = 2;
+  patch.scale = 1.0F;
+
+  h3::DitLoras loras;
+  loras.lokr_terms[desc.name].push_back({.patch = &patch, .strength = 2.0F});
+
+  std::vector<std::uint16_t> weight(16, ToBf16(1.0F));
+  DeviceArray<std::uint16_t> d_weight(16);
+  CHECK(d_weight.CopyFrom(weight));
+  hipStream_t stream = nullptr;
+  CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) == hipSuccess);
+  std::string error;
+  CHECK(h3::ApplyBf16WeightLoras(desc, d_weight.get(), &loras, stream, &error));
+  if (!error.empty()) {
+    std::cerr << error << '\n';
+  }
+  (void)hipStreamDestroy(stream);
+  CHECK(d_weight.CopyTo(weight));
+  // Expected element (0, 0) = 1.0 + 2.0 * (1.0 * 0.5) = 2.0
+  // Expected element (0, 1) = 1.0 + 2.0 * (1.0 * 0.25) = 1.5
+  // Expected element (0, 2) = 1.0 + 2.0 * (0.0 * 0.5) = 1.0
+  CHECK(std::abs(ToFloat(weight[0]) - 2.0F) < 0.02F);
+  CHECK(std::abs(ToFloat(weight[1]) - 1.5F) < 0.02F);
+  CHECK(std::abs(ToFloat(weight[2]) - 1.0F) < 0.02F);
+}
+
+void CheckSparseAttentionHints28k() {
+  constexpr std::uint32_t kRows = 28000U;
+  constexpr std::uint32_t kHeads = 1U;
+  constexpr std::uint32_t kDim = 128U;
+  constexpr std::uint32_t kPaddedRows = (kRows + 31U) & ~31U;
+  const std::size_t qk_count = static_cast<std::size_t>(kHeads) * kRows * kDim;
+  const std::size_t v_count =
+      static_cast<std::size_t>(kHeads) * kPaddedRows * kDim;
+  std::vector<std::uint16_t> q(qk_count, ToBf16(0.25F));
+  std::vector<std::uint16_t> k(qk_count, ToBf16(0.25F));
+  std::vector<std::uint16_t> v(v_count, ToBf16(0.5F));
+  DeviceArray<std::uint16_t> d_q(qk_count), d_k(qk_count), d_pv(v_count),
+      d_out(qk_count);
+  CHECK(d_q.CopyFrom(q));
+  CHECK(d_k.CopyFrom(k));
+  CHECK(d_pv.CopyFrom(v));
+  const ops::SparseAttentionHints hints{
+      .protected_prefix_rows = 3100U,
+      .audio_begin_row = 3100U,
+      .audio_end_row = 3910U,
+      .video_begin_row = 3910U,
+      .video_frame_rows = 390U,
+  };
+  ops::LaunchProjectionAttention(d_q.get(), d_k.get(), d_pv.get(), d_out.get(),
+                                 kRows, kHeads, nullptr, hints);
+  CHECK(hipGetLastError() == hipSuccess);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  std::vector<std::uint16_t> out(qk_count);
+  CHECK(d_out.CopyTo(out));
+  for (std::size_t idx : {std::size_t{0}, std::size_t{3100 * 16},
+                          std::size_t{3910 * 16}, qk_count - 16U}) {
+    CHECK(std::isfinite(ToFloat(out[idx])));
+  }
+}
+
+void CheckVideoVaeFromBf16Ops() {
+  namespace vae_ops = gufo::minimax_h3::video_vae_ops;
+  constexpr std::uint32_t kRows = 4U;
+  constexpr std::uint32_t kHeads = 2U;
+  constexpr std::uint32_t kHeadDim = 64U;
+  constexpr std::uint32_t kWidth = 8U;
+  std::vector<float> res_f32(kRows * kWidth, 0.5F);
+  std::vector<float> res_bf16 = res_f32;
+  std::vector<float> branch_f32(kRows * kWidth);
+  std::vector<std::uint16_t> branch_bf16(kRows * kWidth);
+  std::vector<float> bias(kWidth, 0.125F), scale(kWidth, 0.75F);
+  for (std::size_t i = 0; i < branch_f32.size(); ++i) {
+    const float v = std::sin(static_cast<float>(i) * 0.37F);
+    branch_bf16[i] = ToBf16(v);
+    branch_f32[i] = ToFloat(branch_bf16[i]);
+  }
+  DeviceArray<float> d_res_a(res_f32.size()), d_res_b(res_bf16.size()),
+      d_br_f32(branch_f32.size()), d_bias(bias.size()), d_scale(scale.size());
+  DeviceArray<std::uint16_t> d_br_bf16(branch_bf16.size());
+  CHECK(d_res_a.CopyFrom(res_f32));
+  CHECK(d_res_b.CopyFrom(res_bf16));
+  CHECK(d_br_f32.CopyFrom(branch_f32));
+  CHECK(d_br_bf16.CopyFrom(branch_bf16));
+  CHECK(d_bias.CopyFrom(bias));
+  CHECK(d_scale.CopyFrom(scale));
+  vae_ops::LaunchScaleAdd(d_res_a.get(), d_br_f32.get(), d_bias.get(),
+                          d_scale.get(), kRows, kWidth, nullptr);
+  vae_ops::LaunchScaleAddFromBf16(d_res_b.get(), d_br_bf16.get(), d_bias.get(),
+                                  d_scale.get(), kRows, kWidth, nullptr);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  CHECK(d_res_a.CopyTo(res_f32));
+  CHECK(d_res_b.CopyTo(res_bf16));
+  for (std::size_t i = 0; i < res_f32.size(); ++i) {
+    CHECK(std::abs(res_f32[i] - res_bf16[i]) < 1.0e-5F);
+  }
+
+  // SwiGLU comparison
+  std::vector<float> swi_in_f32(kRows * kWidth * 2U);
+  std::vector<std::uint16_t> swi_in_bf16(kRows * kWidth * 2U);
+  std::vector<float> swi_bias(kWidth * 2U, 0.05F);
+  for (std::size_t i = 0; i < swi_in_f32.size(); ++i) {
+    const float v = std::cos(static_cast<float>(i) * 0.21F);
+    swi_in_bf16[i] = ToBf16(v);
+    swi_in_f32[i] = ToFloat(swi_in_bf16[i]);
+  }
+  DeviceArray<float> d_swi_f32(swi_in_f32.size()), d_swi_bias(swi_bias.size());
+  DeviceArray<std::uint16_t> d_swi_bf16(swi_in_bf16.size()),
+      d_swi_out_a(kRows * kWidth), d_swi_out_b(kRows * kWidth);
+  CHECK(d_swi_f32.CopyFrom(swi_in_f32));
+  CHECK(d_swi_bf16.CopyFrom(swi_in_bf16));
+  CHECK(d_swi_bias.CopyFrom(swi_bias));
+  vae_ops::LaunchSwiGluBf16(d_swi_f32.get(), d_swi_bias.get(),
+                            d_swi_out_a.get(), kRows, kWidth, nullptr);
+  vae_ops::LaunchSwiGluBf16FromBf16(d_swi_bf16.get(), d_swi_bias.get(),
+                                    d_swi_out_b.get(), kRows, kWidth, nullptr);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  std::vector<std::uint16_t> swi_out_a(kRows * kWidth),
+      swi_out_b(kRows * kWidth);
+  CHECK(d_swi_out_a.CopyTo(swi_out_a));
+  CHECK(d_swi_out_b.CopyTo(swi_out_b));
+  for (std::size_t i = 0; i < swi_out_a.size(); ++i) {
+    CHECK(swi_out_a[i] == swi_out_b[i]);
+  }
+
+  // QKV + RoPE comparison
+  const std::size_t qkv_elems =
+      static_cast<std::size_t>(kRows) * kHeads * kHeadDim * 3U;
+  std::vector<float> qkv_f32(qkv_elems);
+  std::vector<std::uint16_t> qkv_bf16(qkv_elems);
+  for (std::size_t i = 0; i < qkv_elems; ++i) {
+    const float v = std::sin(static_cast<float>(i) * 0.13F);
+    qkv_bf16[i] = ToBf16(v);
+    qkv_f32[i] = ToFloat(qkv_bf16[i]);
+  }
+  std::vector<float> qkv_bias(kHeads * kHeadDim * 3U, 0.03F);
+  std::vector<float> cos_v(kRows * 24U, 0.8F), sin_v(kRows * 24U, 0.6F);
+  const std::size_t head_elems = static_cast<std::size_t>(kRows) * kHeads * kHeadDim;
+  DeviceArray<float> d_qkv_f32(qkv_elems), d_qkv_bias(qkv_bias.size()),
+      d_cos(cos_v.size()), d_sin(sin_v.size());
+  DeviceArray<std::uint16_t> d_qkv_bf16(qkv_elems), d_qa(head_elems),
+      d_ka(head_elems), d_va(head_elems), d_qb(head_elems), d_kb(head_elems),
+      d_vb(head_elems);
+  CHECK(d_qkv_f32.CopyFrom(qkv_f32));
+  CHECK(d_qkv_bf16.CopyFrom(qkv_bf16));
+  CHECK(d_qkv_bias.CopyFrom(qkv_bias));
+  CHECK(d_cos.CopyFrom(cos_v));
+  CHECK(d_sin.CopyFrom(sin_v));
+  vae_ops::LaunchVideoQkvRopeBf16HeadMajor(
+      d_qkv_f32.get(), d_qkv_bias.get(), d_cos.get(), d_sin.get(), d_qa.get(),
+      d_ka.get(), d_va.get(), kRows, kHeads, kHeadDim, 24U, 1.0e-5F, nullptr);
+  vae_ops::LaunchVideoQkvRopeBf16HeadMajorFromBf16(
+      d_qkv_bf16.get(), d_qkv_bias.get(), d_cos.get(), d_sin.get(), d_qb.get(),
+      d_kb.get(), d_vb.get(), kRows, kHeads, kHeadDim, 24U, 1.0e-5F, nullptr);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  std::vector<std::uint16_t> qa(head_elems), qb(head_elems), ka(head_elems),
+      kb(head_elems), va(head_elems), vb(head_elems);
+  CHECK(d_qa.CopyTo(qa));
+  CHECK(d_qb.CopyTo(qb));
+  CHECK(d_ka.CopyTo(ka));
+  CHECK(d_kb.CopyTo(kb));
+  CHECK(d_va.CopyTo(va));
+  CHECK(d_vb.CopyTo(vb));
+  CHECK(qa == qb);
+  CHECK(ka == kb);
+  CHECK(va == vb);
+}
+
 bool HasGfx1151() {
   int device = 0;
   hipDeviceProp_t properties{};
@@ -1013,6 +1226,10 @@ int CheckAnalytic() {
   CheckNativeAttention(65, 6.0F);
   CheckNativeAttention(129, 1.7F, true);
   CheckNativeAttention(4097, 1.7F, true);
+  CheckSparseAttentionOver65536Rows();
+  CheckSparseAttentionHints28k();
+  CheckApplyBf16WeightLoras();
+  CheckVideoVaeFromBf16Ops();
   if (failures != 0) {
     std::cerr << failures << " MiniMax H3 DiT analytic checks failed\n";
     return 1;

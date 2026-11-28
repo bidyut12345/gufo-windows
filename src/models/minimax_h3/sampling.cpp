@@ -1057,6 +1057,18 @@ std::optional<std::vector<EulerStepPlan>> BuildEulerPlan(
               ? schedule.audio[static_cast<std::size_t>(previous_evaluated)]
               : 0.0F,
           previous_evaluated >= 0);
+    } else if (steps < 35 && previous_evaluated >= 0 && step + 1 < steps) {
+      // Damped 2nd-order Adams-Bashforth (AB2) multistep update for audio on
+      // interior steps at low step counts (<35). Never extrapolates on the
+      // final step (sigma -> 0) to prevent x0 overshoot into AudioVAE.
+      const float h_curr = schedule.audio[index] - schedule.audio[index + 1];
+      const float h_prev =
+          schedule.audio[static_cast<std::size_t>(previous_evaluated)] -
+          schedule.audio[index];
+      if (h_prev > 0.0F) {
+        item.audio_extrapolation =
+            std::clamp(h_curr / (2.0F * h_prev), 0.0F, 0.35F);
+      }
     }
   }
   return plan;

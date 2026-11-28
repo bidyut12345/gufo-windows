@@ -37,6 +37,7 @@ ROLES = (
     (".lora_A", "down"), (".lora_B", "up"),
     (".lora_down", "down"), (".lora_up", "up"),
     (".alpha", "alpha"),          # comfy/lora.py L45-49
+    (".scale", "scale"),          # stable-diffusion.cpp scale tensor
     (".dora_scale", "dora"),      # comfy/lora.py L51-55
     (".diff", "diff"),            # comfy/lora.py L76-80
 )
@@ -85,9 +86,16 @@ class Base:
 
     def __init__(self, model):
         root = Path(model) / "transformer"
-        index = json.loads((root / "diffusion_pytorch_model.safetensors.index.json").read_text())
-        self.files = {"transformer." + k: root / v for k, v in index["weight_map"].items()}
-        self.shards = {}
+        index_path = root / "diffusion_pytorch_model.safetensors.index.json"
+        if index_path.exists():
+            index = json.loads(index_path.read_text())
+            self.files = {"transformer." + k: root / v for k, v in index["weight_map"].items()}
+            self.shards = {}
+        else:
+            single_path = root / "diffusion_pytorch_model.safetensors"
+            single = SafeTensors(single_path)
+            self.files = {"transformer." + k: single_path for k in single.header}
+            self.shards = {single_path: single}
 
     def __contains__(self, name):
         return name in self.files
@@ -172,7 +180,7 @@ def reference(module, parts, lora, base, strength, meta):
     w = np.concatenate(blocks, axis=0)
     if "diff" in parts:
         # comfy/lora.py L529-534: weight += strength * diff (alpha unused).
-        if {"down", "up", "alpha", "dora"} & parts.keys():
+        if {"down", "up", "alpha", "scale", "dora"} & parts.keys():
             raise ValueError(f"{module}: diff mixed with a low-rank pair")
         diff = lora.get(parts["diff"])
         if diff.size != w.size:
@@ -187,8 +195,10 @@ def reference(module, parts, lora, base, strength, meta):
                 up.shape[0] != w.shape[0] or down.shape[1] != w.shape[1]:
             raise ValueError(f"{module}: pair {up.shape} x {down.shape} vs {w.shape}")
         # comfy/weight_adapter/lora.py L248-251: alpha / rank, else 1.
-        # Without a .alpha tensor, diffusers metadata alpha (rslora: sqrt).
-        if "alpha" in parts:
+        # A .scale tensor gives the scale directly; otherwise diffusers metadata alpha (rslora: sqrt).
+        if "scale" in parts:
+            scale = float(lora.get(parts["scale"]).reshape(-1)[0])
+        elif "alpha" in parts:
             scale = float(lora.get(parts["alpha"]).reshape(-1)[0]) / rank
         elif meta[0] is not None:
             scale = meta[0] / (np.sqrt(rank) if meta[1] else rank)

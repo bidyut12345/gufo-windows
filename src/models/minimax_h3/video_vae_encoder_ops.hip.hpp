@@ -182,6 +182,136 @@ inline void LaunchIm2Col3DReflect(
       out_height, out_width, channels, stride_t, stride_s, pad_s, base, count);
 }
 
+__device__ __forceinline__ std::uint16_t EncFloatToBf16(float value) {
+  const std::uint32_t bits = __float_as_uint(value);
+  if ((bits & 0x7F800000U) == 0x7F800000U) {
+    return static_cast<std::uint16_t>((bits | 0x0040U) >> 16U);
+  }
+  const std::uint32_t rounding = 0x7FFFU + ((bits >> 16U) & 1U);
+  return static_cast<std::uint16_t>((bits + rounding) >> 16U);
+}
+
+// Coalesced vectorized 2D reflect im2col writing BF16 directly in
+// [count][9][channels] layout (matching weights transposed to [cout][9][cin]).
+// Adjacent threads read contiguous float4 channels from NHWC input and write
+// contiguous uint2 (4 x BF16) to columns.
+static __global__ void Im2ColReflectBf16Float4Kernel(
+    const float4* input, uint2* columns, std::uint32_t in_height,
+    std::uint32_t in_width, std::uint32_t out_width, std::uint32_t vectors,
+    std::uint32_t stride, std::int32_t pad_top, std::int32_t pad_left,
+    std::uint32_t base, std::uint32_t count) {
+  const std::uint32_t vec = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t tap = blockIdx.y;
+  const std::uint32_t local_pos = blockIdx.z;
+  if (vec >= vectors || tap >= 9U || local_pos >= count) {
+    return;
+  }
+  const std::uint32_t position = base + local_pos;
+  const std::uint32_t y = position / out_width;
+  const std::uint32_t x = position % out_width;
+  const std::int32_t source_y = ReflectIndex(
+      static_cast<std::int32_t>(y * stride) +
+          static_cast<std::int32_t>(tap / 3U) - pad_top,
+      static_cast<std::int32_t>(in_height));
+  const std::int32_t source_x = ReflectIndex(
+      static_cast<std::int32_t>(x * stride) +
+          static_cast<std::int32_t>(tap % 3U) - pad_left,
+      static_cast<std::int32_t>(in_width));
+  const float4 v =
+      input[(static_cast<std::size_t>(source_y) * in_width + source_x) *
+                vectors +
+            vec];
+  const std::uint32_t b0 = EncFloatToBf16(v.x);
+  const std::uint32_t b1 = EncFloatToBf16(v.y);
+  const std::uint32_t b2 = EncFloatToBf16(v.z);
+  const std::uint32_t b3 = EncFloatToBf16(v.w);
+  columns[(static_cast<std::size_t>(local_pos) * 9U + tap) * vectors + vec] = {
+      b0 | (b1 << 16U), b2 | (b3 << 16U)};
+}
+
+inline void LaunchIm2ColReflectBf16(
+    const float* input, std::uint16_t* columns, std::uint32_t in_height,
+    std::uint32_t in_width, std::uint32_t out_height, std::uint32_t out_width,
+    std::uint32_t channels, std::uint32_t stride, std::int32_t pad_top,
+    std::int32_t pad_left, std::uint32_t base, std::uint32_t count,
+    hipStream_t stream) {
+  (void)out_height;
+  const std::uint32_t vectors = channels / 4U;
+  constexpr std::uint32_t kThreads = 64;
+  hipLaunchKernelGGL(
+      Im2ColReflectBf16Float4Kernel,
+      dim3((vectors + kThreads - 1U) / kThreads, 9U, count), dim3(kThreads), 0,
+      stream, reinterpret_cast<const float4*>(input),
+      reinterpret_cast<uint2*>(columns), in_height, in_width, out_width,
+      vectors, stride, pad_top, pad_left, base, count);
+}
+
+// Coalesced vectorized 3D causal reflect im2col writing BF16 directly in
+// [count][27][channels] layout (matching weights transposed to [cout][27][cin]).
+static __global__ void Im2Col3DReflectBf16Float4Kernel(
+    const float4* input, uint2* columns, std::uint32_t in_time,
+    std::uint32_t in_height, std::uint32_t in_width, std::uint32_t out_height,
+    std::uint32_t out_width, std::uint32_t vectors, std::uint32_t stride_t,
+    std::uint32_t stride_s, std::int32_t pad_s, std::uint32_t base,
+    std::uint32_t count) {
+  const std::uint32_t vec = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t tap = blockIdx.y;
+  const std::uint32_t local_pos = blockIdx.z;
+  if (vec >= vectors || tap >= 27U || local_pos >= count) {
+    return;
+  }
+  const std::size_t out_index =
+      (static_cast<std::size_t>(local_pos) * 27U + tap) * vectors + vec;
+  const std::uint32_t position = base + local_pos;
+  const std::uint32_t spatial_out = out_height * out_width;
+  const std::uint32_t t_out = position / spatial_out;
+  const std::uint32_t kt = tap / 9U;
+  const std::int32_t t_in =
+      static_cast<std::int32_t>(t_out * stride_t + kt) - 2;
+  if (t_in < 0 || t_in >= static_cast<std::int32_t>(in_time)) {
+    columns[out_index] = {0U, 0U};
+    return;
+  }
+  const std::uint32_t hw_out = position % spatial_out;
+  const std::uint32_t y = hw_out / out_width;
+  const std::uint32_t x = hw_out % out_width;
+  const std::uint32_t spatial_tap = tap % 9U;
+  const std::int32_t source_y = ReflectIndex(
+      static_cast<std::int32_t>(y * stride_s) +
+          static_cast<std::int32_t>(spatial_tap / 3U) - pad_s,
+      static_cast<std::int32_t>(in_height));
+  const std::int32_t source_x = ReflectIndex(
+      static_cast<std::int32_t>(x * stride_s) +
+          static_cast<std::int32_t>(spatial_tap % 3U) - pad_s,
+      static_cast<std::int32_t>(in_width));
+  const std::size_t in_pos =
+      (static_cast<std::size_t>(t_in) * in_height + source_y) * in_width +
+      source_x;
+  const float4 v = input[in_pos * vectors + vec];
+  const std::uint32_t b0 = EncFloatToBf16(v.x);
+  const std::uint32_t b1 = EncFloatToBf16(v.y);
+  const std::uint32_t b2 = EncFloatToBf16(v.z);
+  const std::uint32_t b3 = EncFloatToBf16(v.w);
+  columns[out_index] = {b0 | (b1 << 16U), b2 | (b3 << 16U)};
+}
+
+inline void LaunchIm2Col3DReflectBf16(
+    const float* input, std::uint16_t* columns, std::uint32_t in_time,
+    std::uint32_t in_height, std::uint32_t in_width, std::uint32_t out_height,
+    std::uint32_t out_width, std::uint32_t channels, std::uint32_t stride_t,
+    std::uint32_t stride_s, std::int32_t pad_s, std::uint32_t base,
+    std::uint32_t count, hipStream_t stream) {
+  const std::uint32_t vectors = channels / 4U;
+  constexpr std::uint32_t kThreads = 64;
+  // HIP gridDim.z limit is 65535; callers cap count <= 65535.
+  hipLaunchKernelGGL(
+      Im2Col3DReflectBf16Float4Kernel,
+      dim3((vectors + kThreads - 1U) / kThreads, 27U, count), dim3(kThreads), 0,
+      stream, reinterpret_cast<const float4*>(input),
+      reinterpret_cast<uint2*>(columns), in_time, in_height, in_width,
+      out_height, out_width, vectors, stride_t, stride_s, pad_s, base, count);
+}
+
 // GroupNorm(32, eps 1e-6, affine) over one plane. Statistics never mix
 // frames (norm.py:_merge_time_to_batch), so with T=1 the reference set is the
 // group's channels across every position of the tile. Partial sums are
@@ -349,6 +479,156 @@ inline void LaunchGroupNormSilu(const float* input, const float* weight,
       dim3(static_cast<std::uint32_t>((elements + kThreads - 1U) / kThreads)),
       dim3(kThreads), 0, stream, input, weight, bias, means, inverses, output,
       positions, channels, channels / groups);
+}
+
+// Batched GroupNorm(32, eps 1e-6, affine) + SiLU across `time` frames
+// simultaneously (blockIdx.z = t), replacing 17 serial per-frame calls.
+static __global__ void GroupNormPartialBatchedKernel(
+    const float* input, float* sums, float* squares, std::uint32_t positions,
+    std::uint32_t channels, std::uint32_t groups,
+    std::uint32_t positions_per_block, std::uint32_t chunks_per_frame) {
+  const std::uint32_t t = blockIdx.z;
+  const std::uint32_t per_group = channels / groups;
+  const std::uint32_t chunk = blockIdx.x;
+  const std::uint32_t group = blockIdx.y;
+  const std::size_t origin =
+      static_cast<std::size_t>(chunk) * positions_per_block;
+  if (origin >= positions) {
+    return;
+  }
+  const float* frame_in =
+      input + static_cast<std::size_t>(t) * positions * channels;
+  const std::uint32_t count = static_cast<std::uint32_t>(
+      positions_per_block < positions - origin ? positions_per_block
+                                               : positions - origin);
+  const std::size_t elements = static_cast<std::size_t>(count) * per_group;
+  float sum = 0.0F;
+  float square = 0.0F;
+  for (std::size_t index = threadIdx.x; index < elements; index += blockDim.x) {
+    const std::size_t position = origin + index / per_group;
+    const std::size_t channel =
+        static_cast<std::size_t>(group) * per_group + index % per_group;
+    const float value = frame_in[position * channels + channel];
+    sum += value;
+    square = fmaf(value, value, square);
+  }
+  constexpr std::uint32_t kThreads = 256;
+  __shared__ float shared_sum[kThreads];
+  __shared__ float shared_square[kThreads];
+  shared_sum[threadIdx.x] = sum;
+  shared_square[threadIdx.x] = square;
+  __syncthreads();
+#pragma unroll
+  for (std::uint32_t stride = kThreads / 2U; stride >= 32U; stride >>= 1U) {
+    if (threadIdx.x < stride) {
+      shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+      shared_square[threadIdx.x] += shared_square[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x < 32U) {
+#pragma unroll
+    for (std::uint32_t offset = 16U; offset != 0U; offset >>= 1U) {
+      shared_sum[threadIdx.x] +=
+          __shfl_down(shared_sum[threadIdx.x], offset, 32);
+      shared_square[threadIdx.x] +=
+          __shfl_down(shared_square[threadIdx.x], offset, 32);
+    }
+    if (threadIdx.x == 0U) {
+      const std::size_t slot =
+          (static_cast<std::size_t>(t) * chunks_per_frame + chunk) * groups +
+          group;
+      sums[slot] = shared_sum[0];
+      squares[slot] = shared_square[0];
+    }
+  }
+}
+
+static __global__ void GroupNormStatsBatchedKernel(
+    const float* sums, const float* squares, float* means, float* inverses,
+    std::uint32_t chunks, std::uint32_t groups, float count, float epsilon) {
+  const std::uint32_t t = blockIdx.y;
+  const std::uint32_t lane = threadIdx.x;
+  const std::uint32_t group = blockIdx.x;
+  const std::size_t frame_base = static_cast<std::size_t>(t) * chunks * groups;
+  float sum = 0.0F;
+  float square = 0.0F;
+  for (std::uint32_t chunk = lane; chunk < chunks; chunk += 32U) {
+    const std::size_t slot =
+        frame_base + static_cast<std::size_t>(chunk) * groups + group;
+    sum += sums[slot];
+    square += squares[slot];
+  }
+#pragma unroll
+  for (std::uint32_t offset = 16U; offset != 0U; offset >>= 1U) {
+    sum += __shfl_down(sum, offset, 32);
+    square += __shfl_down(square, offset, 32);
+  }
+  if (lane == 0U) {
+    const float mean = sum / count;
+    const float variance = fmaxf(square / count - mean * mean, 0.0F);
+    const std::size_t out_slot = static_cast<std::size_t>(t) * groups + group;
+    means[out_slot] = mean;
+    inverses[out_slot] = rsqrtf(variance + epsilon);
+  }
+}
+
+static __global__ void GroupNormSiluBatchedKernel(
+    const float4* input, const float4* weight, const float4* bias,
+    const float* means, const float* inverses, float4* output,
+    std::uint32_t positions, std::uint32_t vectors, std::uint32_t groups,
+    std::uint32_t vectors_per_group) {
+  const std::uint32_t t = blockIdx.z;
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t position = blockIdx.y;
+  if (position >= positions || column >= vectors) {
+    return;
+  }
+  const std::size_t index =
+      (static_cast<std::size_t>(t) * positions + position) * vectors + column;
+  const float4 value = input[index];
+  const std::size_t stat_idx =
+      static_cast<std::size_t>(t) * groups + (column / vectors_per_group);
+  const float mean = means[stat_idx];
+  const float inv = inverses[stat_idx];
+  const float4 scale = weight[column];
+  const float4 shift = bias[column];
+  const float first = (value.x - mean) * inv * scale.x + shift.x;
+  const float second = (value.y - mean) * inv * scale.y + shift.y;
+  const float third = (value.z - mean) * inv * scale.z + shift.z;
+  const float fourth = (value.w - mean) * inv * scale.w + shift.w;
+  output[index] = {
+      first / (1.0F + expf(-first)), second / (1.0F + expf(-second)),
+      third / (1.0F + expf(-third)), fourth / (1.0F + expf(-fourth))};
+}
+
+inline void LaunchGroupNormSiluBatched(
+    const float* input, const float* weight, const float* bias, float* sums,
+    float* squares, float* means, float* inverses, float* output,
+    std::uint32_t time, std::uint32_t positions, std::uint32_t channels,
+    std::uint32_t groups, float epsilon, hipStream_t stream) {
+  constexpr std::uint32_t kPositionsPerBlock = 32;
+  constexpr std::uint32_t kThreads = 256;
+  const std::uint32_t chunks =
+      (positions + kPositionsPerBlock - 1U) / kPositionsPerBlock;
+  hipLaunchKernelGGL(GroupNormPartialBatchedKernel, dim3(chunks, groups, time),
+                     dim3(kThreads), 0, stream, input, sums, squares, positions,
+                     channels, groups, kPositionsPerBlock, chunks);
+  const float count = static_cast<float>(static_cast<std::size_t>(positions) *
+                                         (channels / groups));
+  hipLaunchKernelGGL(GroupNormStatsBatchedKernel, dim3(groups, time), dim3(32),
+                     0, stream, sums, squares, means, inverses, chunks, groups,
+                     count, epsilon);
+  const std::uint32_t vectors = channels / 4U;
+  const std::uint32_t vectors_per_group = vectors / groups;
+  hipLaunchKernelGGL(
+      GroupNormSiluBatchedKernel,
+      dim3((vectors + kThreads - 1U) / kThreads, positions, time),
+      dim3(kThreads), 0, stream, reinterpret_cast<const float4*>(input),
+      reinterpret_cast<const float4*>(weight),
+      reinterpret_cast<const float4*>(bias), means, inverses,
+      reinterpret_cast<float4*>(output), positions, vectors, groups,
+      vectors_per_group);
 }
 
 // Residual add: the block output accumulates either the block input or the

@@ -799,20 +799,22 @@ struct Model::Impl {
 double Model::Impl::SelectLoras(const std::vector<Lora>& requested,
                                 const CancellationCheck& cancelled) {
   std::vector<Lora> selected;
-  for (const auto& lora : requested)
+  for (const auto& lora : requested) {
+    if (!loras.contains(lora.name))
+      throw std::invalid_argument("unknown LoRA adapter " + lora.name);
     if (lora.scale != 0)
       selected.push_back(lora);
+  }
   if (installed == selected)
     return 0;
   const auto start = Clock::now();
   std::map<std::string, std::vector<LoraTerm>, std::less<>> terms;
   for (const auto& lora : selected) {
     const auto it = loras.find(lora.name);
-    if (it == loras.end())
-      throw std::invalid_argument("unknown LoRA adapter " + lora.name);
     for (const auto& patch : it->second.patches())
       terms[patch.target].push_back({&patch, lora.scale});
   }
+  const bool incomplete = !installed.has_value();
   {
     std::lock_guard active_lock(active_mutex);
     active.clear();
@@ -825,17 +827,20 @@ double Model::Impl::SelectLoras(const std::vector<Lora>& requested,
     // touched pages in the process working set on Windows. Every adapter
     // target is a transformer weight; the loop below then finds them resident
     // and only falls back to the mapping when the files cannot be streamed.
-    if (!rebuild.empty()) {
+    if (!rebuild.empty() ||
+        (incomplete && runtime.MissingBytes("transformer.") > 0)) {
       Cancel(cancelled);
-      runtime.UploadMissing("transformer.");
+      runtime.UploadMissing("transformer.", cancelled);
     }
     for (const auto& name : rebuild) {
       Cancel(cancelled);
       runtime.Weight(name);
     }
     runtime.Synchronize();
+    runtime.ReleaseLoraScratch();
   } catch (...) {
     (void)hipStreamSynchronize(runtime.stream());
+    runtime.ReleaseLoraScratch();
     throw;
   }
   installed = selected;
@@ -866,7 +871,15 @@ LoraInfo Model::AddLora(const std::string& name,
     return weights.Contains(tensor) ? weights.Get(tensor).shape
                                     : std::vector<int>{};
   });
-  LoraInfo info{adapter.format(), adapter.patches().size(), adapter.min_rank(),
+  std::size_t distinct_targets = 0;
+  std::string_view prev_target;
+  for (const auto& patch : adapter.patches()) {
+    if (patch.target != prev_target) {
+      ++distinct_targets;
+      prev_target = patch.target;
+    }
+  }
+  LoraInfo info{adapter.format(), distinct_targets, adapter.min_rank(),
                 adapter.max_rank()};
   impl_->loras.emplace(name, std::move(adapter));
   return info;
@@ -887,11 +900,8 @@ Result Model::Generate(const Request& request,
     throw std::runtime_error("Qwen-Image GPU context lost; restart the server");
   Cancel(cancelled);
   const auto total_start = Clock::now();
-  const double lora_ms = impl_->SelectLoras(request.loras, cancelled);
-  const auto start = Clock::now();
   auto& rt = impl_->runtime;
   Result result;
-  result.metrics.lora_ms = lora_ms;
   struct CacheLimitReset {
     Runtime& rt;
     ~CacheLimitReset() { rt.SetCacheLimit(kDefaultCacheBytes); }
@@ -922,6 +932,8 @@ Result Model::Generate(const Request& request,
     }
   };
   try {
+    result.metrics.lora_ms = impl_->SelectLoras(request.loras, cancelled);
+    const auto start = Clock::now();
     const auto prompt =
         EncodePrompt(rt, impl_->tokenizer, request, cancelled, observer);
     const int height = request.height / 16, width = request.width / 16;

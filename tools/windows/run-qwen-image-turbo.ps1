@@ -81,8 +81,17 @@ $loraDir = Join-Path $ModelLocation "loras"
 if (Test-Path $loraDir) {
   $seenLoras = @{}
   foreach ($loraFile in Get-ChildItem -Path $loraDir -Recurse -Filter *.safetensors -ErrorAction SilentlyContinue) {
-    $loraName = ($loraFile.BaseName -replace '[^A-Za-z0-9_.-]', '_')
-    if ($seenLoras.ContainsKey($loraName)) { continue }
+    $rawName = ($loraFile.BaseName -replace '[^A-Za-z0-9_.-]', '_')
+    if ([string]::IsNullOrEmpty($rawName)) { continue }
+    $baseName = if ($rawName.Length -gt 64) { $rawName.Substring(0, 64) } else { $rawName }
+    $loraName = $baseName
+    $suffixIndex = 2
+    while ($seenLoras.ContainsKey($loraName)) {
+      $suffix = "-$suffixIndex"
+      $prefixLen = [Math]::Min($baseName.Length, 64 - $suffix.Length)
+      $loraName = $baseName.Substring(0, $prefixLen) + $suffix
+      $suffixIndex++
+    }
     $seenLoras[$loraName] = $true
     $gufoArgs += @("--lora", "`"${loraName}=$($loraFile.FullName)`"")
   }

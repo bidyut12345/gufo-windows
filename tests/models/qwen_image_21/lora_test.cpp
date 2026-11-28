@@ -465,6 +465,26 @@ int main() {
                 R"({"lora_adapter_metadata":"{\"transformer.alpha_pattern\":)"
                 R"( {\"to_q\": 4}}"})"),
           "__metadata__: alpha_pattern is unsupported");
+  Rejects(Write("r.safetensors", q, R"({"lora_adapter_metadata": 123})"),
+          "__metadata__: invalid lora_adapter_metadata");
+  Rejects(Write("r.safetensors", q, R"({"lora_adapter_metadata": "null"})"),
+          "__metadata__: invalid lora_adapter_metadata");
+  Rejects(Write("r.safetensors", q, R"({"lora_adapter_metadata": "[1]"})"),
+          "__metadata__: invalid lora_adapter_metadata");
+  Rejects(Write("r.safetensors", q,
+                R"({"lora_adapter_metadata":"{\"lora_alpha\": 1e308}"})"),
+          "__metadata__: non-finite scale");
+  // Raw-bit non-finite detection for BF16, F16, and F32 (+/-Inf and NaN).
+  for (const std::string& dtype : {"BF16", "F16", "F32"}) {
+    for (float bad : {INFINITY, -INFINITY, std::nanf("")}) {
+      Rejects(Write("r.safetensors",
+                    Join({q, {{"transformer_blocks.0.attn.to_k.diff",
+                               {8, 8},
+                               dtype,
+                               bad}}})),
+              "to_k.diff: non-finite value");
+    }
+  }
   Rejects(
       Write("r.safetensors", Join({q, {{std::string(kQ) + ".diff", {8, 8}}}})),
       "to_q.diff: both a low-rank pair and a diff");

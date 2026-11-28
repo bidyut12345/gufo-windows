@@ -1,5 +1,6 @@
 #include "src/models/minimax_h3/media.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstring>
@@ -211,7 +212,8 @@ bool WriteSynchronizedMp4(const std::filesystem::path& path,
 }
 
 bool DecodeReferenceVideo(const std::filesystem::path& path, int max_frames,
-                          DecodedReferenceVideo* out, std::string* error) {
+                          DecodedReferenceVideo* out, std::string* error,
+                          int max_short_edge, std::int64_t max_pixels) {
   if (path.empty() || max_frames < 5 || out == nullptr) {
     return SetError(error, "invalid MiniMax H3 reference video decode arguments");
   }
@@ -244,9 +246,17 @@ bool DecodeReferenceVideo(const std::filesystem::path& path, int max_frames,
     return SetError(error,
                     "FFprobe could not determine reference video dimensions");
   }
-  const auto canvas =
-      ResolveCanvasSize(src_w, src_h, kH3CanvasShortEdge, kH3CanvasPixelBudget,
-                        error);
+  constexpr std::int64_t kMinVisionPixels = 65536;
+  const int effective_short_edge =
+      max_short_edge > 0
+          ? std::clamp(max_short_edge, 256, kH3CanvasShortEdge)
+          : kH3CanvasShortEdge;
+  const std::int64_t effective_pixel_budget =
+      max_pixels > 0
+          ? std::clamp(max_pixels, kMinVisionPixels, kH3CanvasPixelBudget)
+          : kH3CanvasPixelBudget;
+  const auto canvas = ResolveCanvasSize(src_w, src_h, effective_short_edge,
+                                        effective_pixel_budget, error);
   if (!canvas.has_value()) {
     return false;
   }

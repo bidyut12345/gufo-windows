@@ -551,10 +551,39 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       return Error(400, "Bad Request",
                    "'size' must be formatted as WIDTHxHEIGHT", "invalid_size");
     }
-    parameters->internal_width = custom_w;
-    parameters->internal_height = custom_h;
+    if (custom_w < 32 || custom_h < 32 || custom_w > 4096 ||
+        custom_h > 4096 || (custom_w % 32) != 0 || (custom_h % 32) != 0) {
+      return Error(
+          400, "Bad Request",
+          "'size' width and height must be multiples of 32 between 32 and 4096",
+          "invalid_size");
+    }
     parameters->output_width = custom_w;
     parameters->output_height = custom_h;
+    constexpr std::int64_t kMaxInternalPixels = 1856LL * 576LL;
+    constexpr std::int64_t kTargetInternalPixels = 1344LL * 768LL;
+    if (static_cast<std::int64_t>(custom_w) * custom_h <= kMaxInternalPixels) {
+      parameters->internal_width = custom_w;
+      parameters->internal_height = custom_h;
+    } else {
+      const double scale = std::sqrt(
+          static_cast<double>(kTargetInternalPixels) /
+          (static_cast<double>(custom_w) * static_cast<double>(custom_h)));
+      int int_w = std::max(
+          32, static_cast<int>(std::llround((custom_w * scale) / 32.0)) * 32);
+      int int_h = std::max(
+          32, static_cast<int>(std::llround((custom_h * scale) / 32.0)) * 32);
+      while (static_cast<std::int64_t>(int_w) * int_h > kMaxInternalPixels &&
+             (int_w > 32 || int_h > 32)) {
+        if (int_w >= int_h && int_w > 32) {
+          int_w -= 32;
+        } else if (int_h > 32) {
+          int_h -= 32;
+        }
+      }
+      parameters->internal_width = int_w;
+      parameters->internal_height = int_h;
+    }
   }
   parameters->frames = frames.value_or(*duration_frames);
   if (output_format == "ppm") {

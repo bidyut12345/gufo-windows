@@ -41,6 +41,7 @@ constexpr std::uint32_t kOutputPatch = 3 * 4 * 16 * 16;
 constexpr float kNormEpsilon = 1.0e-5F;
 constexpr rocblas_int kGfx1151RocblasF32CompactSolution = -386;
 constexpr rocblas_int kGfx1151RocblasF32WideSolution = -387;
+constexpr rocblas_int kGfx1151RocblasBf16Solution = -1162085109;
 
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
@@ -325,6 +326,86 @@ public:
     return true;
   }
 
+  bool RunBf16ToF32(const std::uint16_t* weight_bf16,
+                    const std::uint16_t* input_bf16, float* output_f32,
+                    std::size_t batch, std::size_t rows, std::size_t columns,
+                    hipStream_t stream, std::string* error) {
+    if (handle_ == nullptr || batch == 0 || rows == 0 || columns == 0 ||
+        batch >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        rows >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        columns >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        rocblas_set_stream(handle_, stream) != rocblas_status_success) {
+      SetError(error, "invalid MiniMax H3 VisualVAE BF16->F32 GEMM");
+      return false;
+    }
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    const rocblas_status status = rocblas_gemm_ex(
+        handle_, rocblas_operation_transpose, rocblas_operation_none,
+        static_cast<rocblas_int>(rows), static_cast<rocblas_int>(batch),
+        static_cast<rocblas_int>(columns), &alpha, weight_bf16,
+        rocblas_datatype_bf16_r, static_cast<rocblas_int>(columns), input_bf16,
+        rocblas_datatype_bf16_r, static_cast<rocblas_int>(columns), &beta,
+        output_f32, rocblas_datatype_f32_r, static_cast<rocblas_int>(rows),
+        output_f32, rocblas_datatype_f32_r, static_cast<rocblas_int>(rows),
+        rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+    if (status != rocblas_status_success) {
+      SetError(error, "MiniMax H3 VisualVAE BF16->F32 GEMM failed: " +
+                          std::to_string(static_cast<int>(status)));
+      return false;
+    }
+    return true;
+  }
+
+  bool RunBf16ToBf16(const std::uint16_t* weight_bf16,
+                      const std::uint16_t* input_bf16,
+                      std::uint16_t* output_bf16, std::size_t batch,
+                      std::size_t rows, std::size_t columns, hipStream_t stream,
+                      std::string* error) {
+    if (handle_ == nullptr || batch == 0 || rows == 0 || columns == 0 ||
+        batch >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        rows >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        columns >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        rocblas_set_stream(handle_, stream) != rocblas_status_success) {
+      SetError(error, "invalid MiniMax H3 VisualVAE BF16->BF16 GEMM");
+      return false;
+    }
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    const auto gemm = [&](rocblas_gemm_algo algo, rocblas_int solution) {
+      return rocblas_gemm_ex(
+          handle_, rocblas_operation_transpose, rocblas_operation_none,
+          static_cast<rocblas_int>(rows), static_cast<rocblas_int>(batch),
+          static_cast<rocblas_int>(columns), &alpha, weight_bf16,
+          rocblas_datatype_bf16_r, static_cast<rocblas_int>(columns),
+          input_bf16, rocblas_datatype_bf16_r,
+          static_cast<rocblas_int>(columns), &beta, output_bf16,
+          rocblas_datatype_bf16_r, static_cast<rocblas_int>(rows), output_bf16,
+          rocblas_datatype_bf16_r, static_cast<rocblas_int>(rows),
+          rocblas_datatype_f32_r, algo, solution, 0);
+    };
+    rocblas_status status =
+        bf16_solution_ != 0
+            ? gemm(rocblas_gemm_algo_solution_index, bf16_solution_)
+            : gemm(rocblas_gemm_algo_standard, 0);
+    if (status != rocblas_status_success && bf16_solution_ != 0) {
+      bf16_solution_ = 0;
+      status = gemm(rocblas_gemm_algo_standard, 0);
+    }
+    if (status != rocblas_status_success) {
+      SetError(error, "MiniMax H3 VisualVAE BF16->BF16 GEMM failed: " +
+                          std::to_string(static_cast<int>(status)));
+      return false;
+    }
+    return true;
+  }
+
   bool RunBf16(const std::uint16_t* weight_bf16, const float* input_f32,
                float* output, std::size_t batch, std::size_t rows,
                std::size_t columns, hipStream_t stream, std::string* error) {
@@ -377,6 +458,7 @@ public:
 private:
   rocblas_handle handle_{nullptr};
   bool pinned_unavailable_{false};
+  rocblas_int bf16_solution_{kGfx1151RocblasBf16Solution};
   DeviceBuffer input_bf16_;
   DeviceBuffer output_bf16_;
 };
@@ -642,11 +724,11 @@ struct VideoVaeDecoder::Impl {
   DeviceBuffer patch_hidden;
   DeviceBuffer hidden;
   DeviceBuffer norm;
+  DeviceBuffer norm_bf16;
   DeviceBuffer qkv;
   DeviceBuffer query;
   DeviceBuffer key;
   DeviceBuffer value;
-  DeviceBuffer attention_scores;
   DeviceBuffer attention_heads;
   DeviceBuffer branch;
   DeviceBuffer fc1;
@@ -657,10 +739,14 @@ struct VideoVaeDecoder::Impl {
   DeviceBuffer local_frames_device;
   DeviceBuffer tile_rgb;
 
-  std::vector<float> tile_rgb_host;
+  float* tile_rgb_host{nullptr};
+  std::size_t tile_rgb_host_elements{0};
   VideoVaeTelemetry base_telemetry;
 
   ~Impl() {
+    if (tile_rgb_host != nullptr) {
+      (void)hipHostFree(tile_rgb_host);
+    }
     if (staging != nullptr) {
       (void)hipHostFree(staging);
     }
@@ -702,6 +788,43 @@ struct VideoVaeDecoder::Impl {
            Load(*descriptor, output, cancellation, error);
   }
 
+  bool LoadNamedBf16(std::string_view name,
+                     std::initializer_list<std::uint64_t> shape,
+                     DeviceBuffer* output,
+                     const CancellationToken* cancellation,
+                     std::string* error) {
+    const TensorDescriptor* descriptor =
+        RequireTensor(*inventory, name, shape, error);
+    if (descriptor == nullptr) {
+      return false;
+    }
+    DeviceBuffer temp_f32;
+    if (!LoadTensor(*inventory, *descriptor, device, stream, staging,
+                    kWeightStagingBytes, cancellation, &temp_f32, error)) {
+      return false;
+    }
+    const std::size_t elements =
+        static_cast<std::size_t>(descriptor->payload_bytes) / sizeof(float);
+    const std::size_t bf16_bytes = elements * sizeof(std::uint16_t);
+    if (!output->Allocate(bf16_bytes, error)) {
+      return false;
+    }
+    video_vae_ops::LaunchFloatToBf16(temp_f32.As<float>(),
+                                     output->As<std::uint16_t>(), elements,
+                                     stream);
+    if (!CheckLaunch("convert H3 VisualVAE weight to BF16", error)) {
+      return false;
+    }
+    const hipError_t status = hipStreamSynchronize(stream);
+    if (status != hipSuccess) {
+      SetError(error, HipError("sync H3 VisualVAE BF16 weight", status));
+      return false;
+    }
+    base_telemetry.weight_bytes += bf16_bytes;
+    base_telemetry.cumulative_allocation_bytes += bf16_bytes;
+    return true;
+  }
+
   bool LoadWeights(const CancellationToken* cancellation, std::string* error) {
     const auto begin = Clock::now();
     if (!LoadNamed(
@@ -730,25 +853,26 @@ struct VideoVaeDecoder::Impl {
       BlockWeights& weight = blocks[block];
       if (!LoadNamed(prefix + "norm1.weight", {kHidden}, &weight.norm1,
                      cancellation, error) ||
-          !LoadNamed(prefix + "attn.to_qkv.weight",
-                     {kAttentionWidth * 3U, kHidden}, &weight.qkv_weight,
-                     cancellation, error) ||
+          !LoadNamedBf16(prefix + "attn.to_qkv.weight",
+                         {kAttentionWidth * 3U, kHidden}, &weight.qkv_weight,
+                         cancellation, error) ||
           !LoadNamed(prefix + "attn.to_qkv.bias", {kAttentionWidth * 3U},
                      &weight.qkv_bias, cancellation, error) ||
-          !LoadNamed(prefix + "attn.to_out.weight", {kHidden, kAttentionWidth},
-                     &weight.output_weight, cancellation, error) ||
+          !LoadNamedBf16(prefix + "attn.to_out.weight",
+                         {kHidden, kAttentionWidth}, &weight.output_weight,
+                         cancellation, error) ||
           !LoadNamed(prefix + "attn.to_out.bias", {kHidden},
                      &weight.output_bias, cancellation, error) ||
           !LoadNamed(prefix + "scale1", {kHidden}, &weight.scale1, cancellation,
                      error) ||
           !LoadNamed(prefix + "norm2.weight", {kHidden}, &weight.norm2,
                      cancellation, error) ||
-          !LoadNamed(prefix + "ff.w1.weight", {kFeedForward * 2U, kHidden},
-                     &weight.fc1_weight, cancellation, error) ||
+          !LoadNamedBf16(prefix + "ff.w1.weight", {kFeedForward * 2U, kHidden},
+                         &weight.fc1_weight, cancellation, error) ||
           !LoadNamed(prefix + "ff.w1.bias", {kFeedForward * 2U},
                      &weight.fc1_bias, cancellation, error) ||
-          !LoadNamed(prefix + "ff.w2.weight", {kHidden, kFeedForward},
-                     &weight.fc2_weight, cancellation, error) ||
+          !LoadNamedBf16(prefix + "ff.w2.weight", {kHidden, kFeedForward},
+                         &weight.fc2_weight, cancellation, error) ||
           !LoadNamed(prefix + "ff.w2.bias", {kHidden}, &weight.fc2_bias,
                      cancellation, error) ||
           !LoadNamed(prefix + "scale2", {kHidden}, &weight.scale2, cancellation,
@@ -781,6 +905,9 @@ struct VideoVaeDecoder::Impl {
     const auto f32 = [](std::size_t elements) {
       return elements * sizeof(float);
     };
+    const auto bf16 = [](std::size_t elements) {
+      return elements * sizeof(std::uint16_t);
+    };
     if (!latent_mean.Allocate(f32(mean.size()), error) ||
         !latent_std.Allocate(f32(deviation.size()), error) ||
         !normalized_latent.Allocate(f32(latent_elements), error) ||
@@ -793,23 +920,23 @@ struct VideoVaeDecoder::Impl {
         !hidden.Allocate(f32(static_cast<std::size_t>(sequence) * kHidden),
                          error) ||
         !norm.Allocate(hidden.bytes(), error) ||
+        !norm_bf16.Allocate(bf16(static_cast<std::size_t>(sequence) * kHidden),
+                            error) ||
         !qkv.Allocate(
-            f32(static_cast<std::size_t>(sequence) * kAttentionWidth * 3U),
+            bf16(static_cast<std::size_t>(sequence) * kAttentionWidth * 3U),
             error) ||
         !query.Allocate(
-            f32(static_cast<std::size_t>(sequence) * kAttentionWidth), error) ||
+            bf16(static_cast<std::size_t>(sequence) * kAttentionWidth),
+            error) ||
         !key.Allocate(query.bytes(), error) ||
         !value.Allocate(query.bytes(), error) ||
-        !attention_scores.Allocate(
-            f32(static_cast<std::size_t>(kHeads) * sequence * sequence),
-            error) ||
         !attention_heads.Allocate(query.bytes(), error) ||
-        !branch.Allocate(hidden.bytes(), error) ||
+        !branch.Allocate(norm_bf16.bytes(), error) ||
         !fc1.Allocate(
-            f32(static_cast<std::size_t>(sequence) * kFeedForward * 2U),
+            bf16(static_cast<std::size_t>(sequence) * kFeedForward * 2U),
             error) ||
         !activated.Allocate(
-            f32(static_cast<std::size_t>(sequence) * kFeedForward), error) ||
+            bf16(static_cast<std::size_t>(sequence) * kFeedForward), error) ||
         !rope_cos.Allocate(f32(static_cast<std::size_t>(sequence) * kRopeHalf),
                            error) ||
         !rope_sin.Allocate(rope_cos.bytes(), error) ||
@@ -835,12 +962,18 @@ struct VideoVaeDecoder::Impl {
     if (!CheckLaunch("generate H3 VisualVAE RoPE", error)) {
       return false;
     }
-    const hipError_t status = hipStreamSynchronize(stream);
+    hipError_t status = hipStreamSynchronize(stream);
     if (status != hipSuccess) {
       SetError(error, HipError("synchronize H3 VisualVAE setup", status));
       return false;
     }
-    tile_rgb_host.resize(tile_rgb.bytes() / sizeof(float));
+    tile_rgb_host_elements = tile_rgb.bytes() / sizeof(float);
+    status = hipHostMalloc(reinterpret_cast<void**>(&tile_rgb_host),
+                           tile_rgb.bytes(), hipHostMallocDefault);
+    if (status != hipSuccess) {
+      SetError(error, HipError("allocate pinned H3 VisualVAE RGB host", status));
+      return false;
+    }
     const std::array<const DeviceBuffer*, 20> runtime = {
         &latent_mean,
         &latent_std,
@@ -850,11 +983,11 @@ struct VideoVaeDecoder::Impl {
         &patch_hidden,
         &hidden,
         &norm,
+        &norm_bf16,
         &qkv,
         &query,
         &key,
         &value,
-        &attention_scores,
         &attention_heads,
         &branch,
         &fc1,
@@ -903,13 +1036,15 @@ struct VideoVaeDecoder::Impl {
                     rows, output_width, input_width, stream, error);
   }
 
-  bool MatmulBf16(const DeviceBuffer& input, const DeviceBuffer& weight,
-                  DeviceBuffer* output, std::size_t rows,
-                  std::size_t input_width, std::size_t output_width,
-                  std::string* error) {
-    return gemm.RunBf16(weight.As<std::uint16_t>(), input.As<float>(),
-                        output->As<float>(), rows, output_width, input_width,
-                        stream, error);
+  bool MatmulBf16ToBf16(const DeviceBuffer& input_bf16,
+                         const DeviceBuffer& weight_bf16,
+                         DeviceBuffer* output_bf16, std::size_t rows,
+                         std::size_t input_width, std::size_t output_width,
+                         std::string* error) {
+    return gemm.RunBf16ToBf16(weight_bf16.As<std::uint16_t>(),
+                              input_bf16.As<std::uint16_t>(),
+                              output_bf16->As<std::uint16_t>(), rows,
+                              output_width, input_width, stream, error);
   }
 
   bool RunTile(int chunk, int tile_y, int tile_x,
@@ -961,66 +1096,58 @@ struct VideoVaeDecoder::Impl {
         return false;
       }
       BlockWeights& weight = blocks[block];
-      video_vae_ops::LaunchRmsNorm(hidden.As<float>(), weight.norm1.As<float>(),
-                                   norm.As<float>(), sequence, kHidden,
-                                   kNormEpsilon, stream);
-      if (!Matmul(norm, weight.qkv_weight, &qkv, sequence, kHidden,
-                  kAttentionWidth * 3U, error)) {
+      video_vae_ops::LaunchRmsNormBf16(hidden.As<float>(),
+                                       weight.norm1.As<float>(),
+                                       norm_bf16.As<std::uint16_t>(), sequence,
+                                       kHidden, kNormEpsilon, stream);
+      if (!MatmulBf16ToBf16(norm_bf16, weight.qkv_weight, &qkv, sequence,
+                            kHidden, kAttentionWidth * 3U, error)) {
         return false;
       }
-      video_vae_ops::LaunchVideoQkvRope(
-          qkv.As<float>(), weight.qkv_bias.As<float>(), rope_cos.As<float>(),
-          rope_sin.As<float>(), query.As<float>(), key.As<float>(),
-          value.As<float>(), sequence, kHeads, kHeadDimension, kRopeHalf,
-          kNormEpsilon, stream);
-      if (!attention_gemm.Scores(
-              query.As<float>(), key.As<float>(), attention_scores.As<float>(),
-              sequence, 1.0F / std::sqrt(static_cast<float>(kHeadDimension)),
-              stream, error)) {
+      video_vae_ops::LaunchVideoQkvRopeBf16HeadMajorFromBf16(
+          qkv.As<std::uint16_t>(), weight.qkv_bias.As<float>(),
+          rope_cos.As<float>(), rope_sin.As<float>(),
+          query.As<std::uint16_t>(), key.As<std::uint16_t>(),
+          value.As<std::uint16_t>(), sequence, kHeads, kHeadDimension,
+          kRopeHalf, kNormEpsilon, stream);
+      video_vae_ops::LaunchVideoWmmaFlashAttention(
+          query.As<std::uint16_t>(), key.As<std::uint16_t>(),
+          value.As<std::uint16_t>(), attention_heads.As<std::uint16_t>(),
+          sequence, kHeads, stream);
+      if (!CheckLaunch("H3 VisualVAE FlashAttention", error) ||
+          !MatmulBf16ToBf16(attention_heads, weight.output_weight, &branch,
+                            sequence, kAttentionWidth, kHidden, error)) {
         return false;
       }
-      video_vae_ops::LaunchSoftmaxScoresInPlace(attention_scores.As<float>(),
-                                                sequence, kHeads, stream);
-      if (!CheckLaunch("H3 VisualVAE attention softmax", error) ||
-          !attention_gemm.Values(
-              value.As<float>(), attention_scores.As<float>(),
-              attention_heads.As<float>(), sequence, stream, error) ||
-          !Matmul(attention_heads, weight.output_weight, &branch, sequence,
-                  kAttentionWidth, kHidden, error)) {
-        return false;
-      }
-      video_vae_ops::LaunchScaleAdd(hidden.As<float>(), branch.As<float>(),
-                                    weight.output_bias.As<float>(),
-                                    weight.scale1.As<float>(), sequence,
-                                    kHidden, stream);
-      video_vae_ops::LaunchRmsNorm(hidden.As<float>(), weight.norm2.As<float>(),
-                                   norm.As<float>(), sequence, kHidden,
-                                   kNormEpsilon, stream);
+      video_vae_ops::LaunchScaleAddFromBf16(
+          hidden.As<float>(), branch.As<std::uint16_t>(),
+          weight.output_bias.As<float>(), weight.scale1.As<float>(), sequence,
+          kHidden, stream);
+      video_vae_ops::LaunchRmsNormBf16(hidden.As<float>(),
+                                       weight.norm2.As<float>(),
+                                       norm_bf16.As<std::uint16_t>(), sequence,
+                                       kHidden, kNormEpsilon, stream);
       if (!CheckLaunch("H3 VisualVAE attention residual/norm", error) ||
-          !Matmul(norm, weight.fc1_weight, &fc1, sequence, kHidden,
-                  kFeedForward * 2U, error)) {
+          !MatmulBf16ToBf16(norm_bf16, weight.fc1_weight, &fc1, sequence,
+                            kHidden, kFeedForward * 2U, error)) {
         return false;
       }
-      video_vae_ops::LaunchSwiGlu(fc1.As<float>(), weight.fc1_bias.As<float>(),
-                                  activated.As<float>(), sequence, kFeedForward,
-                                  stream);
+      video_vae_ops::LaunchSwiGluBf16FromBf16(
+          fc1.As<std::uint16_t>(), weight.fc1_bias.As<float>(),
+          activated.As<std::uint16_t>(), sequence, kFeedForward, stream);
       if (!CheckLaunch("H3 VisualVAE SwiGLU", error) ||
-          !Matmul(activated, weight.fc2_weight, &branch, sequence, kFeedForward,
-                  kHidden, error)) {
+          !MatmulBf16ToBf16(activated, weight.fc2_weight, &branch, sequence,
+                            kFeedForward, kHidden, error)) {
         return false;
       }
-      video_vae_ops::LaunchScaleAdd(
-          hidden.As<float>(), branch.As<float>(), weight.fc2_bias.As<float>(),
-          weight.scale2.As<float>(), sequence, kHidden, stream);
+      video_vae_ops::LaunchScaleAddFromBf16(
+          hidden.As<float>(), branch.As<std::uint16_t>(),
+          weight.fc2_bias.As<float>(), weight.scale2.As<float>(), sequence,
+          kHidden, stream);
       if (!CheckLaunch("H3 VisualVAE MLP residual", error)) {
         return false;
       }
-      status = hipStreamSynchronize(stream);
-      if (status != hipSuccess) {
-        SetError(error, HipError("synchronize H3 VisualVAE block", status));
-        return false;
-      }
-      base_telemetry.dispatches += 9;
+      base_telemetry.dispatches += 8;
     }
     video_vae_ops::LaunchLayerNorm(
         hidden.As<float>(), final_norm_weight.As<float>(),
@@ -1044,7 +1171,7 @@ struct VideoVaeDecoder::Impl {
                                       static_cast<std::size_t>(y_axis.length) *
                                       x_axis.length * 3U;
     if (!CheckLaunch("unpack H3 VisualVAE RGB", error) ||
-        !CopyAsync(tile_rgb_host.data(), tile_rgb.data(),
+        !CopyAsync(tile_rgb_host, tile_rgb.data(),
                    tile_elements * sizeof(float), hipMemcpyDeviceToHost,
                    "read H3 VisualVAE RGB tile", error)) {
       return false;
@@ -1054,9 +1181,7 @@ struct VideoVaeDecoder::Impl {
       SetError(error, HipError("synchronize H3 VisualVAE tile", status));
       return false;
     }
-    output->assign(
-        tile_rgb_host.begin(),
-        tile_rgb_host.begin() + static_cast<std::ptrdiff_t>(tile_elements));
+    output->assign(tile_rgb_host, tile_rgb_host + tile_elements);
     base_telemetry.dispatches += 10;
     base_telemetry.tile_ms.push_back(Milliseconds(begin, Clock::now()));
     return true;

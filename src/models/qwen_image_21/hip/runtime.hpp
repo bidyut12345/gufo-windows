@@ -25,6 +25,18 @@ bool DenseShape(int channels, int inner);
 // Columns must be a multiple of 16.
 void PackDense16(const std::uint16_t* input, std::uint16_t* output, int rows,
                  int cols, hipStream_t stream);
+void PackDense16FromFloat(const float* input, std::uint16_t* output, int rows,
+                          int cols, hipStream_t stream);
+struct LoraFactor {
+  const float* up{nullptr};
+  const float* down{nullptr};
+  int rank{0};
+  float scale{1.0F};
+};
+bool MergeLoraPackDense16(const std::uint16_t* w_bf16,
+                          std::uint16_t* out_packed, int rows, int cols,
+                          const LoraFactor* factors, int factor_count,
+                          hipStream_t stream);
 bool DenseBf16(const std::uint16_t* weights, const std::uint16_t* input,
                std::uint16_t* output, int rows, int channels, int inner,
                hipStream_t stream);
@@ -64,13 +76,21 @@ void FusedAttention128(const std::uint16_t* queries, const std::uint16_t* keys,
                        int heads, int rows, int count, int query_start,
                        hipStream_t stream, int query_count = 128,
                        const int* limits = nullptr);
-// weight[rows x cols] += scale * up[rows x rank] * down[rank x cols]; FP32,
-// row-major.
+// weight[rows x cols] = beta * weight + scale * up[rows x rank] *
+// down[rank x cols]; FP32, row-major.
 void LoraLowRank(hipblasHandle_t blas, float* weight, const float* up,
-                 const float* down, int rows, int cols, int rank, float scale);
+                 const float* down, int rows, int cols, int rank, float scale,
+                 float beta = 1.0F);
 // ComfyUI DoRA on the output axis; norms are of `weight` before this update.
 void LoraDora(float* weight, const float* delta, const float* magnitude,
               int rows, int cols, float strength, hipStream_t stream);
+// Single-term DoRA directly from a BF16 base weight. Writes BF16 to `out_bf16`
+// when non-null, or FP32 in-place to `delta_inout` when `out_bf16` is null.
+void LoraDoraFromBf16(const std::uint16_t* weight_bf16, float* delta_inout,
+                      std::uint16_t* out_bf16, const float* magnitude, int rows,
+                      int cols, float strength, hipStream_t stream);
+void ConvertF16ToFloat(const std::uint16_t* input, float* output,
+                       std::size_t count, hipStream_t stream);
 
 struct Matrix {
   std::shared_ptr<void> owner;
@@ -113,7 +133,12 @@ public:
   /// Upload every weight under `prefix` that is not resident through the
   /// bounded file-streaming path, merging adapter terms as on first load.
   /// False when the files cannot be streamed; Weight() then reads the mapping.
-  bool UploadMissing(std::string_view prefix) { return UploadGroup(prefix); }
+  bool UploadMissing(std::string_view prefix,
+                     const CancellationCheck& cancelled = {}) {
+    return UploadGroup(prefix, cancelled);
+  }
+  /// Release transient LoRA merge scratch and cached factor buffers.
+  void ReleaseLoraScratch();
   Matrix Linear(const Matrix& x, const std::string& name);
   Matrix Normalize(const Matrix& x, Norm kind, const std::string& weight = {},
                    float epsilon = 1e-6F, bool silu = false);
@@ -198,18 +223,36 @@ private:
   // Pinned buffers for weight uploads; see Runtime::UploadMapped.
   std::array<void*, 2> staging_{};
   std::array<hipEvent_t, 2> staging_done_{};
+  std::size_t staging_slot_{0};
+  std::size_t staging_offset_{0};
+  // Reusable FP32 merge scratch and cached down factor during a LoRA switch.
+  Matrix lora_scratch_;
+  std::size_t lora_scratch_bytes_{0};
+  const void* cached_down_source_{nullptr};
+  LoraDtype cached_down_dtype_{LoraDtype::kF32};
+  std::size_t cached_down_count_{0};
+  Matrix cached_down_;
+  std::vector<Matrix> lora_garbage_;
   /// Device buffers for one weight: `m` in BF16, plus `raw` for F32 sources.
   struct StagedWeight {
     Matrix m, raw;
   };
-  Matrix Raw(std::size_t bytes);
+  Matrix Raw(std::size_t bytes, bool exact = false);
+  Matrix New(int rows, int cols, bool exact = false);
   Matrix PackedInput(const Matrix& x);
   void UploadMapped(void* device, const void* host, std::size_t bytes);
   StagedWeight Stage(const qwen_image_21::Weight& w);
-  bool UploadGroup(std::string_view prefix);
+  bool UploadGroup(std::string_view prefix,
+                   const CancellationCheck& cancelled = {});
   Matrix Store(std::string_view name, const qwen_image_21::Weight& w,
-               StagedWeight target);
-  void MergeLoras(Matrix& weight, std::span<const LoraTerm> terms);
+               StagedWeight target, std::vector<Matrix>* garbage = nullptr);
+  Matrix EnsureLoraScratch(std::size_t bytes);
+  Matrix UploadLoraTensor(const LoraTensor& tensor, std::size_t first,
+                          std::size_t count, bool cache,
+                          std::vector<Matrix>* garbage);
+  void MergeLoras(Matrix& weight, const Matrix* fp32_base,
+                  std::span<const LoraTerm> terms, bool pack_output,
+                  std::vector<Matrix>* garbage);
   void Matmul(const Matrix& x, const Matrix& w, Matrix& output,
               const Matrix* bias = nullptr, bool convolution = false);
 };

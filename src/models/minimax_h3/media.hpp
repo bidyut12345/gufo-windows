@@ -69,7 +69,9 @@ struct DecodedReferenceVideo {
 [[nodiscard]] bool DecodeReferenceVideo(const std::filesystem::path& path,
                                         int max_frames,
                                         DecodedReferenceVideo* out,
-                                        std::string* error = nullptr);
+                                        std::string* error = nullptr,
+                                        int max_short_edge = 0,
+                                        std::int64_t max_pixels = 0);
 
 [[nodiscard]] bool ProbeMediaFile(const std::filesystem::path& path,
                                   MediaProbe* probe,

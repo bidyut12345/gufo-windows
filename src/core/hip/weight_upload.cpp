@@ -182,6 +182,24 @@ struct WeightUpload::State {
     return {};
   }
 
+  bool InitSlot(Slot& slot) {
+    if (use_pinned_staging) {
+      if (host_allocations.Allocate(&slot.buffer, kChunkBytes + kAlignment) !=
+              hipSuccess ||
+          hipStreamCreateWithFlags(&slot.stream, hipStreamNonBlocking) !=
+              hipSuccess) {
+        if (slot.stream != nullptr) {
+          (void)hipStreamDestroy(slot.stream);
+          slot.stream = nullptr;
+        }
+        return false;
+      }
+      return true;
+    }
+    slot.buffer = platform::CommitZeroedPages(kChunkBytes + kAlignment);
+    return slot.buffer != nullptr;
+  }
+
   void Run(Slot& slot) {
     for (;;) {
       Task task{};
@@ -230,35 +248,6 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
     shard.size = info.size;
     shard.mapping = region.data;
   }
-  for (auto& slot : s.slots) {
-    if (s.use_pinned_staging) {
-      if (s.host_allocations.Allocate(&slot.buffer, kChunkBytes + kAlignment) !=
-              hipSuccess ||
-          hipStreamCreateWithFlags(&slot.stream, hipStreamNonBlocking) !=
-              hipSuccess) {
-        s.Fail("weight upload staging allocation failed");
-        s.Status(error);
-        return nullptr;
-      }
-    } else {
-      slot.buffer = platform::CommitZeroedPages(kChunkBytes + kAlignment);
-      if (slot.buffer == nullptr) {
-        s.Fail("weight upload staging allocation failed");
-        s.Status(error);
-        return nullptr;
-      }
-    }
-  }
-  try {
-    for (auto& slot : s.slots) {
-      s.readers.emplace_back([&s, &slot] { s.Run(slot); });
-    }
-  } catch (const std::system_error& e) {
-    std::lock_guard lock(s.mutex);
-    s.Fail("weight upload worker creation failed: " + std::string(e.what()));
-    s.Status(error);
-    return nullptr;
-  }
   return uploader;
 }
 
@@ -283,6 +272,28 @@ bool WeightUpload::Copy(std::uint32_t shard, std::uint64_t offset,
         {shard, offset + done, count, static_cast<char*>(device) + done});
     ++s.pending;
     done += count;
+    const std::size_t target_readers = std::min(kReaders, s.pending);
+    while (s.Status(error) && s.readers.size() < target_readers) {
+      const std::size_t idx = s.readers.size();
+      lock.unlock();
+      const bool ok = s.InitSlot(s.slots[idx]);
+      lock.lock();
+      if (!ok) {
+        if (s.readers.empty()) {
+          s.Fail("weight upload staging allocation failed");
+        }
+        break;
+      }
+      try {
+        s.readers.emplace_back([&s, idx] { s.Run(s.slots[idx]); });
+      } catch (const std::system_error& e) {
+        if (s.readers.empty()) {
+          s.Fail("weight upload worker creation failed: " +
+                 std::string(e.what()));
+        }
+        break;
+      }
+    }
     s.changed.notify_all();
   }
   return s.Status(error);

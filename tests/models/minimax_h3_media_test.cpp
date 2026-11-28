@@ -221,6 +221,42 @@ int main() {
   std::filesystem::remove(error_output, ignored);
   std::filesystem::remove(probe_error_output, ignored);
   std::filesystem::remove(output, ignored);
+
+  const std::filesystem::path ref_mp4 =
+      std::filesystem::temp_directory_path() / "gufo-h3-ref-cap-test.mp4";
+  std::filesystem::remove(ref_mp4, ignored);
+  const std::vector<std::uint8_t> ref_frames = MakeFrames(6, 64, 36);
+  const std::vector<float> ref_pcm = MakePcm(8000);
+  if (!WriteSynchronizedMp4(ref_mp4, ref_frames, 6,
+                            MediaVideoOptions{.input_width = 64,
+                                              .input_height = 36,
+                                              .output_width = 640,
+                                              .output_height = 360,
+                                              .fps = 24},
+                            ref_pcm, 8000, 2, 32000, nullptr, &telemetry,
+                            &error)) {
+    Fail(error);
+  }
+  gufo::minimax_h3::DecodedReferenceVideo decoded_480;
+  if (!gufo::minimax_h3::DecodeReferenceVideo(ref_mp4, 5, &decoded_480, &error,
+                                              480, 480LL * 832LL)) {
+    Fail(error);
+  }
+  if (decoded_480.width != 832 || decoded_480.height != 480 ||
+      decoded_480.frame_count != 5) {
+    Fail("DecodeReferenceVideo did not honor 480x832 target cap");
+  }
+  gufo::minimax_h3::DecodedReferenceVideo decoded_default;
+  if (!gufo::minimax_h3::DecodeReferenceVideo(ref_mp4, 5, &decoded_default,
+                                              &error)) {
+    Fail(error);
+  }
+  if (decoded_default.width != 1344 || decoded_default.height != 768 ||
+      decoded_default.frame_count != 5) {
+    Fail("DecodeReferenceVideo did not use default 768p canvas");
+  }
+  std::filesystem::remove(ref_mp4, ignored);
+
   std::cout
       << "ok: bounded concurrent RGB24/PCM mux produced synchronized H.264/AAC"
       << '\n';

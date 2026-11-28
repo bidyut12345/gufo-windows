@@ -20,14 +20,15 @@ constexpr std::string_view kPrefixes[] = {
     "diffusion_model.", "base_model.model.", "transformer."};
 
 constexpr std::string_view kDitBlockModules[] = {
-    "attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2", "adaln_proj"};
+    "attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2",
+    "adaln_proj.linear"};
 
 constexpr std::string_view kRefinerModules[] = {
     "attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"};
 
 constexpr std::string_view kGlobalModules[] = {
     "audio_patch_proj", "video_patch_proj", "final_layer.audio_out",
-    "final_layer.video_out", "final_layer.adaln_proj"};
+    "final_layer.video_out", "final_layer.adaln_proj.linear"};
 
 lora::Schema Schema(const LoraAdapter::BaseShape& base) {
   lora::Schema schema;
@@ -35,6 +36,14 @@ lora::Schema Schema(const LoraAdapter::BaseShape& base) {
   schema.prefixes.assign(std::begin(kPrefixes), std::end(kPrefixes));
   const auto whole = [](const std::string& module) {
     return std::vector<lora::Slice>{{module + ".weight"}};
+  };
+  const auto register_alias = [&](const std::string& alias,
+                                  const std::string& preferred_target) {
+    if (!base(preferred_target + ".weight").empty()) {
+      schema.modules.emplace(alias, whole(preferred_target));
+    } else if (!base(alias + ".weight").empty()) {
+      schema.modules.emplace(alias, whole(alias));
+    }
   };
   for (int b = 0; !base("blocks." + std::to_string(b) + ".attn.qkv_proj.weight")
                        .empty();
@@ -44,6 +53,7 @@ lora::Schema Schema(const LoraAdapter::BaseShape& base) {
       schema.modules.emplace(block + std::string(module),
                              whole(block + std::string(module)));
     }
+    register_alias(block + "adaln_proj", block + "adaln_proj.linear");
   }
   for (int b = 0; !base("token_refiner.blocks." + std::to_string(b) +
                         ".attn.qkv_proj.weight")
@@ -60,6 +70,7 @@ lora::Schema Schema(const LoraAdapter::BaseShape& base) {
       schema.modules.emplace(std::string(module), whole(std::string(module)));
     }
   }
+  register_alias("final_layer.adaln_proj", "final_layer.adaln_proj.linear");
   schema.unknown = [](std::string_view) -> std::string {
     return "not a MiniMax H3 DiT module";
   };
@@ -185,8 +196,16 @@ std::vector<LokrPatch> ParseLokrFile(const std::filesystem::path& path,
       throw std::runtime_error(path.string() + ": incomplete LoKr module " +
                                mod);
     }
-    const std::string target = mod + ".weight";
-    const auto target_shape = base(target);
+    std::string target = mod + ".weight";
+    auto target_shape = base(target);
+    if (target_shape.empty() && mod.ends_with(".adaln_proj")) {
+      const std::string linear_target = mod + ".linear.weight";
+      auto linear_shape = base(linear_target);
+      if (!linear_shape.empty()) {
+        target = linear_target;
+        target_shape = std::move(linear_shape);
+      }
+    }
     if (target_shape.size() != 2) {
       throw std::runtime_error(path.string() + ": unknown MiniMax H3 target " +
                                target);

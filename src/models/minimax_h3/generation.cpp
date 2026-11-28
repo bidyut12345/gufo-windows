@@ -1144,9 +1144,17 @@ bool GenerateTextVideo(const GenerationRequest& request,
   std::vector<DecodedReferenceVideo> ref_videos;
   if (has_videos) {
     ref_videos.resize(request.reference_videos.size());
+    const int ref_vid_short = std::min(
+        kH3CanvasShortEdge,
+        std::min(parameters.internal_width, parameters.internal_height));
+    const std::int64_t ref_vid_pixels = std::min<std::int64_t>(
+        kH3CanvasPixelBudget,
+        static_cast<std::int64_t>(parameters.internal_width) *
+            parameters.internal_height);
     for (std::size_t i = 0; i < request.reference_videos.size(); ++i) {
       if (!DecodeReferenceVideo(request.reference_videos[i], parameters.frames,
-                                &ref_videos[i], error)) {
+                                &ref_videos[i], error, ref_vid_short,
+                                ref_vid_pixels)) {
         return false;
       }
     }
@@ -1209,6 +1217,8 @@ bool GenerateTextVideo(const GenerationRequest& request,
   std::vector<ConditionBlock> condition_blocks;
   double target_temporal_origin = 0.0;
   std::optional<InitialNoise> noise;
+  const float effective_cfg_scale =
+      parameters.decode_audio ? parameters.cfg_scale : 1.0F;
 
   if (resumed_stage >= CheckpointStage::kPrompt) {
     InitialNoise loaded_noise;
@@ -1266,7 +1276,12 @@ bool GenerateTextVideo(const GenerationRequest& request,
       const double w = static_cast<double>(ref.width);
       const double h = static_cast<double>(ref.height);
       const double short_edge = std::min(w, h);
-      const double target_short = std::min(kMaxReferenceShortEdge, short_edge);
+      const double desired_short = std::min(
+          kMaxReferenceShortEdge,
+          static_cast<double>(
+              std::min(parameters.internal_width, parameters.internal_height)));
+      const double target_short =
+          std::min(kMaxReferenceShortEdge, std::max(short_edge, desired_short));
       const double scale = target_short / short_edge;
       int target_w = snap_dim(w * scale);
       int target_h = snap_dim(h * scale);
@@ -1436,9 +1451,10 @@ bool GenerateTextVideo(const GenerationRequest& request,
       }
       return false;
     }
+    local.prompt_tokens = embedding.tokens;
     PromptCache().Put(prompt_cache_key, embedding);
   }
-  if (parameters.cfg_scale > 1.0F) {
+  if (effective_cfg_scale > 1.0F) {
     const std::string uncond_sha256 = Sha256(std::span<const unsigned char>(
         reinterpret_cast<const unsigned char*>(request.negative_prompt.data()),
         request.negative_prompt.size()));
@@ -1854,7 +1870,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
       std::vector<double> uncond_anchor_temporal;
       std::vector<ConditionBlock> uncond_condition_blocks;
       double uncond_target_temporal_origin = 0.0;
-      if (parameters.cfg_scale > 1.0F) {
+      if (effective_cfg_scale > 1.0F) {
         if (uncond_embedding.tokens == 0) {
           Tokenizer tokenizer;
           std::vector<std::uint32_t> uncond_tokens;
@@ -1902,7 +1918,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
            .reuse_interval = parameters.reuse_interval,
            .row_parallel_attention = parameters.row_parallel_attention,
            .condition_video_rows = condition_rows.size() / kH3VideoPatchWidth,
-           .cfg_scale = parameters.cfg_scale,
+           .cfg_scale = effective_cfg_scale,
            .uncond_text_rows = uncond_embedding.tokens,
            .loras = std::move(dit_loras)},
           {.layer50 = embedding.values,

@@ -106,6 +106,7 @@ bool ValidateParameters(const ext::VideoParameters& p, std::string* error) {
       .row_parallel_attention = p.row_parallel_attention,
       .decode_audio = p.decode_audio,
       .mux = p.mux,
+      .cfg_scale = p.cfg_scale,
       .selected_frames = p.selected_frames,
   };
   return gufo::minimax_h3::ValidateGenerationParameters(internal_p, error);
@@ -126,6 +127,7 @@ std::string ParametersJson(const ext::VideoParameters& p, std::uint64_t seed,
       .row_parallel_attention = p.row_parallel_attention,
       .decode_audio = p.decode_audio,
       .mux = p.mux,
+      .cfg_scale = p.cfg_scale,
       .selected_frames = p.selected_frames,
   };
   return gufo::minimax_h3::GenerationParametersJson(internal_p, seed,

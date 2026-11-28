@@ -577,7 +577,8 @@ async function loadLoras() {
       cb.type = "checkbox";
       cb.style.width = "auto";
       cb.dataset.loraName = name;
-      cb.checked = true;
+      const hasDefault = item.default_scale !== null && item.default_scale !== undefined;
+      cb.checked = hasDefault;
       const lbl = document.createElement("span");
       lbl.textContent = name;
       lbl.style.cssText = "flex:1; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;";
@@ -586,7 +587,7 @@ async function loadLoras() {
       sc.step = "0.05";
       sc.min = "-10";
       sc.max = "10";
-      sc.value = "0.8";
+      sc.value = hasDefault ? String(item.default_scale) : "0.8";
       sc.style.width = "72px";
       sc.title = "LoRA scale";
       row.append(cb, lbl, sc);
@@ -604,7 +605,8 @@ function selectedLoras() {
     const cb = row.querySelector("input[type=checkbox]");
     const sc = row.querySelector("input[type=number]");
     if (cb && cb.checked) {
-      out.push({ name: cb.dataset.loraName, scale: parseFloat(sc.value) || 0.8 });
+      const parsed = parseFloat(sc.value);
+      out.push({ name: cb.dataset.loraName, scale: Number.isFinite(parsed) ? parsed : 0.8 });
     }
   }
   return out;
@@ -788,6 +790,8 @@ $("studioForm").onsubmit = async (e) => {
       if (stepsStr) form.append("steps", stepsStr);
       if (seedStr) form.append("seed", seedStr);
       if (neg) form.append("negative_prompt", neg);
+      const loras = selectedLoras();
+      if (loras !== null) form.append("loras", JSON.stringify(loras));
       for (const f of editFiles) form.append("image[]", f);
       resp = await fetch("/v1/images/edits", { method: "POST", body: form });
     }

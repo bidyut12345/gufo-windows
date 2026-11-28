@@ -231,6 +231,7 @@ struct FlatConv {
   EncDeviceBuffer bias;
   std::uint32_t out_channels{0};
   std::uint32_t columns{0};
+  bool is_bf16{false};
 };
 
 struct LevelWeights {
@@ -335,6 +336,47 @@ void FlattenConvWeight(const std::vector<float>& source, int out_channels,
   }
 }
 
+// [cout][cin][3][3][3] -> [cout][9][cin] taking temporal tap 2 (tap-major for
+// coalesced NHWC BF16 im2col).
+void FlattenConvWeightTapMajor(const std::vector<float>& source,
+                               int out_channels, int in_channels,
+                               std::vector<float>& destination) {
+  destination.assign(static_cast<std::size_t>(out_channels) * 9U * in_channels,
+                     0.0F);
+  for (int oc = 0; oc < out_channels; ++oc) {
+    float* dst_oc =
+        destination.data() + static_cast<std::size_t>(oc) * 9U * in_channels;
+    for (int ic = 0; ic < in_channels; ++ic) {
+      const std::size_t origin =
+          (static_cast<std::size_t>(oc) * in_channels + ic) * 27U + 18U;
+      for (std::size_t tap = 0; tap < 9U; ++tap) {
+        dst_oc[tap * static_cast<std::size_t>(in_channels) + ic] =
+            source[origin + tap];
+      }
+    }
+  }
+}
+
+// [cout][cin][27] -> [cout][27][cin] (tap-major for coalesced 3D BF16 im2col).
+void FlattenConvWeight3DTapMajor(const std::vector<float>& source,
+                                 int out_channels, int in_channels,
+                                 std::vector<float>& destination) {
+  destination.assign(static_cast<std::size_t>(out_channels) * 27U * in_channels,
+                     0.0F);
+  for (int oc = 0; oc < out_channels; ++oc) {
+    float* dst_oc =
+        destination.data() + static_cast<std::size_t>(oc) * 27U * in_channels;
+    for (int ic = 0; ic < in_channels; ++ic) {
+      const std::size_t origin =
+          (static_cast<std::size_t>(oc) * in_channels + ic) * 27U;
+      for (std::size_t tap = 0; tap < 27U; ++tap) {
+        dst_oc[tap * static_cast<std::size_t>(in_channels) + ic] =
+            source[origin + tap];
+      }
+    }
+  }
+}
+
 // Position-major -> planar transpose of a small host block.
 void TransposeToPlanar(const std::vector<float>& source, int channels,
                        int height, int width, std::vector<float>& destination) {
@@ -422,14 +464,14 @@ struct VideoVaeEncoder::Impl {
                       &weights.norm_weights[b * 2U],
                       &weights.norm_biases[b * 2U], error) ||
             !LoadConv3x3(block_base + ".conv1", static_cast<int>(cout),
-                         static_cast<int>(cin), &weights.convs[b * 2U],
-                         error) ||
+                         static_cast<int>(cin), &weights.convs[b * 2U], error,
+                         true) ||
             !LoadNorm(block_base + ".norm2", cout,
                       &weights.norm_weights[b * 2U + 1U],
                       &weights.norm_biases[b * 2U + 1U], error) ||
             !LoadConv3x3(block_base + ".conv2", static_cast<int>(cout),
                          static_cast<int>(cout), &weights.convs[b * 2U + 1U],
-                         error)) {
+                         error, true)) {
           return false;
         }
         weights.has_shortcut[b] = cin != cout;
@@ -444,7 +486,8 @@ struct VideoVaeEncoder::Impl {
       weights.time_stride = kH3VaeEncoderTimeDownsample[l];
       if (weights.has_downsample &&
           !LoadConv3x3(base + ".downsample.conv", static_cast<int>(out),
-                       static_cast<int>(out), &weights.downsample, error)) {
+                       static_cast<int>(out), &weights.downsample, error,
+                       true)) {
         return false;
       }
     }
@@ -488,7 +531,8 @@ struct VideoVaeEncoder::Impl {
   }
 
   bool LoadConv3x3(const std::string& base, int out_channels, int in_channels,
-                   FlatConv* conv, std::string* error) {
+                   FlatConv* conv, std::string* error,
+                   bool use_bf16 = false) {
     std::vector<float> source;
     std::vector<float> bias;
     if (!LoadTensorHost(*inventory, base + ".weight", source, error) ||
@@ -501,21 +545,32 @@ struct VideoVaeEncoder::Impl {
       return false;
     }
     std::vector<float> flat;
-    FlattenConvWeight(source, out_channels, in_channels, flat);
     conv->out_channels = static_cast<std::uint32_t>(out_channels);
     conv->columns = static_cast<std::uint32_t>(in_channels) * 9U;
-    if (!conv->weight.Allocate(flat.size() * sizeof(float), error) ||
-        !conv->bias.Allocate(bias.size() * sizeof(float), error) ||
-        !UploadBuffer(stream, conv->weight, flat, error) ||
-        !UploadBuffer(stream, conv->bias, bias, error)) {
-      return false;
+    conv->is_bf16 = use_bf16 && (in_channels % 4 == 0);
+    if (conv->is_bf16) {
+      FlattenConvWeightTapMajor(source, out_channels, in_channels, flat);
+      if (!UploadBf16Weight(stream, conv->weight, flat, error) ||
+          !conv->bias.Allocate(bias.size() * sizeof(float), error) ||
+          !UploadBuffer(stream, conv->bias, bias, error)) {
+        return false;
+      }
+    } else {
+      FlattenConvWeight(source, out_channels, in_channels, flat);
+      if (!conv->weight.Allocate(flat.size() * sizeof(float), error) ||
+          !conv->bias.Allocate(bias.size() * sizeof(float), error) ||
+          !UploadBuffer(stream, conv->weight, flat, error) ||
+          !UploadBuffer(stream, conv->bias, bias, error)) {
+        return false;
+      }
     }
     weight_bytes += conv->weight.bytes() + conv->bias.bytes();
     return true;
   }
 
   bool LoadConv3x3x3(const std::string& base, int out_channels, int in_channels,
-                     FlatConv* conv, std::string* error) {
+                     FlatConv* conv, std::string* error,
+                     bool use_bf16 = false) {
     std::vector<float> source;
     std::vector<float> bias;
     if (!LoadTensorHost(*inventory, base + ".weight", source, error) ||
@@ -530,11 +585,22 @@ struct VideoVaeEncoder::Impl {
     }
     conv->out_channels = static_cast<std::uint32_t>(out_channels);
     conv->columns = static_cast<std::uint32_t>(in_channels) * 27U;
-    if (!conv->weight.Allocate(source.size() * sizeof(float), error) ||
-        !conv->bias.Allocate(bias.size() * sizeof(float), error) ||
-        !UploadBuffer(stream, conv->weight, source, error) ||
-        !UploadBuffer(stream, conv->bias, bias, error)) {
-      return false;
+    conv->is_bf16 = use_bf16 && (in_channels % 4 == 0);
+    if (conv->is_bf16) {
+      std::vector<float> flat;
+      FlattenConvWeight3DTapMajor(source, out_channels, in_channels, flat);
+      if (!UploadBf16Weight(stream, conv->weight, flat, error) ||
+          !conv->bias.Allocate(bias.size() * sizeof(float), error) ||
+          !UploadBuffer(stream, conv->bias, bias, error)) {
+        return false;
+      }
+    } else {
+      if (!conv->weight.Allocate(source.size() * sizeof(float), error) ||
+          !conv->bias.Allocate(bias.size() * sizeof(float), error) ||
+          !UploadBuffer(stream, conv->weight, source, error) ||
+          !UploadBuffer(stream, conv->bias, bias, error)) {
+        return false;
+      }
     }
     weight_bytes += conv->weight.bytes() + conv->bias.bytes();
     return true;
@@ -556,16 +622,16 @@ struct VideoVaeEncoder::Impl {
         const int cout = static_cast<int>(w.block_out[b]);
         const std::string block_base = base + ".block." + std::to_string(block);
         if (!LoadConv3x3x3(block_base + ".conv1", cout, cin,
-                           &w.convs3d[b * 2U], error) ||
+                           &w.convs3d[b * 2U], error, true) ||
             !LoadConv3x3x3(block_base + ".conv2", cout, cout,
-                           &w.convs3d[b * 2U + 1U], error)) {
+                           &w.convs3d[b * 2U + 1U], error, true)) {
           return false;
         }
       }
       if (w.has_downsample) {
         const int out = static_cast<int>(w.block_out[1]);
         if (!LoadConv3x3x3(base + ".downsample.conv", out, out,
-                           &w.downsample3d, error)) {
+                           &w.downsample3d, error, true)) {
           return false;
         }
       }
@@ -580,11 +646,23 @@ struct VideoVaeEncoder::Impl {
         max_positions_3d * 128U * sizeof(float);
     const std::size_t max_columns_3d =
         static_cast<std::size_t>(kIm2ColChunk) * 1024U * 27U * sizeof(float);
+    const std::uint32_t gn_chunks_per_frame = static_cast<std::uint32_t>(
+        (static_cast<std::size_t>(kH3VaeEncoderTilePixels) *
+             kH3VaeEncoderTilePixels +
+         31U) /
+        32U);
     if (!buffer_a.Allocate(max_activation_3d, error) ||
         !buffer_b.Allocate(max_activation_3d, error) ||
         !buffer_s.Allocate(max_activation_3d, error) ||
         !columns.Allocate(max_columns_3d, error) ||
-        !input_tile.Allocate(max_positions_3d * 3U * sizeof(float), error)) {
+        !input_tile.Allocate(max_positions_3d * 3U * sizeof(float), error) ||
+        !gn_sums.Allocate(17ULL * gn_chunks_per_frame *
+                              kH3VaeEncoderGroupNormGroups * sizeof(float),
+                          error) ||
+        !gn_squares.Allocate(gn_sums.bytes(), error) ||
+        !gn_means.Allocate(17ULL * kH3VaeEncoderGroupNormGroups * sizeof(float),
+                           error) ||
+        !gn_inverses.Allocate(gn_means.bytes(), error)) {
       return false;
     }
     loaded_3d_ = true;
@@ -658,7 +736,7 @@ struct VideoVaeEncoder::Impl {
     return true;
   }
 
-  bool Gemm(const FlatConv& conv, const float* input, float* output,
+  bool Gemm(const FlatConv& conv, const void* input, float* output,
             std::size_t batch, std::string* error) {
     if (batch == 0) {
       return true;
@@ -669,19 +747,21 @@ struct VideoVaeEncoder::Impl {
     }
     constexpr float alpha = 1.0F;
     constexpr float beta = 0.0F;
+    const rocblas_datatype ab_type =
+        conv.is_bf16 ? rocblas_datatype_bf16_r : rocblas_datatype_f32_r;
     const rocblas_status status = rocblas_gemm_ex(
         handle_, rocblas_operation_transpose, rocblas_operation_none,
         static_cast<rocblas_int>(conv.out_channels),
         static_cast<rocblas_int>(batch),
-        static_cast<rocblas_int>(conv.columns), &alpha, conv.weight.As<float>(),
-        rocblas_datatype_f32_r, static_cast<rocblas_int>(conv.columns), input,
-        rocblas_datatype_f32_r, static_cast<rocblas_int>(conv.columns), &beta,
-        output, rocblas_datatype_f32_r,
-        static_cast<rocblas_int>(conv.out_channels), output,
+        static_cast<rocblas_int>(conv.columns), &alpha, conv.weight.data(),
+        ab_type, static_cast<rocblas_int>(conv.columns), input, ab_type,
+        static_cast<rocblas_int>(conv.columns), &beta, output,
         rocblas_datatype_f32_r, static_cast<rocblas_int>(conv.out_channels),
-        rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+        output, rocblas_datatype_f32_r,
+        static_cast<rocblas_int>(conv.out_channels), rocblas_datatype_f32_r,
+        rocblas_gemm_algo_standard, 0, 0);
     if (status != rocblas_status_success) {
-      EncSetError(error, "MiniMax H3 VisualVAE encoder F32 GEMM failed: " +
+      EncSetError(error, "MiniMax H3 VisualVAE encoder GEMM failed: " +
                              std::to_string(static_cast<int>(status)));
       return false;
     }
@@ -727,21 +807,32 @@ struct VideoVaeEncoder::Impl {
     }
     const std::size_t positions =
         static_cast<std::size_t>(out_height) * out_width;
-    const std::size_t columns_per_position =
-        static_cast<std::size_t>(channels) * 9U;
-    for (std::size_t base = 0; base < positions; base += kIm2ColChunk) {
+    const std::size_t elem_bytes =
+        conv.is_bf16 ? sizeof(std::uint16_t) : sizeof(float);
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(channels) * 9U * elem_bytes;
+    const std::size_t max_chunk = std::min<std::size_t>(
+        65535U, std::max<std::size_t>(1U, columns.bytes() / row_bytes));
+    for (std::size_t base = 0; base < positions; base += max_chunk) {
       const std::uint32_t count = static_cast<std::uint32_t>(
-          positions - base < kIm2ColChunk ? positions - base : kIm2ColChunk);
-      enc_ops::LaunchIm2ColReflect(input, columns.As<float>(), in_height,
-                                   in_width, out_height, out_width, channels,
-                                   stride, pad, pad,
-                                   static_cast<std::uint32_t>(base), count,
-                                   stream);
+          positions - base < max_chunk ? positions - base : max_chunk);
+      if (conv.is_bf16) {
+        enc_ops::LaunchIm2ColReflectBf16(
+            input, columns.As<std::uint16_t>(), in_height, in_width, out_height,
+            out_width, channels, stride, pad, pad,
+            static_cast<std::uint32_t>(base), count, stream);
+      } else {
+        enc_ops::LaunchIm2ColReflect(input, columns.As<float>(), in_height,
+                                     in_width, out_height, out_width, channels,
+                                     stride, pad, pad,
+                                     static_cast<std::uint32_t>(base), count,
+                                     stream);
+      }
       if (!EncCheckLaunch("im2col", error)) {
         return false;
       }
-      if (!Gemm(conv, columns.As<float>(),
-                output + base * conv.out_channels, count, error)) {
+      if (!Gemm(conv, columns.data(), output + base * conv.out_channels, count,
+                error)) {
         return false;
       }
     }
@@ -769,18 +860,31 @@ struct VideoVaeEncoder::Impl {
     }
     const std::size_t positions =
         static_cast<std::size_t>(out_time) * out_height * out_width;
-    for (std::size_t base = 0; base < positions; base += kIm2ColChunk) {
+    const std::size_t elem_bytes =
+        conv.is_bf16 ? sizeof(std::uint16_t) : sizeof(float);
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(channels) * 27U * elem_bytes;
+    const std::size_t max_chunk = std::min<std::size_t>(
+        65535U, std::max<std::size_t>(1U, columns.bytes() / row_bytes));
+    for (std::size_t base = 0; base < positions; base += max_chunk) {
       const std::uint32_t count = static_cast<std::uint32_t>(
-          positions - base < kIm2ColChunk ? positions - base : kIm2ColChunk);
-      enc_ops::LaunchIm2Col3DReflect(
-          input, columns.As<float>(), in_time, in_height, in_width, out_height,
-          out_width, channels, stride_t, stride_s, pad_s,
-          static_cast<std::uint32_t>(base), count, stream);
+          positions - base < max_chunk ? positions - base : max_chunk);
+      if (conv.is_bf16) {
+        enc_ops::LaunchIm2Col3DReflectBf16(
+            input, columns.As<std::uint16_t>(), in_time, in_height, in_width,
+            out_height, out_width, channels, stride_t, stride_s, pad_s,
+            static_cast<std::uint32_t>(base), count, stream);
+      } else {
+        enc_ops::LaunchIm2Col3DReflect(
+            input, columns.As<float>(), in_time, in_height, in_width,
+            out_height, out_width, channels, stride_t, stride_s, pad_s,
+            static_cast<std::uint32_t>(base), count, stream);
+      }
       if (!EncCheckLaunch("im2col3d", error)) {
         return false;
       }
-      if (!Gemm(conv, columns.As<float>(),
-                output + base * conv.out_channels, count, error)) {
+      if (!Gemm(conv, columns.data(), output + base * conv.out_channels, count,
+                error)) {
         return false;
       }
     }
@@ -791,6 +895,15 @@ struct VideoVaeEncoder::Impl {
                        const EncDeviceBuffer& bias, std::uint32_t time,
                        std::uint32_t hw, std::uint32_t channels,
                        std::string* error) {
+    if (time > 1U && channels % 4U == 0U &&
+        (channels / 4U) % kH3VaeEncoderGroupNormGroups == 0U) {
+      enc_ops::LaunchGroupNormSiluBatched(
+          volume, weight.As<float>(), bias.As<float>(), gn_sums.As<float>(),
+          gn_squares.As<float>(), gn_means.As<float>(), gn_inverses.As<float>(),
+          volume, time, hw, channels, kH3VaeEncoderGroupNormGroups,
+          kH3VaeEncoderGroupNormEpsilon, stream);
+      return EncCheckLaunch("group norm 3d", error);
+    }
     for (std::uint32_t t = 0; t < time; ++t) {
       if (!GroupNormSilu(volume + static_cast<std::size_t>(t) * hw * channels,
                          weight, bias, hw, channels, error)) {

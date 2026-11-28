@@ -556,13 +556,12 @@ __global__ void DitAddLokrDeltaBf16Kernel(std::uint16_t* weight,
   weight[dst_i] = DitFloatToBf16(DitBf16ToFloat(weight[dst_i]) + delta);
 }
 
-bool ApplyLokrTerms(LoadedWeight* weight, std::span<const LokrTerm> terms,
-                    hipStream_t stream, std::string* error) {
-  if (terms.empty() || weight == nullptr || weight->descriptor == nullptr ||
-      weight->descriptor->shape.size() != 2U) {
+bool ApplyLokrTerms(const TensorDescriptor& desc, std::uint16_t* weight_storage,
+                    std::span<const LokrTerm> terms, hipStream_t stream,
+                    std::string* error) {
+  if (terms.empty() || weight_storage == nullptr || desc.shape.size() != 2U) {
     return true;
   }
-  const auto& desc = *weight->descriptor;
   const std::size_t rows = static_cast<std::size_t>(desc.shape[0]);
   const std::size_t cols = static_cast<std::size_t>(desc.shape[1]);
   const std::size_t count = rows * cols;
@@ -593,9 +592,8 @@ bool ApplyLokrTerms(LoadedWeight* weight, std::span<const LokrTerm> terms,
       return false;
     }
     DitAddLokrDeltaBf16Kernel<<<blocks, threads, 0, stream>>>(
-        weight->storage.As<std::uint16_t>(), w1_dev.As<float>(),
-        w2_dev.As<float>(), p.w1_cols, p.w2_rows, p.w2_cols, count, cols,
-        p.scale * term.strength, repack_qkv);
+        weight_storage, w1_dev.As<float>(), w2_dev.As<float>(), p.w1_cols,
+        p.w2_rows, p.w2_cols, count, cols, p.scale * term.strength, repack_qkv);
     hipError_t status = hipGetLastError();
     if (status == hipSuccess) {
       status = hipStreamSynchronize(stream);
@@ -608,14 +606,12 @@ bool ApplyLokrTerms(LoadedWeight* weight, std::span<const LokrTerm> terms,
   return true;
 }
 
-bool ApplyLoraTerms(LoadedWeight* weight, std::span<const LoraTerm> terms,
-                    hipStream_t stream, rocblas_handle blas,
-                    std::string* error) {
-  if (terms.empty() || weight == nullptr || weight->descriptor == nullptr ||
-      weight->descriptor->shape.size() != 2U) {
+bool ApplyLoraTerms(const TensorDescriptor& desc, std::uint16_t* weight_storage,
+                    std::span<const LoraTerm> terms, hipStream_t stream,
+                    rocblas_handle blas, std::string* error) {
+  if (terms.empty() || weight_storage == nullptr || desc.shape.size() != 2U) {
     return true;
   }
-  const auto& desc = *weight->descriptor;
   const std::size_t rows = static_cast<std::size_t>(desc.shape[0]);
   const std::size_t cols = static_cast<std::size_t>(desc.shape[1]);
   const std::size_t count = rows * cols;
@@ -661,6 +657,12 @@ bool ApplyLoraTerms(LoadedWeight* weight, std::span<const LoraTerm> terms,
                             std::to_string(static_cast<int>(bstat)));
         return false;
       }
+      // Sync before per-term host vector and DeviceBuffer leave scope.
+      status = hipStreamSynchronize(stream);
+      if (status != hipSuccess) {
+        SetError(error, HipError("synchronize MiniMax H3 LoRA diff", status));
+        return false;
+      }
       continue;
     }
     const std::size_t up_count = rows * static_cast<std::size_t>(patch.rank);
@@ -695,6 +697,12 @@ bool ApplyLoraTerms(LoadedWeight* weight, std::span<const LoraTerm> terms,
                           std::to_string(static_cast<int>(bstat)));
       return false;
     }
+    // Sync before per-term host vectors and DeviceBuffers leave scope.
+    status = hipStreamSynchronize(stream);
+    if (status != hipSuccess) {
+      SetError(error, HipError("synchronize MiniMax H3 LoRA factors", status));
+      return false;
+    }
   }
   const bool quantized = desc.dtype == DType::kInt8 ||
                          desc.dtype == DType::kFloat8E4M3;
@@ -705,8 +713,7 @@ bool ApplyLoraTerms(LoadedWeight* weight, std::span<const LoraTerm> terms,
   const unsigned blocks =
       static_cast<unsigned>((count + threads - 1U) / threads);
   DitAddLoraDeltaBf16Kernel<<<blocks, threads, 0, stream>>>(
-      weight->storage.As<std::uint16_t>(), delta_dev.As<float>(), count, cols,
-      repack_qkv);
+      weight_storage, delta_dev.As<float>(), count, cols, repack_qkv);
   status = hipGetLastError();
   if (status == hipSuccess) {
     status = hipStreamSynchronize(stream);
@@ -714,6 +721,44 @@ bool ApplyLoraTerms(LoadedWeight* weight, std::span<const LoraTerm> terms,
   if (status != hipSuccess) {
     SetError(error, HipError("apply MiniMax H3 LoRA delta", status));
     return false;
+  }
+  return true;
+}
+
+bool ApplyBf16WeightLorasWithHandle(const TensorDescriptor& desc,
+                                    std::uint16_t* weight_storage,
+                                    const DitLoras* loras, hipStream_t stream,
+                                    rocblas_handle* shared_blas,
+                                    std::string* error) {
+  if (loras == nullptr || weight_storage == nullptr || desc.shape.size() != 2U ||
+      (loras->terms.empty() && loras->lokr_terms.empty())) {
+    return true;
+  }
+  const auto it = loras->terms.find(desc.name);
+  if (it != loras->terms.end() && !it->second.empty()) {
+    if (*shared_blas == nullptr) {
+      if (rocblas_create_handle(shared_blas) != rocblas_status_success ||
+          rocblas_set_atomics_mode(*shared_blas, rocblas_atomics_not_allowed) !=
+              rocblas_status_success ||
+          rocblas_set_stream(*shared_blas, stream) != rocblas_status_success) {
+        if (*shared_blas != nullptr) {
+          (void)rocblas_destroy_handle(*shared_blas);
+          *shared_blas = nullptr;
+        }
+        SetError(error, "failed to create rocBLAS handle for MiniMax H3 LoRA");
+        return false;
+      }
+    }
+    if (!ApplyLoraTerms(desc, weight_storage, it->second, stream, *shared_blas,
+                        error)) {
+      return false;
+    }
+  }
+  const auto lit = loras->lokr_terms.find(desc.name);
+  if (lit != loras->lokr_terms.end() && !lit->second.empty()) {
+    if (!ApplyLokrTerms(desc, weight_storage, lit->second, stream, error)) {
+      return false;
+    }
   }
   return true;
 }
@@ -1239,43 +1284,21 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
   if (options.loras != nullptr &&
       (!options.loras->terms.empty() || !options.loras->lokr_terms.empty())) {
     rocblas_handle lora_blas = nullptr;
+    bool lora_ok = true;
     for (LoadedWeight* weight : {&impl->qkv_weight, &impl->output_weight,
                                  &impl->fc1_weight, &impl->fc2_weight}) {
-      const auto it = options.loras->terms.find(weight->descriptor->name);
-      if (it != options.loras->terms.end() && !it->second.empty()) {
-        if (lora_blas == nullptr) {
-          if (rocblas_create_handle(&lora_blas) != rocblas_status_success ||
-              rocblas_set_atomics_mode(lora_blas, rocblas_atomics_not_allowed) !=
-                  rocblas_status_success ||
-              rocblas_set_stream(lora_blas, impl->stream) !=
-                  rocblas_status_success) {
-            if (lora_blas != nullptr) {
-              (void)rocblas_destroy_handle(lora_blas);
-            }
-            SetError(error,
-                     "failed to create rocBLAS handle for MiniMax H3 LoRA");
-            return nullptr;
-          }
-        }
-        if (!ApplyLoraTerms(weight, it->second, impl->stream, lora_blas,
-                            error)) {
-          (void)rocblas_destroy_handle(lora_blas);
-          return nullptr;
-        }
-      }
-      const auto lit =
-          options.loras->lokr_terms.find(weight->descriptor->name);
-      if (lit != options.loras->lokr_terms.end() && !lit->second.empty()) {
-        if (!ApplyLokrTerms(weight, lit->second, impl->stream, error)) {
-          if (lora_blas != nullptr) {
-            (void)rocblas_destroy_handle(lora_blas);
-          }
-          return nullptr;
-        }
+      if (!ApplyBf16WeightLorasWithHandle(
+              *weight->descriptor, weight->storage.As<std::uint16_t>(),
+              options.loras.get(), impl->stream, &lora_blas, error)) {
+        lora_ok = false;
+        break;
       }
     }
     if (lora_blas != nullptr) {
       (void)rocblas_destroy_handle(lora_blas);
+    }
+    if (!lora_ok) {
+      return nullptr;
     }
   }
   if (impl->native_projections) {
@@ -1577,7 +1600,8 @@ bool DitBlockSession::RunPreparedDevice(
     bool output_rms_required, const CancellationToken* cancellation,
     DitBlockTelemetry* telemetry, std::string* error,
     std::size_t active_rows, const std::uint16_t* rope_cos_override,
-    const std::uint16_t* rope_sin_override) {
+    const std::uint16_t* rope_sin_override,
+    const DitAttentionHints& attention_hints) {
   if (hidden_device == nullptr || row_map_device == nullptr ||
       output_device == nullptr || stream == nullptr) {
     SetError(error, "invalid MiniMax H3 DiT device run arguments");
@@ -1586,7 +1610,7 @@ bool DitBlockSession::RunPreparedDevice(
   return RunInternal({}, cancellation, {}, {}, {}, {}, telemetry, error,
                      hidden_device, row_map_device, output_device, stream,
                      input_rms_prepared, output_rms_required, active_rows,
-                     rope_cos_override, rope_sin_override);
+                     rope_cos_override, rope_sin_override, attention_hints);
 }
 
 bool DitBlockSession::Run(const DitBlockInput& input,
@@ -1629,7 +1653,8 @@ bool DitBlockSession::RunInternal(
     const std::uint32_t* row_map_device, std::uint16_t* output_device,
     void* external_stream, bool input_rms_prepared, bool output_rms_required,
     std::size_t active_rows, const std::uint16_t* rope_cos_override,
-    const std::uint16_t* rope_sin_override) {
+    const std::uint16_t* rope_sin_override,
+    const DitAttentionHints& attention_hints) {
   if (impl_ == nullptr || telemetry == nullptr || !impl_->constants_prepared) {
     SetError(error, "MiniMax H3 DiT constants are not prepared");
     return false;
@@ -1805,12 +1830,24 @@ bool DitBlockSession::RunInternal(
       return false;
     }
   }
+  const dit_ops::SparseAttentionHints sparse_hints{
+      .protected_prefix_rows =
+          static_cast<std::uint32_t>(attention_hints.protected_prefix_rows),
+      .audio_begin_row =
+          static_cast<std::uint32_t>(attention_hints.audio_begin_row),
+      .audio_end_row =
+          static_cast<std::uint32_t>(attention_hints.audio_end_row),
+      .video_begin_row =
+          static_cast<std::uint32_t>(attention_hints.video_begin_row),
+      .video_frame_rows =
+          static_cast<std::uint32_t>(attention_hints.video_frame_rows),
+  };
   if (impl_->native_projections) {
     dit_ops::LaunchProjectionAttention(
         impl_->query.As<std::uint16_t>(), impl_->key.As<std::uint16_t>(),
         impl_->value.As<std::uint16_t>(),
         impl_->attention_heads.As<std::uint16_t>(), rows, kDitAttentionHeads,
-        run_stream);
+        run_stream, sparse_hints);
   } else if (impl_->row_parallel_attention) {
     // QKV is dead after normalization. The attention result occupies its first
     // plane; pack V after that plane, leaving source values and output
@@ -1821,7 +1858,7 @@ bool DitBlockSession::RunInternal(
         impl_->query.As<std::uint16_t>(), impl_->key.As<std::uint16_t>(),
         impl_->value.As<std::uint16_t>(),
         impl_->attention_heads.As<std::uint16_t>(), packed_values, rows,
-        kDitAttentionHeads, run_stream);
+        kDitAttentionHeads, run_stream, sparse_hints);
   } else {
     dit_ops::LaunchFullAttention(
         impl_->query.As<std::uint16_t>(), impl_->key.As<std::uint16_t>(),
@@ -2038,6 +2075,22 @@ std::uint64_t DitBlockSession::gemm_plan_validations() const noexcept {
 
 double DitBlockSession::load_ms() const noexcept {
   return impl_ == nullptr ? 0.0 : impl_->load_ms;
+}
+
+bool ApplyBf16WeightLoras(const TensorDescriptor& descriptor,
+                          std::uint16_t* device_weight, const DitLoras* loras,
+                          void* hip_stream, std::string* error) {
+  if (loras == nullptr || device_weight == nullptr || hip_stream == nullptr) {
+    return true;
+  }
+  rocblas_handle lora_blas = nullptr;
+  const bool ok = ApplyBf16WeightLorasWithHandle(
+      descriptor, device_weight, loras, static_cast<hipStream_t>(hip_stream),
+      &lora_blas, error);
+  if (lora_blas != nullptr) {
+    (void)rocblas_destroy_handle(lora_blas);
+  }
+  return ok;
 }
 
 }  // namespace gufo::minimax_h3

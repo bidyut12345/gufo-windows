@@ -108,11 +108,59 @@ __global__ void Fp8E4M3ToBf16(const std::uint8_t* x, const float* scale, B* y,
   }
 }
 
+__device__ __forceinline__ float F16ToFloatDevice(std::uint16_t bits) {
+  const std::uint32_t sign = static_cast<std::uint32_t>(bits & 0x8000U) << 16;
+  const std::uint32_t exp = (bits >> 10) & 0x1FU;
+  const std::uint32_t mant = bits & 0x3FFU;
+  if (exp == 0x1FU) {
+    return mant == 0 ? __uint_as_float(sign | 0x7F800000U)
+                     : __uint_as_float(0x7FC00000U);
+  }
+  if (exp == 0) {
+    if (mant == 0)
+      return __uint_as_float(sign);
+    const float mag = ldexpf(static_cast<float>(mant), -24);
+    return sign ? -mag : mag;
+  }
+  return __uint_as_float(sign | ((exp + 112U) << 23) | (mant << 13));
+}
+
 __global__ void Bf16ToFloat(const B* x, float* y, std::size_t n) {
   const auto i =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < n)
     y[i] = float(x[i]);
+}
+
+__global__ void F16ToFloat(const std::uint16_t* x, float* y, std::size_t n) {
+  const auto i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n)
+    y[i] = F16ToFloatDevice(x[i]);
+}
+
+__global__ void AddScaledDiffBf16(float* w, const B* diff, float strength,
+                                  std::size_t n) {
+  const auto i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n)
+    w[i] += strength * float(diff[i]);
+}
+
+__global__ void AddScaledDiffF16(float* w, const std::uint16_t* diff,
+                                 float strength, std::size_t n) {
+  const auto i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n)
+    w[i] += strength * F16ToFloatDevice(diff[i]);
+}
+
+__global__ void AddScaledDiffF32(float* w, const float* diff, float strength,
+                                 std::size_t n) {
+  const auto i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n)
+    w[i] += strength * diff[i];
 }
 
 template<bool Convolution>
@@ -636,14 +684,118 @@ __global__ void Dora(float* w, const float* delta, const float* magnitude,
   __shared__ float scratch[256];
   const auto offset = static_cast<std::size_t>(blockIdx.x) * cols;
   float square = 0;
-  for (int c = threadIdx.x; c < cols; c += blockDim.x)
-    square += w[offset + c] * w[offset + c];
+  if ((cols & 3) == 0) {
+    const auto* w4 = reinterpret_cast<const float4*>(w + offset);
+    for (int c4 = threadIdx.x; c4 < cols / 4; c4 += blockDim.x) {
+      const float4 v = w4[c4];
+      square += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+  } else {
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+      const float v = w[offset + c];
+      square += v * v;
+    }
+  }
   const float scale =
       magnitude[blockIdx.x] / (sqrtf(Sum(square, scratch)) + FLT_EPSILON);
-  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
-    const float value = w[offset + c];
-    const float calc = (value + delta[offset + c]) * scale;
-    w[offset + c] = strength == 1 ? calc : value + strength * (calc - value);
+  if ((cols & 3) == 0) {
+    auto* w4 = reinterpret_cast<float4*>(w + offset);
+    const auto* d4 = reinterpret_cast<const float4*>(delta + offset);
+    for (int c4 = threadIdx.x; c4 < cols / 4; c4 += blockDim.x) {
+      const float4 v = w4[c4];
+      const float4 d = d4[c4];
+      const float c0 = (v.x + d.x) * scale;
+      const float c1 = (v.y + d.y) * scale;
+      const float c2 = (v.z + d.z) * scale;
+      const float c3 = (v.w + d.w) * scale;
+      w4[c4] = strength == 1
+                   ? make_float4(c0, c1, c2, c3)
+                   : make_float4(v.x + strength * (c0 - v.x),
+                                 v.y + strength * (c1 - v.y),
+                                 v.z + strength * (c2 - v.z),
+                                 v.w + strength * (c3 - v.w));
+    }
+  } else {
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+      const float value = w[offset + c];
+      const float calc = (value + delta[offset + c]) * scale;
+      w[offset + c] = strength == 1 ? calc : value + strength * (calc - value);
+    }
+  }
+}
+
+__global__ void DoraFromBf16(const B* w_bf16, float* delta_inout, B* out_bf16,
+                             const float* magnitude, int cols, float strength) {
+  __shared__ float scratch[256];
+  const auto offset = static_cast<std::size_t>(blockIdx.x) * cols;
+  float square = 0;
+  if ((cols & 3) == 0) {
+    const auto* w4 = reinterpret_cast<const uint2*>(w_bf16 + offset);
+    for (int c4 = threadIdx.x; c4 < cols / 4; c4 += blockDim.x) {
+      const uint2 packed = w4[c4];
+      const std::uint16_t raw[4] = {
+          static_cast<std::uint16_t>(packed.x),
+          static_cast<std::uint16_t>(packed.x >> 16),
+          static_cast<std::uint16_t>(packed.y),
+          static_cast<std::uint16_t>(packed.y >> 16)};
+      for (int k = 0; k < 4; ++k) {
+        const float v =
+            __uint_as_float(static_cast<std::uint32_t>(raw[k]) << 16);
+        square += v * v;
+      }
+    }
+  } else {
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+      const float v = float(w_bf16[offset + c]);
+      square += v * v;
+    }
+  }
+  const float scale =
+      magnitude[blockIdx.x] / (sqrtf(Sum(square, scratch)) + FLT_EPSILON);
+  if ((cols & 3) == 0) {
+    const auto* w4 = reinterpret_cast<const uint2*>(w_bf16 + offset);
+    auto* d4 = reinterpret_cast<float4*>(delta_inout + offset);
+    auto* o4 = out_bf16 ? reinterpret_cast<uint2*>(out_bf16 + offset) : nullptr;
+    for (int c4 = threadIdx.x; c4 < cols / 4; c4 += blockDim.x) {
+      const uint2 packed = w4[c4];
+      const float4 d = d4[c4];
+      const std::uint16_t raw[4] = {
+          static_cast<std::uint16_t>(packed.x),
+          static_cast<std::uint16_t>(packed.x >> 16),
+          static_cast<std::uint16_t>(packed.y),
+          static_cast<std::uint16_t>(packed.y >> 16)};
+      const float ds[4] = {d.x, d.y, d.z, d.w};
+      float out_f[4];
+      for (int k = 0; k < 4; ++k) {
+        const float value =
+            __uint_as_float(static_cast<std::uint32_t>(raw[k]) << 16);
+        const float calc = (value + ds[k]) * scale;
+        out_f[k] = strength == 1 ? calc : value + strength * (calc - value);
+      }
+      if (o4) {
+        const std::uint16_t b0 = Bf16(out_f[0]).data;
+        const std::uint16_t b1 = Bf16(out_f[1]).data;
+        const std::uint16_t b2 = Bf16(out_f[2]).data;
+        const std::uint16_t b3 = Bf16(out_f[3]).data;
+        o4[c4] = make_uint2(static_cast<std::uint32_t>(b0) |
+                                (static_cast<std::uint32_t>(b1) << 16),
+                            static_cast<std::uint32_t>(b2) |
+                                (static_cast<std::uint32_t>(b3) << 16));
+      } else {
+        d4[c4] = make_float4(out_f[0], out_f[1], out_f[2], out_f[3]);
+      }
+    }
+  } else {
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+      const float value = float(w_bf16[offset + c]);
+      const float calc = (value + delta_inout[offset + c]) * scale;
+      const float out_v =
+          strength == 1 ? calc : value + strength * (calc - value);
+      if (out_bf16)
+        out_bf16[offset + c] = Bf16(out_v);
+      else
+        delta_inout[offset + c] = out_v;
+    }
   }
 }
 
@@ -716,24 +868,42 @@ void ReorderHeads(const std::uint16_t* input, std::uint16_t* output, int rows,
 }
 
 void LoraLowRank(hipblasHandle_t blas, float* weight, const float* up,
-                 const float* down, int rows, int cols, int rank, float scale) {
+                 const float* down, int rows, int cols, int rank, float scale,
+                 float beta) {
   // Without atomics the reduction order is fixed, so rebuilding a merged
   // weight after an adapter switch is bit-identical.
   hipblasAtomicsMode_t atomics{};
   BlasCheck(hipblasGetAtomicsMode(blas, &atomics));
+  struct AtomicsGuard {
+    hipblasHandle_t blas;
+    hipblasAtomicsMode_t previous;
+    ~AtomicsGuard() { (void)hipblasSetAtomicsMode(blas, previous); }
+  } guard{blas, atomics};
   BlasCheck(hipblasSetAtomicsMode(blas, HIPBLAS_ATOMICS_NOT_ALLOWED));
-  // Row-major W += s * U * D is column-major W^T += s * D^T * U^T.
-  const float one = 1;
+  // Row-major W = beta * W + s * U * D is column-major W^T = beta * W^T + s *
+  // D^T * U^T.
   const auto status =
       hipblasSgemm(blas, HIPBLAS_OP_N, HIPBLAS_OP_N, cols, rows, rank, &scale,
-                   down, cols, up, rank, &one, weight, cols);
-  BlasCheck(hipblasSetAtomicsMode(blas, atomics));
+                   down, cols, up, rank, &beta, weight, cols);
   BlasCheck(status);
 }
 
 void LoraDora(float* weight, const float* delta, const float* magnitude,
               int rows, int cols, float strength, hipStream_t stream) {
   Dora<<<rows, 256, 0, stream>>>(weight, delta, magnitude, cols, strength);
+}
+
+void LoraDoraFromBf16(const std::uint16_t* weight_bf16, float* delta_inout,
+                      std::uint16_t* out_bf16, const float* magnitude, int rows,
+                      int cols, float strength, hipStream_t stream) {
+  DoraFromBf16<<<rows, 256, 0, stream>>>(
+      reinterpret_cast<const B*>(weight_bf16), delta_inout,
+      reinterpret_cast<B*>(out_bf16), magnitude, cols, strength);
+}
+
+void ConvertF16ToFloat(const std::uint16_t* input, float* output,
+                       std::size_t count, hipStream_t stream) {
+  F16ToFloat<<<Blocks(count), 256, 0, stream>>>(input, output, count);
 }
 
 void Check(hipError_t status) {
@@ -781,10 +951,12 @@ struct Runtime::Pool {
     (void)hipFree(p);
   }
   std::shared_ptr<void> Allocate(std::size_t bytes,
-                                 const std::shared_ptr<Pool>& self) {
+                                 const std::shared_ptr<Pool>& self,
+                                 bool exact = false) {
     void* p = nullptr;
     auto it = free.lower_bound(bytes);
-    if (it != free.end() && it->first <= bytes * 2) {
+    if (it != free.end() &&
+        (exact ? it->first == bytes : it->first <= bytes * 2)) {
       bytes = it->first;
       p = it->second;
       cached_bytes -= bytes;
@@ -827,6 +999,7 @@ Runtime::~Runtime() {
       (void)hipEventDestroy(staging_done_[i]);
   }
   device_weights_.clear();
+  ReleaseLoraScratch();
   packed_source_ = {};
   packed_input_ = {};
   pool_.reset();
@@ -850,29 +1023,38 @@ void Runtime::UploadMapped(void* device, const void* host, std::size_t bytes) {
   }
   auto* target = static_cast<std::byte*>(device);
   const auto* source = static_cast<const std::byte*>(host);
-  for (std::size_t offset = 0, slot = 0; offset < bytes;
-       offset += kStagingBytes, slot ^= 1U) {
-    const auto chunk = std::min(kStagingBytes, bytes - offset);
-    // The buffer is reused only after its previous copy has completed.
-    Check(hipEventSynchronize(staging_done_[slot]));
-    std::memcpy(staging_[slot], source + offset, chunk);
-    Check(hipMemcpyAsync(target + offset, staging_[slot], chunk,
-                         hipMemcpyHostToDevice, stream_));
-    Check(hipEventRecord(staging_done_[slot], stream_));
+  std::size_t offset = 0;
+  while (offset < bytes) {
+    staging_offset_ = (staging_offset_ + 15U) & ~std::size_t(15U);
+    if (staging_offset_ >= kStagingBytes) {
+      Check(hipEventRecord(staging_done_[staging_slot_], stream_));
+      staging_slot_ ^= 1U;
+      staging_offset_ = 0;
+      Check(hipEventSynchronize(staging_done_[staging_slot_]));
+    }
+    const auto avail = kStagingBytes - staging_offset_;
+    const auto chunk = std::min(avail, bytes - offset);
+    auto* dst = static_cast<std::byte*>(staging_[staging_slot_]) +
+                staging_offset_;
+    std::memcpy(dst, source + offset, chunk);
+    Check(hipMemcpyAsync(target + offset, dst, chunk, hipMemcpyHostToDevice,
+                         stream_));
+    staging_offset_ += chunk;
+    offset += chunk;
   }
 }
 
-Matrix Runtime::Raw(std::size_t bytes) {
+Matrix Runtime::Raw(std::size_t bytes, bool exact) {
   if (!bytes || bytes > (32ULL << 30))
     throw std::length_error("Qwen-Image tensor exceeds memory limit");
-  auto owner = pool_->Allocate(bytes, pool_);
+  auto owner = pool_->Allocate(bytes, pool_, exact);
   return {owner, static_cast<std::uint16_t*>(owner.get()), 1, 1};
 }
 
-Matrix Runtime::New(int rows, int cols) {
+Matrix Runtime::New(int rows, int cols, bool exact) {
   if (rows <= 0 || cols <= 0)
     throw std::logic_error("empty Qwen-Image tensor");
-  auto m = Raw(static_cast<std::size_t>(rows) * cols * 2);
+  auto m = Raw(static_cast<std::size_t>(rows) * cols * 2, exact);
   m.rows = rows;
   m.cols = cols;
   return m;
@@ -929,7 +1111,9 @@ Matrix Runtime::Weight(std::string_view name) {
   auto target = Stage(w);
   UploadMapped(target.raw.data ? target.raw.data : target.m.data, w.data,
                w.bytes);
-  return Store(name, w, std::move(target));
+  auto m = Store(name, w, std::move(target));
+  Synchronize();
+  return m;
 }
 
 Runtime::StagedWeight Runtime::Stage(const qwen_image_21::Weight& w) {
@@ -943,75 +1127,173 @@ Runtime::StagedWeight Runtime::Stage(const qwen_image_21::Weight& w) {
   const auto count = w.bytes / elem_size;
   if (count / rows > static_cast<std::size_t>(std::numeric_limits<int>::max()))
     throw std::runtime_error("Qwen-Image weight exceeds matrix dimensions");
-  StagedWeight target{.m = New(rows, static_cast<int>(count / rows))};
+  StagedWeight target{
+      .m = New(rows, static_cast<int>(count / rows), /*exact=*/true)};
   if (w.dtype != WeightDType::kBf16)
     target.raw = Raw(w.bytes);
   return target;
 }
 
+namespace {
+
+bool IsAuxiliaryWeight(std::string_view name, const qwen_image_21::Weight& w) {
+  return w.dtype == WeightDType::kU8 || name.ends_with("._weight_scale") ||
+         name.ends_with("._weight_zero_point") ||
+         name.ends_with(".weight_scale") || name.ends_with(".input_scale") ||
+         name.ends_with(".comfy_quant");
+}
+
+}  // namespace
+
 // Streams a component from its safetensors files through WeightUpload's
 // bounded pinned buffers. Copying through the mapping faults every page into
 // the process working set first; on Windows those pages stay resident, so a
 // 31 GB model exhausts a 32 GB host beside the GPU carve-out.
-bool Runtime::UploadGroup(std::string_view prefix) {
-  // Bound temporary device storage as well as pinned host storage. Keeping
-  // an entire F32 component staged needs three times its final BF16 size.
-  constexpr std::size_t kBatchBytes = 256ULL << 20;
-  std::vector<
-      std::tuple<std::string_view, const qwen_image_21::Weight*, StagedWeight>>
-      staged;
+bool Runtime::UploadGroup(std::string_view prefix,
+                          const CancellationCheck& cancelled) {
+  std::vector<std::pair<std::string_view, const qwen_image_21::Weight*>>
+      pending;
+  for (const auto& [name, w] : weights_.Group(prefix)) {
+    if (device_weights_.contains(name) || IsAuxiliaryWeight(name, *w))
+      continue;
+    pending.emplace_back(name, w);
+  }
+  if (pending.empty())
+    return true;
+
+  const auto all_files = weights_.Files();
+  std::vector<std::uint32_t> remap(all_files.size(), UINT32_MAX);
+  std::vector<core::GgufMappedRegion> active_files;
+  for (const auto& [name, w] : pending) {
+    (void)name;
+    if (remap[w->file] == UINT32_MAX) {
+      remap[w->file] = static_cast<std::uint32_t>(active_files.size());
+      active_files.push_back(all_files[w->file]);
+    }
+  }
+
+  // Bound temporary device storage and pinned host storage. Double-buffered
+  // 128 MiB batches overlap WeightUpload disk/H2D with GPU Store()/MergeLoras.
+  constexpr std::size_t kBatchBytes = 128ULL << 20;
+  using StagedEntry =
+      std::tuple<std::string_view, const qwen_image_21::Weight*, StagedWeight>;
+  struct EventGuard {
+    hipEvent_t event{nullptr};
+    EventGuard() { Check(hipEventCreateWithFlags(&event, hipEventDisableTiming)); }
+    ~EventGuard() {
+      if (event)
+        (void)hipEventDestroy(event);
+    }
+    EventGuard(const EventGuard&) = delete;
+    EventGuard& operator=(const EventGuard&) = delete;
+  };
+  // Destroy uploader before staged/garbage buffers on every exit so no
+  // background reader writes to a buffer already returned to the pool.
+  std::vector<Matrix> prev_garbage, curr_garbage;
+  std::vector<StagedEntry> curr_staged, next_staged;
+  EventGuard prev_done, curr_done;
   std::string error;
-  // Destroy the uploader before staged on every exit, including allocation
-  // failures, so no worker can write to a destination returned to the pool.
-  auto uploader = gufo::hip::WeightUpload::Create(weights_.Files(), &error);
+  auto uploader = gufo::hip::WeightUpload::Create(active_files, &error);
   if (!uploader)
     return false;
   // Pool blocks handed out below may still be read by queued kernels, and the
   // uploader copies on its own streams.
   Synchronize();
-  std::size_t staged_bytes = 0;
-  const auto flush = [&] {
-    if (!uploader->Finish(&error))
-      throw std::runtime_error("Qwen-Image weight upload failed: " + error);
-    for (auto& [name, w, target] : staged)
-      Store(name, *w, std::move(target));
-    staged.clear();
-    staged_bytes = 0;
+
+  std::size_t index = 0;
+  const auto stage_batch = [&](std::vector<StagedEntry>& out) -> bool {
+    out.clear();
+    std::size_t staged_bytes = 0;
+    while (index < pending.size()) {
+      const auto [name, w] = pending[index];
+      const auto bytes =
+          w->dtype == WeightDType::kBf16 ? w->bytes : w->bytes + w->bytes * 2;
+      // A tensor larger than the budget is uploaded alone.
+      if (!out.empty() &&
+          bytes > kBatchBytes - std::min(staged_bytes, kBatchBytes))
+        break;
+      auto target = Stage(*w);
+      void* destination = target.raw.data ? target.raw.data : target.m.data;
+      out.emplace_back(name, w, std::move(target));
+      staged_bytes += bytes;
+      ++index;
+      if (!uploader->Copy(remap[w->file], w->offset, w->bytes, destination,
+                          &error))
+        return false;
+    }
+    return true;
   };
-  for (const auto& [name, w] : weights_.Group(prefix)) {
-    if (device_weights_.contains(name))
-      continue;
-    if (w->dtype == WeightDType::kU8 || name.ends_with("._weight_scale") ||
-        name.ends_with("._weight_zero_point") ||
-        name.ends_with(".weight_scale") || name.ends_with(".input_scale") ||
-        name.ends_with(".comfy_quant"))
-      continue;
-    const auto bytes =
-        w->dtype == WeightDType::kBf16 ? w->bytes : w->bytes + w->bytes * 2;
-    // A tensor larger than the budget is uploaded alone.
-    if (!staged.empty() &&
-        bytes > kBatchBytes - std::min(staged_bytes, kBatchBytes))
-      flush();
-    auto target = Stage(*w);
-    void* destination = target.raw.data ? target.raw.data : target.m.data;
-    staged.emplace_back(name, w, std::move(target));
-    staged_bytes += bytes;
-    if (!uploader->Copy(w->file, w->offset, w->bytes, destination, &error))
-      break;
+
+  if (cancelled && cancelled())
+    throw std::runtime_error("image request cancelled");
+  if (!stage_batch(curr_staged) || !uploader->Finish(&error))
+    throw std::runtime_error("Qwen-Image weight upload failed: " + error);
+
+  bool has_prev = false;
+  while (!curr_staged.empty()) {
+    if (cancelled && cancelled())
+      throw std::runtime_error("image request cancelled");
+    curr_garbage.clear();
+    for (auto& [name, w, target] : curr_staged)
+      Store(name, *w, std::move(target), &curr_garbage);
+    if (!lora_garbage_.empty()) {
+      curr_garbage.insert(curr_garbage.end(),
+                          std::make_move_iterator(lora_garbage_.begin()),
+                          std::make_move_iterator(lora_garbage_.end()));
+      lora_garbage_.clear();
+    }
+    curr_staged.clear();
+    Check(hipEventRecord(curr_done.event, stream_));
+    if (has_prev) {
+      Check(hipEventSynchronize(prev_done.event));
+      prev_garbage.clear();
+    }
+    if (cancelled && cancelled())
+      throw std::runtime_error("image request cancelled");
+    const bool queued = stage_batch(next_staged);
+    prev_garbage = std::move(curr_garbage);
+    std::swap(prev_done.event, curr_done.event);
+    has_prev = true;
+    if (!queued || !uploader->Finish(&error))
+      throw std::runtime_error("Qwen-Image weight upload failed: " + error);
+    curr_staged = std::move(next_staged);
   }
-  flush();
+  Synchronize();
+  prev_garbage.clear();
+  lora_garbage_.clear();
   return true;
 }
 
 Matrix Runtime::Store(std::string_view name, const qwen_image_21::Weight& w,
-                      StagedWeight target) {
+                      StagedWeight target, std::vector<Matrix>* garbage) {
   Matrix m = std::move(target.m);
   const int rows = m.rows, cols = m.cols;
   const auto count = static_cast<std::size_t>(rows) * cols;
+  const auto lora = loras_.find(name);
+  const bool has_loras = lora != loras_.end() && !lora->second.empty();
+  const bool packed_convolution = w.shape.size() == 4 && w.shape[2] == 3 &&
+                                  w.shape[3] == 3 &&
+                                  Convolve3Shape(w.shape[1], rows);
+  const bool dense_pack =
+      w.shape.size() == 2 && DenseShape(rows, cols) &&
+      name.ends_with(".weight") &&
+      !weights_.Contains(std::string(name.substr(0, name.size() - 7)) +
+                         ".bias");
+  const auto recycle = [&](Matrix buf) {
+    if (garbage && buf.owner)
+      garbage->push_back(std::move(buf));
+  };
+
   if (target.raw.data) {
     if (w.dtype == WeightDType::kF32) {
-      FloatToBf16<<<Blocks(count), 256, 0, stream_>>>(
-          reinterpret_cast<const float*>(target.raw.data), Ptr(m), count);
+      if (has_loras) {
+        MergeLoras(m, &target.raw, lora->second, dense_pack, garbage);
+        recycle(std::move(target.raw));
+      } else {
+        FloatToBf16<<<Blocks(count), 256, 0, stream_>>>(
+            reinterpret_cast<const float*>(target.raw.data), Ptr(m), count);
+        recycle(std::move(target.raw));
+      }
     } else if (w.dtype == WeightDType::kI8 || w.dtype == WeightDType::kF8E4M3) {
       Matrix scale_dev;
       std::size_t scale_count = 0;
@@ -1045,83 +1327,263 @@ Matrix Runtime::Store(std::string_view name, const qwen_image_21::Weight& w,
             reinterpret_cast<const std::uint8_t*>(target.raw.data), scale_ptr,
             Ptr(m), count, cols, scale_count);
       }
+      recycle(std::move(scale_dev));
+      recycle(std::move(target.raw));
+      if (has_loras)
+        MergeLoras(m, nullptr, lora->second, dense_pack, garbage);
+    } else {
+      recycle(std::move(target.raw));
+      if (has_loras)
+        MergeLoras(m, nullptr, lora->second, dense_pack, garbage);
     }
-    target.raw = {};
+  } else if (has_loras) {
+    MergeLoras(m, nullptr, lora->second, dense_pack, garbage);
   }
-  if (const auto lora = loras_.find(name); lora != loras_.end())
-    MergeLoras(m, lora->second);
-  const bool packed_convolution = w.shape.size() == 4 && w.shape[2] == 3 &&
-                                  w.shape[3] == 3 &&
-                                  Convolve3Shape(w.shape[1], rows);
-  if (packed_convolution ||
-      (w.shape.size() == 2 && DenseShape(rows, cols) &&
-       name.ends_with(".weight") &&
-       !weights_.Contains(std::string(name.substr(0, name.size() - 7)) +
-                          ".bias"))) {
-    auto packed = New(rows, cols);
+
+  if (!m.packed && (packed_convolution || dense_pack)) {
+    auto packed = New(rows, cols, /*exact=*/true);
     PackDense16(m.data, packed.data, rows, cols, stream_);
     packed.packed = true;
+    recycle(std::move(m));
     m = std::move(packed);
   }
-  Synchronize();
   weight_bytes_ += count * 2;
   device_weights_.emplace(std::string(name), m);
   return m;
 }
 
-// Terms apply in order to an FP32 copy of the uploaded BF16 weight, which
-// rounds back to BF16 (a second rounding for an FP32 checkpoint tensor).
-// Adapter tensors are widened to FP32 on the host; the device scratch comes
-// from the buffer pool like any other temporary.
-void Runtime::MergeLoras(Matrix& weight, std::span<const LoraTerm> terms) {
-  const auto upload = [&](const LoraTensor& tensor, std::size_t first,
-                          std::size_t count) {
-    const auto values = LoraFloats(tensor, first, count);
-    auto device = Raw(count * 4);
-    UploadMapped(device.data, values.data(), count * 4);
-    return device;
+void Runtime::ReleaseLoraScratch() {
+  lora_scratch_ = {};
+  lora_scratch_bytes_ = 0;
+  cached_down_source_ = nullptr;
+  cached_down_count_ = 0;
+  cached_down_ = {};
+  lora_garbage_.clear();
+}
+
+Matrix Runtime::EnsureLoraScratch(std::size_t bytes) {
+  if (!lora_scratch_.data || lora_scratch_bytes_ < bytes) {
+    if (lora_scratch_.data)
+      lora_garbage_.push_back(std::move(lora_scratch_));
+    lora_scratch_ = Raw(bytes);
+    lora_scratch_bytes_ = bytes;
+  }
+  return lora_scratch_;
+}
+
+Matrix Runtime::UploadLoraTensor(const LoraTensor& tensor, std::size_t first,
+                                 std::size_t count, bool cache,
+                                 std::vector<Matrix>* garbage) {
+  if (cache && first == 0 && cached_down_source_ == tensor.data &&
+      cached_down_dtype_ == tensor.dtype && cached_down_count_ == count &&
+      cached_down_.data != nullptr) {
+    return cached_down_;
+  }
+  const std::size_t elem_bytes = tensor.dtype == LoraDtype::kF32 ? 4 : 2;
+  const auto* src =
+      static_cast<const std::byte*>(tensor.data) + first * elem_bytes;
+  Matrix out = Raw(count * 4);
+  if (tensor.dtype == LoraDtype::kF32) {
+    UploadMapped(out.data, src, count * 4);
+  } else {
+    Matrix raw = Raw(count * 2);
+    UploadMapped(raw.data, src, count * 2);
+    if (tensor.dtype == LoraDtype::kBf16) {
+      Bf16ToFloat<<<Blocks(count), 256, 0, stream_>>>(
+          Ptr(raw), reinterpret_cast<float*>(out.data), count);
+    } else {
+      F16ToFloat<<<Blocks(count), 256, 0, stream_>>>(
+          raw.data, reinterpret_cast<float*>(out.data), count);
+    }
+    if (garbage)
+      garbage->push_back(std::move(raw));
+  }
+  if (cache && first == 0) {
+    if (cached_down_.data) {
+      if (garbage)
+        garbage->push_back(std::move(cached_down_));
+      else
+        lora_garbage_.push_back(std::move(cached_down_));
+    }
+    cached_down_source_ = tensor.data;
+    cached_down_dtype_ = tensor.dtype;
+    cached_down_count_ = count;
+    cached_down_ = out;
+  }
+  return out;
+}
+
+// Terms apply in order to an FP32 copy of the uploaded BF16 weight (or directly
+// to an FP32 checkpoint tensor), then round/pack back to BF16 once.
+void Runtime::MergeLoras(Matrix& weight, const Matrix* fp32_base,
+                         std::span<const LoraTerm> terms, bool pack_output,
+                         std::vector<Matrix>* garbage) {
+  const auto recycle = [&](Matrix buf) {
+    if (garbage && buf.owner)
+      garbage->push_back(std::move(buf));
   };
-  const auto n = weight.size();
-  auto scratch = Raw(n * 4);
-  auto* w = reinterpret_cast<float*>(scratch.data);
-  Bf16ToFloat<<<Blocks(n), 256, 0, stream_>>>(Ptr(weight), w, n);
   for (const auto& term : terms) {
     const auto& patch = *term.patch;
     if (patch.base_row < 0 || patch.base_row + patch.rows > weight.rows ||
         patch.cols != weight.cols)
       throw std::logic_error("LoRA patch shape mismatch: " + patch.target);
+  }
+
+  // Fast path: fuse BF16 load + FP32 low-rank update + PackDense16 store.
+  bool can_fuse = fp32_base == nullptr && pack_output &&
+                  (weight.rows % 64) == 0 && (weight.cols % 64) == 0 &&
+                  !terms.empty() && terms.size() <= 16;
+  if (can_fuse) {
+    for (const auto& term : terms) {
+      const auto& patch = *term.patch;
+      if (patch.diff.data || patch.magnitude.data || patch.base_row != 0 ||
+          patch.rows != weight.rows || patch.cols != weight.cols ||
+          patch.rank < 1 || patch.rank > 128) {
+        can_fuse = false;
+        break;
+      }
+    }
+  }
+  if (can_fuse) {
+    std::array<LoraFactor, 16> factors{};
+    std::vector<Matrix> factor_buffers;
+    factor_buffers.reserve(terms.size() * 2);
+    for (std::size_t i = 0; i < terms.size(); ++i) {
+      const auto& patch = *terms[i].patch;
+      const auto first = static_cast<std::size_t>(patch.first_row);
+      auto up = UploadLoraTensor(
+          patch.up, first * patch.rank,
+          static_cast<std::size_t>(patch.rows) * patch.rank, false, garbage);
+      auto down = UploadLoraTensor(
+          patch.down, 0, static_cast<std::size_t>(patch.rank) * patch.cols,
+          true, garbage);
+      factors[i] = {reinterpret_cast<const float*>(up.data),
+                    reinterpret_cast<const float*>(down.data), patch.rank,
+                    patch.scale * terms[i].strength};
+      factor_buffers.push_back(std::move(up));
+      factor_buffers.push_back(std::move(down));
+    }
+    auto packed = New(weight.rows, weight.cols, /*exact=*/true);
+    if (!MergeLoraPackDense16(weight.data, packed.data, weight.rows,
+                              weight.cols, factors.data(),
+                              static_cast<int>(terms.size()), stream_))
+      throw std::logic_error("fused LoRA pack failed");
+    Check(hipGetLastError());
+    packed.packed = true;
+    recycle(std::move(weight));
+    weight = std::move(packed);
+    for (auto& buf : factor_buffers)
+      recycle(std::move(buf));
+    return;
+  }
+
+  // Fast path: single-term DoRA reads BF16 base weights directly.
+  if (fp32_base == nullptr && terms.size() == 1 &&
+      terms[0].patch->magnitude.data != nullptr &&
+      terms[0].patch->base_row == 0 && terms[0].patch->rows == weight.rows) {
+    const auto& patch = *terms[0].patch;
+    const auto first = static_cast<std::size_t>(patch.first_row);
+    const auto count = static_cast<std::size_t>(patch.rows) * patch.cols;
+    auto scratch = EnsureLoraScratch(count * 4);
+    auto* dw = reinterpret_cast<float*>(scratch.data);
+    auto up = UploadLoraTensor(
+        patch.up, first * patch.rank,
+        static_cast<std::size_t>(patch.rows) * patch.rank, false, garbage);
+    auto down = UploadLoraTensor(
+        patch.down, 0, static_cast<std::size_t>(patch.rank) * patch.cols,
+        true, garbage);
+    auto magnitude =
+        UploadLoraTensor(patch.magnitude, first, patch.rows, false, garbage);
+    LoraLowRank(blas_, dw, reinterpret_cast<const float*>(up.data),
+                reinterpret_cast<const float*>(down.data), patch.rows,
+                patch.cols, patch.rank, patch.scale, 0.0F);
+    if (pack_output) {
+      LoraDoraFromBf16(weight.data, dw, nullptr,
+                       reinterpret_cast<const float*>(magnitude.data),
+                       patch.rows, patch.cols, terms[0].strength, stream_);
+      PackDense16FromFloat(dw, weight.data, weight.rows, weight.cols, stream_);
+      weight.packed = true;
+    } else {
+      LoraDoraFromBf16(weight.data, dw, weight.data,
+                       reinterpret_cast<const float*>(magnitude.data),
+                       patch.rows, patch.cols, terms[0].strength, stream_);
+    }
+    recycle(std::move(up));
+    recycle(std::move(down));
+    recycle(std::move(magnitude));
+    Check(hipGetLastError());
+    return;
+  }
+
+  const auto n = weight.size();
+  float* w = nullptr;
+  if (fp32_base != nullptr) {
+    w = reinterpret_cast<float*>(fp32_base->data);
+  } else {
+    auto scratch = EnsureLoraScratch(n * 4);
+    w = reinterpret_cast<float*>(scratch.data);
+    Bf16ToFloat<<<Blocks(n), 256, 0, stream_>>>(Ptr(weight), w, n);
+  }
+  for (const auto& term : terms) {
+    const auto& patch = *term.patch;
     const auto first = static_cast<std::size_t>(patch.first_row);
     // The patch covers rows [base_row, base_row + rows) of the weight.
     const auto count = static_cast<std::size_t>(patch.rows) * patch.cols;
     auto* rows = w + static_cast<std::size_t>(patch.base_row) * patch.cols;
     if (patch.diff.data) {
-      const auto diff = upload(patch.diff, first * patch.cols, count);
-      BlasCheck(hipblasSaxpy(blas_, static_cast<int>(count), &term.strength,
-                             reinterpret_cast<const float*>(diff.data), 1, rows,
-                             1));
+      const std::size_t elem_bytes = patch.diff.dtype == LoraDtype::kF32 ? 4 : 2;
+      const auto* src = static_cast<const std::byte*>(patch.diff.data) +
+                        first * patch.cols * elem_bytes;
+      auto diff = Raw(count * elem_bytes);
+      UploadMapped(diff.data, src, count * elem_bytes);
+      if (patch.diff.dtype == LoraDtype::kF32) {
+        AddScaledDiffF32<<<Blocks(count), 256, 0, stream_>>>(
+            rows, reinterpret_cast<const float*>(diff.data), term.strength,
+            count);
+      } else if (patch.diff.dtype == LoraDtype::kBf16) {
+        AddScaledDiffBf16<<<Blocks(count), 256, 0, stream_>>>(
+            rows, Ptr(diff), term.strength, count);
+      } else {
+        AddScaledDiffF16<<<Blocks(count), 256, 0, stream_>>>(
+            rows, diff.data, term.strength, count);
+      }
+      recycle(std::move(diff));
       continue;
     }
-    const auto up = upload(patch.up, first * patch.rank,
-                           static_cast<std::size_t>(patch.rows) * patch.rank);
-    const auto down = upload(
-        patch.down, 0, static_cast<std::size_t>(patch.rank) * patch.cols);
+    auto up = UploadLoraTensor(
+        patch.up, first * patch.rank,
+        static_cast<std::size_t>(patch.rows) * patch.rank, false, garbage);
+    auto down = UploadLoraTensor(
+        patch.down, 0, static_cast<std::size_t>(patch.rank) * patch.cols,
+        true, garbage);
     const auto* u = reinterpret_cast<const float*>(up.data);
     const auto* d = reinterpret_cast<const float*>(down.data);
     if (!patch.magnitude.data) {
       LoraLowRank(blas_, rows, u, d, patch.rows, patch.cols, patch.rank,
-                  patch.scale * term.strength);
+                  patch.scale * term.strength, 1.0F);
+      recycle(std::move(up));
+      recycle(std::move(down));
       continue;
     }
     auto delta = Raw(count * 4);
     auto* dw = reinterpret_cast<float*>(delta.data);
-    Check(hipMemsetAsync(dw, 0, count * 4, stream_));
     LoraLowRank(blas_, dw, u, d, patch.rows, patch.cols, patch.rank,
-                patch.scale);
-    const auto magnitude = upload(patch.magnitude, first, patch.rows);
+                patch.scale, 0.0F);
+    auto magnitude =
+        UploadLoraTensor(patch.magnitude, first, patch.rows, false, garbage);
     LoraDora(rows, dw, reinterpret_cast<const float*>(magnitude.data),
              patch.rows, patch.cols, term.strength, stream_);
+    recycle(std::move(up));
+    recycle(std::move(down));
+    recycle(std::move(delta));
+    recycle(std::move(magnitude));
   }
-  FloatToBf16<<<Blocks(n), 256, 0, stream_>>>(w, Ptr(weight), n);
+  if (pack_output) {
+    PackDense16FromFloat(w, weight.data, weight.rows, weight.cols, stream_);
+    weight.packed = true;
+  } else {
+    FloatToBf16<<<Blocks(n), 256, 0, stream_>>>(w, Ptr(weight), n);
+  }
   Check(hipGetLastError());
 }
 
@@ -1227,9 +1689,16 @@ std::size_t Runtime::CachedBytes() const {
 
 std::size_t Runtime::MissingBytes(std::string_view prefix) const {
   std::size_t bytes = 0;
-  for (const auto& [name, w] : weights_.Group(prefix))
-    if (!device_weights_.contains(name))
-      bytes += w->bytes / (w->bf16 ? 1 : 2);
+  for (const auto& [name, w] : weights_.Group(prefix)) {
+    if (device_weights_.contains(name) || IsAuxiliaryWeight(name, *w))
+      continue;
+    if (w->dtype == WeightDType::kBf16)
+      bytes += w->bytes;
+    else if (w->dtype == WeightDType::kF32)
+      bytes += w->bytes / 2;
+    else
+      bytes += w->bytes * 2;
+  }
   return bytes;
 }
 
@@ -1249,6 +1718,7 @@ void Runtime::CopyRows(const Matrix& destination, int row,
 
 void Runtime::Trim() {
   Synchronize();
+  ReleaseLoraScratch();
   packed_source_ = {};
   packed_input_ = {};
   pool_->Clear();

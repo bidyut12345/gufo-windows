@@ -92,6 +92,30 @@ void Conversion() {
   image::Check(hipMemcpy(expected.data(), reference.data, expected.size() * 2,
                          hipMemcpyDeviceToHost));
   assert(actual == expected);
+  // Check GPU F16 -> F32 conversion for all 65,536 binary16 bit patterns.
+  std::vector<std::uint16_t> f16_in(65536);
+  for (std::uint32_t b = 0; b < 65536; ++b)
+    f16_in[b] = static_cast<std::uint16_t>(b);
+  Device<std::uint16_t> f16_dev(65536);
+  Device<float> f32_dev(65536);
+  image::Check(hipMemcpy(f16_dev.data, f16_in.data(), f16_in.size() * 2,
+                         hipMemcpyHostToDevice));
+  image::ConvertF16ToFloat(f16_dev.data, f32_dev.data, f16_in.size(), nullptr);
+  std::vector<float> f32_out(65536);
+  image::Check(hipMemcpy(f32_out.data(), f32_dev.data, f32_out.size() * 4,
+                         hipMemcpyDeviceToHost));
+  for (std::uint32_t b = 0; b < 65536; ++b) {
+    const int exp = (b >> 10) & 0x1f, mant = b & 0x3ff;
+    const double sign = b & 0x8000 ? -1 : 1;
+    const float ref =
+        exp == 0x1f ? (mant ? std::nanf("") : static_cast<float>(sign * INFINITY))
+                    : static_cast<float>(
+                          sign * (exp ? std::ldexp(1024 + mant, exp - 25)
+                                      : std::ldexp(mant, -24)));
+    assert(std::isnan(ref) ? std::isnan(f32_out[b])
+                           : std::bit_cast<std::uint32_t>(f32_out[b]) ==
+                                 std::bit_cast<std::uint32_t>(ref));
+  }
 }
 
 void Normalization() {
@@ -404,15 +428,25 @@ void PackedLayout() {
   for (int rows : {1, 15, 16, 17, 129})
     for (int cols : {16, 48, 64, 128, 1296, 4096}) {
       std::vector<std::uint16_t> input(std::size_t(rows) * cols),
-          output(input.size());
-      for (std::size_t i = 0; i < input.size(); ++i)
+          output(input.size()), from_float(input.size());
+      std::vector<float> f32(input.size());
+      for (std::size_t i = 0; i < input.size(); ++i) {
         input[i] = (i * 17) % 65535;
-      Device<std::uint16_t> x(input.size()), y(output.size());
+        f32[i] = Float(input[i]);
+      }
+      Device<std::uint16_t> x(input.size()), y(output.size()), yf(output.size());
+      Device<float> xf(f32.size());
       image::Check(hipMemcpy(x.data, input.data(), input.size() * 2,
                              hipMemcpyHostToDevice));
+      image::Check(hipMemcpy(xf.data, f32.data(), f32.size() * 4,
+                             hipMemcpyHostToDevice));
       image::PackDense16(x.data, y.data, rows, cols, nullptr);
+      image::PackDense16FromFloat(xf.data, yf.data, rows, cols, nullptr);
       image::Check(hipMemcpy(output.data(), y.data, output.size() * 2,
                              hipMemcpyDeviceToHost));
+      image::Check(hipMemcpy(from_float.data(), yf.data, from_float.size() * 2,
+                             hipMemcpyDeviceToHost));
+      assert(from_float == output);
       for (int row = 0; row < rows; ++row)
         for (int k = 0; k < cols; ++k)
           assert(output[std::size_t(k / 16) * rows * 16 + row * 16 + k % 16] ==
@@ -715,7 +749,12 @@ void LoraMerge() {
       return result;
     };
     for (auto [strength, dora] :
-         {std::pair{1.0F, false}, {0.6F, false}, {1.0F, true}, {0.6F, true}}) {
+         {std::pair{1.0F, false},
+          {0.6F, false},
+          {-0.5F, false},
+          {1.0F, true},
+          {0.6F, true},
+          {-0.5F, true}}) {
       const auto actual = run(strength, dora);
       assert(run(strength, dora) == actual);
       double max_error = 0;
@@ -737,6 +776,121 @@ void LoraMerge() {
         }
       }
       assert(max_error <= 1e-5 * max_weight);
+    }
+    // Check beta=0 low-rank + LoraDoraFromBf16 (both unpacked BF16 and FP32+pack).
+    std::vector<std::uint16_t> w_bf16(count);
+    std::vector<double> bf16_norms(rows);
+    for (int r = 0; r < rows; ++r) {
+      for (int c = 0; c < cols; ++c) {
+        w_bf16[r * cols + c] = Bf16(weight[r * cols + c]);
+        const double v = Float(w_bf16[r * cols + c]);
+        bf16_norms[r] += v * v;
+      }
+      bf16_norms[r] = std::sqrt(bf16_norms[r]);
+    }
+    Device<std::uint16_t> w16(count), out16(count);
+    for (float strength : {1.0F, 0.6F, -0.5F}) {
+      image::Check(hipMemcpy(w16.data, w_bf16.data(), count * 2,
+                             hipMemcpyHostToDevice));
+      image::LoraLowRank(blas, delta.data, u.data, d.data, rows, cols, rank,
+                         kScale, 0.0F);
+      image::LoraDoraFromBf16(w16.data, delta.data, out16.data, m.data, rows,
+                              cols, strength, nullptr);
+      std::vector<std::uint16_t> got16(count);
+      image::Check(hipMemcpy(got16.data(), out16.data, count * 2,
+                             hipMemcpyDeviceToHost));
+      image::LoraLowRank(blas, delta.data, u.data, d.data, rows, cols, rank,
+                         kScale, 0.0F);
+      image::LoraDoraFromBf16(w16.data, delta.data, nullptr, m.data, rows, cols,
+                              strength, nullptr);
+      std::vector<float> got_f32(count);
+      image::Check(hipMemcpy(got_f32.data(), delta.data, count * 4,
+                             hipMemcpyDeviceToHost));
+      for (int r = 0; r < rows; ++r) {
+        const double scale = magnitude[r] / (bf16_norms[r] + FLT_EPSILON);
+        for (int c = 0; c < cols; ++c) {
+          double product = 0;
+          for (int k = 0; k < rank; ++k)
+            product += double(up[r * rank + k]) * down[k * cols + c];
+          const double base = Float(w_bf16[r * cols + c]);
+          const double calc = (base + kScale * product) * scale;
+          const double expected = base + strength * (calc - base);
+          assert(std::abs(got_f32[r * cols + c] - expected) <=
+                 1e-5 * max_weight);
+          assert(got16[r * cols + c] == Bf16(got_f32[r * cols + c]));
+        }
+      }
+    }
+  }
+  // Fused low-rank merge + PackDense16 across ranks and stacked terms.
+  for (auto [rows, cols] :
+       {std::pair{64, 4096}, {128, 128}, {256, 256}}) {
+    const std::size_t count = std::size_t(rows) * cols;
+    std::vector<std::uint16_t> w_bf16(count);
+    for (auto& v : w_bf16)
+      v = Bf16(uniform(rng));
+    Device<std::uint16_t> w_dev(count), out_packed(count);
+    image::Check(hipMemcpy(w_dev.data, w_bf16.data(), count * 2,
+                           hipMemcpyHostToDevice));
+    for (int rank : {1, 5, 16, 32, 64, 128}) {
+      for (int num_terms : {1, 3}) {
+        std::vector<std::vector<float>> ups(num_terms), downs(num_terms);
+        std::vector<float> scales(num_terms);
+        std::vector<std::unique_ptr<Device<float>>> up_devs, down_devs;
+        std::vector<image::LoraFactor> factors(num_terms);
+        for (int t = 0; t < num_terms; ++t) {
+          ups[t].resize(std::size_t(rows) * rank);
+          downs[t].resize(std::size_t(rank) * cols);
+          for (float& v : ups[t])
+            v = uniform(rng) * 0.1F;
+          for (float& v : downs[t])
+            v = uniform(rng) * 0.1F;
+          scales[t] = (t % 2 == 0 ? 0.4F : -0.25F) / (t + 1);
+          up_devs.push_back(std::make_unique<Device<float>>(ups[t].size()));
+          down_devs.push_back(std::make_unique<Device<float>>(downs[t].size()));
+          image::Check(hipMemcpy(up_devs.back()->data, ups[t].data(),
+                                 ups[t].size() * 4, hipMemcpyHostToDevice));
+          image::Check(hipMemcpy(down_devs.back()->data, downs[t].data(),
+                                 downs[t].size() * 4, hipMemcpyHostToDevice));
+          factors[t] = {up_devs.back()->data, down_devs.back()->data, rank,
+                        scales[t]};
+        }
+        assert(image::MergeLoraPackDense16(w_dev.data, out_packed.data, rows,
+                                           cols, factors.data(), num_terms,
+                                           nullptr));
+        image::Check(hipGetLastError());
+        std::vector<std::uint16_t> packed_a(count), packed_b(count);
+        image::Check(hipMemcpy(packed_a.data(), out_packed.data, count * 2,
+                               hipMemcpyDeviceToHost));
+        assert(image::MergeLoraPackDense16(w_dev.data, out_packed.data, rows,
+                                           cols, factors.data(), num_terms,
+                                           nullptr));
+        image::Check(hipMemcpy(packed_b.data(), out_packed.data, count * 2,
+                               hipMemcpyDeviceToHost));
+        assert(packed_a == packed_b);
+        double err = 0, mag = 0;
+        for (int r = 0; r < rows; ++r) {
+          for (int c = 0; c < cols; ++c) {
+            double expected = Float(w_bf16[std::size_t(r) * cols + c]);
+            for (int t = 0; t < num_terms; ++t) {
+              double dot = 0;
+              for (int k = 0; k < rank; ++k)
+                dot += double(ups[t][std::size_t(r) * rank + k]) *
+                       downs[t][std::size_t(k) * cols + c];
+              expected += double(scales[t]) * dot;
+            }
+            const std::uint16_t got_bits =
+                packed_a[std::size_t(c / 16) * rows * 16 + r * 16 + c % 16];
+            const double got = Float(got_bits);
+            const double exp_bf16 = Float(Bf16(static_cast<float>(expected)));
+            const double diff = got - expected;
+            err += diff * diff;
+            mag += expected * expected;
+            assert(std::abs(got - exp_bf16) <= 0.01F * std::abs(expected) + 1e-3);
+          }
+        }
+        assert(std::sqrt(err / std::max(mag, 1e-12)) < 2e-3);
+      }
     }
   }
   (void)hipblasDestroy(blas);

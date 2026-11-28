@@ -107,6 +107,14 @@ struct DitBlockTelemetry {
   std::string first_non_finite;
 };
 
+struct DitAttentionHints {
+  std::size_t protected_prefix_rows{2048U};
+  std::size_t audio_begin_row{0U};
+  std::size_t audio_end_row{0U};
+  std::size_t video_begin_row{0U};
+  std::size_t video_frame_rows{0U};
+};
+
 class DitBlockSession {
 public:
   ~DitBlockSession();
@@ -146,7 +154,8 @@ public:
       DitBlockTelemetry* telemetry, std::string* error = nullptr,
       std::size_t active_rows = 0,
       const std::uint16_t* rope_cos_override = nullptr,
-      const std::uint16_t* rope_sin_override = nullptr);
+      const std::uint16_t* rope_sin_override = nullptr,
+      const DitAttentionHints& attention_hints = {});
 
   [[nodiscard]] bool Run(const DitBlockInput& input,
                          const CancellationToken* cancellation,
@@ -177,9 +186,14 @@ private:
       bool input_rms_prepared = false, bool output_rms_required = false,
       std::size_t active_rows = 0,
       const std::uint16_t* rope_cos_override = nullptr,
-      const std::uint16_t* rope_sin_override = nullptr);
+      const std::uint16_t* rope_sin_override = nullptr,
+      const DitAttentionHints& attention_hints = {});
   std::unique_ptr<Impl> impl_;
 };
+
+[[nodiscard]] bool ApplyBf16WeightLoras(
+    const TensorDescriptor& descriptor, std::uint16_t* device_weight,
+    const DitLoras* loras, void* hip_stream, std::string* error = nullptr);
 
 }  // namespace gufo::minimax_h3
 

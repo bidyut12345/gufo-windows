@@ -49,6 +49,154 @@ __global__ void PackDense(const std::uint16_t* input, std::uint16_t* output,
   }
 }
 
+__global__ void PackDenseFromFloat(const float* input, std::uint16_t* output,
+                                   int rows, int cols) {
+  __shared__ __align__(16) std::uint16_t tile[64][72];
+  const int tid = threadIdx.x, first_row = blockIdx.y * 64;
+  const int first_col = blockIdx.x * 64;
+  const int row = tid / 4, col = (tid % 4) * 16;
+  if (first_row + row < rows && first_col + col < cols) {
+    const float* src =
+        input + std::size_t(first_row + row) * cols + first_col + col;
+    if (first_col + col + 16 <= cols) {
+#pragma unroll
+      for (int g = 0; g < 4; ++g) {
+        const float4 v = *reinterpret_cast<const float4*>(src + g * 4);
+        tile[row][col + g * 4 + 0] = Bf16(v.x).data;
+        tile[row][col + g * 4 + 1] = Bf16(v.y).data;
+        tile[row][col + g * 4 + 2] = Bf16(v.z).data;
+        tile[row][col + g * 4 + 3] = Bf16(v.w).data;
+      }
+    } else {
+      for (int k = 0; k < 16; ++k) {
+        tile[row][col + k] =
+            first_col + col + k < cols ? Bf16(src[k]).data : 0;
+      }
+    }
+  } else {
+#pragma unroll
+    for (int k = 0; k < 16; ++k)
+      tile[row][col + k] = 0;
+  }
+  __syncthreads();
+  const int part = tid / 64, dest_row = tid % 64;
+  if (first_row + dest_row < rows && first_col + part * 16 < cols) {
+    auto dest = output + std::size_t(first_col / 16 + part) * rows * 16 +
+                (first_row + dest_row) * 16;
+    *reinterpret_cast<uint4*>(dest) =
+        *reinterpret_cast<const uint4*>(&tile[dest_row][part * 16]);
+    *reinterpret_cast<uint4*>(dest + 8) =
+        *reinterpret_cast<const uint4*>(&tile[dest_row][part * 16 + 8]);
+  }
+}
+
+struct LoraFactorList {
+  LoraFactor items[16];
+  int count{0};
+};
+
+__global__ void FusedLoraPackDense(const std::uint16_t* w_bf16,
+                                   std::uint16_t* out_packed, int rows,
+                                   int cols, LoraFactorList factors) {
+  union Shared {
+    struct {
+      float u[64][16];
+      float d[16][64];
+    } mat;
+    __align__(16) std::uint16_t tile[64][72];
+  };
+  __shared__ Shared shared;
+  const int tid = threadIdx.x;
+  const int r0 = blockIdx.y * 64, c0 = blockIdx.x * 64;
+  const int ty = tid / 16, tx = tid % 16;
+  float acc[4][4];
+#pragma unroll
+  for (int ir = 0; ir < 4; ++ir) {
+    const uint2 packed = *reinterpret_cast<const uint2*>(
+        w_bf16 + std::size_t(r0 + ty + ir * 16) * cols + c0 + tx * 4);
+    const std::uint16_t raw[4] = {
+        static_cast<std::uint16_t>(packed.x),
+        static_cast<std::uint16_t>(packed.x >> 16),
+        static_cast<std::uint16_t>(packed.y),
+        static_cast<std::uint16_t>(packed.y >> 16)};
+#pragma unroll
+    for (int ic = 0; ic < 4; ++ic) {
+      acc[ir][ic] = __uint_as_float(static_cast<std::uint32_t>(raw[ic]) << 16);
+    }
+  }
+  const int ur = tid / 4, uc = (tid % 4) * 4;
+  const int dr = tid / 16, dc = (tid % 16) * 4;
+  for (int f = 0; f < factors.count; ++f) {
+    const LoraFactor factor = factors.items[f];
+    float delta[4][4]{};
+    for (int k0 = 0; k0 < factor.rank; k0 += 16) {
+      if ((factor.rank & 3) == 0 && k0 + uc + 4 <= factor.rank) {
+        *reinterpret_cast<float4*>(&shared.mat.u[ur][uc]) =
+            *reinterpret_cast<const float4*>(
+                factor.up + std::size_t(r0 + ur) * factor.rank + k0 + uc);
+      } else {
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+          shared.mat.u[ur][uc + kk] =
+              k0 + uc + kk < factor.rank
+                  ? factor.up[std::size_t(r0 + ur) * factor.rank + k0 + uc + kk]
+                  : 0.0F;
+        }
+      }
+      if (k0 + dr < factor.rank) {
+        *reinterpret_cast<float4*>(&shared.mat.d[dr][dc]) =
+            *reinterpret_cast<const float4*>(
+                factor.down + std::size_t(k0 + dr) * cols + c0 + dc);
+      } else {
+        *reinterpret_cast<float4*>(&shared.mat.d[dr][dc]) =
+            make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      }
+      __syncthreads();
+#pragma unroll
+      for (int kk = 0; kk < 16; ++kk) {
+        float u_val[4];
+#pragma unroll
+        for (int ir = 0; ir < 4; ++ir)
+          u_val[ir] = shared.mat.u[ty + ir * 16][kk];
+        const float4 d_val =
+            *reinterpret_cast<const float4*>(&shared.mat.d[kk][tx * 4]);
+#pragma unroll
+        for (int ir = 0; ir < 4; ++ir) {
+          delta[ir][0] += u_val[ir] * d_val.x;
+          delta[ir][1] += u_val[ir] * d_val.y;
+          delta[ir][2] += u_val[ir] * d_val.z;
+          delta[ir][3] += u_val[ir] * d_val.w;
+        }
+      }
+      __syncthreads();
+    }
+#pragma unroll
+    for (int ir = 0; ir < 4; ++ir)
+#pragma unroll
+      for (int ic = 0; ic < 4; ++ic)
+        acc[ir][ic] += factor.scale * delta[ir][ic];
+  }
+#pragma unroll
+  for (int ir = 0; ir < 4; ++ir) {
+    const std::uint16_t b0 = Bf16(acc[ir][0]).data;
+    const std::uint16_t b1 = Bf16(acc[ir][1]).data;
+    const std::uint16_t b2 = Bf16(acc[ir][2]).data;
+    const std::uint16_t b3 = Bf16(acc[ir][3]).data;
+    *reinterpret_cast<uint2*>(&shared.tile[ty + ir * 16][tx * 4]) = make_uint2(
+        static_cast<std::uint32_t>(b0) | (static_cast<std::uint32_t>(b1) << 16),
+        static_cast<std::uint32_t>(b2) |
+            (static_cast<std::uint32_t>(b3) << 16));
+  }
+  __syncthreads();
+  const int part = tid / 64, dest_row = tid % 64;
+  auto dest = out_packed + std::size_t(c0 / 16 + part) * rows * 16 +
+              (r0 + dest_row) * 16;
+  *reinterpret_cast<uint4*>(dest) =
+      *reinterpret_cast<const uint4*>(&shared.tile[dest_row][part * 16]);
+  *reinterpret_cast<uint4*>(dest + 8) =
+      *reinterpret_cast<const uint4*>(&shared.tile[dest_row][part * 16 + 8]);
+}
+
 // Packed operands feed WMMA directly. FP32 accumulation follows increasing K;
 // no LDS staging, extra weight copy, probability narrowing or tensor
 // conversion.
@@ -200,6 +348,28 @@ void PackDense16(const std::uint16_t* input, std::uint16_t* output, int rows,
                  int cols, hipStream_t stream) {
   PackDense<<<dim3((cols + 63) / 64, (rows + 63) / 64), 256, 0, stream>>>(
       input, output, rows, cols);
+}
+
+void PackDense16FromFloat(const float* input, std::uint16_t* output, int rows,
+                          int cols, hipStream_t stream) {
+  PackDenseFromFloat<<<dim3((cols + 63) / 64, (rows + 63) / 64), 256, 0,
+                       stream>>>(input, output, rows, cols);
+}
+
+bool MergeLoraPackDense16(const std::uint16_t* w_bf16,
+                          std::uint16_t* out_packed, int rows, int cols,
+                          const LoraFactor* factors, int factor_count,
+                          hipStream_t stream) {
+  if (rows <= 0 || cols <= 0 || (rows % 64) != 0 || (cols % 64) != 0 ||
+      factor_count < 1 || factor_count > 16 || factors == nullptr)
+    return false;
+  LoraFactorList list{};
+  list.count = factor_count;
+  for (int i = 0; i < factor_count; ++i)
+    list.items[i] = factors[i];
+  FusedLoraPackDense<<<dim3(cols / 64, rows / 64), 256, 0, stream>>>(
+      w_bf16, out_packed, rows, cols, list);
+  return true;
 }
 
 bool DenseBf16(const std::uint16_t* weights, const std::uint16_t* input,

@@ -442,6 +442,19 @@ inline void LaunchSwiGlu(const float* fused, const float* bias, float* output,
       dim3(kThreads), 0, stream, fused, bias, output, rows, width);
 }
 
+__device__ __forceinline__ float Bf16ToFloatScalar(std::uint16_t bits) {
+  return __uint_as_float(static_cast<std::uint32_t>(bits) << 16U);
+}
+
+__device__ __forceinline__ float4 UnpackBf16x4(uint2 packed) {
+  return {
+      __uint_as_float((packed.x & 0xFFFFU) << 16U),
+      __uint_as_float((packed.x >> 16U) << 16U),
+      __uint_as_float((packed.y & 0xFFFFU) << 16U),
+      __uint_as_float((packed.y >> 16U) << 16U),
+  };
+}
+
 static __global__ void ScaleAddKernel(float* residual, const float* branch,
                                       const float* bias, const float* scale,
                                       std::uint32_t rows, std::uint32_t width) {
@@ -450,6 +463,18 @@ static __global__ void ScaleAddKernel(float* residual, const float* branch,
   if (row < rows && column < width) {
     const std::size_t index = static_cast<std::size_t>(row) * width + column;
     const float biased = branch[index] + bias[column];
+    residual[index] = fmaf(biased, scale[column], residual[index]);
+  }
+}
+
+static __global__ void ScaleAddFromBf16Kernel(
+    float* residual, const std::uint16_t* branch, const float* bias,
+    const float* scale, std::uint32_t rows, std::uint32_t width) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row < rows && column < width) {
+    const std::size_t index = static_cast<std::size_t>(row) * width + column;
+    const float biased = Bf16ToFloatScalar(branch[index]) + bias[column];
     residual[index] = fmaf(biased, scale[column], residual[index]);
   }
 }
@@ -465,6 +490,27 @@ static __global__ void ScaleAddFloat4Kernel(
   const std::size_t index = static_cast<std::size_t>(row) * vectors + column;
   const float4 current = residual[index];
   const float4 value = branch[index];
+  const float4 offset = bias[column];
+  const float4 multiplier = scale[column];
+  residual[index] = {
+      fmaf(value.x + offset.x, multiplier.x, current.x),
+      fmaf(value.y + offset.y, multiplier.y, current.y),
+      fmaf(value.z + offset.z, multiplier.z, current.z),
+      fmaf(value.w + offset.w, multiplier.w, current.w),
+  };
+}
+
+static __global__ void ScaleAddFloat4FromBf16Kernel(
+    float4* residual, const uint2* branch_bf16, const float4* bias,
+    const float4* scale, std::uint32_t rows, std::uint32_t vectors) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row >= rows || column >= vectors) {
+    return;
+  }
+  const std::size_t index = static_cast<std::size_t>(row) * vectors + column;
+  const float4 current = residual[index];
+  const float4 value = UnpackBf16x4(branch_bf16[index]);
   const float4 offset = bias[column];
   const float4 multiplier = scale[column];
   residual[index] = {
@@ -492,6 +538,27 @@ inline void LaunchScaleAdd(float* residual, const float* branch,
   }
   hipLaunchKernelGGL(
       ScaleAddKernel, dim3((width + kThreads - 1U) / kThreads, rows),
+      dim3(kThreads), 0, stream, residual, branch, bias, scale, rows, width);
+}
+
+inline void LaunchScaleAddFromBf16(float* residual, const std::uint16_t* branch,
+                                   const float* bias, const float* scale,
+                                   std::uint32_t rows, std::uint32_t width,
+                                   hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  if (width % 4U == 0U) {
+    const std::uint32_t vectors = width / 4U;
+    hipLaunchKernelGGL(
+        ScaleAddFloat4FromBf16Kernel,
+        dim3((vectors + kThreads - 1U) / kThreads, rows), dim3(kThreads), 0,
+        stream, reinterpret_cast<float4*>(residual),
+        reinterpret_cast<const uint2*>(branch),
+        reinterpret_cast<const float4*>(bias),
+        reinterpret_cast<const float4*>(scale), rows, vectors);
+    return;
+  }
+  hipLaunchKernelGGL(
+      ScaleAddFromBf16Kernel, dim3((width + kThreads - 1U) / kThreads, rows),
       dim3(kThreads), 0, stream, residual, branch, bias, scale, rows, width);
 }
 
@@ -649,6 +716,438 @@ inline void LaunchSoftmaxBf16InPlace(std::uint16_t* scores, std::uint32_t rows,
                                      std::uint32_t heads, hipStream_t stream) {
   hipLaunchKernelGGL(SoftmaxBf16InPlaceKernel, dim3(rows, heads), dim3(256), 0,
                      stream, scores, rows, heads);
+}
+
+__device__ __forceinline__ std::uint16_t FloatToBf16Scalar(float value) {
+  const std::uint32_t bits = __float_as_uint(value);
+  if ((bits & 0x7F800000U) == 0x7F800000U) {
+    return static_cast<std::uint16_t>((bits | 0x0040U) >> 16U);
+  }
+  const std::uint32_t rounding = 0x7FFFU + ((bits >> 16U) & 1U);
+  return static_cast<std::uint16_t>((bits + rounding) >> 16U);
+}
+
+static __global__ void RmsNormBf16Kernel(const float* input,
+                                         const float* weight,
+                                         std::uint16_t* output_bf16,
+                                         std::uint32_t rows,
+                                         std::uint32_t width, float epsilon) {
+  constexpr std::uint32_t kRowsPerBlock = 8;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave = threadIdx.x >> 5U;
+  const std::uint32_t row = blockIdx.x * kRowsPerBlock + wave;
+  if (row >= rows) {
+    return;
+  }
+  const std::size_t base = static_cast<std::size_t>(row) * width;
+  float local = 0.0F;
+  for (std::uint32_t column = lane; column < width; column += 32U) {
+    const float v = input[base + column];
+    local = fmaf(v, v, local);
+  }
+#pragma unroll
+  for (std::uint32_t stride = 16U; stride != 0U; stride >>= 1U) {
+    local += __shfl_down(local, stride, 32);
+  }
+  const float inverse =
+      rsqrtf(__shfl(local, 0, 32) / static_cast<float>(width) + epsilon);
+  for (std::uint32_t column = lane; column < width; column += 32U) {
+    output_bf16[base + column] =
+        FloatToBf16Scalar(input[base + column] * inverse * weight[column]);
+  }
+}
+
+inline void LaunchRmsNormBf16(const float* input, const float* weight,
+                              std::uint16_t* output_bf16, std::uint32_t rows,
+                              std::uint32_t width, float epsilon,
+                              hipStream_t stream) {
+  constexpr std::uint32_t kRowsPerBlock = 8;
+  hipLaunchKernelGGL(RmsNormBf16Kernel,
+                     dim3((rows + kRowsPerBlock - 1U) / kRowsPerBlock),
+                     dim3(kRowsPerBlock * 32U), 0, stream, input, weight,
+                     output_bf16, rows, width, epsilon);
+}
+
+__device__ __forceinline__ float ReadScalarAsF32(const float* ptr,
+                                               std::size_t idx) {
+  return ptr[idx];
+}
+
+__device__ __forceinline__ float ReadScalarAsF32(const std::uint16_t* ptr,
+                                               std::size_t idx) {
+  return Bf16ToFloatScalar(ptr[idx]);
+}
+
+template<typename QkvT>
+static __global__ void VideoQkvRopeBf16HeadMajorKernel(
+    const QkvT* qkv, const float* bias, const float* cosine, const float* sine,
+    std::uint16_t* query, std::uint16_t* key, std::uint16_t* value,
+    std::uint32_t rows, std::uint32_t heads, std::uint32_t head_dimension,
+    std::uint32_t rope_half, float epsilon) {
+  const std::uint32_t lane = threadIdx.x;
+  const std::uint32_t head = blockIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row >= rows || head >= heads || lane >= head_dimension) {
+    return;
+  }
+  const std::size_t base =
+      (static_cast<std::size_t>(row) * heads + head) * head_dimension * 3U;
+  const std::size_t bias_base =
+      static_cast<std::size_t>(head) * head_dimension * 3U;
+  const float query_value =
+      ReadScalarAsF32(qkv, base + lane) + bias[bias_base + lane];
+  const float key_value =
+      ReadScalarAsF32(qkv, base + head_dimension + lane) +
+      bias[bias_base + head_dimension + lane];
+  __shared__ float query_squares[64];
+  __shared__ float key_squares[64];
+  query_squares[lane] = query_value * query_value;
+  key_squares[lane] = key_value * key_value;
+  __syncthreads();
+  for (std::uint32_t stride = head_dimension / 2U; stride != 0; stride >>= 1U) {
+    if (lane < stride) {
+      query_squares[lane] += query_squares[lane + stride];
+      key_squares[lane] += key_squares[lane + stride];
+    }
+    __syncthreads();
+  }
+  const float query_inverse =
+      rsqrtf(query_squares[0] / static_cast<float>(head_dimension) + epsilon);
+  const float key_inverse =
+      rsqrtf(key_squares[0] / static_cast<float>(head_dimension) + epsilon);
+  float transformed_query = query_value * query_inverse;
+  float transformed_key = key_value * key_inverse;
+  if (lane < rope_half) {
+    const std::uint32_t pair = lane + rope_half;
+    const float pair_query =
+        (ReadScalarAsF32(qkv, base + pair) + bias[bias_base + pair]) *
+        query_inverse;
+    const float pair_key =
+        (ReadScalarAsF32(qkv, base + head_dimension + pair) +
+         bias[bias_base + head_dimension + pair]) *
+        key_inverse;
+    const float c = cosine[static_cast<std::size_t>(row) * rope_half + lane];
+    const float s = sine[static_cast<std::size_t>(row) * rope_half + lane];
+    transformed_query = transformed_query * c - pair_query * s;
+    transformed_key = transformed_key * c - pair_key * s;
+  } else if (lane < rope_half * 2U) {
+    const std::uint32_t pair = lane - rope_half;
+    const float pair_query =
+        (ReadScalarAsF32(qkv, base + pair) + bias[bias_base + pair]) *
+        query_inverse;
+    const float pair_key =
+        (ReadScalarAsF32(qkv, base + head_dimension + pair) +
+         bias[bias_base + head_dimension + pair]) *
+        key_inverse;
+    const float c = cosine[static_cast<std::size_t>(row) * rope_half + pair];
+    const float s = sine[static_cast<std::size_t>(row) * rope_half + pair];
+    transformed_query = transformed_query * c + pair_query * s;
+    transformed_key = transformed_key * c + pair_key * s;
+  }
+  // Head-major layout [head][row][head_dim] for coalesced FlashAttention loads.
+  const std::size_t output =
+      (static_cast<std::size_t>(head) * rows + row) * head_dimension + lane;
+  query[output] = FloatToBf16Scalar(transformed_query);
+  key[output] = FloatToBf16Scalar(transformed_key);
+  value[output] =
+      FloatToBf16Scalar(ReadScalarAsF32(qkv, base + head_dimension * 2U + lane) +
+                        bias[bias_base + head_dimension * 2U + lane]);
+}
+
+inline void LaunchVideoQkvRopeBf16HeadMajor(
+    const float* qkv, const float* bias, const float* cosine, const float* sine,
+    std::uint16_t* query, std::uint16_t* key, std::uint16_t* value,
+    std::uint32_t rows, std::uint32_t heads, std::uint32_t head_dimension,
+    std::uint32_t rope_half, float epsilon, hipStream_t stream) {
+  hipLaunchKernelGGL(VideoQkvRopeBf16HeadMajorKernel<float>, dim3(heads, rows),
+                     dim3(head_dimension), 0, stream, qkv, bias, cosine, sine,
+                     query, key, value, rows, heads, head_dimension, rope_half,
+                     epsilon);
+}
+
+inline void LaunchVideoQkvRopeBf16HeadMajorFromBf16(
+    const std::uint16_t* qkv, const float* bias, const float* cosine,
+    const float* sine, std::uint16_t* query, std::uint16_t* key,
+    std::uint16_t* value, std::uint32_t rows, std::uint32_t heads,
+    std::uint32_t head_dimension, std::uint32_t rope_half, float epsilon,
+    hipStream_t stream) {
+  hipLaunchKernelGGL(VideoQkvRopeBf16HeadMajorKernel<std::uint16_t>,
+                     dim3(heads, rows), dim3(head_dimension), 0, stream, qkv,
+                     bias, cosine, sine, query, key, value, rows, heads,
+                     head_dimension, rope_half, epsilon);
+}
+
+static __global__ void SwiGluBf16Float4Kernel(const float4* fused,
+                                              const float4* bias,
+                                              uint2* output_bf16,
+                                              std::uint32_t rows,
+                                              std::uint32_t vectors) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row >= rows || column >= vectors) {
+    return;
+  }
+  const std::size_t input_base = static_cast<std::size_t>(row) * vectors * 2U;
+  const float4 gate_value = fused[input_base + column];
+  const float4 up_value = fused[input_base + vectors + column];
+  const float4 gate_bias = bias[column];
+  const float4 up_bias = bias[vectors + column];
+  const float gx = gate_value.x + gate_bias.x;
+  const float gy = gate_value.y + gate_bias.y;
+  const float gz = gate_value.z + gate_bias.z;
+  const float gw = gate_value.w + gate_bias.w;
+  const std::uint32_t b0 =
+      FloatToBf16Scalar((gx / (1.0F + expf(-gx))) * (up_value.x + up_bias.x));
+  const std::uint32_t b1 =
+      FloatToBf16Scalar((gy / (1.0F + expf(-gy))) * (up_value.y + up_bias.y));
+  const std::uint32_t b2 =
+      FloatToBf16Scalar((gz / (1.0F + expf(-gz))) * (up_value.z + up_bias.z));
+  const std::uint32_t b3 =
+      FloatToBf16Scalar((gw / (1.0F + expf(-gw))) * (up_value.w + up_bias.w));
+  output_bf16[static_cast<std::size_t>(row) * vectors + column] = {
+      b0 | (b1 << 16U), b2 | (b3 << 16U)};
+}
+
+static __global__ void SwiGluBf16Float4FromBf16Kernel(const uint2* fused_bf16,
+                                                      const float4* bias,
+                                                      uint2* output_bf16,
+                                                      std::uint32_t rows,
+                                                      std::uint32_t vectors) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row >= rows || column >= vectors) {
+    return;
+  }
+  const std::size_t input_base = static_cast<std::size_t>(row) * vectors * 2U;
+  const float4 gate_value = UnpackBf16x4(fused_bf16[input_base + column]);
+  const float4 up_value =
+      UnpackBf16x4(fused_bf16[input_base + vectors + column]);
+  const float4 gate_bias = bias[column];
+  const float4 up_bias = bias[vectors + column];
+  const float gx = gate_value.x + gate_bias.x;
+  const float gy = gate_value.y + gate_bias.y;
+  const float gz = gate_value.z + gate_bias.z;
+  const float gw = gate_value.w + gate_bias.w;
+  const std::uint32_t b0 =
+      FloatToBf16Scalar((gx / (1.0F + expf(-gx))) * (up_value.x + up_bias.x));
+  const std::uint32_t b1 =
+      FloatToBf16Scalar((gy / (1.0F + expf(-gy))) * (up_value.y + up_bias.y));
+  const std::uint32_t b2 =
+      FloatToBf16Scalar((gz / (1.0F + expf(-gz))) * (up_value.z + up_bias.z));
+  const std::uint32_t b3 =
+      FloatToBf16Scalar((gw / (1.0F + expf(-gw))) * (up_value.w + up_bias.w));
+  output_bf16[static_cast<std::size_t>(row) * vectors + column] = {
+      b0 | (b1 << 16U), b2 | (b3 << 16U)};
+}
+
+inline void LaunchSwiGluBf16(const float* fused, const float* bias,
+                             std::uint16_t* output_bf16, std::uint32_t rows,
+                             std::uint32_t width, hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  const std::uint32_t vectors = width / 4U;
+  hipLaunchKernelGGL(
+      SwiGluBf16Float4Kernel, dim3((vectors + kThreads - 1U) / kThreads, rows),
+      dim3(kThreads), 0, stream, reinterpret_cast<const float4*>(fused),
+      reinterpret_cast<const float4*>(bias),
+      reinterpret_cast<uint2*>(output_bf16), rows, vectors);
+}
+
+inline void LaunchSwiGluBf16FromBf16(const std::uint16_t* fused,
+                                     const float* bias,
+                                     std::uint16_t* output_bf16,
+                                     std::uint32_t rows, std::uint32_t width,
+                                     hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  const std::uint32_t vectors = width / 4U;
+  hipLaunchKernelGGL(
+      SwiGluBf16Float4FromBf16Kernel,
+      dim3((vectors + kThreads - 1U) / kThreads, rows), dim3(kThreads), 0,
+      stream, reinterpret_cast<const uint2*>(fused),
+      reinterpret_cast<const float4*>(bias),
+      reinterpret_cast<uint2*>(output_bf16), rows, vectors);
+}
+
+// Multi-query tiled BF16 WMMA FlashAttention for VisualVAE decoder
+// (head_dim = 64, wave32 gfx1151). Q/K/V are head-major [heads, seq, 64] BF16;
+// output is row-major [seq, heads * 64] BF16. Scores, softmax, and value
+// accumulation stay in FP32 with no quadratic score buffer.
+using VideoWmmaFragment = __attribute__((ext_vector_type(16))) short;
+using VideoWmmaAccumulator = __attribute__((ext_vector_type(8))) float;
+
+__device__ __forceinline__ VideoWmmaFragment LoadVideoFragment(
+    const std::uint16_t* source) {
+  union {
+    VideoWmmaFragment fragment;
+    uint4 words[2];
+  } value;
+  value.words[0] = *reinterpret_cast<const uint4*>(source);
+  value.words[1] = *reinterpret_cast<const uint4*>(source + 8);
+  return value.fragment;
+}
+
+static __global__ __launch_bounds__(256) void VideoWmmaFlashAttentionKernel(
+    const std::uint16_t* query, const std::uint16_t* key,
+    const std::uint16_t* value, std::uint16_t* output, std::uint32_t rows,
+    std::uint32_t heads) {
+  __shared__ __align__(16) std::uint16_t staged_key[32][72];
+  __shared__ __align__(16) std::uint16_t staged_value[64][40];
+  const int tid = threadIdx.x;
+  const int lane = tid % 32;
+  const int wave = tid / 32;
+  const int first_query = blockIdx.x * 128 + wave * 16;
+  const std::size_t head_base = static_cast<std::size_t>(blockIdx.y) * rows * 64;
+  query += head_base;
+  key += head_base;
+  value += head_base;
+
+  VideoWmmaFragment q[4];
+#pragma unroll
+  for (int d = 0; d < 4; ++d) {
+    q[d] = {};
+    if (static_cast<std::uint32_t>(first_query + lane % 16) < rows) {
+      q[d] = LoadVideoFragment(
+          query + static_cast<std::size_t>(first_query + lane % 16) * 64 +
+          d * 16);
+    }
+  }
+
+  VideoWmmaAccumulator result[4]{};
+  float maximum = -INFINITY;
+  float sum = 0.0F;
+
+  const int kv_row = tid / 8;         // 0..31
+  const int kv_col = (tid % 8) * 8;   // 0, 8, ..., 56
+
+  for (std::uint32_t base = 0; base < rows; base += 32U) {
+    const bool valid_kv = (base + static_cast<std::uint32_t>(kv_row)) < rows;
+    const uint4 k_vec =
+        valid_kv
+            ? *reinterpret_cast<const uint4*>(
+                  key + static_cast<std::size_t>(base + kv_row) * 64 + kv_col)
+            : uint4{0, 0, 0, 0};
+    *reinterpret_cast<uint4*>(staged_key[kv_row] + kv_col) = k_vec;
+
+    // Load V tile concurrently and transpose into [64][40] for vector fragment loads.
+    union {
+      uint4 packed;
+      std::uint16_t h[8];
+    } v_vec;
+    v_vec.packed =
+        valid_kv
+            ? *reinterpret_cast<const uint4*>(
+                  value + static_cast<std::size_t>(base + kv_row) * 64 + kv_col)
+            : uint4{0, 0, 0, 0};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      staged_value[kv_col + i][kv_row] = v_vec.h[i];
+    }
+    __syncthreads();
+
+    VideoWmmaAccumulator scores[2]{};
+#pragma unroll
+    for (int d = 0; d < 4; ++d) {
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        const VideoWmmaFragment k =
+            LoadVideoFragment(staged_key[half * 16 + lane % 16] + d * 16);
+        scores[half] =
+            __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(k, q[d], scores[half]);
+      }
+    }
+
+    if (base + 32U > rows) {
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          if (base + static_cast<std::uint32_t>(half * 16 + 2 * i + lane / 16) >=
+              rows) {
+            scores[half][i] = -INFINITY;
+          }
+        }
+      }
+    }
+
+    float next = maximum;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        // log2(e) / sqrt(64) = 1.4426950408889634 / 8
+        scores[half][i] *= 0.18033688011112042F;
+        next = fmaxf(next, scores[half][i]);
+      }
+    }
+    next = fmaxf(next, __uint_as_float(__builtin_amdgcn_permlanex16(
+                           __float_as_uint(next), __float_as_uint(next),
+                           0x76543210U, 0xfedcba98U, false, false)));
+
+    if (next > maximum) {
+      const float correction = __builtin_amdgcn_exp2f(maximum - next);
+      sum *= correction;
+#pragma unroll
+      for (int d = 0; d < 4; ++d) {
+        result[d] *= correction;
+      }
+      maximum = next;
+    }
+
+    float subtotal = 0.0F;
+    VideoWmmaFragment probability_fragments[2];
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float p = __builtin_amdgcn_exp2f(scores[half][i] - maximum);
+        subtotal += p;
+        const unsigned own = FloatToBf16Scalar(p);
+        const unsigned peer = __builtin_amdgcn_permlanex16(
+            own, own, 0x76543210U, 0xfedcba98U, false, false);
+        probability_fragments[half][2 * i] = lane < 16 ? own : peer;
+        probability_fragments[half][2 * i + 1] = lane < 16 ? peer : own;
+      }
+    }
+    subtotal += __uint_as_float(__builtin_amdgcn_permlanex16(
+        __float_as_uint(subtotal), __float_as_uint(subtotal), 0x76543210U,
+        0xfedcba98U, false, false));
+    sum += subtotal;
+
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const VideoWmmaFragment p = probability_fragments[half];
+#pragma unroll
+      for (int d = 0; d < 4; ++d) {
+        const VideoWmmaFragment v =
+            LoadVideoFragment(staged_value[d * 16 + lane % 16] + half * 16);
+        result[d] =
+            __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(v, p, result[d]);
+      }
+    }
+    __syncthreads();
+  }
+
+  const std::uint32_t row = static_cast<std::uint32_t>(first_query + lane % 16);
+  if (row < rows) {
+    const float reciprocal = __builtin_amdgcn_rcpf(sum);
+#pragma unroll
+    for (int d = 0; d < 4; ++d) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        output[(static_cast<std::size_t>(row) * heads + blockIdx.y) * 64 +
+               d * 16 + 2 * i + lane / 16] =
+            FloatToBf16Scalar(result[d][i] * reciprocal);
+      }
+    }
+  }
+}
+
+inline void LaunchVideoWmmaFlashAttention(
+    const std::uint16_t* query, const std::uint16_t* key,
+    const std::uint16_t* value, std::uint16_t* output, std::uint32_t sequence,
+    std::uint32_t heads, hipStream_t stream) {
+  hipLaunchKernelGGL(VideoWmmaFlashAttentionKernel,
+                     dim3((sequence + 127U) / 128U, heads), dim3(256), 0,
+                     stream, query, key, value, output, sequence, heads);
 }
 
 // Tiled FlashAttention for VisualVAE decoder: [sequence, heads, head_dim=64].

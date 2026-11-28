@@ -197,12 +197,15 @@ int Dump(const std::filesystem::path& model, const Weights& weights,
   // Both are matched by their full `transformer.` name.
   if (!filters.empty()) {
     const auto patched = targets.size();
-    const auto manifest = ReadJson(
-        model / "transformer/diffusion_pytorch_model.safetensors.index.json");
-    for (const auto& [tensor, file] : manifest.find("weight_map")->members()) {
-      (void)file;
-      if (const auto target = "transformer." + tensor; wanted(target))
-        targets.insert(target);
+    for (const auto& [tensor, w] : weights.Group("transformer.")) {
+      if (w->dtype == WeightDType::kU8 || tensor.ends_with("._weight_scale") ||
+          tensor.ends_with("._weight_zero_point") ||
+          tensor.ends_with(".weight_scale") ||
+          tensor.ends_with(".input_scale") ||
+          tensor.ends_with(".comfy_quant"))
+        continue;
+      if (wanted(tensor))
+        targets.emplace(tensor);
     }
     if (targets.size() == patched)
       std::cerr << "warning: --tensor selects no unpatched tensor; the "

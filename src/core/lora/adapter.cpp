@@ -15,6 +15,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -116,6 +117,27 @@ struct Resolved {
   std::vector<int> shape;
 };
 
+bool IsFiniteChunk(const void* data, Dtype dtype, std::size_t count) {
+  const auto* bytes = static_cast<const char*>(data);
+  if (dtype == Dtype::kF32) {
+    for (std::size_t i = 0; i < count; ++i) {
+      std::uint32_t bits;
+      std::memcpy(&bits, bytes + i * 4, 4);
+      if ((bits & 0x7F800000U) == 0x7F800000U)
+        return false;
+    }
+    return true;
+  }
+  const std::uint16_t mask = dtype == Dtype::kBf16 ? 0x7F80U : 0x7C00U;
+  for (std::size_t i = 0; i < count; ++i) {
+    std::uint16_t bits;
+    std::memcpy(&bits, bytes + i * 2, 2);
+    if ((bits & mask) == mask)
+      return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 std::vector<float> Floats(const Tensor& tensor, std::size_t first,
@@ -139,19 +161,17 @@ std::vector<float> Floats(const Tensor& tensor, std::size_t first,
 }
 
 Adapter::Adapter(const std::filesystem::path& path, const Schema& schema) {
-  auto mapped = std::make_unique<platform::RawMappedFile>();
   std::string open_error;
-  if (!mapped->Open(path, platform::MapHint::kNone, &open_error))
+  auto mapped = std::make_shared<platform::ReadOnlyMappedFile>(
+      platform::ReadOnlyMappedFile::Open(path, &open_error));
+  if (!mapped->valid())
     Fail(path, "",
          open_error.empty() ? "invalid safetensors file"
                             : "cannot open: " + open_error);
-  const auto size = mapped->size;
-  void* data = mapped->data;
+  const auto size = mapped->size();
+  const void* data = mapped->data();
   // Owns the mapping from here, so every later failure unmaps it.
-  mapping_ = std::shared_ptr<void>(data, [file = mapped.release()](void*) {
-    file->Close();
-    delete file;
-  });
+  mapping_ = mapped;
   if (size < 8)
     Fail(path, "", "invalid safetensors file");
   std::uint64_t header_size;
@@ -293,12 +313,16 @@ Adapter::Adapter(const std::filesystem::path& path, const Schema& schema) {
   bool rslora = false;
   if (metadata && metadata->is_object())
     if (const auto* text = metadata->find("lora_adapter_metadata")) {
+      if (!text->is_string())
+        Fail(path, "__metadata__", "invalid lora_adapter_metadata");
       json::Value config;
       try {
         config = json::parse(text->str());
       } catch (const std::exception&) {
         Fail(path, "__metadata__", "invalid lora_adapter_metadata");
       }
+      if (!config.is_object())
+        Fail(path, "__metadata__", "invalid lora_adapter_metadata");
       const auto find = [&](const std::string& name) {
         const auto* value = config.find("transformer." + name);
         return value ? value : config.find(name);
@@ -327,6 +351,8 @@ Adapter::Adapter(const std::filesystem::path& path, const Schema& schema) {
   std::set<std::string> fused;
   // Patched row ranges per base tensor, to reject overlapping modules.
   std::map<std::string, std::vector<std::pair<int, int>>, std::less<>> claimed;
+  std::vector<std::byte> scan_buffer(1ULL << 20);
+  const auto handle = mapped->PlatformHandle();
   for (const auto& [module, slot] : modules) {
     const auto& t = slot.tensors;
     const auto has = [&](Role role) { return t[role].data != nullptr; };
@@ -335,13 +361,25 @@ Adapter::Adapter(const std::filesystem::path& path, const Schema& schema) {
     for (int role = 0; role < kRoles; ++role) {
       if (!has(Role(role)))
         continue;
+      const std::size_t elem_bytes = t[role].dtype == Dtype::kF32 ? 4 : 2;
+      const std::size_t chunk_elems = scan_buffer.size() / elem_bytes;
       const std::size_t count = Elements(t[role]);
-      for (std::size_t offset = 0; offset < count; offset += 1 << 20)
-        for (float value :
-             Floats(t[role], offset,
-                    std::min<std::size_t>(1 << 20, count - offset)))
-          if (!std::isfinite(value))
-            Fail(path, slot.keys[role], "non-finite value");
+      const auto file_offset = static_cast<std::uint64_t>(
+          static_cast<const char*>(t[role].data) -
+          static_cast<const char*>(data));
+      for (std::size_t elem = 0; elem < count; elem += chunk_elems) {
+        const std::size_t n = std::min(chunk_elems, count - elem);
+        const std::size_t n_bytes = n * elem_bytes;
+        const void* src =
+            static_cast<const char*>(t[role].data) + elem * elem_bytes;
+        if (platform::FileValid(handle) &&
+            platform::ReadFileAt(handle, scan_buffer.data(), n_bytes,
+                                 file_offset + elem * elem_bytes) == n_bytes) {
+          src = scan_buffer.data();
+        }
+        if (!IsFiniteChunk(src, t[role].dtype, n))
+          Fail(path, slot.keys[role], "non-finite value");
+      }
     }
     if (has(kDown) != has(kUp))
       Fail(path, first_key,
@@ -433,16 +471,22 @@ Adapter::Adapter(const std::filesystem::path& path, const Schema& schema) {
         if (Elements(t[kScale]) != 1)
           Fail(path, slot.keys[kScale], "scale must have one element");
         patch.scale = Floats(t[kScale], 0, 1)[0];
+        if (!std::isfinite(patch.scale))
+          Fail(path, slot.keys[kScale], "non-finite scale");
         scale = true;
       } else if (has(kAlpha)) {
         if (Elements(t[kAlpha]) != 1)
           Fail(path, slot.keys[kAlpha], "alpha must have one element");
         patch.scale = Floats(t[kAlpha], 0, 1)[0] / patch.rank;
+        if (!std::isfinite(patch.scale))
+          Fail(path, slot.keys[kAlpha], "non-finite scale");
         alpha = true;
       } else if (metadata_alpha) {
         patch.scale = static_cast<float>(
             *metadata_alpha /
             (rslora ? std::sqrt(double(patch.rank)) : patch.rank));
+        if (!std::isfinite(patch.scale))
+          Fail(path, "__metadata__", "non-finite scale");
         used_metadata = true;
       }
       if (has(kMagnitude)) {

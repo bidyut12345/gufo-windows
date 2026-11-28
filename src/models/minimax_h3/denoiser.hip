@@ -207,6 +207,81 @@ __device__ __forceinline__ std::uint16_t DenFloatToBf16(float value) {
   return static_cast<std::uint16_t>((bits + rounding) >> 16U);
 }
 
+__device__ __forceinline__ float DenBf16ToFloat(std::uint16_t bits) {
+  return __uint_as_float(static_cast<std::uint32_t>(bits) << 16U);
+}
+
+constexpr std::uint32_t kTeaCacheSampleCount = 4096U;
+
+__global__ void TeaCacheSnapshotKernel(const std::uint16_t* hidden,
+                                       std::uint16_t* prev_sample,
+                                       std::size_t elements) {
+  const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= kTeaCacheSampleCount || elements == 0U) return;
+  const std::size_t stride = std::max<std::size_t>(1U, elements / kTeaCacheSampleCount);
+  const std::size_t pos =
+      std::min<std::size_t>(static_cast<std::size_t>(idx) * stride, elements - 1U);
+  prev_sample[idx] = hidden[pos];
+}
+
+__global__ void TeaCacheSampleDeltaKernel(const std::uint16_t* hidden,
+                                          std::uint16_t* prev_sample,
+                                          float* metrics,
+                                          std::size_t elements) {
+  __shared__ float shared_diff[256];
+  __shared__ float shared_ref[256];
+  const std::uint32_t tid = threadIdx.x;
+  float diff = 0.0F;
+  float ref = 0.0F;
+  const std::size_t stride =
+      std::max<std::size_t>(1U, elements / kTeaCacheSampleCount);
+  for (std::uint32_t idx = tid; idx < kTeaCacheSampleCount; idx += 256U) {
+    const std::size_t pos = std::min<std::size_t>(
+        static_cast<std::size_t>(idx) * stride, elements - 1U);
+    const float c = DenBf16ToFloat(hidden[pos]);
+    const float p = DenBf16ToFloat(prev_sample[idx]);
+    diff += fabsf(c - p);
+    ref += fabsf(p);
+    prev_sample[idx] = hidden[pos];
+  }
+  shared_diff[tid] = diff;
+  shared_ref[tid] = ref;
+  __syncthreads();
+  for (std::uint32_t s = 128U; s > 0U; s >>= 1U) {
+    if (tid < s) {
+      shared_diff[tid] += shared_diff[tid + s];
+      shared_ref[tid] += shared_ref[tid + s];
+    }
+    __syncthreads();
+  }
+  if (tid == 0U) {
+    metrics[0] = shared_diff[0];
+    metrics[1] = shared_ref[0];
+  }
+}
+
+__global__ void TeaCacheSubBf16Kernel(const std::uint16_t* after49,
+                                      std::uint16_t* residual_in_out,
+                                      std::size_t elements) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < elements) {
+    residual_in_out[idx] = DenFloatToBf16(
+        DenBf16ToFloat(after49[idx]) - DenBf16ToFloat(residual_in_out[idx]));
+  }
+}
+
+__global__ void TeaCacheAddBf16Kernel(std::uint16_t* hidden_in_out,
+                                      const std::uint16_t* residual,
+                                      std::size_t elements) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < elements) {
+    hidden_in_out[idx] = DenFloatToBf16(
+        DenBf16ToFloat(hidden_in_out[idx]) + DenBf16ToFloat(residual[idx]));
+  }
+}
+
 __device__ __forceinline__ float DenDecodeFp8E4M3(std::uint8_t bits) {
   const std::uint32_t sign = (bits >> 7U) & 1U;
   const std::uint32_t exp = (bits >> 3U) & 0xFU;
@@ -714,6 +789,7 @@ struct RefinerWeights {
 
 bool LoadRefinerBlock(const ModelInventory& inventory, std::size_t block,
                       int device, hipStream_t stream, void* staging,
+                      const DitLoras* loras,
                       const CancellationToken* cancellation,
                       RefinerWeights* weights, std::uint64_t* loaded_bytes,
                       std::string* error) {
@@ -751,6 +827,12 @@ bool LoadRefinerBlock(const ModelInventory& inventory, std::size_t block,
   for (std::size_t index = 0; index < tensors.size(); ++index) {
     if (!LoadTensor(inventory, *tensors[index], device, stream, staging,
                     kWeightStagingBytes, cancellation, buffers[index], error)) {
+      return false;
+    }
+    if (loras != nullptr && tensors[index]->shape.size() == 2U &&
+        !ApplyBf16WeightLoras(*tensors[index],
+                              buffers[index]->As<std::uint16_t>(), loras,
+                              stream, error)) {
       return false;
     }
     *loaded_bytes += tensors[index]->payload_bytes;
@@ -898,12 +980,25 @@ struct DenoiserSession::Impl {
   DeviceBuffer uncond_rope_sin_device;
   DeviceBuffer previous_video_velocity_f32;
   DeviceBuffer previous_audio_velocity_f32;
+  struct TeaCacheState {
+    DeviceBuffer residual;
+    DeviceBuffer prev_sample;
+    DeviceBuffer audio_prev_sample;
+    DeviceBuffer metrics;
+    bool valid{false};
+    float accum{0.0F};
+    int consecutive_skips{0};
+  };
+  TeaCacheState cond_teacache;
+  TeaCacheState uncond_teacache;
 
   DenoiserTelemetry base_telemetry;
   int active_blocks{static_cast<int>(kDitBlocks)};
   int reuse_interval{1};
   bool row_parallel_attention{true};
   float cfg_scale{1.0F};
+  DitAttentionHints attention_hints;
+  DitAttentionHints uncond_attention_hints;
   std::shared_ptr<const DitLoras> loras;
 
   [[nodiscard]] std::size_t MaxLayoutRows() const noexcept {
@@ -1034,7 +1129,8 @@ struct DenoiserSession::Impl {
       RefinerWeights weights;
       std::uint64_t loaded_bytes = 0;
       if (!LoadRefinerBlock(*inventory, block, device, stream, staging,
-                            cancellation, &weights, &loaded_bytes, error)) {
+                            loras.get(), cancellation, &weights, &loaded_bytes,
+                            error)) {
         return false;
       }
       base_telemetry.cumulative_allocation_bytes += loaded_bytes;
@@ -1313,6 +1409,8 @@ struct DenoiserSession::Impl {
     DeviceBuffer reference;
     DeviceBuffer mismatch;
     if (!Load(*weight, &weight_device, cancellation, error) ||
+        !ApplyBf16WeightLoras(*weight, weight_device.As<std::uint16_t>(),
+                              loras.get(), stream, error) ||
         !Load(*bias, &bias_device, cancellation, error) ||
         !output.Allocate(
             time_rows.time_rows * output_width * sizeof(std::uint16_t),
@@ -1507,7 +1605,8 @@ struct DenoiserSession::Impl {
                  .rows = rows,
                  .modulation_rows = modulation_rows,
                  .row_parallel_attention = row_parallel_attention,
-                 .validate_gemm_plans = block == 0},
+                 .validate_gemm_plans = block == 0,
+                 .loras = loras},
                 block_workspace, cancellation, &worker_result.error);
             if (session == nullptr) {
               break;
@@ -1700,6 +1799,8 @@ struct DenoiserSession::Impl {
       return false;
     }
     if (!Load(*video_weight, &video_patch_weight, cancellation, error) ||
+        !ApplyFloat32Loras(*video_weight, &video_patch_weight, loras.get(),
+                           stream, error) ||
         !Load(*video_bias, &video_patch_bias, cancellation, error) ||
         !Load(*audio_weight, &audio_patch_weight, cancellation, error) ||
         !ApplyFloat32Loras(*audio_weight, &audio_patch_weight, loras.get(),
@@ -1754,6 +1855,16 @@ struct DenoiserSession::Impl {
     const auto bf16 = [](std::size_t elements) {
       return elements * sizeof(std::uint16_t);
     };
+    const bool enable_teacache =
+        blocks.size() >= 10U && reuse_interval == 1 && schedule.evaluations() >= 10;
+    const auto alloc_teacache = [&](TeaCacheState* tc) {
+      return tc->residual.Allocate(bf16(hidden_elements), error) &&
+             tc->prev_sample.Allocate(
+                 kTeaCacheSampleCount * sizeof(std::uint16_t), error) &&
+             tc->audio_prev_sample.Allocate(
+                 kTeaCacheSampleCount * sizeof(std::uint16_t), error) &&
+             tc->metrics.Allocate(4U * sizeof(float), error);
+    };
     if (!video_sample.Allocate(video_elements * sizeof(float), error) ||
         !audio_sample.Allocate(audio_elements * sizeof(float), error) ||
         (condition_elements != 0 &&
@@ -1769,17 +1880,21 @@ struct DenoiserSession::Impl {
                                   video_elements * sizeof(float), error) ||
                               !uncond_audio_velocity_f32.Allocate(
                                   audio_elements * sizeof(float), error))) ||
-        (reuse_interval > 1 && (!previous_video_velocity_f32.Allocate(
-                                    video_elements * sizeof(float), error) ||
-                                !previous_audio_velocity_f32.Allocate(
-                                    audio_elements * sizeof(float), error)))) {
+        (reuse_interval > 1 && !previous_video_velocity_f32.Allocate(
+                                   video_elements * sizeof(float), error)) ||
+        ((reuse_interval > 1 || schedule.evaluations() < 35) &&
+         !previous_audio_velocity_f32.Allocate(
+             audio_elements * sizeof(float), error)) ||
+        (enable_teacache &&
+         (!alloc_teacache(&cond_teacache) ||
+          (cfg_scale > 1.0F && !alloc_teacache(&uncond_teacache))))) {
       return false;
     }
     video_rows_host.resize(video_elements);
     audio_rows_host.resize(audio_elements);
     forward_history.reserve(static_cast<std::size_t>(schedule.evaluations()) +
                             16U);
-    const std::array<const DeviceBuffer*, 14> buffers = {
+    const std::array<const DeviceBuffer*, 22> buffers = {
         &video_sample,
         &audio_sample,
         &condition_sample,
@@ -1794,6 +1909,14 @@ struct DenoiserSession::Impl {
         &uncond_rope_sin_device,
         &previous_video_velocity_f32,
         &previous_audio_velocity_f32,
+        &cond_teacache.residual,
+        &cond_teacache.prev_sample,
+        &cond_teacache.audio_prev_sample,
+        &cond_teacache.metrics,
+        &uncond_teacache.residual,
+        &uncond_teacache.prev_sample,
+        &uncond_teacache.audio_prev_sample,
+        &uncond_teacache.metrics,
     };
     std::uint64_t bytes = projection_gemm.workspace_bytes();
     for (const DeviceBuffer* buffer : buffers) {
@@ -1950,21 +2073,151 @@ struct DenoiserSession::Impl {
     // A block consumes its input before producing the final gated residual;
     // carry the trunk in place instead of reserving a second full hidden state.
     std::uint16_t* hidden_input = hidden_device.As<std::uint16_t>();
-    for (std::size_t block = 0; block < blocks.size(); ++block) {
+    const std::size_t active_elements = active_layout.rows() * kDitHiddenSize;
+    const std::size_t audio_elements =
+        active_layout.audio_target_rows * kDitHiddenSize;
+    const DitAttentionHints& active_attention_hints =
+        use_uncond ? uncond_attention_hints : attention_hints;
+    TeaCacheState& tc = use_uncond ? uncond_teacache : cond_teacache;
+    const bool use_teacache = !read_velocity &&
+                              tc.residual.bytes() == hidden_device.bytes() &&
+                              blocks.size() >= 10U &&
+                              schedule.evaluations() >= 10;
+    if (use_teacache) {
       if (IsCancelled(cancellation)) {
-        SetError(error, "MiniMax H3 denoiser cancelled after block " +
-                            std::to_string(block));
+        SetError(error, "MiniMax H3 denoiser cancelled before block 0");
         return false;
       }
-      DitBlockTelemetry block_telemetry;
-      if (!blocks[block]->RunPreparedDevice(
+      DitBlockTelemetry block0_telemetry;
+      if (!blocks[0]->RunPreparedDevice(
               hidden_input, block_row_map.As<std::uint32_t>(), hidden_input,
-              static_cast<void*>(stream), block != 0,
-              block + 1U < blocks.size(), cancellation, &block_telemetry,
-              error, active_layout.rows(), active_rope_cos, active_rope_sin)) {
+              static_cast<void*>(stream), false, true, cancellation,
+              &block0_telemetry, error, active_layout.rows(), active_rope_cos,
+              active_rope_sin, active_attention_hints)) {
         return false;
       }
-      block_dispatches += block_telemetry.dispatches;
+      block_dispatches += block0_telemetry.dispatches;
+
+      bool skip_remaining = false;
+      const bool protected_step =
+          step < 2 || step + 3 >= schedule.evaluations();
+      if (!protected_step && tc.valid) {
+        TeaCacheSampleDeltaKernel<<<1, 256, 0, stream>>>(
+            hidden_input, tc.prev_sample.As<std::uint16_t>(),
+            tc.metrics.As<float>(), active_elements);
+        if (audio_elements > 0U) {
+          TeaCacheSampleDeltaKernel<<<1, 256, 0, stream>>>(
+              hidden_input + audio_offset,
+              tc.audio_prev_sample.As<std::uint16_t>(),
+              tc.metrics.As<float>() + 2, audio_elements);
+        }
+        float metrics[4]{0.0F, 0.0F, 0.0F, 0.0F};
+        const std::size_t copy_bytes =
+            audio_elements > 0U ? 4U * sizeof(float) : 2U * sizeof(float);
+        if (!CheckLaunch("H3 TeaCache sample delta", error) ||
+            !CopyAsync(metrics, tc.metrics.data(), copy_bytes,
+                       hipMemcpyDeviceToHost, "read H3 TeaCache metrics",
+                       error)) {
+          return false;
+        }
+        const hipError_t tc_sync = hipStreamSynchronize(stream);
+        if (tc_sync != hipSuccess) {
+          SetError(error, HipError("synchronize H3 TeaCache metrics", tc_sync));
+          return false;
+        }
+        const float rel_l1 =
+            metrics[1] > 1.0e-6F ? metrics[0] / metrics[1] : 1.0F;
+        const float audio_rel_l1 =
+            audio_elements == 0U
+                ? 0.0F
+                : (metrics[3] > 1.0e-6F ? metrics[2] / metrics[3] : 1.0F);
+        tc.accum += rel_l1;
+        if (tc.accum < 0.08F && audio_rel_l1 < 0.06F &&
+            tc.consecutive_skips < 1) {
+          skip_remaining = true;
+          ++tc.consecutive_skips;
+        }
+      }
+
+      if (skip_remaining) {
+        constexpr std::uint32_t kThreads = 256U;
+        const std::uint32_t grid = static_cast<std::uint32_t>(
+            (active_elements + kThreads - 1U) / kThreads);
+        TeaCacheAddBf16Kernel<<<grid, kThreads, 0, stream>>>(
+            hidden_input, tc.residual.As<std::uint16_t>(), active_elements);
+        if (!CheckLaunch("H3 TeaCache add residual", error)) {
+          return false;
+        }
+        ++block_dispatches;
+      } else {
+        if (!CopyAsync(tc.residual.data(), hidden_input,
+                       active_elements * sizeof(std::uint16_t),
+                       hipMemcpyDeviceToDevice,
+                       "snapshot H3 TeaCache block0 hidden", error)) {
+          return false;
+        }
+        if (protected_step || !tc.valid) {
+          TeaCacheSnapshotKernel<<<(kTeaCacheSampleCount + 255U) / 256U, 256U,
+                                   0, stream>>>(
+              hidden_input, tc.prev_sample.As<std::uint16_t>(),
+              active_elements);
+          if (audio_elements > 0U) {
+            TeaCacheSnapshotKernel<<<(kTeaCacheSampleCount + 255U) / 256U, 256U,
+                                     0, stream>>>(
+                hidden_input + audio_offset,
+                tc.audio_prev_sample.As<std::uint16_t>(), audio_elements);
+          }
+          if (!CheckLaunch("H3 TeaCache snapshot", error)) {
+            return false;
+          }
+        }
+        for (std::size_t block = 1; block < blocks.size(); ++block) {
+          if (IsCancelled(cancellation)) {
+            SetError(error, "MiniMax H3 denoiser cancelled after block " +
+                                std::to_string(block));
+            return false;
+          }
+          DitBlockTelemetry block_telemetry;
+          if (!blocks[block]->RunPreparedDevice(
+                  hidden_input, block_row_map.As<std::uint32_t>(), hidden_input,
+                  static_cast<void*>(stream), true,
+                  block + 1U < blocks.size(), cancellation, &block_telemetry,
+                  error, active_layout.rows(), active_rope_cos,
+                  active_rope_sin, active_attention_hints)) {
+            return false;
+          }
+          block_dispatches += block_telemetry.dispatches;
+        }
+        constexpr std::uint32_t kThreads = 256U;
+        const std::uint32_t grid = static_cast<std::uint32_t>(
+            (active_elements + kThreads - 1U) / kThreads);
+        TeaCacheSubBf16Kernel<<<grid, kThreads, 0, stream>>>(
+            hidden_input, tc.residual.As<std::uint16_t>(), active_elements);
+        if (!CheckLaunch("H3 TeaCache compute residual", error)) {
+          return false;
+        }
+        tc.valid = true;
+        tc.accum = 0.0F;
+        tc.consecutive_skips = 0;
+      }
+    } else {
+      for (std::size_t block = 0; block < blocks.size(); ++block) {
+        if (IsCancelled(cancellation)) {
+          SetError(error, "MiniMax H3 denoiser cancelled after block " +
+                              std::to_string(block));
+          return false;
+        }
+        DitBlockTelemetry block_telemetry;
+        if (!blocks[block]->RunPreparedDevice(
+                hidden_input, block_row_map.As<std::uint32_t>(), hidden_input,
+                static_cast<void*>(stream), block != 0,
+                block + 1U < blocks.size(), cancellation, &block_telemetry,
+                error, active_layout.rows(), active_rope_cos,
+                active_rope_sin, active_attention_hints)) {
+          return false;
+        }
+        block_dispatches += block_telemetry.dispatches;
+      }
     }
 
     dit_ops::LaunchFinalAdaLn(
@@ -2168,6 +2421,47 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   impl->reuse_interval = options.reuse_interval;
   impl->row_parallel_attention = options.row_parallel_attention;
   impl->cfg_scale = options.cfg_scale;
+  auto compute_protected_prefix =
+      [](const PackedLayout& l, std::span<const ConditionBlock> cond_blocks) {
+        std::size_t prefix = l.text_rows;
+        if (!cond_blocks.empty()) {
+          for (const ConditionBlock& cb : cond_blocks) {
+            if (cb.latent_frames > 1) {
+              break;
+            }
+            prefix += static_cast<std::size_t>(cb.latent_height / 2) *
+                      static_cast<std::size_t>(cb.latent_width / 2);
+          }
+        } else if (l.video_condition_rows > 0) {
+          prefix += l.video_condition_rows;
+        } else {
+          prefix += l.audio_target_rows;
+        }
+        return std::max<std::size_t>(2048U, prefix);
+      };
+  auto build_attention_hints =
+      [&compute_protected_prefix](const PackedLayout& l,
+                                  std::span<const ConditionBlock> cond_blocks) {
+        DitAttentionHints hints;
+        hints.protected_prefix_rows = compute_protected_prefix(l, cond_blocks);
+        hints.audio_begin_row = l.text_rows + l.video_condition_rows;
+        hints.audio_end_row = hints.audio_begin_row + l.audio_target_rows;
+        hints.video_begin_row = hints.audio_end_row;
+        hints.video_frame_rows =
+            static_cast<std::size_t>(l.latent_height / 2) *
+            static_cast<std::size_t>(l.latent_width / 2);
+        return hints;
+      };
+  impl->attention_hints =
+      build_attention_hints(impl->layout, conditioning.condition_blocks);
+  if (use_cfg) {
+    const std::span<const ConditionBlock> uncond_blocks =
+        !conditioning.uncond_condition_blocks.empty()
+            ? conditioning.uncond_condition_blocks
+            : conditioning.condition_blocks;
+    impl->uncond_attention_hints =
+        build_attention_hints(impl->uncond_layout, uncond_blocks);
+  }
   impl->loras = options.loras;
   impl->base_telemetry.row_parallel_attention = options.row_parallel_attention;
   impl->text_tags.assign(conditioning.tags.begin(), conditioning.tags.end());
@@ -2327,6 +2621,12 @@ bool DenoiserSession::DenoiseWithCheckpoints(
   if (!impl_->UploadLatents(upload_video, upload_audio, error)) {
     return false;
   }
+  impl_->cond_teacache.valid = false;
+  impl_->cond_teacache.accum = 0.0F;
+  impl_->cond_teacache.consecutive_skips = 0;
+  impl_->uncond_teacache.valid = false;
+  impl_->uncond_teacache.accum = 0.0F;
+  impl_->uncond_teacache.consecutive_skips = 0;
   double sampler_ms = 0.0;
   bool have_velocity = false;
   if (start_step > 0 && initial_state != nullptr) {
@@ -2377,29 +2677,39 @@ bool DenoiserSession::DenoiseWithCheckpoints(
   for (int step = start_step; step < impl_->schedule.evaluations(); ++step) {
     const EulerStepPlan& plan =
         impl_->euler_plan[static_cast<std::size_t>(step)];
+    const bool retain_previous_video = impl_->reuse_interval > 1;
+    const bool retain_previous_audio =
+        impl_->reuse_interval > 1 || impl_->schedule.evaluations() < 35;
     if (plan.evaluate) {
-      if (have_velocity && impl_->reuse_interval > 1 &&
-          (!impl_->CopyAsync(impl_->previous_video_velocity_f32.data(),
-                             impl_->video_velocity_f32.data(),
-                             impl_->video_velocity_f32.bytes(),
-                             hipMemcpyDeviceToDevice,
-                             "retain H3 previous video velocity", error) ||
-           !impl_->CopyAsync(impl_->previous_audio_velocity_f32.data(),
-                             impl_->audio_velocity_f32.data(),
-                             impl_->audio_velocity_f32.bytes(),
-                             hipMemcpyDeviceToDevice,
-                             "retain H3 previous audio velocity", error))) {
+      if (have_velocity &&
+          ((retain_previous_video &&
+            !impl_->CopyAsync(impl_->previous_video_velocity_f32.data(),
+                              impl_->video_velocity_f32.data(),
+                              impl_->video_velocity_f32.bytes(),
+                              hipMemcpyDeviceToDevice,
+                              "retain H3 previous video velocity", error)) ||
+           (retain_previous_audio &&
+            !impl_->CopyAsync(impl_->previous_audio_velocity_f32.data(),
+                              impl_->audio_velocity_f32.data(),
+                              impl_->audio_velocity_f32.bytes(),
+                              hipMemcpyDeviceToDevice,
+                              "retain H3 previous audio velocity", error)))) {
         return false;
       }
-      if (impl_->cfg_scale > 1.0F) {
+      bool apply_cfg = impl_->cfg_scale > 1.0F;
+      if (apply_cfg && impl_->schedule.evaluations() >= 10) {
+        const float audio_sigma =
+            impl_->schedule.audio[static_cast<std::size_t>(step)];
+        apply_cfg = audio_sigma >= 0.12F && audio_sigma <= 0.90F;
+      }
+      if (apply_cfg) {
+        // Video trunk is CFG-distilled (video_cfg = 1.0); apply guidance only
+        // to the audio velocity so speech/singing improves without causing
+        // video morphing or hallucinated duplicate subjects.
         if (!impl_->ForwardDevice(step, cancellation, false, nullptr, error,
                                   true) ||
             !impl_->ForwardDevice(step, cancellation, false, nullptr, error,
                                   false) ||
-            !HipCfgCombine(impl_->video_velocity_f32.data(),
-                           impl_->uncond_video_velocity_f32.data(),
-                           impl_->video_velocity_f32.bytes() / sizeof(float),
-                           impl_->cfg_scale, impl_->stream, error) ||
             !HipCfgCombine(impl_->audio_velocity_f32.data(),
                            impl_->uncond_audio_velocity_f32.data(),
                            impl_->audio_velocity_f32.bytes() / sizeof(float),
@@ -2411,25 +2721,29 @@ bool DenoiserSession::DenoiseWithCheckpoints(
           return false;
         }
       }
-      if (!have_velocity && impl_->reuse_interval > 1 &&
-          (!impl_->CopyAsync(impl_->previous_video_velocity_f32.data(),
-                             impl_->video_velocity_f32.data(),
-                             impl_->video_velocity_f32.bytes(),
-                             hipMemcpyDeviceToDevice,
-                             "initialize H3 previous video velocity", error) ||
-           !impl_->CopyAsync(impl_->previous_audio_velocity_f32.data(),
-                             impl_->audio_velocity_f32.data(),
-                             impl_->audio_velocity_f32.bytes(),
-                             hipMemcpyDeviceToDevice,
-                             "initialize H3 previous audio velocity", error))) {
+      if (!have_velocity &&
+          ((retain_previous_video &&
+            !impl_->CopyAsync(impl_->previous_video_velocity_f32.data(),
+                              impl_->video_velocity_f32.data(),
+                              impl_->video_velocity_f32.bytes(),
+                              hipMemcpyDeviceToDevice,
+                              "initialize H3 previous video velocity",
+                              error)) ||
+           (retain_previous_audio &&
+            !impl_->CopyAsync(impl_->previous_audio_velocity_f32.data(),
+                              impl_->audio_velocity_f32.data(),
+                              impl_->audio_velocity_f32.bytes(),
+                              hipMemcpyDeviceToDevice,
+                              "initialize H3 previous audio velocity",
+                              error)))) {
         return false;
       }
       have_velocity = true;
     }
-    const void* previous_video = impl_->reuse_interval > 1
+    const void* previous_video = retain_previous_video
                                      ? impl_->previous_video_velocity_f32.data()
                                      : impl_->video_velocity_f32.data();
-    const void* previous_audio = impl_->reuse_interval > 1
+    const void* previous_audio = retain_previous_audio
                                      ? impl_->previous_audio_velocity_f32.data()
                                      : impl_->audio_velocity_f32.data();
     const auto sampler_begin = Clock::now();

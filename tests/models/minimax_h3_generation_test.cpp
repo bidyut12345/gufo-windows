@@ -16,6 +16,7 @@
 #include "src/core/platform/os_info.hpp"
 #include "src/models/minimax_h3/generation.hpp"
 #include "src/models/minimax_h3/json.hpp"
+#include "src/models/minimax_h3/lora.hpp"
 
 namespace {
 
@@ -449,6 +450,97 @@ void TestCfgParameters() {
         "cfg_scale above 20.0 is rejected");
 }
 
+void WriteTinySafetensors(
+    const std::filesystem::path& path,
+    const std::vector<std::tuple<std::string, std::string, std::vector<int>,
+                                 std::vector<float>>>& tensors) {
+  std::string body;
+  std::ostringstream header;
+  header << '{';
+  std::size_t offset = 0;
+  for (std::size_t idx = 0; idx < tensors.size(); ++idx) {
+    const auto& [name, dtype, shape, vals] = tensors[idx];
+    const std::size_t nbytes = vals.size() * sizeof(float);
+    if (idx != 0) header << ',';
+    header << '"' << name << "\":{\"dtype\":\"" << dtype << "\",\"shape\":[";
+    for (std::size_t s = 0; s < shape.size(); ++s) {
+      if (s != 0) header << ',';
+      header << shape[s];
+    }
+    header << "],\"data_offsets\":[" << offset << ',' << (offset + nbytes)
+           << "]}";
+    body.append(reinterpret_cast<const char*>(vals.data()), nbytes);
+    offset += nbytes;
+  }
+  header << '}';
+  const std::string hdr = header.str();
+  const std::uint64_t hdr_len = hdr.size();
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(&hdr_len), sizeof(hdr_len));
+  out.write(hdr.data(), static_cast<std::streamsize>(hdr.size()));
+  out.write(body.data(), static_cast<std::streamsize>(body.size()));
+  Check(out.good(), "write test safetensors");
+}
+
+void TestLoraAdalnLinearSchema() {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      ("gufo-h3-lora-test-" + std::to_string(gufo::platform::ProcessId()));
+  std::error_code ignored;
+  std::filesystem::remove_all(root, ignored);
+  std::filesystem::create_directories(root);
+  const std::filesystem::path lora_path = root / "adaln_test.safetensors";
+
+  // Exercise both explicit .adaln_proj.linear and .adaln_proj alias keys.
+  const std::vector<float> a_vals(4 * 8, 0.1F);
+  const std::vector<float> b_vals(16 * 4, 0.2F);
+  WriteTinySafetensors(
+      lora_path,
+      {
+          {"diffusion_model.blocks.0.adaln_proj.linear.lora_A.weight",
+           "F32",
+           {4, 8},
+           a_vals},
+          {"diffusion_model.blocks.0.adaln_proj.linear.lora_B.weight",
+           "F32",
+           {16, 4},
+           b_vals},
+          {"diffusion_model.final_layer.adaln_proj.lora_A.weight",
+           "F32",
+           {4, 8},
+           a_vals},
+          {"diffusion_model.final_layer.adaln_proj.lora_B.weight",
+           "F32",
+           {16, 4},
+           b_vals},
+      });
+
+  const auto base_shape = [](std::string_view name) -> std::vector<int> {
+    if (name == "blocks.0.attn.qkv_proj.weight") return {16, 8};
+    if (name == "blocks.0.adaln_proj.linear.weight" ||
+        name == "final_layer.adaln_proj.linear.weight") {
+      return {16, 8};
+    }
+    return {};
+  };
+  const h3::LoadedAdapter loaded =
+      h3::LoadMinimaxAdapter(lora_path, base_shape);
+  Check(loaded.lora != nullptr, "loaded tiny AdaLN LoRA");
+  Check(loaded.lora->patches().size() == 2U,
+        "loaded both block0 and final_layer AdaLN patches");
+  bool saw_block0 = false;
+  bool saw_final = false;
+  for (const auto& patch : loaded.lora->patches()) {
+    if (patch.target == "blocks.0.adaln_proj.linear.weight") saw_block0 = true;
+    if (patch.target == "final_layer.adaln_proj.linear.weight") {
+      saw_final = true;
+    }
+  }
+  Check(saw_block0 && saw_final,
+        "AdaLN LoRA keys resolve to .adaln_proj.linear.weight targets");
+  std::filesystem::remove_all(root, ignored);
+}
+
 }  // namespace
 
 int main() {
@@ -459,6 +551,7 @@ int main() {
   TestAtomicFrames();
   TestAtomicLatents();
   TestCfgParameters();
+  TestLoraAdalnLinearSchema();
 #if !defined(ENGINE_ENABLE_HIP)
   h3::GenerationTelemetry telemetry;
   std::string error;
